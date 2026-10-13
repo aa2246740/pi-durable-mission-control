@@ -26,6 +26,7 @@ export interface NodeCapabilities {
   credentialRefs: string[];
   executionEnabled: boolean;
   executionMode?: "metadata-only" | "workspace-effects";
+  effectApprovals?: true;
 }
 export interface RemoteMachine {
   id: string; name: string; kind: 'remote';
@@ -77,6 +78,18 @@ export interface Approval {
     definitionHash: string; commandId: string; permissionMode: "approve" | "allow";
   };
   authorizationSource?: "role-permission" | "user-approval";
+  remoteEffectBinding?: {
+    spec: {
+      binding: import("./worker-mailbox.js").WorkerBinding;
+      descriptorHash: string;
+      taskId: string;
+      method: "read_file" | "write_file" | "bash";
+      args: { [key: string]: import("./worker-mailbox.js").JsonValue };
+    };
+    originalRpcId: string;
+    roleRevision: number;
+  };
+  remoteEffectReceipt?: import("./node-effects.js").NodeEffectReceipt;
 }
 export interface Artifact {
   id: string; missionId: string; agentId: string; name: string; path: string; sha256: string; size: number; createdAt: string;

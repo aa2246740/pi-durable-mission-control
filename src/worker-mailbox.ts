@@ -33,6 +33,18 @@ export type WorkerUplinkPayload =
 
 export type WorkerDownlinkPayload =
   | { kind: "deliver"; messageId: string; requestId: string; attempt: number; content: string; mode: "steer" | "followUp" }
+  | {
+      kind: "approved-effect";
+      approvalId: string;
+      permit: {
+        binding: WorkerBinding;
+        descriptorHash: string;
+        taskId: string;
+        method: "read_file" | "write_file" | "bash";
+        args: { [key: string]: JsonValue };
+        expiresAt: number;
+      };
+    }
   | { kind: "reply"; rpcId: string; ok: true; result: JsonValue }
   | { kind: "reply"; rpcId: string; ok: false; error: string }
   | { kind: "abort" }
@@ -317,6 +329,33 @@ function payloadFrom(value: unknown, binding: WorkerBinding): WorkerPayload | un
       attempt: value.attempt, content: value.content, mode: value.mode
     };
   }
+  if (value.kind === "approved-effect") {
+    if (!exactKeys(value, ["kind", "approvalId", "permit"]) || !validId(value.approvalId) ||
+        !plainObject(value.permit) ||
+        !exactKeys(value.permit, ["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"])) return undefined;
+    const permit = value.permit;
+    const permitBinding = parseWorkerBinding(permit.binding);
+    if (!permitBinding || typeof permit.descriptorHash !== "string" || !/^[a-f0-9]{64}$/.test(permit.descriptorHash) ||
+        !validId(permit.taskId) || !permit.taskId.startsWith(`${binding.agentId}:`) ||
+        ["runtimeId", "machineId", "sessionId", "sessionEpoch", "agentId", "epoch"].some((key) =>
+          permitBinding[key as keyof WorkerBinding] !== binding[key as keyof WorkerBinding]) ||
+        (permit.method !== "read_file" && permit.method !== "write_file" && permit.method !== "bash") ||
+        !plainObject(permit.args) || typeof permit.expiresAt !== "number" ||
+        !Number.isSafeInteger(permit.expiresAt) || permit.expiresAt <= 0) return undefined;
+    const spec = parseWorkerEnvelope({
+      binding: permitBinding, messageId: "approved-effect-preflight", sequence: 1,
+      payload: { kind: "rpc", rpcId: "approved-effect-preflight", taskId: permit.taskId, method: permit.method, args: permit.args }
+    });
+    if (!spec || spec.payload.kind !== "rpc") return undefined;
+    return {
+      kind: "approved-effect", approvalId: value.approvalId,
+      permit: {
+        binding: permitBinding, descriptorHash: permit.descriptorHash, taskId: spec.payload.taskId,
+        method: spec.payload.method as "read_file" | "write_file" | "bash",
+        args: spec.payload.args, expiresAt: permit.expiresAt
+      }
+    };
+  }
   if (value.kind === "reply") {
     if (!plainObject(value) || !validId(value.rpcId) || !own(value, "ok") || typeof value.ok !== "boolean") return undefined;
     if (value.ok) {
@@ -337,7 +376,7 @@ function payloadFrom(value: unknown, binding: WorkerBinding): WorkerPayload | un
 function outgoing(side: MailboxSide, payload: WorkerPayload): boolean {
   return side === "node"
     ? payload.kind === "notice" || payload.kind === "rpc"
-    : payload.kind === "deliver" || payload.kind === "reply" || payload.kind === "abort" || payload.kind === "shutdown";
+    : payload.kind === "deliver" || payload.kind === "approved-effect" || payload.kind === "reply" || payload.kind === "abort" || payload.kind === "shutdown";
 }
 
 function incoming(side: MailboxSide, payload: WorkerPayload): boolean {
@@ -666,7 +705,7 @@ export class DurableWorkerMailbox {
     return envelope;
   }
 
-  enqueue(value: WorkerBinding, valuePayload: WorkerPayload, messageId = randomUUID()): WorkerEnvelope {
+  enqueue(value: WorkerBinding, valuePayload: WorkerPayload, messageId: string = randomUUID()): WorkerEnvelope {
     const binding = this.checkedBinding(value);
     if (!validId(messageId)) throw new Error("Invalid worker message ID");
     const payload = this.payloadFor(valuePayload, binding);

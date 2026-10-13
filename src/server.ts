@@ -571,7 +571,13 @@ export async function startServer(options: ServerOptions) {
         if (body.decision !== "approved" && body.decision !== "denied") throw new HttpError(400, "Invalid approval decision");
         const approval = control.resolveApproval(decodeURIComponent(approvalMatch[1]!), body.decision);
         const mission = control.missionById(approval.missionId);
-        const result = body.decision === "approved" && mission?.status === "active" ? await control.executeApproved(approval.id) : approval;
+        const result = approval.remoteEffectBinding
+          ? body.decision === "approved" && mission?.status === "active"
+            ? await control.executeApproved(approval.id)
+            : control.getApproval(approval.id)
+          : body.decision === "approved" && mission?.status === "active"
+            ? await control.executeApproved(approval.id)
+            : approval;
         if (mission?.status === "active" && ["succeeded", "failed", "uncertain", "denied"].includes(result.status)) await workers.dispatchPending();
         return jsonResponse(response, 200, result);
       }
@@ -643,6 +649,7 @@ export async function startServer(options: ServerOptions) {
       try {
         control.tickSchedules();
         control.tickWatchdogs();
+        control.reconcileRemoteEffectApprovals();
       } finally {
         maintenanceTicking = false;
       }

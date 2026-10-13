@@ -25,6 +25,7 @@ export interface NodeCapabilities {
   credentialRefs: string[];
   executionEnabled: boolean;
   executionMode?: "metadata-only" | "workspace-effects";
+  effectApprovals?: true;
 }
 
 export interface RemoteMachine {
@@ -125,7 +126,7 @@ function shortText(value: unknown, name: string, max = 200): string {
 export function parseNodeCapabilities(value: unknown): NodeCapabilities {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new MachineError(400, "Node capabilities must be an object");
   const input = value as Record<string, unknown>;
-  const allowed = ["protocol", "version", "platform", "arch", "node", "piDurable", "roots", "credentialRefs", "executionEnabled", "executionMode"];
+  const allowed = ["protocol", "version", "platform", "arch", "node", "piDurable", "roots", "credentialRefs", "executionEnabled", "executionMode", "effectApprovals"];
   const unknown = Object.keys(input).filter((key) => !allowed.includes(key));
   if (unknown.length) throw new MachineError(400, "Unsupported node capability fields");
   const readonly = input.protocol === NODE_PROTOCOL_VERSION && input.executionEnabled === false && !Object.hasOwn(input, "executionMode");
@@ -133,6 +134,12 @@ export function parseNodeCapabilities(value: unknown): NodeCapabilities {
     && input.executionEnabled === true && input.executionMode === "metadata-only";
   const workspaceEffects = input.protocol === NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION
     && input.executionEnabled === true && input.executionMode === "workspace-effects";
+  if (Object.hasOwn(input, "effectApprovals") && input.effectApprovals !== true) {
+    throw new MachineError(400, "effectApprovals must be true when present");
+  }
+  if (input.effectApprovals === true && !workspaceEffects) {
+    throw new MachineError(409, "Effect approvals require protocol-3 workspace effects");
+  }
   if (!readonly && !metadataOnly && !workspaceEffects) throw new MachineError(409, "Node protocol and execution mode are not supported");
   const roots = stringList(input.roots, "roots", (item) => item.startsWith("/") && item.length <= 4096 && !/[\u0000-\u001f]/.test(item), 32);
   if (!roots.length) throw new MachineError(400, "A node must declare at least one workspace root");
@@ -146,7 +153,8 @@ export function parseNodeCapabilities(value: unknown): NodeCapabilities {
     roots,
     credentialRefs: stringList(input.credentialRefs, "credentialRefs", (item) => CREDENTIAL_REF.test(item), 64),
     executionEnabled: metadataOnly || workspaceEffects,
-    ...((metadataOnly || workspaceEffects) ? { executionMode: input.executionMode as "metadata-only" | "workspace-effects" } : {})
+    ...((metadataOnly || workspaceEffects) ? { executionMode: input.executionMode as "metadata-only" | "workspace-effects" } : {}),
+    ...(input.effectApprovals === true ? { effectApprovals: true as const } : {})
   };
 }
 

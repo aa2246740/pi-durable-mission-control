@@ -879,7 +879,10 @@ export class ControlPlane {
       };
       const descriptor = parseWorkerStartSpec({
         binding, missionId: mission.id, workspacePath: workspace.path,
-        workspaceStrategy: "shared", ...(machine.capabilities?.executionMode === "workspace-effects" ? { effects: true } : {}), profile, role
+        workspaceStrategy: "shared",
+        ...(machine.capabilities?.executionMode === "workspace-effects" ? { effects: true } : {}),
+        ...(machine.capabilities?.effectApprovals === true ? { effectApprovals: true } : {}),
+        profile, role
       });
       const assigned = this.remoteRuntimes.assign(descriptor);
       this.workerMailbox.open(binding);
@@ -1408,7 +1411,8 @@ export class ControlPlane {
           agentId: randomUUID(), epoch: 1
         },
         missionId: mission.id, workspacePath: workspace.path, workspaceStrategy: "shared",
-        ...(machine.capabilities.executionMode === "workspace-effects" ? { effects: true } : {}), profile, role
+        ...(machine.capabilities.executionMode === "workspace-effects" ? { effects: true } : {}),
+        ...(machine.capabilities.effectApprovals === true ? { effectApprovals: true } : {}), profile, role
       });
     }
     const id = randomUUID();
@@ -3015,7 +3019,6 @@ export class ControlPlane {
     if (current && current.machineId !== "local" && REMOTE_EFFECT_METHODS.has(request.method)) {
       if (mission.status !== "active") throw new HttpError(409, "Mission is not accepting worker commands");
       if (role.kind === "validator" && request.method !== "read_file") throw new HttpError(403, "Validators may only read remote workspaces");
-      if (mission.autonomy === "approve") throw new HttpError(409, "Approval-mode remote effects are pending phase 2 and unavailable in phase 1");
       const runtime = this.remoteRuntimes.activeForAgent(agent.id);
       const machine = runtime ? this.machineRegistry.get(runtime.machine_id) : undefined;
       let descriptor: ReturnType<typeof parseWorkerStartSpec> | undefined;
@@ -3036,6 +3039,66 @@ export class ControlPlane {
         runtimeId: runtime.runtime_id, machineId: runtime.machine_id, sessionId: runtime.session_id,
         sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
       };
+      if (mission.autonomy === "approve" && request.method !== "read_file") {
+        if (descriptor.effectApprovals !== true || machine.capabilities.effectApprovals !== true) {
+          throw new HttpError(409, "This remote node does not support effect approvals");
+        }
+        if (role.kind !== "worker") throw new HttpError(403, "Remote effect approvals require a worker role");
+        if (typeof request.id !== "string" || !request.id || request.id.length > 240) {
+          throw new HttpError(400, "Remote approval requires the original RPC ID");
+        }
+        const spec = {
+          binding, descriptorHash: runtime.descriptor_hash, taskId: request.taskId,
+          method: request.method as "write_file" | "bash",
+          args: args as Record<string, import("./worker-mailbox.js").JsonValue>
+        };
+        const roleRevision = this.roleRevision(role.id);
+        const approvalScope = `mission:${mission.id}:remote-effect-approvals`;
+        const approvalPayload = { spec, roleRevision };
+        const prior = this.commandReplay<{ approvalId: string }>(approvalScope, request.taskId, approvalPayload);
+        let approvalId = prior?.approvalId;
+        const permitScope = `mission:${mission.id}:remote-effects`;
+        const existingPermit = this.db.prepare("SELECT payload_hash,response FROM commands WHERE scope=? AND command_id=?")
+          .get(permitScope, request.taskId) as { payload_hash: string; response: string } | undefined;
+        if (existingPermit) {
+          const permitPayload = {
+            binding, descriptorHash: runtime.descriptor_hash, taskId: request.taskId,
+            method: request.method, args, approvalId
+          };
+          let permitMatches = false;
+          try {
+            const storedPermit = JSON.parse(existingPermit.response).effectPermit;
+            permitMatches = Boolean(approvalId && existingPermit.payload_hash === hash(permitPayload) &&
+              storedPermit && stable({
+                binding: storedPermit.binding, descriptorHash: storedPermit.descriptorHash,
+                taskId: storedPermit.taskId, method: storedPermit.method, args: storedPermit.args
+              }) === stable({ binding, descriptorHash: runtime.descriptor_hash, taskId: request.taskId,
+                method: request.method, args }));
+          } catch {
+            permitMatches = false;
+          }
+          if (!permitMatches) throw new HttpError(409, "Remote effect task ID already has unrelated trusted authorization");
+        }
+        if (!approvalId) {
+          const created = this.command(approvalScope, request.taskId, approvalPayload, () => {
+            const approval: Approval = {
+              id: randomUUID(), missionId: mission.id, agentId: agent.id, tool: request.method,
+              args, status: "pending", createdAt: now(),
+              remoteEffectBinding: { spec, originalRpcId: request.id!, roleRevision }
+            };
+            this.db.prepare("INSERT INTO approvals(id,mission_id,status,data) VALUES(?,?,?,?)")
+              .run(approval.id, mission.id, "pending", json(approval));
+            this.setAgentStatus(agent.id, agent.epoch, "waiting_approval");
+            this.event(mission.id, "approval_requested", `Approval requested for ${request.method}.`, agent.id,
+              { approvalId: approval.id, remoteEffect: true });
+            return { approvalId: approval.id };
+          });
+          approvalId = created.approvalId;
+        }
+        const saved = this.db.prepare("SELECT data FROM approvals WHERE id=?").get(approvalId) as Row | undefined;
+        if (!saved) throw new HttpError(409, "Remote effect approval record is missing");
+        return { status: "pending", approvalId };
+      }
       const expiresAt = Math.min(machine.leaseExpiresAt ?? 0, Date.now() + 20_000);
       const permit = { effectPermit: { binding, descriptorHash: runtime.descriptor_hash, taskId: request.taskId, method: request.method, args, expiresAt } };
       return this.command(`mission:${mission.id}:remote-effects`, request.taskId, { binding, descriptorHash: runtime.descriptor_hash, method: request.method, args }, () => {
@@ -3490,16 +3553,24 @@ export class ControlPlane {
   async executeApprovedPending(missionId: string): Promise<void> {
     const rows = this.db.prepare("SELECT id FROM approvals WHERE mission_id=? AND status='approved'").all(missionId) as Array<{ id: string }>;
     for (const row of rows) await this.executeApproved(row.id);
+    this.reconcileRemoteEffectApprovals();
   }
 
   private async executeApprovedOnce(id: string): Promise<Approval> {
     const row = this.db.prepare("SELECT data FROM approvals WHERE id=?").get(id) as Row | undefined;
     if (!row) throw new HttpError(404, "Approval not found");
     const previous = decode<Approval>(row.data);
+    if (previous.remoteEffectBinding) {
+      this.reconcileRemoteEffectApprovals();
+      const current = this.db.prepare("SELECT data FROM approvals WHERE id=?").get(id) as Row | undefined;
+      if (!current) throw new HttpError(404, "Approval not found");
+      return decode<Approval>(current.data);
+    }
     if (["succeeded", "failed", "uncertain", "denied"].includes(previous.status)) return previous;
     const agent = this.getAgent(previous.agentId);
     const mission = this.getMission(previous.missionId);
     if (previous.status !== "approved") throw new HttpError(409, "Approval must be approved before execution");
+    if (previous.remoteEffectBinding) return previous;
     if (!agent || !mission || mission.status !== "active") throw new HttpError(409, "Approved operation cannot run outside an active mission");
     if (agent.machineId !== "local") throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
     if (previous.tool === "run_validation") {
@@ -4223,6 +4294,240 @@ export class ControlPlane {
     return row?.revision ?? 0;
   }
 
+  private remoteEffectApprovalCurrent(approval: Approval): boolean {
+    const remote = approval.remoteEffectBinding;
+    if (!remote) return false;
+    const { spec, roleRevision } = remote;
+    const mission = this.getMission(approval.missionId);
+    const agent = this.getAgent(approval.agentId);
+    const role = agent ? this.role(agent.roleId) : undefined;
+    const profile = agent ? this.profile(agent.profileId) : undefined;
+    const workspace = agent?.workspaceId ? this.workspace(agent.workspaceId) : undefined;
+    const runtime = agent ? this.remoteRuntimes.activeForAgent(agent.id) : undefined;
+    const machine = runtime ? this.machineRegistry.get(runtime.machine_id) : undefined;
+    let descriptor: ReturnType<typeof parseWorkerStartSpec> | undefined;
+    try { if (runtime) descriptor = parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)); } catch {}
+    let intentResponse: { approvalId?: unknown } | undefined;
+    if (mission) {
+      const intent = this.db.prepare("SELECT payload_hash,response FROM commands WHERE scope=? AND command_id=?")
+        .get(`mission:${mission.id}:remote-effect-approvals`, spec.taskId) as { payload_hash: string; response: string } | undefined;
+      if (intent) {
+        try { intentResponse = JSON.parse(intent.response) as { approvalId?: unknown }; } catch {}
+      }
+      if (!intent || intent.payload_hash !== hash({ spec, roleRevision }) || intentResponse?.approvalId !== approval.id) return false;
+    } else {
+      return false;
+    }
+    if (approval.missionId !== mission.id || approval.agentId !== spec.binding.agentId ||
+        approval.tool !== spec.method || stable(approval.args) !== stable(spec.args) ||
+        !remote.originalRpcId || remote.originalRpcId.length > 240 ||
+        spec.taskId !== remote.spec.taskId || !spec.taskId.startsWith(`${approval.agentId}:`)) return false;
+    if (!mission || mission.status !== "active" || mission.autonomy !== "approve" ||
+        !agent || !role || !profile || !workspace || !runtime ||
+        !machine || runtime.state !== "running" || runtime.desired !== "run" ||
+        role.kind !== "worker" || !descriptor ||
+        agent.machineId !== spec.binding.machineId || agent.epoch !== spec.binding.epoch ||
+        runtime.runtime_id !== spec.binding.runtimeId || runtime.session_id !== spec.binding.sessionId ||
+        runtime.session_epoch !== spec.binding.sessionEpoch || runtime.agent_id !== spec.binding.agentId ||
+        runtime.epoch !== spec.binding.epoch || runtime.descriptor_hash !== spec.descriptorHash ||
+        workerStartSpecHash(descriptor) !== spec.descriptorHash ||
+        machine.status !== "online" || machine.sessionId !== spec.binding.sessionId ||
+        machine.sessionEpoch !== spec.binding.sessionEpoch || (machine.leaseExpiresAt ?? 0) <= Date.now() ||
+        machine.capabilities?.executionMode !== "workspace-effects" || machine.capabilities.effectApprovals !== true ||
+        this.roleRevision(role.id) !== roleRevision || profile.id !== agent.profileId ||
+        workspace.machineId !== agent.machineId || !mission.remoteWorkspaceIds?.includes(workspace.id) ||
+        descriptor.effects !== true || descriptor.effectApprovals !== true ||
+        descriptor.missionId !== mission.id || descriptor.binding.runtimeId !== spec.binding.runtimeId ||
+        descriptor.binding.machineId !== spec.binding.machineId || descriptor.binding.sessionId !== spec.binding.sessionId ||
+        descriptor.binding.sessionEpoch !== spec.binding.sessionEpoch || descriptor.binding.agentId !== spec.binding.agentId ||
+        descriptor.binding.epoch !== spec.binding.epoch || descriptor.profile.id !== profile.id ||
+        descriptor.profile.revision !== profile.revision || descriptor.role.id !== role.id ||
+        descriptor.role.profileId !== role.profileId || descriptor.role.kind !== "worker" ||
+        descriptor.workspacePath !== workspace.path ||
+        agent.roleId !== role.id || !mission.roleIds.includes(role.id)) return false;
+    try { return this.workerMailbox.inspectBinding(spec.binding).status === "open"; }
+    catch { return false; }
+  }
+
+  reconcileRemoteEffectApprovals(): void {
+    const rows = this.db.prepare("SELECT id,data FROM approvals WHERE status IN ('pending','approved','running')")
+      .all() as Array<{ id: string; data: string }>;
+    for (const row of rows) {
+      const approval = decode<Approval>(row.data);
+      const remote = approval.remoteEffectBinding;
+      if (!remote) continue;
+      if (approval.status === "running") {
+        const effectId = `${remote.spec.binding.agentId}\0${remote.spec.taskId}`;
+        const evidence = this.detail(approval.missionId).events.find((event) =>
+          event.type === "remote_effect_receipt" && event.data && typeof event.data === "object" &&
+          (event.data as { effectId?: unknown }).effectId === effectId);
+        const receipt = evidence?.data && typeof evidence.data === "object"
+          ? (evidence.data as { receipt?: import("./node-effects.js").NodeEffectReceipt }).receipt : undefined;
+        if (receipt) {
+          if (receipt.status === "uncertain") {
+            this.transaction(() => {
+              const latest = this.db.prepare("SELECT data,status FROM approvals WHERE id=?").get(approval.id) as { data: string; status: Approval["status"] } | undefined;
+              if (!latest || latest.status !== "running") return;
+            const updated = {
+              ...decode<Approval>(latest.data), status: "uncertain" as const,
+              remoteEffectReceipt: receipt,
+              receipt: { stdout: "", stderr: receipt.error, exitCode: null }
+            };
+            this.db.prepare("UPDATE approvals SET status='uncertain',data=? WHERE id=?").run(json(updated), approval.id);
+              this.insertSystemBlocker(`approval:${approval.id}`, approval.missionId, "approval",
+                `Remote approval ${approval.id} has an uncertain effect receipt. Do not replay it; record a human resolution.`);
+            });
+          } else {
+            this.recordRemoteApprovalOutcome(approval, receipt);
+          }
+        } else if (!this.remoteEffectApprovalCurrent(approval)) {
+          this.transaction(() => {
+            const latest = this.db.prepare("SELECT data,status FROM approvals WHERE id=?").get(approval.id) as { data: string; status: Approval["status"] } | undefined;
+            if (!latest || latest.status !== "running") return;
+            const error = "Runtime binding was lost before a terminal receipt arrived; do not replay.";
+            const updated = {
+              ...decode<Approval>(latest.data), status: "uncertain" as const,
+              remoteEffectReceipt: { status: "uncertain" as const, error },
+              receipt: { stdout: "", stderr: error, exitCode: null }
+            };
+            this.db.prepare("UPDATE approvals SET status='uncertain',data=? WHERE id=?").run(json(updated), approval.id);
+            this.insertSystemBlocker(`approval:${approval.id}`, approval.missionId, "approval",
+              `Remote approval ${approval.id} may have executed before its runtime was lost. Do not replay it; record a human resolution.`);
+          });
+        }
+        continue;
+      }
+      if (!this.remoteEffectApprovalCurrent(approval)) {
+        this.transaction(() => {
+          const latest = this.db.prepare("SELECT data,status FROM approvals WHERE id=?").get(approval.id) as { data: string; status: Approval["status"] } | undefined;
+          if (!latest || (latest.status !== "pending" && latest.status !== "approved")) return;
+          const updated = {
+            ...decode<Approval>(latest.data), status: "failed" as const,
+            receipt: { stdout: "", stderr: "Approval scope became stale before dispatch; the effect was not dispatched.", exitCode: null }
+          };
+          this.db.prepare("UPDATE approvals SET status='failed',data=? WHERE id=?").run(json(updated), approval.id);
+          this.insertSystemBlocker(`approval:${approval.id}`, approval.missionId, "approval",
+            `Remote approval ${approval.id} became stale before dispatch; no effect was sent.`);
+        });
+      } else if (approval.status === "approved") {
+        try {
+          this.dispatchRemoteEffectApproval(approval);
+        } catch (error) {
+          if (!(error instanceof HttpError) || error.status !== 409) throw error;
+          this.failRemoteApprovalNotDispatched(approval, error.message);
+        }
+      }
+    }
+  }
+
+  private failRemoteApprovalNotDispatched(approval: Approval, reason: string): void {
+    this.transaction(() => {
+      const latest = this.db.prepare("SELECT data,status FROM approvals WHERE id=?").get(approval.id) as
+        { data: string; status: Approval["status"] } | undefined;
+      if (!latest || latest.status !== "approved") return;
+      const updated = {
+        ...decode<Approval>(latest.data), status: "failed" as const,
+        receipt: { stdout: "", stderr: `Remote effect was not dispatched: ${reason}`, exitCode: null }
+      };
+      this.db.prepare("UPDATE approvals SET status='failed',data=? WHERE id=?").run(json(updated), approval.id);
+      this.insertSystemBlocker(`approval:${approval.id}`, approval.missionId, "approval",
+        `Remote approval ${approval.id} was not dispatched: ${reason}`);
+    });
+  }
+
+  private dispatchRemoteEffectApproval(approval: Approval): void {
+    const remote = approval.remoteEffectBinding;
+    if (!remote || !this.remoteEffectApprovalCurrent(approval)) return;
+    const binding = remote.spec.binding;
+    const barrier = this.workerMailbox.inspectOutbox(binding).some(({ envelope, status }) =>
+      status !== "cancelled" && status !== "uncertain" && envelope.payload.kind === "reply" &&
+      envelope.payload.rpcId === remote.originalRpcId &&
+      envelope.payload.ok && envelope.payload.result && typeof envelope.payload.result === "object" &&
+      (envelope.payload.result as Record<string, unknown>).status === "pending" &&
+      (envelope.payload.result as Record<string, unknown>).approvalId === approval.id);
+    if (!barrier) return;
+    this.transaction(() => {
+      const latestRow = this.db.prepare("SELECT data,status FROM approvals WHERE id=?").get(approval.id) as { data: string; status: Approval["status"] } | undefined;
+      if (!latestRow || latestRow.status !== "approved") return;
+      const latest = decode<Approval>(latestRow.data);
+      if (!this.remoteEffectApprovalCurrent(latest)) return;
+      const machine = this.machineRegistry.get(binding.machineId);
+      const expiresAt = Math.min(machine?.leaseExpiresAt ?? 0, Date.now() + 20_000);
+      if (expiresAt <= Date.now()) return;
+      const permit = { ...remote.spec, expiresAt };
+      const scope = `mission:${approval.missionId}:remote-effects`;
+      const payload = { binding, descriptorHash: remote.spec.descriptorHash, taskId: remote.spec.taskId,
+        method: remote.spec.method, args: remote.spec.args, approvalId: approval.id };
+      const prior = this.db.prepare("SELECT payload_hash,response FROM commands WHERE scope=? AND command_id=?")
+        .get(scope, remote.spec.taskId) as { payload_hash: string; response: string } | undefined;
+      if (prior) {
+        let storedPermit: Record<string, unknown> | undefined;
+        try { storedPermit = JSON.parse(prior.response).effectPermit as Record<string, unknown> | undefined; } catch {}
+        if (prior.payload_hash !== hash(payload) || !storedPermit ||
+            stable({ binding: storedPermit.binding, descriptorHash: storedPermit.descriptorHash,
+              taskId: storedPermit.taskId, method: storedPermit.method, args: storedPermit.args }) !==
+            stable({ binding, descriptorHash: remote.spec.descriptorHash, taskId: remote.spec.taskId,
+              method: remote.spec.method, args: remote.spec.args })) {
+          throw new HttpError(409, "Remote effect task ID already has different authorization");
+        }
+      }
+      if (!prior) {
+        this.db.prepare("INSERT INTO commands(scope,command_id,payload_hash,response,created_at) VALUES(?,?,?,?,?)")
+          .run(scope, remote.spec.taskId, hash(payload), json({ effectPermit: permit }), now());
+      }
+      const updated = { ...latest, status: "running" as const };
+      this.db.prepare("UPDATE approvals SET status='running',data=? WHERE id=?").run(json(updated), approval.id);
+      this.workerMailbox.enqueue(binding, { kind: "approved-effect", approvalId: approval.id, permit },
+        `approval-effect:${approval.id}`);
+      this.event(approval.missionId, "approval_execution", "Approved remote effect was dispatched to its node.", approval.agentId,
+        { approvalId: approval.id, status: "running" });
+    });
+  }
+
+  private recordRemoteApprovalOutcome(approval: Approval, receipt: import("./node-effects.js").NodeEffectReceipt): void {
+    if (receipt.status === "uncertain") return;
+    this.transaction(() => {
+      const latestRow = this.db.prepare("SELECT data,status FROM approvals WHERE id=?").get(approval.id) as { data: string; status: Approval["status"] } | undefined;
+      if (!latestRow || latestRow.status !== "running") return;
+      const status = receipt.status === "succeeded" ? "succeeded" as const : "failed" as const;
+      const latest = decode<Approval>(latestRow.data);
+      const updated = { ...latest, status, remoteEffectReceipt: receipt };
+      const result = receipt.result && typeof receipt.result === "object" && !Array.isArray(receipt.result)
+        ? receipt.result as Record<string, unknown> : undefined;
+      const approvalReceipt = latest.tool === "bash"
+        ? {
+            stdout: typeof result?.stdout === "string" ? result.stdout : "",
+            stderr: typeof result?.stderr === "string" ? result.stderr : "",
+            exitCode: typeof result?.exitCode === "number" && Number.isSafeInteger(result.exitCode)
+              ? result.exitCode : null
+          }
+        : {
+            stdout: JSON.stringify(receipt.result),
+            stderr: "",
+            exitCode: receipt.status === "succeeded" ? 0 : 1
+          };
+      const withReceipt = { ...updated, receipt: approvalReceipt };
+      this.db.prepare("UPDATE approvals SET status=?,data=? WHERE id=?").run(status, json(withReceipt), approval.id);
+      this.event(approval.missionId, "approval_execution", `Approved remote effect is ${status}.`, approval.agentId,
+        { approvalId: approval.id, status });
+      const mission = this.getMission(approval.missionId);
+      if (!mission || mission.status !== "active" || !this.remoteEffectApprovalCurrent(latest) ||
+          this.blockers(approval.missionId).some((blocker) =>
+            blocker.status === "open" && ["unsafe_execution", "delivery", "approval"].includes(blocker.kind))) return;
+      const id = `approval-execution:${approval.id}:${status}`;
+      const exists = this.db.prepare("SELECT 1 FROM messages WHERE id=?").get(id);
+      if (exists) return;
+      const message: Message = {
+        id, missionId: mission.id, senderId: "control", recipientId: approval.agentId,
+        content: `Approval ${approval.id} execution ${status}.`, mode: "followUp",
+        status: "queued", attempt: 1, createdAt: now()
+      };
+      this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)")
+        .run(message.id, message.missionId, message.status, json(message));
+      this.enqueue(message);
+    });
+  }
+
   resolveApproval(id: string, decision: "approved" | "denied"): Approval {
     return this.command(`approval:${id}`, "user-decision", { decision }, () => {
       const row = this.db.prepare("SELECT data FROM approvals WHERE id=?").get(id) as Row | undefined;
@@ -4236,7 +4541,8 @@ export class ControlPlane {
       this.db.prepare("UPDATE approvals SET status=?,data=? WHERE id=?").run(decision, json(updated), id);
       const mission = this.getMission(approval.missionId);
       const recipient = this.getAgent(approval.agentId);
-      if (mission && recipient) {
+      const remoteEffect = Boolean(approval.remoteEffectBinding);
+      if (mission && recipient && (!remoteEffect || (decision === "denied" && this.remoteEffectApprovalCurrent(approval)))) {
         const message: Message = {
           id: `approval-outcome:${id}:${decision}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
           content: `Approval ${id} was ${decision}.`, mode: "followUp",
@@ -4249,6 +4555,12 @@ export class ControlPlane {
       this.event(approval.missionId, `approval_${decision}`, `Approval ${decision}.`, approval.agentId, { approvalId: id });
       return updated;
     });
+  }
+
+  getApproval(id: string): Approval {
+    const row = this.db.prepare("SELECT data FROM approvals WHERE id=?").get(id) as Row | undefined;
+    if (!row) throw new HttpError(404, "Approval not found");
+    return decode<Approval>(row.data);
   }
 
   consumeApproval(id: string): Approval {

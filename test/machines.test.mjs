@@ -103,6 +103,10 @@ test("node capabilities accept only readonly v1 or explicit metadata-only v2", (
   });
   assert.equal(v3.executionEnabled, true);
   assert.equal(v3.executionMode, "workspace-effects");
+  const approvalV3 = parseNodeCapabilities({
+    ...v1, protocol: 3, executionEnabled: true, executionMode: "workspace-effects", effectApprovals: true
+  });
+  assert.equal(approvalV3.effectApprovals, true);
   for (const invalid of [
     { ...v1, protocol: 1, executionEnabled: true },
     { ...v1, protocol: 1, executionEnabled: false, executionMode: "metadata-only" },
@@ -112,7 +116,10 @@ test("node capabilities accept only readonly v1 or explicit metadata-only v2", (
     { ...v1, protocol: 2, executionEnabled: true, executionMode: "metadata-only", testOnlyScripted: true },
     { ...v1, protocol: 2, executionEnabled: true, executionMode: "workspace-effects" },
     { ...v1, protocol: 3, executionEnabled: true, executionMode: "metadata-only" },
-    { ...v1, protocol: 3, executionEnabled: false, executionMode: "workspace-effects" }
+    { ...v1, protocol: 3, executionEnabled: false, executionMode: "workspace-effects" },
+    { ...v1, protocol: 3, executionEnabled: true, executionMode: "metadata-only", effectApprovals: true },
+    { ...v1, protocol: 2, executionEnabled: true, executionMode: "metadata-only", effectApprovals: true },
+    { ...v1, protocol: 3, executionEnabled: true, executionMode: "workspace-effects", effectApprovals: false }
   ]) assert.throws(() => parseNodeCapabilities(invalid));
 });
 

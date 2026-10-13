@@ -211,6 +211,14 @@ test("starts one real node worker with isolated durable state and strict admissi
   assert.equal(supervisor.inspect()[0].live, false);
 });
 
+test("effect-approval descriptors require an explicit effect-capable node", () => {
+  const binding = bindingFor("approval-spec");
+  const base = specFor(binding, "/tmp");
+  assert.equal(parseWorkerStartSpec({ ...base, effects: true, effectApprovals: true }).effectApprovals, true);
+  assert.throws(() => parseWorkerStartSpec({ ...base, effectApprovals: true }), /requires workspace effects/);
+  assert.throws(() => parseWorkerStartSpec({ ...base, effects: true, effectApprovals: false }), /must be true/);
+});
+
 test("lease loss cancels a running node-local shell before reporting confirmed stop", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-node-worker-effect-stop-"));
   const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
@@ -476,6 +484,190 @@ test("effect receipt is durable before a failed child reply send", async (t) => 
   assert.ok(receipt);
   assert.equal(receipt.spec.taskId, taskId);
   assert.equal(receipt.receipt.status, "succeeded");
+});
+
+test("approved effects reject unsolicited, mismatched, and expired permits without an effect", async t => {
+  for (const scenario of ["unsolicited", "mismatched", "expired"]) {
+    const home = mkdtempSync(join(tmpdir(), `mission-control-approved-${scenario}-`));
+    const root = join(home, "root"), workspace = join(root, "workspace");
+    const binding = bindingFor(`approved-${scenario}`);
+    mkdirSync(workspace, { recursive: true });
+    const supervisor = new NodeWorkerSupervisor({
+      ...supervisorOptions(join(home, "node-home"), root),
+      executionMode: "workspace-effects", effectApprovals: true
+    });
+    t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+    const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true, effectApprovals: true });
+    const handle = supervisor.handles.get(binding.runtimeId);
+    assert.ok(handle?.child);
+    const taskId = `${binding.agentId}:approved-${scenario}`;
+    const args = { command: "printf x >> effect-marker" };
+    const approvalId = `approval-${scenario}`;
+    if (scenario !== "unsolicited") {
+      const rpcId = `rpc-${scenario}`;
+      handle.child.emit("message", {
+        type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId,
+        epoch: binding.epoch, method: "bash", args, taskId
+      });
+      await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+        envelope.payload.kind === "rpc" && envelope.payload.rpcId === rpcId));
+      supervisor.mailbox.receive(binding, {
+        binding, messageId: `pending-${scenario}`, sequence: 1,
+        payload: { kind: "reply", rpcId, ok: true, result: { status: "pending", approvalId } }
+      });
+      await supervisor.pump(binding);
+    }
+    const permit = {
+      binding, descriptorHash: started.descriptorHash, taskId,
+      method: "bash", args, expiresAt: Date.now() + 20000
+    };
+    if (scenario === "mismatched") permit.args = { command: "touch unexpected" };
+    if (scenario === "expired") permit.expiresAt = Date.now() - 1;
+    supervisor.mailbox.receive(binding, {
+      binding, messageId: `approved-command-${scenario}`, sequence: scenario === "unsolicited" ? 1 : 2,
+      payload: { kind: "approved-effect", approvalId, permit }
+    });
+    await supervisor.pump(binding);
+    assert.equal(existsSync(join(workspace, "effect-marker")), false);
+    assert.equal(supervisor.inspect().find(row => row.runtimeId === binding.runtimeId).state, "closed");
+  }
+});
+
+test("duplicate pending reply from a different binding is not accepted by this worker", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-pending-binding-"));
+  const root = join(home, "root"), workspace = join(root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  const binding = bindingFor("pending-binding");
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(join(home, "node-home"), root), executionMode: "workspace-effects", effectApprovals: true
+  });
+  await supervisor.start({ ...specFor(binding, workspace, ""), effects: true, effectApprovals: true });
+  const foreign = {
+    binding: { ...binding, runtimeId: "foreign-runtime" },
+    descriptorHash: supervisor.db.prepare("SELECT descriptor_hash FROM node_worker_runtimes WHERE runtime_id=?")
+      .get(binding.runtimeId).descriptor_hash,
+    taskId: `${binding.agentId}:spoofed`, method: "bash", args: { command: "printf x >> effect-marker" }
+  };
+  supervisor.db.prepare("INSERT INTO node_effect_approvals(approval_id,spec_json) VALUES(?,?)")
+    .run("foreign-approval", JSON.stringify(foreign));
+  supervisor.db.prepare("INSERT INTO node_effect_approval_replies(rpc_id,approval_id,result_json) VALUES(?,?,?)")
+    .run("foreign-rpc", "foreign-approval", JSON.stringify({ approvalId: "foreign-approval", status: "pending" }));
+  supervisor.mailbox.receive(binding, {
+    binding, messageId: "foreign-pending-reply", sequence: 1,
+    payload: { kind: "reply", rpcId: "foreign-rpc", ok: true,
+      result: { status: "pending", approvalId: "foreign-approval" } }
+  });
+  await supervisor.pump(binding);
+  assert.equal(supervisor.inspect().find(row => row.runtimeId === binding.runtimeId).state, "closed");
+  assert.equal(existsSync(join(workspace, "effect-marker")), false);
+  assert.notEqual(supervisor.mailbox.inspectInbox(binding).find(item =>
+    item.envelope.messageId === "foreign-pending-reply").status, "applied");
+});
+
+test("duplicate approved terminal command reuses its journal receipt and appends once", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-approved-duplicate-"));
+  const root = join(home, "root"), workspace = join(root, "workspace");
+  const nodeHome = join(home, "node-home"), binding = bindingFor("approved-duplicate");
+  mkdirSync(workspace, { recursive: true });
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root), executionMode: "workspace-effects", effectApprovals: true
+  });
+  const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true, effectApprovals: true });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle?.child);
+  const taskId = `${binding.agentId}:append-once`;
+  const args = { command: "printf x >> effect-marker" };
+  const approvalId = "approval-append-once";
+  handle.child.emit("message", {
+    type: "rpc", id: "rpc-append-once", token: handle.token, agentId: binding.agentId,
+    epoch: binding.epoch, method: "bash", args, taskId
+  });
+  await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.rpcId === "rpc-append-once"));
+  supervisor.mailbox.receive(binding, {
+    binding, messageId: "pending-append-once", sequence: 1,
+    payload: { kind: "reply", rpcId: "rpc-append-once", ok: true, result: { status: "pending", approvalId } }
+  });
+  await supervisor.pump(binding);
+  const permit = {
+    binding, descriptorHash: started.descriptorHash, taskId,
+    method: "bash", args, expiresAt: Date.now() + 20000
+  };
+  supervisor.mailbox.receive(binding, {
+    binding, messageId: "approved-append-once", sequence: 2,
+    payload: { kind: "approved-effect", approvalId, permit }
+  });
+  await supervisor.pump(binding);
+  supervisor.mailbox.receive(binding, {
+    binding, messageId: "approved-append-once-duplicate", sequence: 3,
+    payload: { kind: "approved-effect", approvalId, permit }
+  });
+  await supervisor.pump(binding);
+  assert.equal(readFileSync(join(workspace, "effect-marker"), "utf8"), "x");
+  assert.equal(supervisor.pendingEffectReceipts().length, 1);
+  assert.equal(supervisor.mailbox.inspectInbox(binding)
+    .filter(({ envelope }) => envelope.payload.kind === "approved-effect" && envelope.payload.approvalId === approvalId)
+    .every(({ status }) => status === "applied"), true);
+});
+
+test("failed terminal journal persistence leaves the permit inbox unfinished", async t => {
+  for (const caller of ["ordinary", "approved"]) {
+    const home = mkdtempSync(join(tmpdir(), `mission-control-effect-journal-failure-${caller}-`));
+    const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+    mkdirSync(workspace, { recursive: true });
+    const binding = bindingFor(`terminal-journal-failure-${caller}`);
+    let supervisor;
+    t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+    supervisor = new NodeWorkerSupervisor({
+      ...supervisorOptions(nodeHome, root), executionMode: "workspace-effects", effectApprovals: true
+    });
+    const started = await supervisor.start({
+      ...specFor(binding, workspace, ""), effects: true, effectApprovals: true
+    });
+    const handle = supervisor.handles.get(binding.runtimeId);
+    assert.ok(handle?.child);
+    const rpcId = `rpc-terminal-journal-failure-${caller}`;
+    const taskId = `${binding.agentId}:terminal-journal-failure`;
+    const args = { path: "journal-failure.txt", content: "executed once" };
+    handle.child.emit("message", {
+      type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId,
+      epoch: binding.epoch, method: "write_file", taskId, args
+    });
+    await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+      envelope.payload.kind === "rpc" && envelope.payload.rpcId === rpcId));
+    if (caller === "approved") {
+      supervisor.mailbox.receive(binding, {
+        binding, messageId: `pending-${caller}`, sequence: 1,
+        payload: { kind: "reply", rpcId, ok: true, result: { status: "pending", approvalId: `approval-${caller}` } }
+      });
+      await supervisor.pump(binding);
+    }
+    supervisor.db.exec(`CREATE TRIGGER reject_terminal_effect BEFORE UPDATE OF state,receipt_json ON node_effects
+      WHEN NEW.state IN ('succeeded','failed','uncertain')
+      BEGIN SELECT RAISE(ABORT, 'injected terminal journal failure'); END`);
+    const inboxId = `terminal-journal-failure-permit-${caller}`;
+    const permit = {
+      binding, descriptorHash: started.descriptorHash, taskId, method: "write_file",
+      args, expiresAt: Date.now() + 20000
+    };
+    supervisor.mailbox.receive(binding, {
+      binding, messageId: inboxId, sequence: caller === "approved" ? 2 : 1,
+      payload: caller === "approved"
+        ? { kind: "approved-effect", approvalId: `approval-${caller}`, permit }
+        : { kind: "reply", rpcId, ok: true, result: { effectPermit: permit } }
+    });
+    await supervisor.pump(binding);
+    const inbox = supervisor.mailbox.inspectInbox(binding).find(item => item.envelope.messageId === inboxId);
+    assert.ok(["processing", "uncertain"].includes(inbox.status));
+    const [entry] = supervisor.effects.inspect();
+    assert.equal(entry.state, "executing");
+    assert.equal(entry.receipt, null);
+    assert.equal(readFileSync(join(workspace, "journal-failure.txt"), "utf8"), "executed once");
+  }
 });
 
 test("redacts IPC JSON without truncating business content and rejects invalid payloads before persistence", async (t) => {

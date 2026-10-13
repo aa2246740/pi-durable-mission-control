@@ -15,6 +15,7 @@ export interface WorkerStartSpec {
   workspacePath: string;
   workspaceStrategy: "shared";
   effects?: boolean;
+  effectApprovals?: true;
   profile: ModelProfile;
   role: RoleProfile;
 }
@@ -28,7 +29,7 @@ export function isReservedCredentialEnvironmentName(name: string): boolean {
   return RESERVED_ENVIRONMENT_NAMES.includes(name) || /^(NODE_|LD_|DYLD_)/.test(name);
 }
 
-const SPEC_KEYS = ["binding", "missionId", "workspacePath", "workspaceStrategy", "effects", "profile", "role"];
+const SPEC_KEYS = ["binding", "missionId", "workspacePath", "workspaceStrategy", "effects", "effectApprovals", "profile", "role"];
 const PROFILE_KEYS = [
   "id", "name", "api", "modelId", "baseUrl", "credentialEnv", "contextWindow",
   "maxTokens", "reasoning", "toolCalling", "vision", "revision", "cost"
@@ -167,6 +168,12 @@ export function parseWorkerStartSpec(value: unknown): WorkerStartSpec {
     fail("only the shared workspace strategy is supported; remote worktrees are not implemented yet");
   }
   const effects = input.effects === undefined ? undefined : flag(input.effects, "effects");
+  if (input.effectApprovals !== undefined && input.effectApprovals !== true) {
+    fail("effectApprovals must be true when present");
+  }
+  if (input.effectApprovals === true && effects !== true) {
+    fail("effectApprovals requires workspace effects");
+  }
   const profile = parseProfile(input.profile);
   return {
     binding,
@@ -174,6 +181,7 @@ export function parseWorkerStartSpec(value: unknown): WorkerStartSpec {
     workspacePath: parseWorkspacePath(input.workspacePath),
     workspaceStrategy: "shared",
     ...(effects === undefined ? {} : { effects }),
+    ...(input.effectApprovals === true ? { effectApprovals: true as const } : {}),
     profile,
     role: parseRole(input.role, profile)
   };

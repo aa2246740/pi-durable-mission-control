@@ -498,7 +498,8 @@ function capabilities(roots: string[], credentialRefs: string[], executionMode?:
     roots,
     credentialRefs,
     executionEnabled: executionMode !== undefined,
-    ...(executionMode ? { executionMode } : {})
+    ...(executionMode ? { executionMode } : {}),
+    ...(executionMode === "workspace-effects" ? { effectApprovals: true as const } : {})
   };
 }
 
@@ -636,6 +637,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
         forbiddenCredentialRefs: [options.tokenEnv],
         executionEnabled: true,
         executionMode: options.executionMode,
+        effectApprovals: options.executionMode === "workspace-effects",
         onMailboxActivity: notifyMailboxActivity,
         ...(options.testOnlyScripted ? { testOnlyScripted: true } : {}),
         ...(options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),

@@ -115,7 +115,7 @@ test("metadata-only stays fail-closed; validators and approval autonomy cannot o
   const approval = fixture(t, "workspace-effects", "approve");
   await assert.rejects(
     () => approval.control.workerCommand(request(approval.agent, "bash", { command: "true" })),
-    error => error.status === 409 && /pending phase 2/.test(error.message)
+    error => error.status === 409 && /does not support effect approvals/.test(error.message)
   );
 });
 

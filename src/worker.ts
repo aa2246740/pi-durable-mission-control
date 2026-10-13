@@ -27,6 +27,7 @@ export type WorkerConfig = {
   profile: ModelProfile;
   role: RoleProfile;
   runtimeMode?: "remote-metadata-only" | "remote-workspace-effects";
+  effectApprovals?: true;
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
   testOnlyWorkspaceEffectLoop?: boolean;
@@ -293,7 +294,7 @@ export async function openWorkerRuntime(
     const agent = {
       extensions: [extension],
       model: { provider: config.testOnlyScripted ? "faux" : `mission-${config.profile.id}`, modelId: config.testOnlyScripted ? "faux-1" : config.profile.modelId },
-      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : config.runtimeMode === "remote-workspace-effects" ? "\n\nThis runtime permits only node-local read_file, write_file, and bash effects in the assigned workspace. Approval-mode effects are still required by policy and are explicitly pending phase 2; they are unavailable in phase 1. bash is not an OS sandbox: it runs as the node's OS user. Only read_file/write_file paths are scoped to the assigned workspace; the shell receives no credential environment variables intentionally." : ""}`,
+      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : config.runtimeMode === "remote-workspace-effects" ? `\n\nThis runtime permits only node-local read_file, write_file, and bash effects in the assigned workspace.${config.effectApprovals ? " Under approval autonomy, write_file and bash may return a durable pending approval and end this worker turn. Wait for the execution outcome; do not retry or poll." : " Approval-mode write_file and bash are unavailable on this node."} bash is not an OS sandbox: it runs as the node's OS user. Only read_file/write_file paths are scoped to the assigned workspace; the shell receives no credential environment variables intentionally.` : ""}`,
       ...(extension.tools ? { tools: extension.tools } : {}),
       cwd: config.workspacePath
     };
