@@ -7,6 +7,7 @@ import {
   DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope, type JsonValue, type WorkerBinding, type WorkerEnvelope
 } from "./worker-mailbox.js";
 import { parseWorkerNotice, type WorkerNotice } from "./worker-events.js";
+import { NodeEffectJournal } from "./node-effects.js";
 import { redactDiagnosticChunk, sanitizeDiagnostic } from "./workers.js";
 import {
   isReservedCredentialEnvironmentName, parseWorkerStartSpec, workerStartSpecHash, RESERVED_ENVIRONMENT_NAMES,
@@ -209,6 +210,7 @@ export class NodeWorkerSupervisor {
         confirmed_stopped INTEGER NOT NULL DEFAULT 0
       )`);
       this.mailbox = new DurableWorkerMailbox(this.db, "node");
+      new NodeEffectJournal(this.db).recover();
       this.recover();
     } catch (error) {
       try { this.db?.close(); } catch { /* preserve the setup error */ }
