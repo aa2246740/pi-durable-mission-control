@@ -659,6 +659,15 @@ export async function runNode(options: NodeOptions): Promise<void> {
       const mailboxFencedBindings = new Set<string>();
       while (!stopping) {
         const roundGeneration = mailboxActivityGeneration;
+        for (const upload of supervisor.pendingEffectReceipts()) {
+          const ack = await fetchJson(coordinator, "/api/nodes/effects/receipts", token, {
+            machineId: options.machineId,
+            sessionId: session.sessionId,
+            sessionEpoch: session.sessionEpoch,
+            upload
+          }, abort.signal);
+          supervisor.acknowledgeEffectReceipt(upload, ack);
+        }
         for (const report of journal.pendingRuntimeReports()) {
           await postRuntimeReport(report);
         }

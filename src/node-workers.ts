@@ -7,7 +7,9 @@ import {
   DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope, type JsonValue, type WorkerBinding, type WorkerEnvelope
 } from "./worker-mailbox.js";
 import { parseWorkerNotice, type WorkerNotice } from "./worker-events.js";
-import { NodeEffectJournal, type NodeEffectReceipt, type NodeEffectSpec } from "./node-effects.js";
+import {
+  NodeEffectJournal, type NodeEffectReceipt, type NodeEffectSpec, type NodeEffectUpload
+} from "./node-effects.js";
 import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct } from "./node-effect-executor.js";
 import { REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { redactDiagnosticChunk, sanitizeDiagnostic } from "./workers.js";
@@ -91,7 +93,6 @@ type Handle = {
   pid: number;
   ready: Promise<void>;
   pendingRpc: Set<string>;
-  internalReceiptRpc: Set<string>;
   pendingEffects: Map<string, { taskId: string; method: "read_file" | "write_file" | "bash"; args: { [key: string]: JsonValue } }>;
   completedEffects: Map<string, { identity: string; receipt: string; expiresAt: number }>;
   pendingDeliveries: Map<DeliveryKey, string>;
@@ -142,18 +143,19 @@ async function waitForExitOrTimeout(childExit: Promise<void>, timeoutMs: number)
   }
 }
 
-function redactExact(value: string, secret: string | undefined, token: string): string {
-  const privateValues = [secret, token]
+function redactExact(value: string, secret: string | undefined, token: string, additional: readonly string[] = []): string {
+  const privateValues = [secret, token, ...additional]
     .filter((candidate): candidate is string => Boolean(candidate))
+    .filter((candidate, index, values) => values.indexOf(candidate) === index)
     .sort((left, right) => right.length - left.length);
   let result = value;
   for (const privateValue of privateValues) result = result.split(privateValue).join("[REDACTED]");
   return result;
 }
 
-function safeDiagnostic(value: unknown, secret: string | undefined, token: string): string {
+function safeDiagnostic(value: unknown, secret: string | undefined, token: string, additional: readonly string[] = []): string {
   const text = value instanceof Error ? value.message : String(value);
-  return sanitizeDiagnostic(redactExact(text, secret, token));
+  return sanitizeDiagnostic(redactExact(text, secret, token, additional));
 }
 
 /**
@@ -171,6 +173,7 @@ export class NodeWorkerSupervisor {
   private readonly roots: string[];
   private readonly credentialRefs: Set<string>;
   private readonly forbidden: Set<string>;
+  private readonly redactionValues: string[];
   private readonly handles = new Map<string, Handle>();
   private readonly flights = new Map<string, { hash: string; promise: Promise<NodeWorkerSnapshot> }>();
   private readonly pumps = new Map<string, Promise<void>>();
@@ -193,6 +196,13 @@ export class NodeWorkerSupervisor {
     this.roots = options.roots.map((root) => canonicalDirectory(resolve(root), "Declared root"));
     this.credentialRefs = new Set(options.credentialRefs);
     this.forbidden = new Set([...(options.forbiddenCredentialRefs ?? []), ...RESERVED_ENVIRONMENT_NAMES]);
+    this.redactionValues = [...new Set([
+      ...options.credentialRefs,
+      ...(options.forbiddenCredentialRefs ?? [])
+    ])]
+      .filter((name) => !RESERVED_ENVIRONMENT_NAMES.includes(name))
+      .map((name) => process.env[name])
+      .filter((value): value is string => Boolean(value));
     for (const ref of this.credentialRefs) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref)) throw new NodeWorkerError("Allowed credential reference names must be environment variable names");
       if (this.forbidden.has(ref) || isReservedCredentialEnvironmentName(ref)) {
@@ -295,6 +305,14 @@ export class NodeWorkerSupervisor {
       binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash,
       state: row.state, confirmedStopped: row.confirmed_stopped === 1
     }));
+  }
+
+  pendingEffectReceipts(limit = 16): NodeEffectUpload[] {
+    return this.effects.pendingReceipts(Math.min(16, Math.max(1, Math.floor(limit))));
+  }
+
+  acknowledgeEffectReceipt(upload: NodeEffectUpload, ack: unknown): void {
+    this.effects.acknowledgeReceipt(upload, ack);
   }
 
   private note(runtimeId: string, text: string): void {
@@ -427,7 +445,7 @@ export class NodeWorkerSupervisor {
     child.on("error", (error: Error) => {
       const activeHandle = handleRef.current;
       if (!activeHandle) {
-        this.note(binding.runtimeId, safeDiagnostic(error, secret, token));
+        this.note(binding.runtimeId, safeDiagnostic(error, secret, token, this.redactionValues));
         if (!this.closed) this.fenceRuntime(binding, "Worker process failed before ownership was established");
         cleanupFailedChild();
         return;
@@ -468,7 +486,6 @@ export class NodeWorkerSupervisor {
       binding, descriptorHash: hash, workspacePath: workspace, child, token, secret, pid,
       ready: Promise.resolve(),
       pendingRpc: new Set(),
-      internalReceiptRpc: new Set(),
       pendingEffects: new Map(),
       completedEffects: new Map(),
       pendingDeliveries: new Map(),
@@ -508,27 +525,30 @@ export class NodeWorkerSupervisor {
   }
 
   private safeText(handle: Handle, value: unknown): string {
-    return safeDiagnostic(value, handle.secret, handle.token);
+    return safeDiagnostic(value, handle.secret, handle.token, this.redactionValues);
   }
 
   private attachStderr(handle: Handle): void {
-    let secretPending = "";
-    let tokenPending = "";
-    handle.child.stderr?.on("data", (chunk: Buffer) => {
-      const secretRedacted = redactDiagnosticChunk(secretPending, chunk.toString("utf8"), handle.secret);
-      secretPending = secretRedacted.pending;
-      const tokenRedacted = redactDiagnosticChunk(tokenPending, secretRedacted.complete, handle.token);
-      tokenPending = tokenRedacted.pending;
-      if (tokenRedacted.complete) {
-        this.note(handle.binding.runtimeId, sanitizeDiagnostic(tokenRedacted.complete));
+    const stages = [...new Set(
+      [handle.secret, handle.token, ...this.redactionValues]
+        .filter((value): value is string => Boolean(value))
+    )]
+      .sort((left, right) => right.length - left.length)
+      .map((value) => ({ value, pending: "" }));
+    const append = (chunk: string, final = false): void => {
+      let output = chunk;
+      for (const stage of stages) {
+        const redacted = redactDiagnosticChunk(stage.pending, output, stage.value, final);
+        stage.pending = redacted.pending;
+        output = redacted.complete;
       }
+      if (output) this.note(handle.binding.runtimeId, sanitizeDiagnostic(output));
+    };
+    handle.child.stderr?.on("data", (chunk: Buffer) => {
+      append(chunk.toString("utf8"));
     });
     handle.child.once("exit", () => {
-      const secretFinal = redactDiagnosticChunk(secretPending, "", handle.secret, true).complete;
-      secretPending = "";
-      const tokenFinal = redactDiagnosticChunk(tokenPending, secretFinal, handle.token, true).complete;
-      tokenPending = "";
-      if (tokenFinal) this.note(handle.binding.runtimeId, sanitizeDiagnostic(tokenFinal));
+      append("", true);
     });
   }
 
@@ -694,19 +714,19 @@ export class NodeWorkerSupervisor {
   }
 
   private requireUnredactedIdentifier(handle: Handle, value: string): void {
-    if (redactExact(value, handle.secret, handle.token) !== value) {
+    if (redactExact(value, handle.secret, handle.token, this.redactionValues) !== value) {
       throw new Error("Worker IPC identifier contains private data");
     }
   }
 
   private redactStructured(handle: Handle, value: JsonValue, depth = 0): JsonValue {
     if (depth > 256) throw new Error("Worker IPC payload is too deeply nested");
-    if (typeof value === "string") return redactExact(value, handle.secret, handle.token);
+    if (typeof value === "string") return redactExact(value, handle.secret, handle.token, this.redactionValues);
     if (value === null || typeof value === "boolean" || typeof value === "number") return value;
     if (Array.isArray(value)) return value.map((item) => this.redactStructured(handle, item, depth + 1));
     const result: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
     for (const [key, item] of Object.entries(value)) {
-      const redactedKey = redactExact(key, handle.secret, handle.token);
+      const redactedKey = redactExact(key, handle.secret, handle.token, this.redactionValues);
       if (redactedKey !== key || Object.hasOwn(result, redactedKey)) {
         throw new Error("Worker IPC object key contains private data or collides after redaction");
       }
@@ -824,16 +844,6 @@ export class NodeWorkerSupervisor {
         await this.stopHandle(handle, "A reply did not match an issued worker RPC");
         return;
       }
-      if (handle.internalReceiptRpc.has(payload.rpcId)) {
-        handle.pendingRpc.delete(payload.rpcId);
-        handle.internalReceiptRpc.delete(payload.rpcId);
-        this.mailbox.finish(binding, envelope.messageId);
-        if (!payload.ok) {
-          this.note(binding.runtimeId, "Coordinator rejected the durable workspace effect receipt");
-          await this.stopHandle(handle, "Coordinator rejected the workspace effect receipt");
-        }
-        return;
-      }
       const effect = handle.pendingEffects.get(payload.rpcId);
       if (effect) {
         await this.applyEffectReply(handle, envelope, payload, effect);
@@ -931,18 +941,10 @@ export class NodeWorkerSupervisor {
       });
     }
     const returnedReceipt = this.redactStructured(handle, receipt as unknown as JsonValue) as unknown as NodeEffectReceipt;
-    const receiptRpcId = `receipt:${payload.rpcId}`;
     let transactionOpen = false;
     try {
       this.db.exec("BEGIN IMMEDIATE");
       transactionOpen = true;
-      this.mailbox.enqueue(binding, {
-        kind: "rpc", rpcId: receiptRpcId, taskId: effect.taskId,
-        method: "RecordEffectReceipt", args: {
-          effectId: `${binding.agentId}\0${effect.taskId}`, binding: { ...binding }, descriptorHash: handle.descriptorHash,
-          taskId: effect.taskId, receipt: returnedReceipt
-        }
-      });
       if (!this.mailbox.finish(binding, envelope.messageId)) {
         throw new Error("Workspace effect permit reply was not processing");
       }
@@ -956,9 +958,11 @@ export class NodeWorkerSupervisor {
     }
     handle.pendingRpc.delete(payload.rpcId);
     handle.pendingEffects.delete(payload.rpcId);
-    handle.pendingRpc.add(receiptRpcId);
-    handle.internalReceiptRpc.add(receiptRpcId);
     this.options.onMailboxActivity?.();
+    if (returnedReceipt.status === "uncertain") {
+      await this.stopHandle(handle, "A workspace effect outcome is uncertain; the worker must not retry it");
+      return;
+    }
     await this.send(handle, { id: payload.rpcId, result: returnedReceipt });
   }
 

@@ -223,6 +223,18 @@ export async function startServer(options: ServerOptions) {
             body.outcome
           ));
         }
+        if (url.pathname === "/api/nodes/effects/receipts") {
+          const body = await readBody(request);
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "upload"]);
+          if (Object.keys(body).length !== 4) throw new MachineError(400, "Receipt upload fields are required");
+          return jsonResponse(response, 200, control.nodeEffectReceipt(
+            text(body.machineId, "machineId", 64),
+            nodeToken,
+            text(body.sessionId, "sessionId", 64),
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch"),
+            body.upload
+          ));
+        }
         if (url.pathname === "/api/nodes/runtimes/poll") {
           const body = await readBody(request);
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch"]);

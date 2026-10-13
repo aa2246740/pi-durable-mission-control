@@ -294,27 +294,40 @@ test("effect receipts redact configured secrets before mailbox disclosure", asyn
   const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
   mkdirSync(workspace, { recursive: true });
   const secret = "effect-result-secret-sentinel";
+  const bearer = "node-auth-token-secret-sentinel";
   const previous = process.env.MC_NODE_TEST_CREDENTIAL;
+  const previousBearer = process.env.NODE_AUTH_TOKEN;
   process.env.MC_NODE_TEST_CREDENTIAL = secret;
+  process.env.NODE_AUTH_TOKEN = bearer;
   let supervisor;
   const binding = bindingFor("effect-result-redaction");
   const spec = { ...specFor(binding, workspace), effects: true };
-  writeFileSync(join(workspace, "secret.txt"), secret);
   t.after(async () => {
     await closeQuietly(supervisor);
     if (previous === undefined) delete process.env.MC_NODE_TEST_CREDENTIAL;
     else process.env.MC_NODE_TEST_CREDENTIAL = previous;
+    if (previousBearer === undefined) delete process.env.NODE_AUTH_TOKEN;
+    else process.env.NODE_AUTH_TOKEN = previousBearer;
     rmSync(home, { recursive: true, force: true });
   });
   supervisor = new NodeWorkerSupervisor({
     ...supervisorOptions(nodeHome, root),
+    forbiddenCredentialRefs: ["NODE_AUTH_TOKEN"],
     executionMode: "workspace-effects"
   });
   const started = await supervisor.start(spec);
   const handle = supervisor.handles.get(binding.runtimeId);
   assert.ok(handle);
+  const content = `public:${secret}|${handle.token}|${bearer}:end`;
+  writeFileSync(join(workspace, "secret.txt"), content);
   const taskId = `${binding.agentId}:secret-read`;
   const args = { path: "secret.txt" };
+  const childResults = [];
+  const originalSend = handle.child.send;
+  handle.child.send = (message, callback) => {
+    if (message?.id === "rpc-secret-read") childResults.push(message);
+    return originalSend.call(handle.child, message, callback);
+  };
   handle.child.emit("message", {
     type: "rpc", id: "rpc-secret-read", token: handle.token, agentId: binding.agentId,
     epoch: binding.epoch, method: "read_file", args, taskId
@@ -331,12 +344,83 @@ test("effect receipts redact configured secrets before mailbox disclosure", asyn
     }
   });
   await supervisor.pump(binding);
-  const receipt = supervisor.mailbox.inspectOutbox(binding).find(({ envelope }) =>
-    envelope.payload.kind === "rpc" && envelope.payload.method === "RecordEffectReceipt")?.envelope.payload;
-  assert.ok(receipt && receipt.kind === "rpc");
-  assert.equal(receipt.args.receipt.result.content, "[REDACTED]");
-  assert.equal(JSON.stringify(receipt).includes(secret), false);
-  assert.equal(JSON.stringify(supervisor.effects.inspect()).includes(secret), false);
+  const [receipt] = supervisor.pendingEffectReceipts();
+  assert.ok(receipt);
+  assert.equal(receipt.spec.method, "read_file");
+  assert.equal(receipt.receipt.result.content, "public:[REDACTED]|[REDACTED]|[REDACTED]:end");
+  for (const value of [secret, handle.token, bearer]) {
+    for (const evidence of [
+      JSON.stringify(receipt),
+      JSON.stringify(supervisor.effects.inspect()),
+      JSON.stringify(childResults),
+      JSON.stringify(supervisor.mailbox.inspectInbox(binding)),
+      JSON.stringify(supervisor.mailbox.inspectOutbox(binding))
+    ]) assert.equal(evidence.includes(value), false);
+  }
+  assert.equal(childResults.length, 1);
+  assert.equal(childResults[0].result.result.content, "public:[REDACTED]|[REDACTED]|[REDACTED]:end");
+});
+
+test("stderr diagnostics redact whole-chunk and split model, IPC, and node bearer secrets", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-node-worker-stderr-redaction-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  const modelSecret = "stderr-model-credential-sentinel";
+  const bearerSecret = "stderr-node-bearer-sentinel";
+  const previousModel = process.env.MC_NODE_TEST_CREDENTIAL;
+  const previousBearer = process.env.NODE_AUTH_TOKEN;
+  process.env.MC_NODE_TEST_CREDENTIAL = modelSecret;
+  process.env.NODE_AUTH_TOKEN = bearerSecret;
+  let supervisor;
+  const binding = bindingFor("stderr-redaction");
+  t.after(async () => {
+    await closeQuietly(supervisor);
+    if (previousModel === undefined) delete process.env.MC_NODE_TEST_CREDENTIAL;
+    else process.env.MC_NODE_TEST_CREDENTIAL = previousModel;
+    if (previousBearer === undefined) delete process.env.NODE_AUTH_TOKEN;
+    else process.env.NODE_AUTH_TOKEN = previousBearer;
+    rmSync(home, { recursive: true, force: true });
+  });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    forbiddenCredentialRefs: ["NODE_AUTH_TOKEN"],
+    executionMode: "workspace-effects"
+  });
+  await supervisor.start({ ...specFor(binding, workspace), effects: true });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle);
+  const ipcToken = handle.token;
+  const values = [modelSecret, ipcToken, bearerSecret];
+  const emissions = [];
+  const note = supervisor.note.bind(supervisor);
+  supervisor.note = (runtimeId, text) => {
+    emissions.push(text);
+    note(runtimeId, text);
+  };
+  const chunks = [
+    `whole model=${modelSecret};`,
+    `ipc=${ipcToken};bearer=${bearerSecret}; whole-tail\n`,
+    `split model=${modelSecret.slice(0, 7)}`,
+    `${modelSecret.slice(7)};ipc=${ipcToken.slice(0, 11)}`,
+    `${ipcToken.slice(11)};bearer=${bearerSecret.slice(0, 9)}`,
+    `${bearerSecret.slice(9)};safe diagnostic survives\n`
+  ];
+  for (const chunk of chunks) {
+    handle.child.stderr.emit("data", Buffer.from(chunk));
+    const diagnostic = supervisor.inspect()[0]?.diagnostic;
+    if (diagnostic) emissions.push(diagnostic);
+  }
+  const combined = emissions.join("");
+  for (const value of values) {
+    assert.equal(combined.includes(value), false);
+    assert.equal(combined.includes(value.slice(0, 8)), false);
+    assert.equal(combined.includes(value.slice(-8)), false);
+  }
+  assert.match(combined, /whole model=/);
+  assert.match(combined, /whole-tail/);
+  assert.match(combined, /split model=/);
+  assert.match(combined, /safe diagnostic survives/);
+  assert.equal(combined.match(/\[REDACTED\]/g)?.length >= values.length * 2, true);
 });
 
 test("effect receipt is durable before a failed child reply send", async (t) => {
@@ -388,8 +472,10 @@ test("effect receipt is durable before a failed child reply send", async (t) => 
   assert.equal(supervisor.inspect()[0].state, "closed");
   assert.equal(readFileSync(join(workspace, "durable-before-send.txt"), "utf8"), "written once");
   assert.equal(supervisor.mailbox.inspectInbox(binding).find(({ envelope }) => envelope.messageId === permitId).status, "applied");
-  assert.ok(supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
-    envelope.payload.kind === "rpc" && envelope.payload.method === "RecordEffectReceipt"));
+  const [receipt] = supervisor.pendingEffectReceipts();
+  assert.ok(receipt);
+  assert.equal(receipt.spec.taskId, taskId);
+  assert.equal(receipt.receipt.status, "succeeded");
 });
 
 test("redacts IPC JSON without truncating business content and rejects invalid payloads before persistence", async (t) => {

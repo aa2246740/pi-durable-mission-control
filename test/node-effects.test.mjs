@@ -114,3 +114,25 @@ test("effect receipts carry the node-local read_file content limit", t => {
   assert.equal(journal.begin(readSpec).execute, true);
   assert.equal(journal.complete(readSpec, receipt).result.content.length, 300000);
 });
+
+test("terminal receipt uploads survive restart and require an exact durable acknowledgement", t => {
+  const f = fixture(t), journal = f.open();
+  journal.admit(spec);
+  assert.equal(journal.begin(spec).execute, true);
+  journal.complete(spec, { status: "succeeded", result: { exitCode: 0 } });
+  const [upload] = journal.pendingReceipts();
+  assert.ok(upload);
+  const ack = { recorded: true, duplicate: false, effectId: upload.effectId, receiptHash: upload.receiptHash };
+  assert.throws(() => journal.acknowledgeReceipt(upload, { ...ack, receiptHash: "f".repeat(64) }), /does not match/);
+  f.close();
+  const resumed = f.open(); resumed.recover();
+  assert.deepEqual(normalizedJson(resumed.pendingReceipts()), normalizedJson([upload]));
+  assert.equal(resumed.begin(spec).execute, false);
+  resumed.acknowledgeReceipt(upload, ack);
+  resumed.acknowledgeReceipt(upload, { ...ack, duplicate: true });
+  assert.deepEqual(resumed.pendingReceipts(), []);
+  f.close();
+  const again = f.open(); again.recover();
+  assert.deepEqual(again.pendingReceipts(), []);
+  assert.equal(again.begin(spec).execute, false);
+});

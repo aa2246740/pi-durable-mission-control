@@ -14,6 +14,20 @@ export type NodeEffectReceipt =
   | { status: "succeeded" | "failed"; result: JsonValue }
   | { status: "uncertain"; error: string };
 
+export interface NodeEffectUpload {
+  effectId: string;
+  receiptHash: string;
+  spec: NodeEffectSpec;
+  receipt: NodeEffectReceipt;
+}
+
+export interface NodeEffectAck {
+  recorded: true;
+  duplicate: boolean;
+  effectId: string;
+  receiptHash: string;
+}
+
 type EffectState = "prepared" | "executing" | NodeEffectReceipt["status"];
 type EffectRow = {
   effect_id: string; input_hash: string; spec_json: string; state: EffectState;
@@ -93,6 +107,23 @@ export function parseNodeEffectReceipt(value: unknown, binding: WorkerBinding): 
   }
 }
 
+export function nodeEffectUpload(specValue: NodeEffectSpec, receiptValue: NodeEffectReceipt): NodeEffectUpload {
+  const spec = checkedSpec(specValue);
+  const receipt = checkedReceipt(receiptValue, spec.binding);
+  return {
+    effectId: digest(spec.binding.agentId + "\0" + spec.taskId),
+    receiptHash: digest(stable(receipt)), spec, receipt
+  };
+}
+
+export function parseNodeEffectUpload(value: unknown): NodeEffectUpload | undefined {
+  try {
+    if (!exact(value, ["effectId", "receiptHash", "spec", "receipt"])) return undefined;
+    const upload = nodeEffectUpload(value.spec as NodeEffectSpec, value.receipt as NodeEffectReceipt);
+    return upload.effectId === value.effectId && upload.receiptHash === value.receiptHash ? upload : undefined;
+  } catch { return undefined; }
+}
+
 /** The owner must hold the node supervisor's exclusive lock. This journal does not authorize or execute effects. */
 export class NodeEffectJournal {
   constructor(private readonly db: DatabaseSync) {
@@ -100,6 +131,9 @@ export class NodeEffectJournal {
       effect_id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, spec_json TEXT NOT NULL,
       state TEXT NOT NULL CHECK(state IN ('prepared','executing','succeeded','failed','uncertain')),
       receipt_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS node_effect_upload_acks(
+      effect_id TEXT PRIMARY KEY, receipt_hash TEXT NOT NULL, acknowledged_at INTEGER NOT NULL
     )`);
   }
 
@@ -198,6 +232,34 @@ export class NodeEffectJournal {
     };
     this.db.prepare("UPDATE node_effects SET state='uncertain',receipt_json=?,updated_at=? WHERE state='executing'")
       .run(stable(receipt), Date.now());
+  }
+
+  pendingReceipts(limit = 16): NodeEffectUpload[] {
+    const rows = this.db.prepare(`SELECT e.* FROM node_effects e
+      LEFT JOIN node_effect_upload_acks a ON a.effect_id=e.effect_id
+      WHERE e.state IN ('succeeded','failed','uncertain') AND a.effect_id IS NULL
+      ORDER BY e.created_at,e.effect_id LIMIT ?`).all(limit) as EffectRow[];
+    return rows.map(row => nodeEffectUpload(JSON.parse(row.spec_json), JSON.parse(row.receipt_json!)));
+  }
+
+  acknowledgeReceipt(uploadValue: NodeEffectUpload, ack: unknown): void {
+    const upload = parseNodeEffectUpload(uploadValue);
+    if (!upload || !exact(ack, ["recorded", "duplicate", "effectId", "receiptHash"]) ||
+        ack.recorded !== true || typeof ack.duplicate !== "boolean" ||
+        ack.effectId !== upload.effectId || ack.receiptHash !== upload.receiptHash) {
+      throw new NodeEffectError("Receipt acknowledgement does not match the durable effect");
+    }
+    this.atomic(() => {
+      const { id, hash } = this.identity(upload.spec);
+      const row = this.matching(id, hash);
+      if (!row.receipt_json || digest(row.receipt_json) !== upload.receiptHash) {
+        throw new NodeEffectError("Receipt acknowledgement cannot replace terminal evidence");
+      }
+      const prior = this.db.prepare("SELECT receipt_hash FROM node_effect_upload_acks WHERE effect_id=?").get(id) as { receipt_hash: string } | undefined;
+      if (prior && prior.receipt_hash !== upload.receiptHash) throw new NodeEffectError("Receipt acknowledgement conflicts with prior evidence");
+      this.db.prepare("INSERT OR IGNORE INTO node_effect_upload_acks(effect_id,receipt_hash,acknowledged_at) VALUES(?,?,?)")
+        .run(id, upload.receiptHash, Date.now());
+    });
   }
 
   inspect(): Array<{ effectId: string; spec: NodeEffectSpec; state: EffectState; receipt: NodeEffectReceipt | null }> {

@@ -43,7 +43,7 @@ import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type Work
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
 import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
-import { parseNodeEffectReceipt } from "./node-effects.js";
+import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
 import {
   addAgentWorktree,
   addDetachedWorktree,
@@ -748,6 +748,47 @@ export class ControlPlane {
   nodeRuntimePoll(machineId: string, token: string, sessionId: string, sessionEpoch: number): { directives: RemoteRuntimeDirective[] } {
     this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
     return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch) };
+  }
+
+  nodeEffectReceipt(machineId: string, token: string, sessionId: string, sessionEpoch: number, value: unknown): NodeEffectAck {
+    this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
+    const upload = parseNodeEffectUpload(value);
+    if (!upload) throw new HttpError(400, "Invalid remote effect receipt");
+    if (upload.spec.binding.machineId !== machineId) throw new HttpError(403, "Effect receipt belongs to another machine");
+    return this.recordRemoteEffectReceipt(upload);
+  }
+
+  private recordRemoteEffectReceipt(upload: NodeEffectUpload): NodeEffectAck {
+    const { spec, receipt, effectId, receiptHash } = upload;
+    return this.transaction(() => {
+      const runtime = this.remoteRuntimes.byRuntime(spec.binding.runtimeId);
+      const descriptor = runtime ? parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)) : undefined;
+      if (!runtime || !descriptor?.effects || runtime.descriptor_hash !== spec.descriptorHash ||
+          hash(descriptor.binding) !== hash(spec.binding)) {
+        throw new HttpError(409, "Effect receipt does not match the original assignment");
+      }
+      const missionId = descriptor.missionId;
+      const authorization = this.db.prepare("SELECT response FROM commands WHERE scope=? AND command_id=?")
+        .get(`mission:${missionId}:remote-effects`, spec.taskId) as { response: string } | undefined;
+      const permit = authorization ? JSON.parse(authorization.response).effectPermit as Record<string, unknown> | undefined : undefined;
+      if (!permit || hash({ binding: permit.binding, descriptorHash: permit.descriptorHash, taskId: permit.taskId, method: permit.method, args: permit.args }) !== hash(spec)) {
+        throw new HttpError(409, "Effect receipt has no matching original authorization");
+      }
+      const scope = `mission:${missionId}:effect-receipts`;
+      const payload = { effectId: `${spec.binding.agentId}\0${spec.taskId}`, descriptorHash: spec.descriptorHash, receipt };
+      const prior = this.commandReplay(scope, spec.taskId, payload);
+      const duplicate = prior !== undefined;
+      if (!duplicate) {
+        this.event(missionId, "remote_effect_receipt", "A remote workspace effect produced a receipt.", spec.binding.agentId, { effectId: payload.effectId, receipt });
+        if (receipt.status === "uncertain") {
+          this.insertSystemBlocker(`remote-effect:${effectId}`, missionId, "unsafe_execution",
+            "A remote operation may have partially executed. Inspect its durable receipt and reconcile manually; do not repeat automatically.");
+        }
+        this.db.prepare("INSERT INTO commands(scope,command_id,payload_hash,response,created_at) VALUES(?,?,?,?,?)")
+          .run(scope, spec.taskId, hash(payload), json({ recorded: true }), now());
+      }
+      return { recorded: true, duplicate, effectId, receiptHash };
+    });
   }
 
   nodeRuntimeReport(machineId: string, token: string, sessionId: string, sessionEpoch: number, report: {
@@ -3152,10 +3193,13 @@ export class ControlPlane {
             !bindingMatches || taskId !== request.taskId || !String(taskId).startsWith(`${agent.id}:`) || !receipt) {
           throw new HttpError(409, "Effect receipt does not match the active remote assignment");
         }
-        return this.command(`mission:${mission.id}:effect-receipts`, request.taskId, { effectId, descriptorHash, receipt }, () => {
-          this.event(mission.id, "remote_effect_receipt", "A remote workspace effect produced a receipt.", agent.id, { effectId, receipt });
-          return { recorded: true };
-        });
+        const authorization = this.db.prepare("SELECT response FROM commands WHERE scope=? AND command_id=?")
+          .get(`mission:${mission.id}:remote-effects`, request.taskId) as { response: string } | undefined;
+        const permit = authorization ? JSON.parse(authorization.response).effectPermit : undefined;
+        if (!permit) throw new HttpError(409, "Effect receipt has no matching original authorization");
+        this.recordRemoteEffectReceipt(nodeEffectUpload({ binding: expectedBinding!, descriptorHash: runtime.descriptor_hash,
+          taskId: request.taskId, method: permit.method, args: permit.args }, receipt));
+        return { recorded: true };
       }
       default:
         throw new HttpError(400, `Unknown worker operation: ${request.method}`);

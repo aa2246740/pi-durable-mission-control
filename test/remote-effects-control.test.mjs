@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ControlPlane } from "../dist/control.js";
+import { nodeEffectUpload } from "../dist/node-effects.js";
 
 function fixture(t, executionMode = "workspace-effects", autonomy = "trusted") {
   const home = mkdtempSync(join(tmpdir(), "remote-effects-control-"));
@@ -116,4 +117,159 @@ test("metadata-only stays fail-closed; validators and approval autonomy cannot o
     () => approval.control.workerCommand(request(approval.agent, "bash", { command: "true" })),
     error => error.status === 409 && /pending phase 2/.test(error.message)
   );
+});
+
+test("dedicated receipt evidence accepts a historical same-machine binding without changing ownership", async t => {
+  const f = fixture(t);
+  const { control, agent, assignment, enrolled, session, mission } = f;
+  const taskId = `${agent.id}:historical-receipt`;
+  const spec = {
+    binding: assignment.binding,
+    descriptorHash: assignment.descriptorHash,
+    taskId,
+    method: "write_file",
+    args: { path: "late.txt", content: "late" }
+  };
+  await control.workerCommand(request(agent, "write_file", spec.args, "historical-receipt"));
+  const upload = nodeEffectUpload(spec, { status: "succeeded", result: { path: "late.txt", bytes: 4 } });
+  control.missionAction(mission.id, "pause");
+  control.requestRemoteRuntimeStop(agent.id);
+  control.markAgentInterrupted(agent.id, agent.epoch);
+  control.nodeRuntimeReport(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch, {
+    reportId: crypto.randomUUID(), binding: assignment.binding, descriptorHash: assignment.descriptorHash, outcome: "stopped"
+  });
+  assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
+  assert.equal(control.missionById(mission.id).status, "paused");
+  const stableBeforeLateReceipt = {
+    agent: control.getAgentPublic(agent.id),
+    runtime: control.remoteRuntimeForAgent(agent.id),
+    messages: control.detail(mission.id).messages,
+    budget: control.detail(mission.id).budget
+  };
+  assert.equal(stableBeforeLateReceipt.runtime.state, "closed");
+  assert.equal(control.detail(mission.id).events.filter(event => event.type === "remote_effect_receipt").length, 0);
+  assert.deepEqual(
+    control.nodeEffectReceipt(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch, upload),
+    { recorded: true, duplicate: false, effectId: upload.effectId, receiptHash: upload.receiptHash }
+  );
+  assert.deepEqual(
+    control.nodeEffectReceipt(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch, upload),
+    { recorded: true, duplicate: true, effectId: upload.effectId, receiptHash: upload.receiptHash }
+  );
+  const afterLateReceipt = {
+    mission: control.missionById(mission.id),
+    agent: control.getAgentPublic(agent.id),
+    runtime: control.remoteRuntimeForAgent(agent.id),
+    messages: control.detail(mission.id).messages,
+    budget: control.detail(mission.id).budget
+  };
+  assert.equal(afterLateReceipt.mission.status, "paused");
+  assert.deepEqual(afterLateReceipt.agent, stableBeforeLateReceipt.agent);
+  assert.deepEqual(afterLateReceipt.runtime, stableBeforeLateReceipt.runtime);
+  assert.deepEqual(afterLateReceipt.messages, stableBeforeLateReceipt.messages);
+  assert.deepEqual(afterLateReceipt.budget, stableBeforeLateReceipt.budget);
+  assert.equal(control.detail(mission.id).events.filter(event => event.type === "remote_effect_receipt").length, 1);
+
+  control.revokeMachine(enrolled.machine.id);
+  const replacement = control.reenrollMachine(enrolled.machine.id);
+  const replacementSession = control.nodeSession(
+    enrolled.machine.id, replacement.token,
+    { protocol: 3, version: "test", platform: process.platform, arch: process.arch, node: process.version,
+      piDurable: "test", roots: [f.remotePath], credentialRefs: [], executionEnabled: true, executionMode: "workspace-effects" },
+    crypto.randomUUID()
+  );
+  const stableAfterReenrollment = {
+    mission: control.missionById(mission.id),
+    agent: control.getAgentPublic(agent.id),
+    runtime: control.remoteRuntimeForAgent(agent.id),
+    messages: control.detail(mission.id).messages,
+    budget: control.detail(mission.id).budget
+  };
+  assert.deepEqual(
+    control.nodeEffectReceipt(enrolled.machine.id, replacement.token, replacementSession.sessionId, replacementSession.sessionEpoch, upload),
+    { recorded: true, duplicate: true, effectId: upload.effectId, receiptHash: upload.receiptHash }
+  );
+  const after = {
+    mission: control.missionById(mission.id),
+    agent: control.getAgentPublic(agent.id),
+    runtime: control.remoteRuntimeForAgent(agent.id),
+    messages: control.detail(mission.id).messages,
+    budget: control.detail(mission.id).budget
+  };
+  assert.deepEqual(after.agent, stableAfterReenrollment.agent);
+  assert.deepEqual(after.messages, stableAfterReenrollment.messages);
+  assert.deepEqual(after.budget, stableAfterReenrollment.budget);
+  assert.equal(after.runtime.state, "closed");
+  assert.equal(after.mission.status, "paused");
+  assert.equal(control.detail(mission.id).events.filter(event => event.type === "remote_effect_receipt").length, 1);
+
+  assert.throws(
+    () => control.nodeEffectReceipt(enrolled.machine.id, enrolled.token, replacementSession.sessionId, replacementSession.sessionEpoch, upload),
+    error => error.status === 401
+  );
+  const wrongMachine = control.enrollMachine(`wrong-${crypto.randomUUID()}`, "Wrong machine");
+  const wrongSession = control.nodeSession(wrongMachine.machine.id, wrongMachine.token, {
+    protocol: 1, version: "test", platform: process.platform, arch: process.arch, node: process.version,
+    piDurable: "test", roots: [f.remotePath], credentialRefs: [], executionEnabled: false
+  }, crypto.randomUUID());
+  assert.throws(
+    () => control.nodeEffectReceipt(wrongMachine.machine.id, wrongMachine.token, wrongSession.sessionId, wrongSession.sessionEpoch, upload),
+    error => error.status === 403
+  );
+  for (const changed of [
+    { ...spec, method: "bash", args: { command: "true" } },
+    { ...spec, args: { path: "other.txt", content: "late" } },
+    { ...spec, descriptorHash: "0".repeat(64) },
+    { ...spec, taskId: `${agent.id}:never-authorized` },
+  ]) {
+    const changedUpload = nodeEffectUpload(changed, upload.receipt);
+    assert.throws(
+      () => control.nodeEffectReceipt(enrolled.machine.id, replacement.token, replacementSession.sessionId, replacementSession.sessionEpoch, changedUpload),
+      error => error.status === 409
+    );
+  }
+  const conflicting = nodeEffectUpload(spec, { status: "succeeded", result: { path: "late.txt", bytes: 99 } });
+  assert.throws(
+    () => control.nodeEffectReceipt(enrolled.machine.id, replacement.token, replacementSession.sessionId, replacementSession.sessionEpoch, conflicting),
+    error => error.status === 409
+  );
+});
+
+test("recovered uncertain receipt creates one durable unsafe-execution blocker without resuming", async t => {
+  const f = fixture(t);
+  const { control, agent, assignment, enrolled, session, mission } = f;
+  const taskId = `${agent.id}:recovered-uncertain`;
+  const spec = {
+    binding: assignment.binding,
+    descriptorHash: assignment.descriptorHash,
+    taskId,
+    method: "bash",
+    args: { command: "printf x >> effect-marker" }
+  };
+  await control.workerCommand(request(agent, "bash", spec.args, "recovered-uncertain"));
+  control.missionAction(mission.id, "pause");
+  control.requestRemoteRuntimeStop(agent.id);
+  control.markAgentInterrupted(agent.id, agent.epoch);
+  const stopped = control.nodeRuntimeReport(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch, {
+    reportId: crypto.randomUUID(), binding: assignment.binding, descriptorHash: assignment.descriptorHash, outcome: "stopped"
+  });
+  assert.equal(stopped.recorded, true);
+  assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
+  const upload = nodeEffectUpload(spec, { status: "uncertain", error: "Node restarted while the effect was executing" });
+  const first = control.nodeEffectReceipt(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch, upload);
+  assert.equal(first.duplicate, false);
+  const blockers = control.blockers(mission.id).filter(blocker => blocker.kind === "unsafe_execution");
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].status, "open");
+  assert.equal(control.missionById(mission.id).status, "paused");
+  assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
+  const eventsBeforeDuplicate = control.detail(mission.id).events.filter(event => event.type === "remote_effect_receipt").length;
+  assert.equal(eventsBeforeDuplicate, 1);
+  const duplicate = control.nodeEffectReceipt(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch, upload);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(control.detail(mission.id).events.filter(event => event.type === "remote_effect_receipt").length, eventsBeforeDuplicate);
+  assert.equal(control.blockers(mission.id).filter(blocker => blocker.kind === "unsafe_execution").length, 1);
+  assert.equal(control.missionById(mission.id).status, "paused");
+  assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
+  assert.throws(() => control.missionAction(mission.id, "resume"), error => error.status === 409);
 });

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { NodeEffectJournal } from "../dist/node-effects.js";
+import { nodeEffectUpload } from "../dist/node-effects.js";
 import { startServer } from "../dist/server.js";
 
 const waitFor = async predicate => {
@@ -59,6 +60,12 @@ test("real node supervisor executes workspace effects once, records receipts, an
   const machine = control.machineRegistry.get(enrolled.machine.id);
   assert.equal(machine.capabilities.protocol, 3);
   assert.equal(machine.capabilities.executionMode, "workspace-effects");
+  const malformedReceipt = await fetch(`http://127.0.0.1:${service.nodePort}/api/nodes/effects/receipts`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${enrolled.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ machineId: enrolled.machine.id, sessionId: machine.sessionId, sessionEpoch: machine.sessionEpoch })
+  });
+  assert.equal(malformedReceipt.status, 400);
   const probe = control.probeMachine(enrolled.machine.id, crypto.randomUUID(), root);
   await waitFor(() => control.machineCommand(enrolled.machine.id, probe.id).status === "completed");
   const remote = control.addRemoteWorkspace("Remote effects workspace", enrolled.machine.id, probe.id);
@@ -111,8 +118,102 @@ test("real node supervisor executes workspace effects once, records receipts, an
   assert.equal(node.signalCode, null, nodeOutput);
   assert.equal((control.db.prepare("SELECT COUNT(*) AS count FROM remote_worker_runtimes WHERE agent_id=?").get(agent.id)).count, 1);
 
+  const lateTaskId = `${agent.id}:late-first-upload`;
+  const lateArgs = { path: "late-evidence-only.txt", content: "authorized before pause" };
+  const latePermit = await control.workerCommand({
+    agentId: agent.id, epoch: binding.epoch, taskId: lateTaskId, method: "write_file", args: lateArgs
+  });
+  assert.equal(latePermit.effectPermit.taskId, lateTaskId);
+  const lateUpload = nodeEffectUpload({
+    binding, descriptorHash: runtime.descriptor_hash, taskId: lateTaskId, method: "write_file", args: lateArgs
+  }, { status: "succeeded", result: { path: lateArgs.path, bytes: Buffer.byteLength(lateArgs.content) } });
+  control.missionAction(mission.id, "pause");
+  await service.workers.pauseMission(mission.id);
+  await waitFor(() => control.remoteRuntimeForAgent(agent.id)?.state === "closed");
+  assert.equal(control.missionById(mission.id).status, "paused");
+  assert.equal(control.detail(mission.id).events.filter(event =>
+    event.type === "remote_effect_receipt" && event.data.effectId === lateUpload.effectId).length, 0);
+  assert.equal(readFileSync(join(root, "effect-marker"), "utf8"), "x");
+
   await stopNode(node);
   node = undefined;
+  const permitRow = control.db.prepare(
+    "SELECT command_id,response FROM commands WHERE scope=? ORDER BY rowid LIMIT 1"
+  ).get(`mission:${mission.id}:remote-effects`);
+  assert.ok(permitRow);
+  const permit = JSON.parse(permitRow.response).effectPermit;
+  const recordedEffect = control.detail(mission.id).events.find(event =>
+    event.type === "remote_effect_receipt" &&
+    event.data.effectId === `${binding.agentId}\0${permitRow.command_id}`);
+  assert.ok(recordedEffect);
+  const historicalUpload = nodeEffectUpload({
+    binding,
+    descriptorHash: runtime.descriptor_hash,
+    taskId: permitRow.command_id,
+    method: permit.method,
+    args: permit.args
+  }, recordedEffect.data.receipt);
+  control.revokeMachine(enrolled.machine.id);
+  const reenrolled = control.reenrollMachine(enrolled.machine.id);
+  const replacementSession = control.nodeSession(enrolled.machine.id, reenrolled.token, {
+    protocol: 3, version: "test", platform: process.platform, arch: process.arch, node: process.version,
+    piDurable: "test", roots: [root], credentialRefs: [], executionEnabled: true, executionMode: "workspace-effects"
+  }, crypto.randomUUID());
+  const stableAfterReenrollment = {
+    mission: control.missionById(mission.id),
+    agent: control.getAgentPublic(agent.id),
+    runtime: control.remoteRuntimeForAgent(agent.id),
+    messages: control.detail(mission.id).messages
+  };
+  const postLateReceipt = async () => {
+    const response = await fetch(`http://127.0.0.1:${service.nodePort}/api/nodes/effects/receipts`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${reenrolled.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId: enrolled.machine.id,
+        sessionId: replacementSession.sessionId,
+        sessionEpoch: replacementSession.sessionEpoch,
+        upload: lateUpload
+      })
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    return JSON.parse(text);
+  };
+  assert.deepEqual(await postLateReceipt(), {
+    recorded: true, duplicate: false, effectId: lateUpload.effectId, receiptHash: lateUpload.receiptHash
+  });
+  assert.deepEqual(await postLateReceipt(), {
+    recorded: true, duplicate: true, effectId: lateUpload.effectId, receiptHash: lateUpload.receiptHash
+  });
+  assert.equal(readFileSync(join(root, "effect-marker"), "utf8"), "x");
+  const receiptResponse = await fetch(`http://127.0.0.1:${service.nodePort}/api/nodes/effects/receipts`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${reenrolled.token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      machineId: enrolled.machine.id,
+      sessionId: replacementSession.sessionId,
+      sessionEpoch: replacementSession.sessionEpoch,
+      upload: historicalUpload
+    })
+  });
+  const receiptResponseText = await receiptResponse.text();
+  assert.equal(receiptResponse.status, 200, receiptResponseText);
+  assert.deepEqual(JSON.parse(receiptResponseText), {
+    recorded: true, duplicate: true, effectId: historicalUpload.effectId, receiptHash: historicalUpload.receiptHash
+  });
+  const afterReceiptDetails = {
+    mission: control.missionById(mission.id),
+    agent: control.getAgentPublic(agent.id),
+    runtime: control.remoteRuntimeForAgent(agent.id),
+    messages: control.detail(mission.id).messages
+  };
+  assert.equal(afterReceiptDetails.mission.status, "paused");
+  assert.deepEqual(afterReceiptDetails.mission, stableAfterReenrollment.mission);
+  assert.deepEqual(afterReceiptDetails.agent, stableAfterReenrollment.agent);
+  assert.deepEqual(afterReceiptDetails.runtime, stableAfterReenrollment.runtime);
+  assert.deepEqual(afterReceiptDetails.messages, stableAfterReenrollment.messages);
+  assert.equal(control.detail(mission.id).events.filter(event => event.type === "remote_effect_receipt").length, 3);
   const dbPath = join(nodeHome, "worker-runtime", "node-workers.sqlite");
   const db = new DatabaseSync(dbPath);
   const journal = new NodeEffectJournal(db);

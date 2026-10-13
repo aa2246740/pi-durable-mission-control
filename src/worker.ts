@@ -247,8 +247,8 @@ export async function openWorkerRuntime(
     faux!.setResponses(config.testOnlyWorkspaceEffectLoop
       ? [
           fauxAssistantMessage(fauxToolCall("GetMissionState", {}), { stopReason: "toolUse" }),
-          fauxAssistantMessage(fauxToolCall("write_file", { path: "remote-effect.txt", content: "node-only" }), { stopReason: "toolUse" }),
           fauxAssistantMessage(fauxToolCall("bash", { command: "printf x >> effect-marker" }), { stopReason: "toolUse" }),
+          fauxAssistantMessage(fauxToolCall("write_file", { path: "remote-effect.txt", content: "node-only" }), { stopReason: "toolUse" }),
           fauxAssistantMessage([
             { type: "text", text: "test-only workspace effects completed" },
             fauxToolCall("Report", { summary: "test-only workspace effects", evidence: "node-local effect receipt" })
