@@ -134,6 +134,8 @@ The durable worker mailbox exposes node-only POST endpoints at `/api/nodes/mailb
 
 This is still an internal transport stage: uploads are durably recorded and an asynchronous dispatcher may apply only the coordinator metadata allowlist (mission state, messages, tasks, reports, and user-input coordination). It is not a remote worker or runtime, and it does not enable the execution capability. Remote filesystem, shell, MCP, artifact, and validation effects remain unavailable; there is no remote agent execution proof yet.
 
+A standalone node-local process-supervision library now exists as preparation for a later runtime-descriptor integration. It owns a separate node journal and mailbox, admits a descriptor before forking a real worker child, authenticates that child's private IPC, supervises its detached process group, and preserves uncertain ownership across restart. It is not wired into `runNode`, HTTP assignment, the CLI, or the shipped protocol: `executionEnabled` remains `false`. It performs no remote filesystem, shell, MCP, Git, artifact, or effect work, and its uncertain-binding transport is intentionally left for a future trusted reconciliation phase rather than auto-confirmed on stop.
+
 ## MCP servers
 
 An authenticated operator can save an MCP server with `POST /api/mcp-servers` and discover its catalog with `POST /api/mcp-servers/<id>/discover` using `{ "workspaceId": "..." }`. Updates require the current `expectedRevision`. Discovery connects only to list tools; it never invokes one. The worker-facing `ListMcpTools` and `CallMcpTool` tools are limited to exact `{ serverId, toolName, mode }` role grants (`approve` or `allow`); there are no wildcard grants, and roles default to no MCP permissions.
