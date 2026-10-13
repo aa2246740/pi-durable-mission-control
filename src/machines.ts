@@ -26,6 +26,7 @@ export interface NodeCapabilities {
   executionEnabled: boolean;
   executionMode?: "metadata-only" | "workspace-effects";
   effectApprovals?: true;
+  artifactTransfers?: true;
 }
 
 export interface RemoteMachine {
@@ -126,7 +127,7 @@ function shortText(value: unknown, name: string, max = 200): string {
 export function parseNodeCapabilities(value: unknown): NodeCapabilities {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new MachineError(400, "Node capabilities must be an object");
   const input = value as Record<string, unknown>;
-  const allowed = ["protocol", "version", "platform", "arch", "node", "piDurable", "roots", "credentialRefs", "executionEnabled", "executionMode", "effectApprovals"];
+  const allowed = ["protocol", "version", "platform", "arch", "node", "piDurable", "roots", "credentialRefs", "executionEnabled", "executionMode", "effectApprovals", "artifactTransfers"];
   const unknown = Object.keys(input).filter((key) => !allowed.includes(key));
   if (unknown.length) throw new MachineError(400, "Unsupported node capability fields");
   const readonly = input.protocol === NODE_PROTOCOL_VERSION && input.executionEnabled === false && !Object.hasOwn(input, "executionMode");
@@ -139,6 +140,12 @@ export function parseNodeCapabilities(value: unknown): NodeCapabilities {
   }
   if (input.effectApprovals === true && !workspaceEffects) {
     throw new MachineError(409, "Effect approvals require protocol-3 workspace effects");
+  }
+  if (Object.hasOwn(input, "artifactTransfers") && input.artifactTransfers !== true) {
+    throw new MachineError(400, "artifactTransfers must be true when present");
+  }
+  if (input.artifactTransfers === true && !workspaceEffects) {
+    throw new MachineError(409, "Artifact transfers require protocol-3 workspace effects");
   }
   if (!readonly && !metadataOnly && !workspaceEffects) throw new MachineError(409, "Node protocol and execution mode are not supported");
   const roots = stringList(input.roots, "roots", (item) => item.startsWith("/") && item.length <= 4096 && !/[\u0000-\u001f]/.test(item), 32);
@@ -154,7 +161,8 @@ export function parseNodeCapabilities(value: unknown): NodeCapabilities {
     credentialRefs: stringList(input.credentialRefs, "credentialRefs", (item) => CREDENTIAL_REF.test(item), 64),
     executionEnabled: metadataOnly || workspaceEffects,
     ...((metadataOnly || workspaceEffects) ? { executionMode: input.executionMode as "metadata-only" | "workspace-effects" } : {}),
-    ...(input.effectApprovals === true ? { effectApprovals: true as const } : {})
+    ...(input.effectApprovals === true ? { effectApprovals: true as const } : {}),
+    ...(input.artifactTransfers === true ? { artifactTransfers: true as const } : {})
   };
 }
 

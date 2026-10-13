@@ -16,6 +16,7 @@ export interface WorkerStartSpec {
   workspaceStrategy: "shared";
   effects?: boolean;
   effectApprovals?: true;
+  artifactTransfers?: true;
   profile: ModelProfile;
   role: RoleProfile;
 }
@@ -29,7 +30,7 @@ export function isReservedCredentialEnvironmentName(name: string): boolean {
   return RESERVED_ENVIRONMENT_NAMES.includes(name) || /^(NODE_|LD_|DYLD_)/.test(name);
 }
 
-const SPEC_KEYS = ["binding", "missionId", "workspacePath", "workspaceStrategy", "effects", "effectApprovals", "profile", "role"];
+const SPEC_KEYS = ["binding", "missionId", "workspacePath", "workspaceStrategy", "effects", "effectApprovals", "artifactTransfers", "profile", "role"];
 const PROFILE_KEYS = [
   "id", "name", "api", "modelId", "baseUrl", "credentialEnv", "contextWindow",
   "maxTokens", "reasoning", "toolCalling", "vision", "revision", "cost"
@@ -174,6 +175,12 @@ export function parseWorkerStartSpec(value: unknown): WorkerStartSpec {
   if (input.effectApprovals === true && effects !== true) {
     fail("effectApprovals requires workspace effects");
   }
+  if (input.artifactTransfers !== undefined && input.artifactTransfers !== true) {
+    fail("artifactTransfers must be true when present");
+  }
+  if (input.artifactTransfers === true && effects !== true) {
+    fail("artifactTransfers requires workspace effects");
+  }
   const profile = parseProfile(input.profile);
   return {
     binding,
@@ -182,6 +189,7 @@ export function parseWorkerStartSpec(value: unknown): WorkerStartSpec {
     workspaceStrategy: "shared",
     ...(effects === undefined ? {} : { effects }),
     ...(input.effectApprovals === true ? { effectApprovals: true as const } : {}),
+    ...(input.artifactTransfers === true ? { artifactTransfers: true as const } : {}),
     profile,
     role: parseRole(input.role, profile)
   };

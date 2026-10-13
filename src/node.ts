@@ -5,9 +5,11 @@ import { chmodSync, existsSync, mkdirSync, realpathSync, statSync } from "node:f
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { NodeCommand, NodeCapabilities } from "./machines.js";
 import { NODE_EXECUTION_PROTOCOL_VERSION, NODE_PROTOCOL_VERSION, NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION } from "./machines.js";
-import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding } from "./worker-mailbox.js";
+import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type JsonValue, type WorkerBinding } from "./worker-mailbox.js";
 import { NodeWorkerSupervisor } from "./node-workers.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
+import { REMOTE_ARTIFACT_CHUNK_BYTES, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
+import type { NodeEffectSpec } from "./node-effects.js";
 import { performance } from "node:perf_hooks";
 
 const require = createRequire(import.meta.url);
@@ -32,6 +34,8 @@ export interface NodeOptions {
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
   testOnlyWorkspaceEffectLoop?: boolean;
+  testOnlyArtifactTransferLoop?: boolean;
+  testOnlyArtifactTaskId?: string;
 }
 
 type JournalOperation = {
@@ -499,7 +503,7 @@ function capabilities(roots: string[], credentialRefs: string[], executionMode?:
     credentialRefs,
     executionEnabled: executionMode !== undefined,
     ...(executionMode ? { executionMode } : {}),
-    ...(executionMode === "workspace-effects" ? { effectApprovals: true as const } : {})
+    ...(executionMode === "workspace-effects" ? { effectApprovals: true as const, artifactTransfers: true as const } : {})
   };
 }
 
@@ -627,6 +631,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
     }
     journal.sessionStarted(session);
     if (options.executionMode) {
+      const runtimeSession = session;
       supervisor = new NodeWorkerSupervisor({
         home: resolve(options.home, "worker-runtime"),
         machineId: options.machineId,
@@ -638,10 +643,49 @@ export async function runNode(options: NodeOptions): Promise<void> {
         executionEnabled: true,
         executionMode: options.executionMode,
         effectApprovals: options.executionMode === "workspace-effects",
+        artifactTransfers: options.executionMode === "workspace-effects",
+        uploadArtifact: async ({ spec, manifest, readChunk, verifySnapshot }: {
+          spec: NodeEffectSpec; manifest: RemoteArtifactManifest; readChunk: (offset: number, length: number) => Buffer;
+          verifySnapshot: () => void;
+        }): Promise<JsonValue> => {
+          const current = (): void => {
+            if (stopping || performance.now() >= leaseDeadline ||
+                session?.sessionId !== runtimeSession.sessionId || session?.sessionEpoch !== runtimeSession.sessionEpoch) throw genericError();
+          };
+          const post = async (path: string, body: unknown): Promise<unknown> => {
+            current();
+            try {
+              return await fetchJson(coordinator, path, token, body, abort.signal);
+            } catch (error) {
+              if (error instanceof CoordinatorConflict) throw error;
+              current();
+              return fetchJson(coordinator, path, token, body, abort.signal);
+            }
+          };
+          const base = { machineId: options.machineId, sessionId: session!.sessionId, sessionEpoch: session!.sessionEpoch, spec, manifest };
+          const transferId = remoteArtifactTransferId(spec, manifest);
+          for (let offset = 0; offset < manifest.size; offset += REMOTE_ARTIFACT_CHUNK_BYTES) {
+            const length = Math.min(REMOTE_ARTIFACT_CHUNK_BYTES, manifest.size - offset);
+            const bytes = readChunk(offset, length);
+            const reply = await post("/api/nodes/artifacts/chunk", { ...base, offset, chunkBase64: bytes.toString("base64") });
+            if (!reply || typeof reply !== "object" || (reply as Record<string, unknown>).transferId !== transferId ||
+                (reply as Record<string, unknown>).offset !== offset || (reply as Record<string, unknown>).acceptedBytes !== length ||
+                typeof (reply as Record<string, unknown>).duplicate !== "boolean") {
+              throw genericError();
+            }
+          }
+          verifySnapshot();
+          const completed = await post("/api/nodes/artifacts/complete", base);
+          if (!completed || typeof completed !== "object" || !(completed as Record<string, unknown>).artifact ||
+              typeof (completed as Record<string, unknown>).artifact !== "object") throw genericError();
+          return (completed as { artifact: JsonValue }).artifact;
+        },
         onMailboxActivity: notifyMailboxActivity,
         ...(options.testOnlyScripted ? { testOnlyScripted: true } : {}),
         ...(options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
         ...(options.testOnlyWorkspaceEffectLoop ? { testOnlyWorkspaceEffectLoop: true } : {}),
+        ...(options.testOnlyArtifactTransferLoop ? { testOnlyArtifactTransferLoop: true } : {}),
+        ...(options.testOnlyArtifactTaskId ? { testOnlyArtifactTaskId: options.testOnlyArtifactTaskId } : {}),
         isLeaseCurrent: (binding) => !stopping && performance.now() < leaseDeadline &&
           binding.machineId === options.machineId && binding.sessionId === session.sessionId &&
           binding.sessionEpoch === session.sessionEpoch

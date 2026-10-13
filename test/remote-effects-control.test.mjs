@@ -91,6 +91,33 @@ test("protocol-3 worker receives identity-bound idempotent permits without coord
   assert.equal(control.detail(mission.id).artifacts.some(item => item.name === "only-on-node.txt"), false);
 });
 
+test("remote PublishArtifact fails closed on protocol 3 without the frozen transfer capability", async t => {
+  const f = fixture(t), { control, agent, mission, roleIds } = f;
+  assert.equal(f.assignment.descriptor.artifactTransfers, undefined);
+  const orchestrator = control.listAgents(mission.id).find(item => item.kind === "orchestrator");
+  const validator = control.createAgent(mission.id, "Validator", roleIds[2], "fixture", `validator-${crypto.randomUUID()}`);
+  const task = control.createTask(orchestrator.id, orchestrator.epoch, `create-${crypto.randomUUID()}`, {
+    missionId: mission.id, title: "Publish", description: "", acceptance: "bound artifact",
+    dependencies: [], ownerId: agent.id, validatorId: validator.id
+  });
+  const before = {
+    agents: control.db.prepare("SELECT COUNT(*) AS count FROM agents").get().count,
+    messages: control.db.prepare("SELECT COUNT(*) AS count FROM messages").get().count,
+    events: control.detail(mission.id).events.length,
+    transfers: control.db.prepare("SELECT COUNT(*) AS count FROM remote_artifact_transfers").get().count
+  };
+  await assert.rejects(() => control.workerCommand({
+    agentId: agent.id, epoch: agent.epoch, taskId: `${agent.id}:publish-without-negotiation`,
+    method: "PublishArtifact", args: { name: "evidence", path: "evidence.bin", taskId: task.id }
+  }), error => error.status === 409 && /not negotiated/.test(error.message));
+  assert.deepEqual({
+    agents: control.db.prepare("SELECT COUNT(*) AS count FROM agents").get().count,
+    messages: control.db.prepare("SELECT COUNT(*) AS count FROM messages").get().count,
+    events: control.detail(mission.id).events.length,
+    transfers: control.db.prepare("SELECT COUNT(*) AS count FROM remote_artifact_transfers").get().count
+  }, before);
+});
+
 test("metadata-only stays fail-closed; validators and approval autonomy cannot obtain write/bash permits", async t => {
   const metadata = fixture(t, "metadata-only");
   assert.equal(Object.hasOwn(metadata.assignment.descriptor, "effects"), false);

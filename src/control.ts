@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, realpathSync, readFileSync, writeFileSync, statSync, existsSync, chmodSync, lstatSync } from "node:fs";
+import { mkdirSync, realpathSync, readFileSync, writeFileSync, statSync, existsSync, chmodSync, lstatSync, copyFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { RpcMessage } from "./worker.js";
 import type {
@@ -43,7 +43,8 @@ import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type Work
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
 import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
-import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
+import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, parseNodeEffectSpec, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
+import { RemoteArtifactStore, parseRemoteArtifactManifest, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
 import {
   addAgentWorktree,
   addDetachedWorktree,
@@ -62,7 +63,7 @@ import {
   type RepositoryIdentity
 } from "./worktrees.js";
 
-export const CONTROL_SCHEMA_VERSION = 7;
+export const CONTROL_SCHEMA_VERSION = 8;
 const REMOTE_OPERATION_UNAVAILABLE = "Remote operation is unavailable for this agent";
 export class HttpError extends Error {
   readonly status: number;
@@ -245,6 +246,7 @@ export class ControlPlane {
   readonly machineRegistry: MachineRegistry;
   readonly workerMailbox: DurableWorkerMailbox;
   readonly remoteRuntimes: RemoteRuntimeRegistry;
+  readonly remoteArtifacts: RemoteArtifactStore;
 
   constructor(home: string) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -261,6 +263,7 @@ export class ControlPlane {
       this.workerMailbox = this.transaction(() => {
         this.checkStartupCompatibility();
         this.migrate();
+        RemoteArtifactStore.migrate(this.db);
         const workerMailbox = new DurableWorkerMailbox(this.db, "coordinator");
         this.seedProfiles();
         this.acquireOwner();
@@ -278,6 +281,7 @@ export class ControlPlane {
         workerMailbox.recover();
         return workerMailbox;
       });
+      this.remoteArtifacts = new RemoteArtifactStore(this.db, this.home);
     } catch (error) {
       this.db.close();
       throw error;
@@ -758,6 +762,122 @@ export class ControlPlane {
     return this.recordRemoteEffectReceipt(upload);
   }
 
+  private authorizeRemoteArtifactTransfer(
+    machineId: string, token: string, sessionId: string, sessionEpoch: number, rawSpec: unknown, rawManifest: unknown
+  ): { spec: import("./node-effects.js").NodeEffectSpec; manifest: RemoteArtifactManifest; agent: Agent; mission: Mission; task: Task; runtime: RemoteRuntimeRow } {
+    this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
+    const spec = parseNodeEffectSpec(rawSpec);
+    const manifest = parseRemoteArtifactManifest(rawManifest);
+    if (!spec || spec.method !== "PublishArtifact" || !manifest) throw new HttpError(400, "Invalid remote artifact transfer identity");
+    const binding = spec.binding;
+    if (binding.machineId !== machineId || binding.sessionId !== sessionId || binding.sessionEpoch !== sessionEpoch) {
+      throw new HttpError(403, "Artifact transfer does not belong to this node session");
+    }
+    const runtime = this.remoteRuntimes.byRuntime(binding.runtimeId);
+    const descriptor = runtime ? parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)) : undefined;
+    const machine = this.machineRegistry.get(machineId);
+    const agent = this.getAgent(binding.agentId);
+    if (!runtime || !descriptor?.effects || descriptor.artifactTransfers !== true ||
+        descriptor.binding.runtimeId !== binding.runtimeId || descriptor.binding.machineId !== binding.machineId ||
+        descriptor.binding.sessionId !== binding.sessionId || descriptor.binding.sessionEpoch !== binding.sessionEpoch ||
+        descriptor.binding.agentId !== binding.agentId || descriptor.binding.epoch !== binding.epoch ||
+        runtime.machine_id !== binding.machineId || runtime.session_id !== binding.sessionId ||
+        runtime.session_epoch !== binding.sessionEpoch || runtime.agent_id !== binding.agentId || runtime.epoch !== binding.epoch ||
+        runtime.descriptor_hash !== spec.descriptorHash || runtime.state !== "running" || runtime.desired !== "run" ||
+        !machine || machine.status !== "online" || machine.capabilities?.protocol !== 3 ||
+        machine.capabilities.artifactTransfers !== true || machine.sessionId !== sessionId ||
+        machine.sessionEpoch !== sessionEpoch || (machine.leaseExpiresAt ?? 0) <= Date.now() ||
+        !agent || agent.machineId !== machineId || agent.epoch !== binding.epoch) {
+      throw new HttpError(409, "Artifact transfer is not authorized by the active runtime binding");
+    }
+    if (manifest.relativePath !== spec.args.path ||
+        manifest.sourcePath !== resolve(descriptor.workspacePath, manifest.relativePath)) {
+      throw new HttpError(409, "Artifact manifest path does not match its effect specification");
+    }
+    let auth: ReturnType<ControlPlane["authorizeAgent"]>;
+    try { auth = this.authorizeAgent(agent.id, binding.epoch, agent.missionId); }
+    catch { throw new HttpError(409, "Artifact owner is no longer current"); }
+    if (auth.role.kind !== "worker" || auth.mission.status !== "active") {
+      throw new HttpError(409, "Artifact publication requires an active mission worker");
+    }
+    const taskId = spec.args.taskId;
+    const task = typeof taskId === "string" ? this.task(taskId) : undefined;
+    if (!task || task.missionId !== auth.mission.id || task.ownerId !== agent.id ||
+        task.attempt !== spec.taskAttempt || !["ready", "assigned", "running", "review", "blocked"].includes(task.status)) {
+      throw new HttpError(409, "Artifact does not belong to the current task owner and attempt");
+    }
+    const authorization = this.db.prepare("SELECT response FROM commands WHERE scope=? AND command_id=?")
+      .get(`mission:${auth.mission.id}:remote-effects`, spec.taskId) as { response: string } | undefined;
+    let permit: Record<string, unknown> | undefined;
+    try {
+      const response: unknown = authorization ? JSON.parse(authorization.response) : undefined;
+      const candidate = response && typeof response === "object" && !Array.isArray(response)
+        ? (response as Record<string, unknown>).effectPermit : undefined;
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) permit = candidate as Record<string, unknown>;
+    } catch {}
+    const authorizedSpec = permit && {
+      binding: permit.binding, descriptorHash: permit.descriptorHash, taskId: permit.taskId,
+      method: permit.method, args: permit.args,
+      ...(permit.method === "PublishArtifact" ? { taskAttempt: permit.taskAttempt } : {})
+    };
+    if (!authorizedSpec || hash(authorizedSpec) !== hash(spec)) {
+      throw new HttpError(409, "Artifact transfer has no matching original effect authorization");
+    }
+    try {
+      if (this.workerMailbox.inspectBinding(binding).status !== "open") throw new Error("fenced");
+    } catch {
+      throw new HttpError(409, "Artifact runtime binding is fenced");
+    }
+    return { spec, manifest, agent, mission: auth.mission, task, runtime };
+  }
+
+  nodeArtifactChunk(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawSpec: unknown,
+    rawManifest: unknown, offset: number, chunkBase64: unknown): { transferId: string; offset: number; acceptedBytes: number; duplicate: boolean } {
+    const auth = this.authorizeRemoteArtifactTransfer(machineId, token, sessionId, sessionEpoch, rawSpec, rawManifest);
+    if (typeof chunkBase64 !== "string" || chunkBase64.length > Math.ceil(192 * 1024 / 3) * 4 ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(chunkBase64)) {
+      throw new HttpError(400, "Invalid remote artifact chunk encoding");
+    }
+    const bytes = Buffer.from(chunkBase64, "base64");
+    if (bytes.toString("base64") !== chunkBase64) throw new HttpError(400, "Invalid remote artifact chunk encoding");
+    try {
+      const result = this.remoteArtifacts.chunk(auth.spec, auth.manifest, offset, bytes);
+      return { transferId: result.transferId, offset: result.offset, acceptedBytes: result.bytes, duplicate: result.duplicate };
+    } catch {
+      throw new HttpError(409, "Remote artifact chunk was rejected");
+    }
+  }
+
+  nodeArtifactComplete(machineId: string, token: string, sessionId: string, sessionEpoch: number,
+    rawSpec: unknown, rawManifest: unknown): { artifact: Record<string, unknown> } {
+    const auth = this.authorizeRemoteArtifactTransfer(machineId, token, sessionId, sessionEpoch, rawSpec, rawManifest);
+    const transferId = remoteArtifactTransferId(auth.spec, auth.manifest);
+    return this.command(`mission:${auth.mission.id}:remote-artifacts`, transferId, {
+      spec: auth.spec, manifest: auth.manifest
+    }, () => {
+      const artifact = this.remoteArtifacts.complete(auth.spec, auth.manifest, (snapshotPath, identity) => ({
+        id: randomUUID(), missionId: auth.mission.id, agentId: auth.agent.id,
+        name: String(auth.spec.args.name), path: auth.manifest.sourcePath,
+        sha256: auth.manifest.sha256, size: auth.manifest.size, createdAt: now(),
+        snapshotPath, taskId: auth.task.id, relativePath: auth.manifest.relativePath,
+        remoteProvenance: {
+          transferId: identity, runtimeId: auth.spec.binding.runtimeId, machineId: auth.spec.binding.machineId,
+          sessionId: auth.spec.binding.sessionId, sessionEpoch: auth.spec.binding.sessionEpoch,
+          agentId: auth.spec.binding.agentId, epoch: auth.spec.binding.epoch,
+          descriptorHash: auth.spec.descriptorHash, workerTaskId: auth.spec.taskId, taskAttempt: auth.spec.taskAttempt!
+        }
+      }), (item) => {
+        this.db.prepare("INSERT INTO artifacts(id,mission_id,data) VALUES(?,?,?)").run(item.id, item.missionId, json(item));
+        this.event(auth.mission.id, "artifact_published", `Remote artifact ${item.name} published from a frozen node snapshot.`, auth.agent.id,
+          { artifactId: item.id, taskId: auth.task.id, attempt: auth.task.attempt, sha256: item.sha256, size: item.size, transferId });
+      });
+      return { artifact: {
+        id: artifact.id, name: artifact.name, path: artifact.path, relativePath: artifact.relativePath,
+        sha256: artifact.sha256, size: artifact.size, taskId: artifact.taskId
+      } };
+    });
+  }
+
   private recordRemoteEffectReceipt(upload: NodeEffectUpload): NodeEffectAck {
     const { spec, receipt, effectId, receiptHash } = upload;
     return this.transaction(() => {
@@ -771,7 +891,11 @@ export class ControlPlane {
       const authorization = this.db.prepare("SELECT response FROM commands WHERE scope=? AND command_id=?")
         .get(`mission:${missionId}:remote-effects`, spec.taskId) as { response: string } | undefined;
       const permit = authorization ? JSON.parse(authorization.response).effectPermit as Record<string, unknown> | undefined : undefined;
-      if (!permit || hash({ binding: permit.binding, descriptorHash: permit.descriptorHash, taskId: permit.taskId, method: permit.method, args: permit.args }) !== hash(spec)) {
+      if (!permit || hash({
+        binding: permit.binding, descriptorHash: permit.descriptorHash, taskId: permit.taskId,
+        method: permit.method, args: permit.args,
+        ...(permit.method === "PublishArtifact" ? { taskAttempt: permit.taskAttempt } : {})
+      }) !== hash(spec)) {
         throw new HttpError(409, "Effect receipt has no matching original authorization");
       }
       const scope = `mission:${missionId}:effect-receipts`;
@@ -882,6 +1006,7 @@ export class ControlPlane {
         workspaceStrategy: "shared",
         ...(machine.capabilities?.executionMode === "workspace-effects" ? { effects: true } : {}),
         ...(machine.capabilities?.effectApprovals === true ? { effectApprovals: true } : {}),
+        ...(machine.capabilities?.artifactTransfers === true ? { artifactTransfers: true } : {}),
         profile, role
       });
       const assigned = this.remoteRuntimes.assign(descriptor);
@@ -1412,7 +1537,8 @@ export class ControlPlane {
         },
         missionId: mission.id, workspacePath: workspace.path, workspaceStrategy: "shared",
         ...(machine.capabilities.executionMode === "workspace-effects" ? { effects: true } : {}),
-        ...(machine.capabilities.effectApprovals === true ? { effectApprovals: true } : {}), profile, role
+        ...(machine.capabilities.effectApprovals === true ? { effectApprovals: true } : {}),
+        ...(machine.capabilities.artifactTransfers === true ? { artifactTransfers: true } : {}), profile, role
       });
     }
     const id = randomUUID();
@@ -3028,18 +3154,39 @@ export class ControlPlane {
           machine.sessionId !== runtime.session_id || machine.sessionEpoch !== runtime.session_epoch ||
           (machine.leaseExpiresAt ?? 0) <= Date.now()) throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
       if (!request.taskId.startsWith(`${agent.id}:`)) throw new HttpError(400, "Remote effects require a stable worker task ID");
-      const keys = request.method === "read_file" ? ["path"] : request.method === "write_file" ? ["path", "content"] : ["command"];
+      const artifactPublication = request.method === "PublishArtifact";
+      let taskAttempt: number | undefined;
+      if (artifactPublication) {
+        if (descriptor.artifactTransfers !== true || machine.capabilities?.artifactTransfers !== true ||
+            machine.capabilities.protocol !== 3) throw new HttpError(409, "Remote artifact transfers were not negotiated for this worker");
+        if (role.kind !== "worker") throw new HttpError(403, "Only a task worker may publish a remote artifact");
+        if (typeof args.taskId !== "string" || !args.taskId.trim()) throw new HttpError(400, "Remote PublishArtifact requires taskId");
+        const task = this.task(args.taskId);
+        if (!task || task.missionId !== mission.id || task.ownerId !== agent.id ||
+            !["ready", "assigned", "running", "review", "blocked"].includes(task.status)) {
+          throw new HttpError(409, "Remote artifact task is not owned by this worker");
+        }
+        taskAttempt = task.attempt;
+      }
+      const keys = artifactPublication ? ["name", "path", "taskId"]
+        : request.method === "read_file" ? ["path"] : request.method === "write_file" ? ["path", "content"] : ["command"];
       const required = request.method === "write_file" ? ["path"] : keys;
       if (Reflect.ownKeys(args).length !== keys.length || keys.some((key) => typeof args[key] !== "string") ||
           required.some((key) => !String(args[key]).trim()) ||
           keys.some((key) => Buffer.byteLength(String(args[key])) > (key === "command" ? 32000 : key === "content" ? 256 * 1024 : 4096))) {
         throw new HttpError(400, "Invalid remote workspace effect arguments");
       }
+      if (artifactPublication && (String(args.name).length > 200 || String(args.taskId).length > 240 ||
+          String(args.path).startsWith("/") || String(args.path).includes("\\") ||
+          /\p{Cc}/u.test(String(args.name)) || /\p{Cc}/u.test(String(args.path)) ||
+          String(args.path).split("/").some((part) => !part || part === "." || part === ".."))) {
+        throw new HttpError(400, "Remote artifact requires a safe relative path, name, and task ID");
+      }
       const binding = {
         runtimeId: runtime.runtime_id, machineId: runtime.machine_id, sessionId: runtime.session_id,
         sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
       };
-      if (mission.autonomy === "approve" && request.method !== "read_file") {
+      if (mission.autonomy === "approve" && request.method !== "read_file" && !artifactPublication) {
         if (descriptor.effectApprovals !== true || machine.capabilities.effectApprovals !== true) {
           throw new HttpError(409, "This remote node does not support effect approvals");
         }
@@ -3103,8 +3250,12 @@ export class ControlPlane {
         return { status: "pending", approvalId };
       }
       const expiresAt = Math.min(machine.leaseExpiresAt ?? 0, Date.now() + 20_000);
-      const permit = { effectPermit: { binding, descriptorHash: runtime.descriptor_hash, taskId: request.taskId, method: request.method, args, expiresAt } };
-      return this.command(`mission:${mission.id}:remote-effects`, request.taskId, { binding, descriptorHash: runtime.descriptor_hash, method: request.method, args }, () => {
+      const specIdentity = {
+        binding, descriptorHash: runtime.descriptor_hash, method: request.method, args,
+        ...(taskAttempt === undefined ? {} : { taskAttempt })
+      };
+      const permit = { effectPermit: { ...specIdentity, taskId: request.taskId, expiresAt } };
+      return this.command(`mission:${mission.id}:remote-effects`, request.taskId, specIdentity, () => {
         this.event(mission.id, "remote_effect_authorized", `Authorized ${request.method} on the remote workspace.`, agent.id, { taskId: request.taskId, method: request.method });
         return permit;
       });
@@ -3263,8 +3414,9 @@ export class ControlPlane {
           .get(`mission:${mission.id}:remote-effects`, request.taskId) as { response: string } | undefined;
         const permit = authorization ? JSON.parse(authorization.response).effectPermit : undefined;
         if (!permit) throw new HttpError(409, "Effect receipt has no matching original authorization");
-        this.recordRemoteEffectReceipt(nodeEffectUpload({ binding: expectedBinding!, descriptorHash: runtime.descriptor_hash,
-          taskId: request.taskId, method: permit.method, args: permit.args }, receipt));
+      this.recordRemoteEffectReceipt(nodeEffectUpload({ binding: expectedBinding!, descriptorHash: runtime.descriptor_hash,
+          taskId: request.taskId, method: permit.method, args: permit.args,
+          ...(permit.method === "PublishArtifact" ? { taskAttempt: permit.taskAttempt } : {}) }, receipt));
         return { recorded: true };
       }
       default:
@@ -3929,6 +4081,14 @@ export class ControlPlane {
     const mission = this.getMission(task.missionId)!;
     const worktreeMode = mission.workspaceStrategy === "worktree";
     const owner = task.ownerId ? this.getAgent(task.ownerId) : undefined;
+    const remoteValidation = artifacts.some((artifact) => artifact?.remoteProvenance !== undefined);
+    if (remoteValidation && (artifacts.some((artifact) => !artifact?.remoteProvenance) ||
+        worktreeMode || owner?.machineId === "local" || !owner || owner.missionId !== task.missionId)) {
+      throw new HttpError(409, "Remote snapshot validation requires only remote-provenance artifacts from a remote task owner");
+    }
+    if (!remoteValidation && owner?.machineId !== "local") {
+      throw new HttpError(409, "Remote task validation requires its published remote artifacts");
+    }
     const ownerRecord = worktreeMode && owner?.worktreeId ? this.worktree(owner.worktreeId) : undefined;
     let ownerCommit: string | undefined;
     if (worktreeMode) {
@@ -3942,9 +4102,33 @@ export class ControlPlane {
     }
     const artifactDigests = Object.fromEntries(artifacts.map((artifact) => {
       if (!artifact!.snapshotPath) throw new HttpError(409, "Artifact has no immutable daemon snapshot");
+      if (remoteValidation) {
+        const expectedCasPath = join(resolve(this.home), "artifacts", artifact!.sha256);
+        let snapshotStat;
+        try { snapshotStat = lstatSync(artifact!.snapshotPath); } catch { throw new HttpError(409, "Remote artifact CAS snapshot is unavailable"); }
+        if (artifact!.snapshotPath !== expectedCasPath || !/^[a-f0-9]{64}$/.test(artifact!.sha256) ||
+            snapshotStat.isSymbolicLink() || !snapshotStat.isFile()) {
+          throw new HttpError(409, "Remote artifact is not a coordinator-owned CAS file");
+        }
+      }
       const snapshotDigest = createHash("sha256").update(readFileSync(artifact!.snapshotPath)).digest("hex");
-      if (snapshotDigest !== artifact!.sha256) throw new HttpError(409, "Immutable artifact snapshot changed");
-      if (worktreeMode) {
+      if (snapshotDigest !== artifact!.sha256 || statSync(artifact!.snapshotPath).size !== artifact!.size) throw new HttpError(409, "Immutable artifact snapshot changed");
+      if (remoteValidation) {
+        const provenance = artifact!.remoteProvenance!;
+        if (artifact!.agentId !== owner!.id || artifact!.taskId !== task.id ||
+            provenance.agentId !== owner!.id || provenance.taskAttempt !== task.attempt ||
+            !provenance.workerTaskId.startsWith(`${owner!.id}:`) || !provenance.transferId ||
+            !provenance.descriptorHash || !provenance.machineId || !provenance.runtimeId ||
+            !artifact!.relativePath || /\p{Cc}/u.test(artifact!.relativePath)) {
+          throw new HttpError(409, "Remote artifact provenance is stale or belongs to another task attempt");
+        }
+        const relative = artifact!.relativePath;
+        if (!relative || relative.startsWith("/") || relative.includes("\\") ||
+            relative.split("/").some((part) => /\p{Cc}/u.test(part)) ||
+            relative.split("/").some((part) => !part || part === "." || part === "..")) {
+          throw new HttpError(409, "Remote artifact has an unsafe relative path");
+        }
+      } else if (worktreeMode) {
         if (artifact!.agentId !== owner!.id || artifact!.taskId !== task.id || !artifact!.workspaceCommit || !artifact!.relativePath ||
           !isAncestor(ownerRecord!.repositoryPath, artifact!.workspaceCommit, ownerCommit!)) {
           throw new HttpError(409, "Every selected worktree artifact must be committed by this task owner and present in its current branch");
@@ -3959,8 +4143,8 @@ export class ControlPlane {
       }
       return [artifact!.id, snapshotDigest];
     }));
-    const workspace = this.workspaceForMission(task.missionId);
-    if (!workspace && !worktreeMode) throw new HttpError(409, "Mission workspace is unavailable");
+    const workspace = remoteValidation ? undefined : this.workspaceForMission(task.missionId);
+    if (!workspace && !worktreeMode && !remoteValidation) throw new HttpError(409, "Mission workspace is unavailable");
     const contract = this.validationContract(task.missionId);
     const effectiveAssertions = task.integration && contract
       ? contract.assertions.map((assertion) => assertion.id)
@@ -3987,12 +4171,45 @@ export class ControlPlane {
       status: "pending",
       createdAt: now()
     } : undefined;
+    const remoteValidationPath = remoteValidation
+      ? join(resolve(this.home), "validations", "remote", hash([scope, commandId]).slice(0, 32))
+      : undefined;
     this.transaction(() => {
       this.db.prepare("INSERT INTO validation_intents(scope,command_id,payload_hash,status,mission_id,task_id,receipt_id,created_at) VALUES(?,?,?,?,?,?,?,?)")
         .run(scope, commandId, digest, "pending", task.missionId, task.id, receiptId, now());
       if (validationWorktree) this.saveWorktree(validationWorktree);
     });
     let validationCwd = workspace?.path ?? "";
+    if (remoteValidationPath) {
+      try {
+        mkdirSync(dirname(remoteValidationPath), { recursive: true, mode: 0o700 });
+        mkdirSync(remoteValidationPath, { mode: 0o700 });
+        const seen = new Set<string>();
+        const paths = artifacts.map((artifact) => artifact!.relativePath!);
+        for (const current of paths) {
+          const folded = current.toLocaleLowerCase("en-US");
+          if (seen.has(folded) || paths.some((other) => other !== current &&
+              (other.toLocaleLowerCase("en-US").startsWith(folded + "/") ||
+               folded.startsWith(other.toLocaleLowerCase("en-US") + "/")))) {
+            throw new Error("Remote artifact paths collide or conflict by nesting");
+          }
+          seen.add(folded);
+        }
+        for (const artifact of artifacts) {
+          const destination = join(remoteValidationPath, ...artifact!.relativePath!.split("/"));
+          mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+          copyFileSync(artifact!.snapshotPath!, destination);
+          chmodSync(destination, 0o600);
+        }
+        validationCwd = remoteValidationPath;
+      } catch (error) {
+        this.transaction(() => {
+          this.db.prepare("UPDATE validation_intents SET status='aborted',receipt_id=NULL WHERE scope=? AND command_id=? AND status='pending'")
+            .run(scope, commandId);
+        });
+        throw new HttpError(409, `Remote validation snapshot could not be prepared safely: ${error instanceof Error ? error.message : "copy failed"}`);
+      }
+    }
     if (validationWorktree) {
       try {
         ensureWorktreeParent(this.home, validationWorktree.path);
@@ -4014,7 +4231,16 @@ export class ControlPlane {
     }
     const key = `${scope}\0${commandId}`;
     const promise = this.startShellProcess(input.command, validationCwd, env, task.missionId, agentId).then(({ stdout, stderr, exitCode }) => {
-      const snapshotIntegrity = validationWorktree ? isTrackedSnapshotClean(validationCwd, ownerCommit!) : undefined;
+      const snapshotIntegrity = validationWorktree ? isTrackedSnapshotClean(validationCwd, ownerCommit!) : remoteValidation
+        ? artifacts.every((artifact) => {
+          try {
+            const path = join(remoteValidationPath!, ...artifact!.relativePath!.split("/"));
+            const info = lstatSync(path);
+            return info.isFile() && !info.isSymbolicLink() && info.nlink === 1 &&
+              realpathSync(path) === path && createHash("sha256").update(readFileSync(path)).digest("hex") === artifact!.sha256;
+          } catch { return false; }
+        })
+        : undefined;
       const receipt: ValidationReceipt = {
         id: receiptId, missionId: task.missionId, taskId: task.id, validatorId: agentId, command: input.command,
         stdout, stderr, exitCode,
@@ -4024,7 +4250,11 @@ export class ControlPlane {
         ...(validationWorktree ? {
           workspaceCommit: ownerCommit!, ...(ownerRecord!.branch ? { workspaceBranch: ownerRecord!.branch } : {}), workspacePath: validationCwd,
           snapshotIntegrity: snapshotIntegrity === true, ...(snapshotIntegrity !== true ? { snapshotError: "Tracked validation inputs changed during execution." } : {})
-        } : {})
+        } : remoteValidation ? {
+          workspaceKind: "remote-snapshot" as const, workspacePath: validationCwd,
+          snapshotIntegrity: snapshotIntegrity === true,
+          ...(snapshotIntegrity !== true ? { snapshotError: "Detached remote validation inputs changed during execution." } : {})
+        } : { workspaceKind: "shared" as const })
       };
       this.db.prepare("INSERT INTO validation_receipts(id,mission_id,task_id,data) VALUES(?,?,?,?)").run(receipt.id, receipt.missionId, receipt.taskId, json(receipt));
       this.db.prepare("UPDATE validation_intents SET status=?,receipt_id=? WHERE scope=? AND command_id=?").run(exitCode === null ? "uncertain" : "terminal", receipt.id, scope, commandId);
@@ -4099,6 +4329,15 @@ export class ControlPlane {
     const receipt = decode<ValidationReceipt>(receiptRow.data);
     if (receipt.validatorId !== agentId || receipt.attempt !== task.attempt || receipt.taskRevision !== (task.revision ?? 0)) throw new HttpError(409, "Validation receipt is stale or belongs to another validator");
     if (receipt.contractRevision !== contract?.revision) throw new HttpError(409, "Validation receipt is stale for the current contract revision");
+    const remoteSnapshot = receipt.workspaceKind === "remote-snapshot";
+    const taskOwner = task.ownerId ? this.getAgent(task.ownerId) : undefined;
+    if (remoteSnapshot && (receipt.snapshotIntegrity !== true || !receipt.workspacePath ||
+        taskOwner?.machineId === "local" || !taskOwner)) {
+      throw new HttpError(409, "Remote snapshot validation receipt is incomplete or belongs to a local task");
+    }
+    if (!remoteSnapshot && taskOwner?.machineId !== "local") {
+      throw new HttpError(409, "Remote task requires detached snapshot validation");
+    }
     if (worktreeMode) {
       if (receipt.snapshotIntegrity !== true || !receipt.workspaceCommit || !receipt.workspacePath) {
         throw new HttpError(409, "Worktree validation receipt does not prove an intact tracked snapshot");
@@ -4125,8 +4364,23 @@ export class ControlPlane {
     }
     for (const artifactId of receipt.artifactIds) {
       const artifact = this.artifact(artifactId);
+      if (remoteSnapshot && artifact?.snapshotPath) {
+        const expectedCasPath = join(resolve(this.home), "artifacts", artifact.sha256);
+        try {
+          const info = lstatSync(artifact.snapshotPath);
+          if (artifact.snapshotPath !== expectedCasPath || info.isSymbolicLink() || !info.isFile()) {
+            throw new Error("CAS path is not a regular file");
+          }
+        } catch {
+          throw new HttpError(409, "Remote artifact CAS snapshot is missing or unsafe");
+        }
+      }
       if (!artifact || !artifact.snapshotPath ||
-        (!worktreeMode && createHash("sha256").update(readFileSync(artifact.path)).digest("hex") !== artifact.sha256) ||
+        (remoteSnapshot ? (!artifact.remoteProvenance || artifact.agentId !== task.ownerId ||
+          artifact.taskId !== task.id || artifact.remoteProvenance.taskAttempt !== task.attempt ||
+          artifact.remoteProvenance.agentId !== task.ownerId) :
+          (artifact.remoteProvenance !== undefined ||
+            (!worktreeMode && createHash("sha256").update(readFileSync(artifact.path)).digest("hex") !== artifact.sha256))) ||
         createHash("sha256").update(readFileSync(artifact.snapshotPath)).digest("hex") !== artifact.sha256 ||
         receipt.artifactDigests[artifactId] !== artifact.sha256 ||
         (worktreeMode && (!artifact.workspaceCommit || !artifact.relativePath || artifact.agentId !== task.ownerId ||
@@ -4135,8 +4389,39 @@ export class ControlPlane {
         throw new HttpError(409, "Validation artifact is stale or has changed");
       }
     }
+    if (remoteSnapshot) {
+      const remoteRoot = join(resolve(this.home), "validations", "remote");
+      const workspacePath = receipt.workspacePath!;
+      const leaf = basename(workspacePath);
+      try {
+        if (!/^[a-f0-9]{32}$/.test(leaf) || workspacePath !== resolve(workspacePath) ||
+            !workspacePath.startsWith(remoteRoot + sep) || realpathSync(remoteRoot) !== remoteRoot ||
+            realpathSync(workspacePath) !== workspacePath || lstatSync(workspacePath).isSymbolicLink() ||
+            !lstatSync(workspacePath).isDirectory()) {
+          throw new Error("Detached validation directory escaped its coordinator-owned root");
+        }
+        for (const artifactId of receipt.artifactIds) {
+          const artifact = this.artifact(artifactId)!;
+          const relative = artifact.relativePath!;
+          if (!relative || relative.startsWith("/") || relative.includes("\\") ||
+              relative.split("/").some((part) => !part || part === "." || part === ".." || /\p{Cc}/u.test(part))) {
+            throw new Error("Remote validation artifact path is unsafe");
+          }
+          const path = join(workspacePath, ...relative.split("/"));
+          const fileStat = lstatSync(path);
+          if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.nlink !== 1 || realpathSync(path) !== path ||
+              fileStat.size !== artifact.size ||
+              createHash("sha256").update(readFileSync(path)).digest("hex") !== artifact.sha256) {
+            throw new Error("Detached validation input changed after receipt creation");
+          }
+        }
+      } catch {
+        throw new HttpError(409, "Remote detached validation inputs are missing, unsafe, or changed");
+      }
+    }
     if (passed && receipt.exitCode !== 0) throw new HttpError(409, "A passing validation requires a completed exit-0 command receipt");
     if (passed && worktreeMode && receipt.snapshotIntegrity !== true) throw new HttpError(409, "A passing worktree validation requires an intact tracked snapshot");
+    if (passed && remoteSnapshot && receipt.snapshotIntegrity !== true) throw new HttpError(409, "A passing remote validation requires intact detached inputs");
     if (passed && normalizedResults?.some((result) => result.status !== "passed")) throw new HttpError(409, "Every claimed assertion must pass before the task can be accepted");
     if (task.dependencies.some((id) => this.task(id)?.status !== "accepted")) throw new HttpError(409, "Task dependencies must be accepted before validation");
     return this.command(validationScope, commandId, validationPayload, () => {
@@ -4582,6 +4867,7 @@ export class ControlPlane {
   publishArtifact(agentId: string, epoch: number, commandId: string, name: string, path: string, bytes: Buffer, taskId?: string): Artifact {
     const agent = this.getAgent(agentId);
     if (!agent) throw new HttpError(404, "Agent not found");
+    if (agent.machineId !== "local") throw new HttpError(409, "Remote agents must publish through the negotiated artifact transfer protocol");
     const auth = this.authorizeAgent(agentId, epoch, agent.missionId);
     if (auth.role.kind === "validator") throw new HttpError(403, "Validators cannot publish workspace artifacts");
     const sha256 = createHash("sha256").update(bytes).digest("hex");

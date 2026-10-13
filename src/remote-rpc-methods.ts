@@ -3,4 +3,4 @@ export const REMOTE_RPC_METHODS = new Set([
   "SendMessage", "CreateTask", "UpdateTask", "Report", "RequestUserInput",
   "RecordEffectReceipt"
 ]);
-export const REMOTE_EFFECT_METHODS = new Set(["read_file", "write_file", "bash"]);
+export const REMOTE_EFFECT_METHODS = new Set(["read_file", "write_file", "bash", "PublishArtifact"]);

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { constants, closeSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { constants, appendFileSync, chmodSync, closeSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
-import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct } from "../dist/node-effect-executor.js";
+import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct, readNodeArtifactChunk, snapshotNodeArtifact, verifyNodeArtifactSnapshot } from "../dist/node-effect-executor.js";
 import { parseNodeEffectReceipt } from "../dist/node-effects.js";
+import { REMOTE_ARTIFACT_CHUNK_BYTES } from "../dist/remote-artifacts.js";
 
 const binding = { runtimeId: "executor-runtime", machineId: "node", sessionId: "session", sessionEpoch: 1, agentId: "agent", epoch: 1 };
 const spec = (method, args) => ({ binding, descriptorHash: "a".repeat(64), taskId: "agent:effect-1", method, args });
@@ -110,6 +111,39 @@ test("FIFO paths are rejected for reads and writes without blocking", async t =>
   } finally {
     closeSync(reader);
   }
+});
+
+test("artifact snapshot is bounded, immutable, stable, and scans credentials across chunk boundaries", t => {
+  const root = mkdtempSync(join(tmpdir(), "node-artifact-snapshot-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace"), snapshots = join(root, "snapshots");
+  mkdirSync(workspace);
+  const artifactSpec = {
+    ...spec("PublishArtifact", { name: "evidence", path: "artifact.bin", taskId: "domain-task" }),
+    taskAttempt: 1
+  };
+  const secretSource = Buffer.concat([
+    Buffer.alloc(REMOTE_ARTIFACT_CHUNK_BYTES - 2, 0x78), Buffer.from("known-secret")
+  ]);
+  writeFileSync(join(workspace, "artifact.bin"), secretSource);
+  assert.throws(() => snapshotNodeArtifact(artifactSpec, workspace, snapshots, ["known-secret"]), /known credential/i);
+  assert.deepEqual(readdirSync(snapshots), []);
+
+  const source = Buffer.concat([Buffer.from([0, 255, 128]), Buffer.alloc(REMOTE_ARTIFACT_CHUNK_BYTES + 7, 0x45)]);
+  writeFileSync(join(workspace, "artifact.bin"), source);
+  const snapshot = snapshotNodeArtifact(artifactSpec, workspace, snapshots, ["known-secret"]);
+  assert.deepEqual(readNodeArtifactChunk(snapshot, 0, REMOTE_ARTIFACT_CHUNK_BYTES), source.subarray(0, REMOTE_ARTIFACT_CHUNK_BYTES));
+  assert.deepEqual(readNodeArtifactChunk(snapshot, REMOTE_ARTIFACT_CHUNK_BYTES, source.length - REMOTE_ARTIFACT_CHUNK_BYTES),
+    source.subarray(REMOTE_ARTIFACT_CHUNK_BYTES));
+  verifyNodeArtifactSnapshot(snapshot);
+  writeFileSync(join(workspace, "artifact.bin"), "changed source after publication");
+  verifyNodeArtifactSnapshot(snapshot);
+  chmodSync(snapshot.path, 0o600);
+  writeFileSync(snapshot.path, source);
+  appendFileSync(snapshot.path, Buffer.from([0]));
+  assert.throws(() => verifyNodeArtifactSnapshot(snapshot), /changed|size|grew/i);
+  writeFileSync(snapshot.path, "tampered snapshot");
+  assert.throws(() => verifyNodeArtifactSnapshot(snapshot), /changed|digest/i);
 });
 
 test("shell exit kills background children and preserves the shell exit status", async t => {

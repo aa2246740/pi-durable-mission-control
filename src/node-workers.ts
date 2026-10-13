@@ -10,7 +10,8 @@ import { parseWorkerNotice, type WorkerNotice } from "./worker-events.js";
 import {
   NodeEffectJournal, type NodeEffectReceipt, type NodeEffectSpec, type NodeEffectUpload
 } from "./node-effects.js";
-import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct } from "./node-effect-executor.js";
+import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct, readNodeArtifactChunk, snapshotNodeArtifact, verifyNodeArtifactSnapshot, type NodeArtifactSnapshot } from "./node-effect-executor.js";
+import type { RemoteArtifactManifest } from "./remote-artifacts.js";
 import { REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { redactDiagnosticChunk, sanitizeDiagnostic } from "./workers.js";
 import {
@@ -57,6 +58,15 @@ export interface NodeWorkerSupervisorOptions {
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
   testOnlyWorkspaceEffectLoop?: boolean;
+  testOnlyArtifactTransferLoop?: boolean;
+  testOnlyArtifactTaskId?: string;
+  artifactTransfers?: boolean;
+  uploadArtifact?: (input: {
+    spec: NodeEffectSpec;
+    manifest: RemoteArtifactManifest;
+    readChunk: (offset: number, length: number) => Buffer;
+    verifySnapshot: () => void;
+  }) => Promise<JsonValue>;
 }
 
 export class NodeWorkerError extends Error {}
@@ -94,8 +104,9 @@ type Handle = {
   pid: number;
   ready: Promise<void>;
   pendingRpc: Set<string>;
-  pendingEffects: Map<string, { taskId: string; method: "read_file" | "write_file" | "bash"; args: { [key: string]: JsonValue } }>;
+  pendingEffects: Map<string, { taskId: string; method: "read_file" | "write_file" | "bash" | "PublishArtifact"; args: { [key: string]: JsonValue } }>;
   effectApprovals: boolean;
+  artifactTransfers: boolean;
   completedEffects: Map<string, { identity: string; receipt: string; expiresAt: number }>;
   pendingDeliveries: Map<DeliveryKey, string>;
   pendingAbort: string | undefined;
@@ -387,6 +398,9 @@ export class NodeWorkerSupervisor {
     if (spec.effectApprovals && (spec.effects !== true || this.options.effectApprovals !== true)) {
       throw new NodeWorkerError("Remote effect approvals are not enabled for this node session");
     }
+    if (spec.artifactTransfers && (spec.effects !== true || this.options.artifactTransfers !== true)) {
+      throw new NodeWorkerError("Remote artifact transfers are not enabled for this node session");
+    }
     if (!this.leaseCurrent(binding)) throw new NodeWorkerError("Node lease is not current for this binding");
     const workspace = canonicalDirectory(spec.workspacePath, "Workspace path");
     if (!this.roots.some((root) => within(root, workspace))) {
@@ -406,9 +420,14 @@ export class NodeWorkerSupervisor {
       role: spec.role,
       runtimeMode: spec.effects ? "remote-workspace-effects" as const : "remote-metadata-only" as const,
       ...(spec.effectApprovals ? { effectApprovals: true as const } : {}),
+      ...(spec.artifactTransfers ? { artifactTransfers: true as const } : {}),
       ...(this.options.testOnlyScripted ? { testOnlyScripted: true } : {}),
       ...(this.options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
-      ...(this.options.testOnlyWorkspaceEffectLoop ? { testOnlyWorkspaceEffectLoop: true } : {})
+      ...(this.options.testOnlyWorkspaceEffectLoop ? { testOnlyWorkspaceEffectLoop: true } : {}),
+      ...(this.options.testOnlyArtifactTransferLoop ? {
+        testOnlyArtifactTransferLoop: true,
+        ...(this.options.testOnlyArtifactTaskId ? { testOnlyArtifactTaskId: this.options.testOnlyArtifactTaskId } : {})
+      } : {})
     };
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -500,6 +519,7 @@ export class NodeWorkerSupervisor {
       pendingRpc: new Set(),
       pendingEffects: new Map(),
       effectApprovals: spec.effectApprovals === true,
+      artifactTransfers: spec.artifactTransfers === true,
       completedEffects: new Map(),
       pendingDeliveries: new Map(),
       pendingAbort: undefined,
@@ -693,7 +713,7 @@ export class NodeWorkerSupervisor {
     if (REMOTE_EFFECT_METHODS.has(checked.payload.method)) {
       handle.pendingEffects.set(checked.payload.rpcId, {
         taskId: checked.payload.taskId,
-        method: checked.payload.method as "read_file" | "write_file" | "bash",
+        method: checked.payload.method as "read_file" | "write_file" | "bash" | "PublishArtifact",
         args: checked.payload.args
       });
     }
@@ -908,7 +928,7 @@ export class NodeWorkerSupervisor {
     handle: Handle,
     envelope: WorkerEnvelope,
     payload: Extract<WorkerEnvelope["payload"], { kind: "reply" }>,
-    effect: { taskId: string; method: "read_file" | "write_file" | "bash"; args: { [key: string]: JsonValue } }
+    effect: { taskId: string; method: "read_file" | "write_file" | "bash" | "PublishArtifact"; args: { [key: string]: JsonValue } }
   ): Promise<void> {
     const binding = handle.binding;
     const pendingResult = payload.ok && payload.result && typeof payload.result === "object"
@@ -963,16 +983,22 @@ export class NodeWorkerSupervisor {
     const descriptorMatches = permitRecord?.descriptorHash === handle.descriptorHash;
     const taskMatches = permitRecord?.taskId === effect.taskId;
     const expiresAt = permitRecord?.expiresAt;
-    const exactPermit = Boolean(permitRecord && permitKeys?.length === 6 &&
+    const hasAttempt = Object.hasOwn(permitRecord ?? {}, "taskAttempt");
+    const exactPermit = Boolean(permitRecord && permitKeys?.length === (hasAttempt ? 7 : 6) &&
       ["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(permitRecord, key)));
     if (!payload.ok || !exactPermit || !bindingMatches || !descriptorMatches || !taskMatches ||
         typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) ||
-        method !== effect.method || canonicalJson(args) !== canonicalJson(effect.args)) {
+        method !== effect.method || canonicalJson(args) !== canonicalJson(effect.args) ||
+        (effect.method === "PublishArtifact" && (typeof permitRecord?.taskAttempt !== "number" || !Number.isSafeInteger(permitRecord.taskAttempt) || permitRecord.taskAttempt <= 0)) ||
+        (effect.method !== "PublishArtifact" && hasAttempt)) {
       await this.send(handle, { id: payload.rpcId, error: payload.ok ? "Coordinator effect permit did not match the requested operation" : payload.error });
       await this.stopHandle(handle, "A workspace effect permit was rejected or mismatched");
       return;
     }
-    const spec = { binding, descriptorHash: handle.descriptorHash, taskId: effect.taskId, method: effect.method, args: effect.args };
+    const spec: NodeEffectSpec = {
+      binding, descriptorHash: handle.descriptorHash, taskId: effect.taskId, method: effect.method, args: effect.args,
+      ...(effect.method === "PublishArtifact" ? { taskAttempt: permitRecord!.taskAttempt as number } : {})
+    };
     const receipt = await this.executePermittedEffect(handle, spec, expiresAt);
     const durable = this.effects.inspect().find(entry => canonicalJson(entry.spec) === canonicalJson(spec));
     if (durable && durable.state !== "prepared" && durable.state !== "executing" && durable.receipt &&
@@ -1084,7 +1110,21 @@ export class NodeWorkerSupervisor {
           if (handle.stopping || Date.now() >= expiresAt || !this.leaseCurrent(binding)) {
             throw new Error("Remote effect permit expired or runtime ownership was lost before dispatch");
           }
-          receipt = await executeNodeEffect(spec, handle.workspacePath);
+          if (spec.method === "PublishArtifact") {
+            if (!handle.artifactTransfers || !this.options.uploadArtifact) throw new Error("Negotiated remote artifact upload is unavailable");
+            const snapshot: NodeArtifactSnapshot = snapshotNodeArtifact(
+              spec, handle.workspacePath, join(this.home, "artifact-snapshots"),
+              [...this.redactionValues, handle.secret ?? "", handle.token]
+            );
+            const result = await this.options.uploadArtifact({
+              spec, manifest: snapshot.manifest,
+              readChunk: (offset, length) => readNodeArtifactChunk(snapshot, offset, length),
+              verifySnapshot: () => verifyNodeArtifactSnapshot(snapshot)
+            });
+            receipt = { status: "succeeded", result };
+          } else {
+            receipt = await executeNodeEffect(spec, handle.workspacePath);
+          }
           if (handle.stopping || !this.leaseCurrent(binding)) {
             receipt = { status: "uncertain", error: "Node lease or runtime ownership was lost during workspace effect execution" };
           }

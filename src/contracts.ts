@@ -27,6 +27,7 @@ export interface NodeCapabilities {
   executionEnabled: boolean;
   executionMode?: "metadata-only" | "workspace-effects";
   effectApprovals?: true;
+  artifactTransfers?: true;
 }
 export interface RemoteMachine {
   id: string; name: string; kind: 'remote';
@@ -97,6 +98,10 @@ export interface Artifact {
   id: string; missionId: string; agentId: string; name: string; path: string; sha256: string; size: number; createdAt: string;
   snapshotPath?: string; taskId?: string;
   workspaceCommit?: string; relativePath?: string;
+  remoteProvenance?: {
+    transferId: string; runtimeId: string; machineId: string; sessionId: string; sessionEpoch: number;
+    agentId: string; epoch: number; descriptorHash: string; workerTaskId: string; taskAttempt: number;
+  };
 }
 export interface ValidationReceipt {
   id: string; missionId: string; taskId: string; validatorId: string; command: string; stdout: string; stderr: string;
@@ -105,6 +110,7 @@ export interface ValidationReceipt {
   contractRevision?: number; requirementRevisions?: Record<string, number>;
   workspaceCommit?: string; workspaceBranch?: string; workspacePath?: string;
   snapshotIntegrity?: boolean; snapshotError?: string;
+  workspaceKind?: "shared" | "worktree" | "remote-snapshot";
 }
 export interface Validation {
   id: string; missionId: string; taskId: string; agentId: string; passed: boolean; evidence: string; createdAt: string;

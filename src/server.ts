@@ -235,6 +235,25 @@ export async function startServer(options: ServerOptions) {
             body.upload
           ));
         }
+        if (url.pathname === "/api/nodes/artifacts/chunk") {
+          const body = await readBody(request);
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "spec", "manifest", "offset", "chunkBase64"]);
+          if (typeof body.offset !== "number" || !Number.isSafeInteger(body.offset) || body.offset < 0) {
+            throw new MachineError(400, "Artifact chunk offset must be a non-negative safe integer");
+          }
+          return jsonResponse(response, 200, control.nodeArtifactChunk(
+            text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch"), body.spec, body.manifest, body.offset, body.chunkBase64
+          ));
+        }
+        if (url.pathname === "/api/nodes/artifacts/complete") {
+          const body = await readBody(request);
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "spec", "manifest"]);
+          return jsonResponse(response, 200, control.nodeArtifactComplete(
+            text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch"), body.spec, body.manifest
+          ));
+        }
         if (url.pathname === "/api/nodes/runtimes/poll") {
           const body = await readBody(request);
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch"]);

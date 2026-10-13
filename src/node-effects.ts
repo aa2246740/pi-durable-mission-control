@@ -6,8 +6,9 @@ export interface NodeEffectSpec {
   binding: WorkerBinding;
   descriptorHash: string;
   taskId: string;
-  method: "read_file" | "write_file" | "bash";
+  method: "read_file" | "write_file" | "bash" | "PublishArtifact";
   args: { [key: string]: JsonValue };
+  taskAttempt?: number;
 }
 
 export type NodeEffectReceipt =
@@ -61,25 +62,48 @@ function digest(value: string): string {
 }
 
 function checkedSpec(value: unknown): NodeEffectSpec {
-  if (!exact(value, ["binding", "descriptorHash", "taskId", "method", "args"])) fail();
-  const binding = parseWorkerBinding(value.binding);
-  if (!binding || typeof value.descriptorHash !== "string" || !/^[a-f0-9]{64}$/.test(value.descriptorHash)) fail();
-  if (typeof value.taskId !== "string" || !value.taskId.startsWith(binding.agentId + ":") || value.taskId.length > 240 || /\p{Cc}/u.test(value.taskId)) fail();
-  const method = value.method;
-  if (method !== "read_file" && method !== "write_file" && method !== "bash") fail();
-  const args = value.args;
-  const keys = method === "bash" ? ["command"] : method === "write_file" ? ["path", "content"] : ["path"];
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail();
+  const record = value as Record<string, unknown>;
+  const allowed = ["binding", "descriptorHash", "taskId", "method", "args", "taskAttempt"];
+  if (Reflect.ownKeys(record).some((key) => typeof key !== "string" || !allowed.includes(key)) ||
+      !["binding", "descriptorHash", "taskId", "method", "args"].every((key) => Object.hasOwn(record, key))) fail();
+  const binding = parseWorkerBinding(record.binding);
+  if (!binding || typeof record.descriptorHash !== "string" || !/^[a-f0-9]{64}$/.test(record.descriptorHash)) fail();
+  if (typeof record.taskId !== "string" || !record.taskId.startsWith(binding.agentId + ":") || record.taskId.length > 240 || /\p{Cc}/u.test(record.taskId)) fail();
+  const method = record.method;
+  if (method !== "read_file" && method !== "write_file" && method !== "bash" && method !== "PublishArtifact") fail();
+  const taskAttempt = record.taskAttempt;
+  if (method === "PublishArtifact") {
+    if (typeof taskAttempt !== "number" || !Number.isSafeInteger(taskAttempt) || taskAttempt < 1) fail();
+  } else if (taskAttempt !== undefined) fail();
+  const args = record.args;
+  const keys = method === "PublishArtifact" ? ["name", "path", "taskId"]
+    : method === "bash" ? ["command"] : method === "write_file" ? ["path", "content"] : ["path"];
   if (!exact(args, keys)) fail();
   const path = method === "bash" ? args.command : args.path;
   if (typeof path !== "string" || !path.trim() || path.length > (method === "bash" ? 32000 : 4096) || path.includes("\0")) fail();
   if (method !== "bash" && /\p{Cc}/u.test(path)) fail();
   if (method === "write_file" && (typeof args.content !== "string" || Buffer.byteLength(args.content) > 256 * 1024)) fail();
+  if (method === "PublishArtifact") {
+    const name = args.name, artifactTask = args.taskId;
+    if (typeof name !== "string" || !name.trim() || name.length > 200 || /\p{Cc}/u.test(name) ||
+        typeof artifactTask !== "string" || !artifactTask.trim() || artifactTask.length > 240 || /\p{Cc}/u.test(artifactTask) ||
+        path.startsWith("/") || path.includes("\\") || path.split("/").some((part: string) => !part || part === "." || part === "..")) fail();
+  }
   const envelope = parseWorkerEnvelope({
     binding, messageId: "node-effect-validation", sequence: 1,
-    payload: { kind: "rpc", rpcId: "node-effect-validation", taskId: value.taskId, method, args }
+    payload: { kind: "rpc", rpcId: "node-effect-validation", taskId: record.taskId, method, args }
   });
   if (!envelope || envelope.payload.kind !== "rpc") fail();
-  return { binding, descriptorHash: value.descriptorHash, taskId: value.taskId, method, args: envelope.payload.args };
+  return {
+    binding, descriptorHash: record.descriptorHash as string, taskId: record.taskId as string, method,
+    args: envelope.payload.args,
+    ...(method === "PublishArtifact" ? { taskAttempt: taskAttempt as number } : {})
+  };
+}
+
+export function parseNodeEffectSpec(value: unknown): NodeEffectSpec | undefined {
+  try { return checkedSpec(value); } catch { return undefined; }
 }
 
 function checkedReceipt(value: unknown, binding: WorkerBinding): NodeEffectReceipt {

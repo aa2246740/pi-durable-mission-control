@@ -28,9 +28,12 @@ export type WorkerConfig = {
   role: RoleProfile;
   runtimeMode?: "remote-metadata-only" | "remote-workspace-effects";
   effectApprovals?: true;
+  artifactTransfers?: true;
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
   testOnlyWorkspaceEffectLoop?: boolean;
+  testOnlyArtifactTransferLoop?: boolean;
+  testOnlyArtifactTaskId?: string;
 };
 
 type ParentMessage = { type: "deliver"; messageId: string; requestId: string; attempt: number; epoch: number; content: string; mode: "steer" | "followUp" } | { type: "abort" } | { type: "shutdown" };
@@ -160,8 +163,20 @@ export function rpcRequest(config: WorkerConfig, method: string, args: unknown, 
 }
 
 function tools(config: WorkerConfig) {
-  const call = (name: string, args: unknown, api: { taskId: unknown }) =>
-    rpcRequest(config, name, args, String(api.taskId));
+  const call = async (name: string, args: unknown, api: { taskId: unknown }) => {
+    if (name === "PublishArtifact" && config.testOnlyArtifactTransferLoop &&
+        config.testOnlyArtifactTaskId === "__test_only_current_owned_task__") {
+      const state = await rpcRequest(config, "GetMissionState", {}, String(api.taskId));
+      const tasks = state && typeof state === "object" && "tasks" in state && Array.isArray(state.tasks)
+        ? state.tasks as Array<Record<string, unknown>> : [];
+      const owned = tasks.filter(task => task.ownerId === config.agentId && task.status === "running");
+      if (owned.length !== 1 || typeof owned[0]?.id !== "string") {
+        throw new Error("Test-only artifact publication requires one current owned running task");
+      }
+      args = { ...(args as Record<string, unknown>), taskId: owned[0].id };
+    }
+    return rpcRequest(config, name, args, String(api.taskId));
+  };
   const tool = (name: string, description: string, properties: Record<string, TSchema>) =>
     defineTool({
       name,
@@ -199,7 +214,7 @@ function tools(config: WorkerConfig) {
     tool("Report", "Submit one idempotent handoff to the orchestrator and end this run. Call alone after finishing the work; new messages wake you. Use WaitForMessage instead of repeated waiting reports.", { summary: Type.String(), evidence: Type.String() }),
     tool("RunValidation", "Run a real validation command and record its output and artifact digests.", { taskId: Type.String(), command: Type.String(), artifactIds: Type.Array(Type.String()) }),
     tool("ValidateTask", "Decide task acceptance using a genuine validation receipt.", { taskId: Type.String(), receiptId: Type.String(), passed: Type.Boolean(), evidence: Type.String(), assertionResults: Type.Optional(Type.Array(Type.Object({ assertionId: Type.String(), status: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("untested")]), evidence: Type.String() }, { additionalProperties: false }))) }),
-    tool("PublishArtifact", "Publish a workspace file as an immutable snapshot.", { name: Type.String(), path: Type.String(), taskId: Type.Optional(Type.String()) }),
+    tool("PublishArtifact", "Publish a workspace file as an immutable snapshot. Remote workers must provide the ID of their current owned task.", { name: Type.String(), path: Type.String(), taskId: Type.Optional(Type.String()) }),
     tool("RequestUserInput", "Ask the user for a decision.", { question: Type.String() }),
     tool("CompleteMission", "Request mission completion after domain gates pass.", {}),
     tool("read_file", "Read a file inside the mission workspace.", { path: Type.String() }),
@@ -217,7 +232,8 @@ function tools(config: WorkerConfig) {
   const runtimeTools = config.runtimeMode === "remote-metadata-only"
     ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name))
     : config.runtimeMode === "remote-workspace-effects"
-      ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name) || REMOTE_EFFECT_METHODS.has(item.name))
+      ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name) ||
+        REMOTE_EFFECT_METHODS.has(item.name) && (item.name !== "PublishArtifact" || config.artifactTransfers === true))
     : selected;
   return defineExtension({ name: "mission-control-tools", tools: runtimeTools });
 }
@@ -245,7 +261,19 @@ export async function openWorkerRuntime(
   };
   const faux = config.testOnlyScripted ? fauxProvider() : undefined;
   if (config.testOnlyScripted) {
-    faux!.setResponses(config.testOnlyWorkspaceEffectLoop
+    faux!.setResponses(config.testOnlyArtifactTransferLoop
+      ? [
+        fauxAssistantMessage(fauxToolCall("PublishArtifact", {
+            name: "frozen-evidence", path: "artifact.bin",
+            taskId: config.testOnlyArtifactTaskId ?? "__test_only_current_owned_task__"
+          }), { stopReason: "toolUse" }),
+          fauxAssistantMessage([
+            { type: "text", text: "test-only artifact transfer completed" },
+            fauxToolCall("Report", { summary: "test-only artifact transfer", evidence: "coordinator CAS artifact" })
+          ], { stopReason: "toolUse" }),
+          fauxAssistantMessage("test-only next durable input")
+        ]
+      : config.testOnlyWorkspaceEffectLoop
       ? [
           fauxAssistantMessage(fauxToolCall("GetMissionState", {}), { stopReason: "toolUse" }),
           fauxAssistantMessage(fauxToolCall("bash", { command: "printf x >> effect-marker" }), { stopReason: "toolUse" }),
@@ -294,7 +322,7 @@ export async function openWorkerRuntime(
     const agent = {
       extensions: [extension],
       model: { provider: config.testOnlyScripted ? "faux" : `mission-${config.profile.id}`, modelId: config.testOnlyScripted ? "faux-1" : config.profile.modelId },
-      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : config.runtimeMode === "remote-workspace-effects" ? `\n\nThis runtime permits only node-local read_file, write_file, and bash effects in the assigned workspace.${config.effectApprovals ? " Under approval autonomy, write_file and bash may return a durable pending approval and end this worker turn. Wait for the execution outcome; do not retry or poll." : " Approval-mode write_file and bash are unavailable on this node."} bash is not an OS sandbox: it runs as the node's OS user. Only read_file/write_file paths are scoped to the assigned workspace; the shell receives no credential environment variables intentionally.` : ""}`,
+      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : config.runtimeMode === "remote-workspace-effects" ? `\n\nThis runtime permits only node-local read_file, write_file, and bash effects in the assigned workspace.${config.artifactTransfers ? " PublishArtifact captures and uploads a bounded frozen snapshot; always provide the current task ID you own. It does not publish latest-source validation." : ""}${config.effectApprovals ? " Under approval autonomy, write_file and bash may return a durable pending approval and end this worker turn. Wait for the execution outcome; do not retry or poll." : " Approval-mode write_file and bash are unavailable on this node."} bash is not an OS sandbox: it runs as the node's OS user. Only read_file/write_file paths are scoped to the assigned workspace; the shell receives no credential environment variables intentionally.` : ""}`,
       ...(extension.tools ? { tools: extension.tools } : {}),
       cwd: config.workspacePath
     };
