@@ -1,0 +1,40 @@
+{
+  "name": "mission-control",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "A local, durable mission orchestration daemon",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "mission-control": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node copy-public.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src test",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "start": "node dist/cli.js serve"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-durable": "1.1.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "cron-parser": "5.4.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "eslint": "9.37.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.48.0"
+  }
+}

@@ -1,0 +1,21 @@
+node_modules/
+dist/
+coverage/
+.DS_Store
+*.tgz
+*.log
+
+# Local credentials and runtime state must never enter source history.
+.env
+.env.*
+*.token
+*.pem
+*.key
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.qcow2
+*.img
+*.iso
+*.bundle

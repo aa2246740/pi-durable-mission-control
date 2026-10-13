@@ -1,0 +1,163 @@
+# Mission Control
+
+Mission Control is a local daemon for durable, role-based work orchestration. It stores control-plane state in SQLite and gives each agent its own pi-durable SQLite database. No example mission is created automatically.
+
+## Requirements and start
+
+Use Node.js 22.19 or newer.
+
+```sh
+npm install --ignore-scripts
+npm run build
+npm start
+```
+
+The daemon listens only on `127.0.0.1:4310` by default. The `mission-control` CLI supports:
+
+```sh
+mission-control serve --home ~/.mission-control --port 4310
+mission-control start --home ~/.mission-control --port 4310
+mission-control status --home ~/.mission-control
+mission-control logs --home ~/.mission-control --lines 100
+mission-control doctor --home ~/.mission-control
+mission-control stop --home ~/.mission-control
+mission-control service install --home ~/.mission-control
+mission-control service start --home ~/.mission-control
+mission-control service status --home ~/.mission-control
+mission-control service uninstall --home ~/.mission-control
+mission-control export <mission-id> --home ~/.mission-control
+```
+
+`serve` remains the foreground command and is also the default when no command is given. `start` launches the same CLI daemon in the background, then returns only after its recorded process ID and daemon identity answer the local health check. It accepts port `0` to select an available port. Repeating `start` for an already healthy daemon in the same home reports that daemon rather than replacing it. `stop` asks that verified daemon to exit and waits for its process and matching record to disappear.
+
+`start` is terminal-independent, but it does not configure login or boot autostart. On macOS, use the per-user login service described below; other platforms need a separately configured service manager. The detached process writes `daemon.out.log` and `daemon.err.log` in its home with owner-only file permissions; `logs` shows a bounded, redacted tail. Keep the home directory protected because it also contains the administrative token and state database.
+
+For a source checkout, build first with `npm run build`, then use `node dist/cli.js start` (or `npm start` for the foreground daemon). In a packaged installation, use the installed `mission-control` command. Before upgrading, stop the daemon and create an offline backup with `mission-control backup --home <home> --out <backup-directory>`.
+
+`doctor` reports local runtime and state-file presence without opening the database, repairing files, or displaying credential or environment values. It does not scan outside the selected home. `--help` and `--version` exit without creating the home.
+
+The home directory contains the control database, one database per agent, exports, and a randomly generated `admin.token` file. The browser UI receives that token as an `HttpOnly`, `SameSite=Strict` cookie when `/` is loaded. Browser mutations must include the UI's `X-Requested-With: MissionControl` header and a same-origin `Origin`; no separate browser login step is needed. Non-browser clients can authenticate with the local token as a bearer token. Keep the home directory private.
+
+## Profiles and permissions
+
+Profiles store provider names and environment-variable references, never credential values. The built-in GLM-4.7 Coding and MiniMax-M2.5 entries are configurable presets, not verified inference claims. Add a profile for any supported pi-ai API family (`openai-completions`, `openai-responses`, or `anthropic-messages`), including a keyless local endpoint. Select explicit cost rates to enable cost-limit enforcement; unknown rates remain `costKnown: false`.
+
+Missions require an orchestrator role. Profile changes are allowed only while an agent is idle or offline. In `approve` autonomy, shell commands and file writes are persisted as exact-argument approvals and consumed once. `trusted` autonomy is an explicit mission setting; it bypasses that approval gate.
+
+Each started mission creates one orchestrator and queues its opening instructions through the durable outbox. Tasks need distinct worker-owner and validator assignments. A validator runs `RunValidation`; Mission Control records the exact command, output, exit status, task revision, and artifact digests. `ValidateTask` accepts only a current receipt from that assigned validator, not free-form prose. Published files keep their workspace source path for provenance, while the browser receives a content-addressed snapshot stored under the daemon home. Completion rechecks both the source and snapshot digests.
+
+Every new mission also receives a persisted validation contract. If no assertions are supplied, the full acceptance text is retained as `REQ-001`; an explicit empty assertion list is rejected. Tasks claim assertion IDs through `fulfills`, and an assertion has exactly one owner. A validator must provide one non-empty result for every claimed assertion in addition to a genuine exit-0 receipt before that task is accepted. Mission completion requires every current assertion to be assigned and passed. Contract snapshots are revisioned and exposed in mission detail and export.
+
+Users update a stopped contract with `PUT /api/missions/:id/validation-contract` using `{ expectedRevision, assertions, reason, confirmRemoval }`. The optimistic revision must match, `reason` is required, and removing an assertion requires explicit `confirmRemoval: true`; an update may not leave the contract empty. Description changes increment that assertion's revision and invalidate its owner and dependent tasks, while unchanged assertions retain their passing evidence. Removed IDs remain reserved in contract history and cannot be reused. Legacy missions without a contract retain their original semantics until a user explicitly adopts a first contract with `expectedRevision: 0`.
+
+Human questions and uncertain external operations appear as blockers in mission detail. Resolve a blocker through `POST /api/blockers/:id/resolve` with a human resolution; resolving an uncertain side effect does not rerun it. Missions with resolved blockers remain paused until explicitly resumed, except a user-input answer, which is delivered as a durable follow-up. Turn and cost limits block the mission before additional work is admitted; adjust limits with `PATCH /api/missions/:id` while stopped, then explicitly resume. `maxCost: 0` means no monetary cap, and unknown rates are never treated as zero.
+
+Agents end a handoff with a standalone `Report`, or use a standalone `WaitForMessage` after delegation or while waiting for an actual result. These terminate the current pi-durable run; they do not delete the agent or conversation. New durable inputs wake the same agent. Both tools must be called alone: pi-durable only terminates a tool round when every call in that round requests termination.
+
+Before each new pi-durable generation or context-compaction request, the daemon atomically reserves a turn against the shared mission limit. Generation task IDs are scoped to their agent; retries and recovery of that same generation reuse its reservation. Auxiliary calls, including each compaction-model request, receive their own request ID and reservation. Reservations and rejected requests are exported as `generationAdmissions` and `generationDenials`. Failed or interrupted requests do not refund a reserved turn automatically, observing the response does not charge it again, and a locally rejected request does not count as a provider call. Historical response-based counts are retained, not reset or capped during upgrade. This bounds new logical requests, not every provider-internal HTTP retry; monetary limits still depend on reported, priced usage and can include in-flight charges.
+
+## Scheduled Mission inputs
+
+Schedules are durable Mission configuration, not a second worker or a completion shortcut. Create one with `POST /api/missions/:id/schedules`:
+
+```json
+{
+  "requestId": "schedule-create-1",
+  "name": "Nightly check",
+  "prompt": "Review the latest durable work.",
+  "schedule": { "kind": "cron", "expression": "0 9 * * *", "timeZone": "Asia/Shanghai" },
+  "enabled": true
+}
+```
+
+The cron form has exactly five fields and an explicit IANA timezone. A one-time schedule uses an ISO8601 timestamp with an explicit `Z` or numeric offset. Times are normalized to UTC and must have a computable future occurrence before the schedule is stored. Creation defaults to held when `enabled` is omitted or false. Replace a schedule with `PATCH /api/missions/:id/schedules/:scheduleId` and the complete editable configuration plus `expectedRevision`; use `POST .../hold`, `.../resume`, or `.../delete` for explicit lifecycle operations. Delete is a soft delete and keeps all history. Every accepted configuration or lifecycle command increments the schedule revision; replaying the same `requestId` and payload is idempotent, while reusing it with a different payload is rejected.
+
+The daemon evaluates enabled schedules on its existing heartbeat. Each due occurrence is recorded transactionally with its original schedule revision and scheduled time. A due recurring schedule advances to the first occurrence strictly after the tick time; missed occurrences are coalesced rather than fabricated. Delivery is queued only for an active Mission whose original orchestrator is idle and whose existing acceptance, approval, blocker, outbox, and budget gates allow work. Scheduled messages use the same durable agent and outbox admission path, add no turn budget, and are not a completion signal. Held, skipped, finished, and deleted schedules never mutate already queued or admitted work. Mission detail and export include both full schedule configuration and occurrence history, including delivery status for that occurrence's original request and attempt.
+
+The parser is pinned to cron-parser 5.4.0. Randomized `H` fields are rejected: reparsing a durable schedule must not randomly move its next occurrence. Existing five-field expressions, weekday aliases, and explicit timezones retain their meaning.
+
+## Mission watchdog
+
+The watchdog records local progress diagnoses for each Mission; it does not start or resume a Mission. It is observe-only by default. Configure explicit auto-wake through `POST /api/missions/:id/watchdog` with exactly `{ "requestId": "watchdog-config-1", "expectedRevision": 1, "autoWake": true }`. The returned revision is required for the next change; repeating the same request ID and payload is idempotent. Completed and cancelled Missions cannot be reconfigured.
+
+Automatic wake is limited to one new bounded input per semantic task/evidence fingerprint, after at least 60 seconds with an active Mission, actionable unblocked work, the entire team idle, a valid original orchestrator, and all existing blocker, approval, delivery, uncertainty, and budget gates clear. Messages, reports, daemon restarts, plain task revision bumps, and toggling the setting do not create progress or reset the immutable wake ledger. A material task, contract, artifact-digest, or validation-receipt change starts a new observation period. Delivery history reports the status of the exact original outbox attempt. Busy-without-progress diagnoses are advisory only; the watchdog does not interrupt workers, replay uncertain operations, or alter turn or cost limits. Mission detail and export include the current diagnosis and wake history.
+
+## Git worktree Missions
+
+Create a Mission with `workspaceStrategy: "worktree"` to give each agent its own Git worktree and stable local branch. Omitting the field keeps the existing shared-workspace behavior; choose `"shared"` explicitly for folders that are not Git repositories. Worktree mode accepts only a clean, non-bare Git repository root with an existing commit. It pins that repository's canonical path, Git common directory, and full base commit before start. Submodules, Git LFS, and required checkout filters are unsupported. Ignored dependencies and credentials are not copied into worktrees.
+
+Agent directories live under the daemon home at `worktrees/<mission-id>/<agent-id>`, with branches named `mission-control/<mission-id>/<agent-id>`. Worktree preparation is journaled and verified before an agent starts. On restart a verified worktree is reused at its existing HEAD; an ambiguous, replaced, or conflicting path is reported and preserved for human reconciliation. The daemon does not switch the source checkout, reset an advanced branch, remove a worktree, delete a branch, or silently replace an agent.
+
+Worktrees provide separate durable directories and Git histories, **not an OS sandbox or a Git-object/ref security boundary**. Agents must commit work locally before publishing an artifact. Publication binds the artifact to the publisher's current commit, tracked path, Git blob, and daemon snapshot. Validation runs the real command in a separate detached worktree at the task owner's complete commit, not against the source checkout or only the selected artifact files. The receipt records the command's real exit status and output and whether tracked inputs remained intact. A changed owner HEAD or dirty owner worktree makes that receipt stale at the acceptance decision.
+
+A worktree Mission also needs exactly one separately owned integration task with `fulfills: []`, dependent (through its dependency closure) on every ordinary task. Its owner must explicitly merge the task branches locally; conflicts are not resolved automatically. Independent validation of that new integration commit must provide passing results for every current contract assertion. Completion additionally proves that each accepted ordinary-task commit is an ancestor of the clean, still-current integration commit. Mission detail and export expose worktree records, immutable artifact commit/path, and validation snapshot metadata. These gates do not change shared-mode artifact or validation behavior.
+
+## Control database upgrades
+
+The control database now carries SQLite `user_version` (current schema: 5). Version 0 is the existing unversioned layout, including earlier outbox layouts. Startup upgrades it in one SQLite transaction together with profile initialization, daemon ownership, and agent recovery fencing. A failure rolls back those schema and data changes; the version advances only when the transaction commits. Historical mission payloads, failed receipts, and uncertain deliveries are preserved. This does not migrate pi-durable's separate agent stores. Schema 4 records every node registration ID. Upgrading an older node registry cannot reconstruct retired registration IDs, so previously connected nodes have their authorization revoked rather than accepting an old registration as new; enroll a replacement machine ID and use a new node home. Nodes that have never connected retain their enrollment. Probe evidence is retained and dispatched probes become uncertain, not replayed.
+
+A live owner blocks migration. A schema newer than this build supports is rejected before changing its journal mode or application data; it is never silently downgraded. Stop the existing daemon before upgrading and use the offline backup procedure below. For worktree Missions, both the external Git common directory and the recorded paths matter.
+
+Older unversioned binaries do not have this guard: do not launch them against an upgraded home. See [Backup and restore](#backup-and-restore) for restoring a compatible offline backup; release rollback is not implemented.
+
+## Backup and restore
+
+Backup and restore are offline-only. Stop Mission Control before backing up; backup refuses a confirmed live daemon or a live database owner. Create a backup with `mission-control backup --home <home> --out <backup-directory>` and restore with `mission-control restore --from <backup-directory> --home <new-home>`. The output directory must not already exist. A restore target must not exist or must be empty; restore never overwrites existing files.
+
+A backup contains consistent SQLite snapshots, regular artifact files, the administrative token, a digest manifest, and worktree metadata. It excludes logs, `daemon.json`, worktree directories, and Git repositories. It includes the `admin.token` credential and private Mission conversations, so protect backup directories and copies accordingly. SHA-256 digests detect changes relative to the manifest but do not authenticate a backup; the manifest is not signed. This is a home-state backup, not a complete disaster-recovery package: back up the Git common directory and source repository separately. For a Mission using worktrees, the recorded absolute worktree paths are bound to the original home. Such a backup can only be restored to that same canonical home path, after moving the old home aside; even there, the Git repositories and worktrees must be restored separately.
+
+Restore verifies the manifest and file digests before changing the target, checks the control database integrity and supported schema version, rebases only verified daemon-owned artifact snapshots when restoring a shared home elsewhere, and does not automatically upgrade or roll back the application version. Staged files and directories are synced before publication; if the platform cannot sync directory entries, the CLI reports that crash durability is not guaranteed. This does not prove recovery from power loss. Before publishing a restored home, it blocks every non-draft, nonterminal Mission for human reconciliation: outside effects may have happened since the backup, so compare the real workspace and never replay uncertain operations. Pending deliveries become uncertain; pending approvals and tool effects do not execute automatically. The open reconciliation blocker must be resolved through explicit human review before an explicit resume; restored work is never auto-started. Release rollback is not implemented.
+
+## Connection-only execution nodes
+
+Start the coordinator with a separate node-only listener, for example `mission-control start --home <home> --port 4310 --node-port 4311`. Both listeners bind to loopback. Forward **only the node port** through SSH or a certificate-validated HTTPS reverse proxy; never forward the admin/UI port, whose local browser bootstrap deliberately grants local administrative access. The node listener only exposes `/api/nodes/*`, rejects cookies/browser origins, and never serves the UI, bootstrap, state, or administrator APIs, even with an administrator bearer token. HTTPS proxies must preserve node bearer authorization and use a loopback Host header to the upstream. The daemon record and machine connection instructions show the actual node port; `--node-port 0` selects a free port. Changing this option requires an explicit stop/start; an existing daemon is not silently restarted. The macOS service installer does not yet configure this optional listener.
+
+For a worker with SSH access to the coordinator, `ssh -N -L 14311:127.0.0.1:4311 user@coordinator` creates an encrypted path; the worker's node command then uses `--coordinator http://127.0.0.1:14311`. Use normal verified SSH host keys and authentication. This is not permission to expose the admin port or disable HTTPS certificate checks.
+
+Enroll a node from an authenticated local administrator with `POST /api/machines` and keep the returned token out of logs, shells, and transcripts. Run the node with a separate private home:
+
+```text
+mission-control node --coordinator https://coordinator.example/ \
+  --machine-id build-node --token-env MISSION_NODE_TOKEN \
+  --home /var/lib/mission-control-node --root /workspaces/project
+```
+
+The node home contains only the node's owner lock and durable probe journal; it never opens or mounts the coordinator's control database. `--root` may be repeated and is checked as a real directory before startup. Credential references are an explicit name allowlist (`--credential-ref NAME`); ambient environment values are not enumerated or persisted. Plain HTTP is accepted only for literal `127.0.0.1` or `[::1]`, which is intended for a user-managed SSH local forward. HTTPS certificate validation remains enabled and redirects are rejected. Do not expose the admin listener publicly.
+
+This first node protocol is an authenticated connection and read-only `inspect_workspace` probe only. It reports declared capabilities with `executionEnabled: false`; it does not start agents, execute arbitrary commands, transfer effects or artifacts, or create remote worktrees. A registration ID is idempotent only for its current live session; used IDs remain durable history. Lease expiry, restart, revocation, disconnect, and backup restore preserve uncertainty and never replay a possibly effective operation. Remote runtime/effects/artifacts/worktrees remain a later slice.
+
+An administrator can explicitly register a remote workspace from a successful probe in the current live node session: `POST /api/workspaces` with `{name,machineId,probeCommandId}`, or use the registration button on its receipt in the UI. The canonical path comes only from that machine's authenticated receipt, never from a coordinator filesystem lookup or a caller-supplied path. Repeating the same receipt and name returns the original immutable binding; changing its name with the same receipt is a conflict. The binding preserves machine identity, command ID, requested path, session epoch and verification time. A saved binding is historical directory evidence, not continuing authorization or a guarantee the path still exists. Mission delivery/integration and initial independent validation remain local, and local MCP discovery rejects remote workspaces. Agent execution remains disabled. Schema 6 is a compatibility fence so older builds cannot misinterpret these remote directories as local workspaces.
+
+Missions may declare bound remote workspace IDs in `remoteWorkspaceIds`; orchestrators can select an allowed target for a worker with SpawnAgent's optional `targetWorkspaceId`. Remote spawn is rejected until execution-enabled nodes ship.
+
+The durable worker mailbox exposes node-only POST endpoints at `/api/nodes/mailbox/upload`, `/api/nodes/mailbox/poll`, and `/api/nodes/mailbox/ack`. Each requires the node bearer, current machine session, and an existing coordinator-owned worker binding; nodes cannot register their own runtimes through these endpoints. Receipts confirm durable arrival, not successful execution. A node-side exchange adapter persists received messages before acknowledging them. Mailbox traffic does not renew the node lease; the existing node poll remains the heartbeat. Restart, restore, revocation and stale ownership fence pending traffic without replaying uncertain operations.
+
+This is still an internal transport stage: uploads are durably recorded and an asynchronous dispatcher may apply only the coordinator metadata allowlist (mission state, messages, tasks, reports, and user-input coordination). It is not a remote worker or runtime, and it does not enable the execution capability. Remote filesystem, shell, MCP, artifact, and validation effects remain unavailable; there is no remote agent execution proof yet.
+
+## MCP servers
+
+An authenticated operator can save an MCP server with `POST /api/mcp-servers` and discover its catalog with `POST /api/mcp-servers/<id>/discover` using `{ "workspaceId": "..." }`. Updates require the current `expectedRevision`. Discovery connects only to list tools; it never invokes one. The worker-facing `ListMcpTools` and `CallMcpTool` tools are limited to exact `{ serverId, toolName, mode }` role grants (`approve` or `allow`); there are no wildcard grants, and roles default to no MCP permissions.
+
+Only stdio and Streamable HTTP are supported. Stdio commands must be absolute. Credential values are never saved: configuration stores environment-variable reference names, and only explicitly referenced values are passed to the server. HTTP references supply selected headers; redirects are rejected and tool calls are not retried. A server may advertise resources, prompts, logging, or experimental capabilities without making its tools unavailable; this is an offer, not a local permission. Mission Control still requires the tools capability, never calls those optional APIs, and rejects tools that require task execution because task APIs are not enabled here. OAuth, legacy SSE, resource reads, sampling, elicitation, and custom transports are outside this integration. MCP servers are trusted programs selected by the operator; process management, schema validation, size limits, and secret redaction do not provide an operating-system sandbox or constrain arbitrary grandchildren.
+
+Every tool call, including a role-permitted automatic call, is recorded as a durable `mcp_call` approval bound to the server and role revisions, worker epoch, exact tool definition hash, and JSON arguments. Mission autonomy `approve` or an `approve` grant requires a human decision before dispatch; an automatic `allow` grant is available only to a trusted Mission. Tool metadata and results are untrusted external data. Results are recorded in the approval receipt, and a returned MCP `isError` is a terminal failure.
+
+If a call may have reached the server but no terminal response was recorded, Mission Control records an uncertain approval and blocker. It will not replay that call after a timeout, transport failure, cancellation, or daemon restart; inspect the external system and resolve the blocker explicitly. Server/role revisions and worker/mission cancellation fence calls that have not yet been submitted. Restarting the daemon preserves the journal and does not replace the Mission or orchestrator.
+
+## macOS login service
+
+On macOS, `mission-control service install --home <home> [--port <port>]` installs a per-user LaunchAgent in the current user's `gui/<uid>` domain. `service start --home <home>` starts or resumes an already-installed service without replacing a healthy daemon; `service status --home <home>` reports whether that configuration is loaded and whether its daemon is healthy; `service uninstall --home <home>` unloads and removes only the matching home-specific plist. This is a login-session service, not a boot-time system service. Its label is derived from the canonical home path, and the plist is written with owner-only permissions.
+
+The plist explicitly sets only `PATH`, `HOME`, and `LANG`; launchd may supply other environment variables, and the service does not persist arbitrary variables from the invoking shell. It does not store credentials. A Mission that needs a provider credential will continue to fail through the existing missing-credential checks until credentials are supplied through a supported mechanism. Secure credential integration such as Keychain is future work.
+
+Launchd restarts the daemon after a crash or unsuccessful exit, but a normal `mission-control stop --home <home>` exits successfully and stays stopped. Tests verify current-session loading, crash restart, graceful stop, and uninstall. They do not verify behavior across logout/login or system restart; successful installation means only that the login-agent configuration is loaded in the current GUI session.
+
+## Trust boundary
+
+Workspace file operations enforce realpath containment and reject symlink escapes. **This is not an operating-system sandbox.** Worker subprocesses receive only `PATH`, `HOME`, `TMPDIR`, `LANG`, their selected provider credential, and internal worker configuration. `bash` runs in the workspace working directory with only `PATH`, `HOME`, `TMPDIR`, and `LANG`. A command can still access files and services available to the daemon's OS user. Run only trusted code, and do not treat a workspace as isolation from the host.
+
+The daemon binds to loopback, checks local `Host` and `Origin` values, requires authentication for sensitive reads and mutations, sets `frame-ancestors` and `nosniff` protections, bounds JSON request bodies, and authenticates worker IPC with an epoch and per-worker token. Each pi-durable agent store has an exclusive process-owner lease. Durable message delivery is deduplicated by the pi-durable request ID. This does not guarantee exactly-once external side effects: interrupted or uncertain deliveries are recorded and are not automatically replayed. Explicitly resuming a mission creates new attempts only for deliveries known not to have been admitted to a worker.
+
+## Tests
+
+`npm test` runs focused control-plane, HTTP-authentication, and pi-durable worker-runtime tests. The worker persistence case uses pi's test-only faux provider, not a production profile. It verifies runtime/storage mechanics only; it is not real-model E2E or Mission product acceptance. No provider inference is performed by the test suite.
