@@ -302,6 +302,11 @@ export async function startServer(options: ServerOptions) {
         exactKeys(await readBody(request), []);
         return jsonResponse(response, 200, control.revokeMachine(decodeURIComponent(machineRevokeMatch[1]!)));
       }
+      const machineReenrollMatch = /^\/api\/machines\/([^/]+)\/reenroll$/.exec(url.pathname);
+      if (machineReenrollMatch && method === "POST") {
+        exactKeys(await readBody(request), []);
+        return jsonResponse(response, 201, control.reenrollMachine(decodeURIComponent(machineReenrollMatch[1]!)));
+      }
       const machineProbeMatch = /^\/api\/machines\/([^/]+)\/probe$/.exec(url.pathname);
       if (machineProbeMatch && method === "POST") {
         const body = await readBody(request);

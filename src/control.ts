@@ -724,6 +724,10 @@ export class ControlPlane {
     return machine;
   }
 
+  reenrollMachine(id: string): { machine: RemoteMachine; token: string } {
+    return this.machineRegistry.reenroll(id);
+  }
+
   probeMachine(id: string, requestId: string, path: string): NodeCommand {
     return this.machineRegistry.enqueueProbe(id, requestId, path);
   }

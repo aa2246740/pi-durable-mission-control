@@ -116,6 +116,8 @@ For a worker with SSH access to the coordinator, `ssh -N -L 14311:127.0.0.1:4311
 
 Enroll a node from an authenticated local administrator with `POST /api/machines` and keep the returned token out of logs, shells, and transcripts. Run the node with a separate private home:
 
+If the node bearer is lost or must be rotated, explicitly revoke the machine with `POST /api/machines/<id>/revoke`, then use the administrator-only `POST /api/machines/<id>/reenroll` with an empty JSON body. Reenrollment is rejected unless the machine is already revoked. It issues a fresh bearer once, preserves the machine ID and historical commands/receipts, clears old live capabilities, and advances the session epoch; the old bearer remains invalid even after restart. Repeated reenrollment is rejected until another explicit revocation. It neither reconciles worker ownership nor starts workers, replays uncertain work, or authorizes historical workspace receipts. Supply the new bearer to the existing node home through its configured token environment variable, then obtain a new live session and workspace probe before any new assignment.
+
 ```text
 mission-control node --coordinator https://coordinator.example/ \
   --machine-id build-node --token-env MISSION_NODE_TOKEN \

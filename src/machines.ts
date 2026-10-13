@@ -396,6 +396,24 @@ export class MachineRegistry {
     });
   }
 
+  reenroll(id: string): { machine: RemoteMachine; token: string } {
+    return this.atomic(() => {
+      const { machine } = this.row(parseMachineId(id));
+      if (machine.status !== "revoked") throw new MachineError(409, "Reenrollment requires explicit machine revocation");
+      const token = randomBytes(32).toString("base64url");
+      const enrolled: RemoteMachine = { ...machine, status: "enrolled", sessionEpoch: machine.sessionEpoch + 1 };
+      delete enrolled.sessionId;
+      delete enrolled.registrationId;
+      delete enrolled.capabilitiesHash;
+      delete enrolled.leaseExpiresAt;
+      delete enrolled.capabilities;
+      delete enrolled.lastSeenAt;
+      this.db.prepare("UPDATE remote_machines SET token_hash=?,data=? WHERE id=?")
+        .run(tokenHash(token), JSON.stringify(enrolled), machine.id);
+      return { machine: enrolled, token };
+    });
+  }
+
   private authenticateTokenInside(machineId: string, token: string): { row: MachineRow; machine: RemoteMachine } {
     let current: { row: MachineRow; machine: RemoteMachine };
     try {

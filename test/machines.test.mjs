@@ -16,6 +16,80 @@ const capabilities = (root) => ({
 });
 const uuid = () => crypto.randomUUID();
 
+test("reenrollment requires revocation, rotates the bearer and preserves fenced command history across restart", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-reenroll-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let control = new ControlPlane(home);
+  t.after(() => control.close());
+  const enrolled = control.enrollMachine("rotate-node", "Rotate node");
+  const registrationId = uuid();
+  const session = control.nodeSession(enrolled.machine.id, enrolled.token, capabilities("/remote"), registrationId);
+  assert.throws(() => control.reenrollMachine(enrolled.machine.id), (e) => e.status === 409);
+  const dispatched = control.probeMachine(enrolled.machine.id, uuid(), "/remote");
+  control.nodePoll(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch);
+  const queued = control.probeMachine(enrolled.machine.id, uuid(), "/remote/second");
+  const revoked = control.revokeMachine(enrolled.machine.id);
+  const history = control.db.prepare("SELECT * FROM node_commands ORDER BY id").all();
+  const registrations = control.db.prepare("SELECT * FROM node_registrations ORDER BY registration_id").all();
+  assert.equal(history.find(c => c.id === dispatched.id).status, "uncertain");
+  assert.equal(history.find(c => c.id === queued.id).status, "cancelled");
+  const replacement = control.reenrollMachine(enrolled.machine.id);
+  assert.notEqual(replacement.token, enrolled.token);
+  assert.equal(replacement.machine.id, enrolled.machine.id);
+  assert.equal(replacement.machine.createdAt, enrolled.machine.createdAt);
+  assert.equal(replacement.machine.status, "enrolled");
+  assert.ok(replacement.machine.sessionEpoch > revoked.sessionEpoch);
+  assert.equal(replacement.machine.capabilities, undefined);
+  assert.equal(replacement.machine.sessionId, undefined);
+  assert.equal(replacement.machine.leaseExpiresAt, undefined);
+  assert.deepEqual(control.db.prepare("SELECT * FROM node_commands ORDER BY id").all(), history);
+  assert.deepEqual(control.db.prepare("SELECT * FROM node_registrations ORDER BY registration_id").all(), registrations);
+  assert.throws(() => control.reenrollMachine(enrolled.machine.id), (e) => e.status === 409);
+  assert.throws(() => control.nodeSession(enrolled.machine.id, enrolled.token, capabilities("/remote"), uuid()), (e) => e.status === 401);
+  assert.throws(() => control.nodeSession(enrolled.machine.id, replacement.token, capabilities("/remote"), registrationId), (e) => e.status === 409);
+  assert.throws(() => control.nodePoll(enrolled.machine.id, replacement.token, session.sessionId, session.sessionEpoch), (e) => e.status === 409);
+  control.close();
+  control = new ControlPlane(home);
+  assert.throws(() => control.nodeSession(enrolled.machine.id, enrolled.token, capabilities("/remote"), uuid()), (e) => e.status === 401);
+  const next = control.nodeSession(enrolled.machine.id, replacement.token, capabilities("/remote"), uuid());
+  assert.ok(next.sessionEpoch > replacement.machine.sessionEpoch);
+  assert.deepEqual(control.nodePoll(enrolled.machine.id, replacement.token, next.sessionId, next.sessionEpoch).commands, []);
+  assert.deepEqual(control.db.prepare("SELECT * FROM node_commands ORDER BY id").all(), history);
+  assert.equal(JSON.stringify(control.state()).includes(replacement.token), false);
+  for (const name of ["control.sqlite", "control.sqlite-wal"]) {
+    const path = join(home, name);
+    if (existsSync(path)) assert.equal(readFileSync(path).includes(Buffer.from(replacement.token)), false);
+  }
+});
+
+test("reenrollment is administrator-only, rejects extra fields and never crosses the node listener", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-reenroll-http-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const service = await startServer({ home, port: 0, nodePort: 0 });
+  t.after(() => service.close());
+  const original = service.control.enrollMachine("http-rotate", "HTTP rotate");
+  const admin = readFileSync(join(home, "admin.token"), "utf8").trim();
+  const post = (port, path, token, body = {}) => fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body)
+  });
+  const path = "/api/machines/http-rotate/reenroll";
+  assert.equal((await post(service.port, path, original.token)).status, 401);
+  assert.equal((await post(service.nodePort, path, admin)).status, 404);
+  assert.equal((await post(service.port, path, admin)).status, 409);
+  assert.equal((await post(service.port, "/api/machines/http-rotate/revoke", admin)).status, 200);
+  assert.equal((await post(service.port, path, admin, { token: "caller-chosen" })).status, 400);
+  const response = await post(service.port, path, admin);
+  assert.equal(response.status, 201);
+  const replacement = await response.json();
+  assert.equal(replacement.machine.id, original.machine.id);
+  assert.notEqual(replacement.token, original.token);
+  assert.equal((await post(service.port, path, admin)).status, 409);
+  const sessionBody = { machineId: original.machine.id, capabilities: capabilities(home), registrationId: uuid() };
+  assert.equal((await post(service.nodePort, "/api/nodes/session", original.token, sessionBody)).status, 401);
+  assert.equal((await post(service.nodePort, "/api/nodes/session", replacement.token, sessionBody)).status, 200);
+  assert.equal(JSON.stringify(service.control.state()).includes(replacement.token), false);
+});
+
 test("node capabilities accept only readonly v1 or explicit metadata-only v2", () => {
   const v1 = capabilities("/remote");
   assert.equal(parseNodeCapabilities(v1).executionEnabled, false);
