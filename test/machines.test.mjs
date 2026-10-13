@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { ControlPlane } from "../dist/control.js";
-import { MachineRegistry } from "../dist/machines.js";
+import { MachineRegistry, parseNodeCapabilities } from "../dist/machines.js";
 import { startServer } from "../dist/server.js";
 import { WorkerManager } from "../dist/workers.js";
 
@@ -15,6 +15,24 @@ const capabilities = (root) => ({
   node: process.version, piDurable: "1.1.0", roots: [root], credentialRefs: [], executionEnabled: false
 });
 const uuid = () => crypto.randomUUID();
+
+test("node capabilities accept only readonly v1 or explicit metadata-only v2", () => {
+  const v1 = capabilities("/remote");
+  assert.equal(parseNodeCapabilities(v1).executionEnabled, false);
+  const v2 = parseNodeCapabilities({
+    ...v1, protocol: 2, executionEnabled: true, executionMode: "metadata-only"
+  });
+  assert.equal(v2.executionEnabled, true);
+  assert.equal(v2.executionMode, "metadata-only");
+  for (const invalid of [
+    { ...v1, protocol: 1, executionEnabled: true },
+    { ...v1, protocol: 1, executionEnabled: false, executionMode: "metadata-only" },
+    { ...v1, protocol: 2, executionEnabled: false },
+    { ...v1, protocol: 2, executionEnabled: true },
+    { ...v1, protocol: 2, executionEnabled: true, executionMode: "full" },
+    { ...v1, protocol: 2, executionEnabled: true, executionMode: "metadata-only", testOnlyScripted: true }
+  ]) assert.throws(() => parseNodeCapabilities(invalid));
+});
 
 test("remote workspace registration binds an authenticated receipt, never a coordinator path, and survives restart", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-remote-workspace-"));
@@ -76,7 +94,7 @@ test("remote workspace registration binds an authenticated receipt, never a coor
   assert.equal(service.control.state().workspaces.length, 1);
 });
 
-test("remote workspace assignments are mission-scoped and remote spawning remains disabled", async (t) => {
+test("remote workspace assignments are mission-scoped and readonly protocol-1 nodes cannot spawn workers", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-remote-assignment-"));
   const control = new ControlPlane(join(home, "state"));
   let manager;
@@ -190,7 +208,7 @@ test("remote workspace assignments are mission-scoped and remote spawning remain
   const spawnArgs = { title: "Remote worker", roleId: "assignment-worker", prompt: "Start the worker." };
   await assert.rejects(
     () => request("spawn-remote-worker", "SpawnAgent", { ...spawnArgs, targetWorkspaceId: remoteWorkspace.id }),
-    (error) => error.status === 409 && error.message === "Remote execution is not enabled on this machine"
+    (error) => error.status === 409 && /Remote execution is not enabled|metadata-only node session/.test(error.message)
   );
   assert.deepEqual(missionCounts(), unchangedCounts);
   await assert.rejects(
@@ -229,7 +247,7 @@ test("remote workspace assignments are mission-scoped and remote spawning remain
   manager = new WorkerManager(control, true);
   await assert.rejects(
     () => manager.startAgent(forgedRemoteAgent),
-    (error) => error.status === 409 && error.message === "Remote execution is not enabled for this agent"
+    (error) => error.status === 409 && /Remote execution is not enabled|metadata-only node session/.test(error.message)
   );
   assert.equal(existsSync(join(control.home, "agents", `${forgedRemoteAgent.id}.sqlite`)), false);
 });

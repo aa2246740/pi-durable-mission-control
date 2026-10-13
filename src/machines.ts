@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 export const NODE_LEASE_MS = 20_000;
 export const NODE_PROTOCOL_VERSION = 1;
+export const NODE_EXECUTION_PROTOCOL_VERSION = 2;
 export const NODE_COMMAND_KIND = "inspect_workspace" as const;
 
 export class MachineError extends Error {
@@ -21,7 +22,8 @@ export interface NodeCapabilities {
   piDurable: string;
   roots: string[];
   credentialRefs: string[];
-  executionEnabled: false;
+  executionEnabled: boolean;
+  executionMode?: "metadata-only";
 }
 
 export interface RemoteMachine {
@@ -122,15 +124,17 @@ function shortText(value: unknown, name: string, max = 200): string {
 export function parseNodeCapabilities(value: unknown): NodeCapabilities {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new MachineError(400, "Node capabilities must be an object");
   const input = value as Record<string, unknown>;
-  const allowed = ["protocol", "version", "platform", "arch", "node", "piDurable", "roots", "credentialRefs", "executionEnabled"];
+  const allowed = ["protocol", "version", "platform", "arch", "node", "piDurable", "roots", "credentialRefs", "executionEnabled", "executionMode"];
   const unknown = Object.keys(input).filter((key) => !allowed.includes(key));
   if (unknown.length) throw new MachineError(400, "Unsupported node capability fields");
-  if (input.protocol !== NODE_PROTOCOL_VERSION) throw new MachineError(409, "Node protocol is not supported");
-  if (input.executionEnabled !== false) throw new MachineError(409, "Remote execution is not enabled for this node protocol");
+  const readonly = input.protocol === NODE_PROTOCOL_VERSION && input.executionEnabled === false && !Object.hasOwn(input, "executionMode");
+  const metadataOnly = input.protocol === NODE_EXECUTION_PROTOCOL_VERSION
+    && input.executionEnabled === true && input.executionMode === "metadata-only";
+  if (!readonly && !metadataOnly) throw new MachineError(409, "Node protocol and execution mode are not supported");
   const roots = stringList(input.roots, "roots", (item) => item.startsWith("/") && item.length <= 4096 && !/[\u0000-\u001f]/.test(item), 32);
   if (!roots.length) throw new MachineError(400, "A node must declare at least one workspace root");
   return {
-    protocol: NODE_PROTOCOL_VERSION,
+    protocol: input.protocol as number,
     version: shortText(input.version, "version", 40),
     platform: shortText(input.platform, "platform", 40),
     arch: shortText(input.arch, "arch", 40),
@@ -138,7 +142,8 @@ export function parseNodeCapabilities(value: unknown): NodeCapabilities {
     piDurable: shortText(input.piDurable, "piDurable", 80),
     roots,
     credentialRefs: stringList(input.credentialRefs, "credentialRefs", (item) => CREDENTIAL_REF.test(item), 64),
-    executionEnabled: false
+    executionEnabled: metadataOnly,
+    ...(metadataOnly ? { executionMode: "metadata-only" as const } : {})
   };
 }
 

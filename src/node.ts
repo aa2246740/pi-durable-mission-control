@@ -4,8 +4,11 @@ import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { NodeCommand, NodeCapabilities } from "./machines.js";
-import { NODE_PROTOCOL_VERSION } from "./machines.js";
-import { DurableWorkerMailbox, parseWorkerReceipt, type WorkerBinding } from "./worker-mailbox.js";
+import { NODE_EXECUTION_PROTOCOL_VERSION, NODE_PROTOCOL_VERSION } from "./machines.js";
+import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding } from "./worker-mailbox.js";
+import { NodeWorkerSupervisor } from "./node-workers.js";
+import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
+import { performance } from "node:perf_hooks";
 
 const require = createRequire(import.meta.url);
 const durableVersion = String((require("@earendil-works/pi-durable/package.json") as { version: string }).version);
@@ -13,6 +16,8 @@ const productVersion = String((require("../package.json") as { version: string }
 const BODY_LIMIT = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 7000;
 const POLL_INTERVAL_MS = 3000;
+const MAILBOX_IDLE_INTERVAL_MS = 150;
+const MAX_ACTIVE_DRAIN_ROUNDS = 4;
 const TOKEN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -23,6 +28,9 @@ export interface NodeOptions {
   home: string;
   roots: string[];
   credentialRefs: string[];
+  executionMode?: "metadata-only";
+  testOnlyScripted?: boolean;
+  testOnlyToolLoop?: boolean;
 }
 
 type JournalOperation = {
@@ -211,6 +219,11 @@ class NodeJournal {
           command_id TEXT PRIMARY KEY, requested_path TEXT NOT NULL, status TEXT NOT NULL,
           outcome TEXT, updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS node_runtime_reports (
+          report_id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, binding_json TEXT NOT NULL,
+          descriptor_hash TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('stopped','uncertain','rejected')),
+          state TEXT NOT NULL CHECK(state IN ('pending','sent')), created_at INTEGER NOT NULL
+        );
       `);
       const existing = this.db.prepare("SELECT owner_id,pid FROM node_owner WHERE singleton=1").get() as { owner_id: string; pid: number } | undefined;
       if (existing) {
@@ -370,6 +383,43 @@ class NodeJournal {
     this.db.prepare("UPDATE node_operations SET status='uncertain',updated_at=? WHERE status='admitted'").run(Date.now());
   }
 
+  recordRuntimeReport(binding: WorkerBinding, descriptorHash: string, outcome: "stopped" | "uncertain" | "rejected"): { reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected" } {
+    const prior = this.db.prepare("SELECT report_id,binding_json FROM node_runtime_reports WHERE runtime_id=? AND descriptor_hash=? AND outcome=? ORDER BY created_at LIMIT 1")
+      .get(binding.runtimeId, descriptorHash, outcome) as { report_id: string; binding_json: string } | undefined;
+    if (prior) {
+      const priorBinding = JSON.parse(prior.binding_json) as WorkerBinding;
+      if (!sameBinding(priorBinding, binding)) throw new Error("Runtime report binding conflicts with its durable history");
+      return { reportId: prior.report_id, binding: priorBinding, descriptorHash, outcome };
+    }
+    const reportId = randomUUID();
+    this.db.prepare("INSERT INTO node_runtime_reports(report_id,runtime_id,binding_json,descriptor_hash,outcome,state,created_at) VALUES(?,?,?,?,?,'pending',?)")
+      .run(reportId, binding.runtimeId, JSON.stringify(binding), descriptorHash, outcome, Date.now());
+    return { reportId, binding, descriptorHash, outcome };
+  }
+
+  pendingRuntimeReports(): Array<{ reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected" }> {
+    return (this.db.prepare("SELECT report_id,binding_json,descriptor_hash,outcome FROM node_runtime_reports WHERE state='pending' ORDER BY created_at,report_id").all() as Array<{ report_id: string; binding_json: string; descriptor_hash: string; outcome: "stopped" | "uncertain" | "rejected" }>)
+      .map((row) => ({ reportId: row.report_id, binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash, outcome: row.outcome }));
+  }
+
+  sentRuntimeReport(reportId: string): void {
+    this.db.prepare("UPDATE node_runtime_reports SET state='sent' WHERE report_id=? AND state='pending'").run(reportId);
+  }
+
+  hasRuntimeReport(runtimeId: string, descriptorHash: string, outcome?: "stopped" | "uncertain" | "rejected"): boolean {
+    return Boolean(outcome
+      ? this.db.prepare("SELECT 1 FROM node_runtime_reports WHERE runtime_id=? AND descriptor_hash=? AND outcome=? LIMIT 1")
+        .get(runtimeId, descriptorHash, outcome)
+      : this.db.prepare("SELECT 1 FROM node_runtime_reports WHERE runtime_id=? AND descriptor_hash=? LIMIT 1")
+        .get(runtimeId, descriptorHash));
+  }
+
+  runtimeReportIdentity(runtimeId: string): { binding: WorkerBinding; descriptorHash: string } | undefined {
+    const row = this.db.prepare("SELECT binding_json,descriptor_hash FROM node_runtime_reports WHERE runtime_id=? ORDER BY created_at LIMIT 1")
+      .get(runtimeId) as { binding_json: string; descriptor_hash: string } | undefined;
+    return row ? { binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash } : undefined;
+  }
+
   close(): void {
     try {
       this.db.exec("BEGIN IMMEDIATE");
@@ -436,9 +486,9 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
   }
 }
 
-function capabilities(roots: string[], credentialRefs: string[]): NodeCapabilities {
+function capabilities(roots: string[], credentialRefs: string[], executionMode?: "metadata-only"): NodeCapabilities {
   return {
-    protocol: NODE_PROTOCOL_VERSION,
+    protocol: executionMode ? NODE_EXECUTION_PROTOCOL_VERSION : NODE_PROTOCOL_VERSION,
     version: productVersion,
     platform: process.platform,
     arch: process.arch,
@@ -446,7 +496,8 @@ function capabilities(roots: string[], credentialRefs: string[]): NodeCapabiliti
     piDurable: durableVersion,
     roots,
     credentialRefs,
-    executionEnabled: false
+    executionEnabled: executionMode === "metadata-only",
+    ...(executionMode ? { executionMode } : {})
   };
 }
 
@@ -469,14 +520,16 @@ export async function exchangeWorkerMailbox(
   mailbox: DurableWorkerMailbox,
   binding: WorkerBinding,
   signal?: AbortSignal
-): Promise<void> {
+): Promise<boolean> {
   if (mailbox.side !== "node") throw new Error("Node mailbox required");
   const base = safeCoordinatorUrl(coordinator);
   const identity = { machineId: binding.machineId, sessionId: binding.sessionId, sessionEpoch: binding.sessionEpoch, binding };
+  let progressed = false;
   for (const envelope of mailbox.pending(binding, 1)) {
     const receipt = parseWorkerReceipt(await fetchJson(base, "/api/nodes/mailbox/upload", token, { ...identity, envelope }, signal));
     if (!receipt) throw genericError();
     mailbox.acknowledge(binding, receipt);
+    progressed = true;
   }
   const response = await fetchJson(base, "/api/nodes/mailbox/poll", token, identity, signal);
   if (!response || typeof response !== "object" || Array.isArray(response) ||
@@ -491,7 +544,21 @@ export async function exchangeWorkerMailbox(
         Object.keys(result).length !== 1 || !("acknowledged" in result) || result.acknowledged !== true) {
       throw genericError();
     }
+    progressed = true;
   }
+  return progressed;
+}
+
+function sameBinding(left: WorkerBinding, right: WorkerBinding): boolean {
+  return left.runtimeId === right.runtimeId && left.machineId === right.machineId &&
+    left.sessionId === right.sessionId && left.sessionEpoch === right.sessionEpoch &&
+    left.agentId === right.agentId && left.epoch === right.epoch;
+}
+
+export function validRuntimeReportAck(value: unknown): boolean {
+  return object(value) && value.recorded === true &&
+    (exactKeys(value, ["recorded"]) || exactKeys(value, ["recorded", "duplicate"])) &&
+    (!("duplicate" in value) || typeof value.duplicate === "boolean");
 }
 
 export async function runNode(options: NodeOptions): Promise<void> {
@@ -515,9 +582,37 @@ export async function runNode(options: NodeOptions): Promise<void> {
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   const registrationId = journal.registrationId();
+  let leaseDeadline = 0;
+  let mailboxActivityGeneration = 0;
+  let wakeMailboxWait: (() => void) | undefined;
+  const notifyMailboxActivity = (): void => {
+    mailboxActivityGeneration++;
+    wakeMailboxWait?.();
+  };
+  const waitForMailboxActivity = (generation: number, timeoutMs: number): Promise<void> =>
+    new Promise<void>((resolveWait) => {
+      if (stopping || abort.signal.aborted || mailboxActivityGeneration !== generation) {
+        resolveWait();
+        return;
+      }
+      const finish = (): void => {
+        clearTimeout(timer);
+        abort.signal.removeEventListener("abort", finish);
+        if (wakeMailboxWait === finish) wakeMailboxWait = undefined;
+        resolveWait();
+      };
+      wakeMailboxWait = finish;
+      const timer = setTimeout(finish, timeoutMs);
+      abort.signal.addEventListener("abort", finish, { once: true });
+      if (stopping || mailboxActivityGeneration !== generation) finish();
+    });
+  let supervisor: NodeWorkerSupervisor | undefined;
+  let runtimeTask: Promise<void> | undefined;
+  let runtimeFailure: unknown;
+  const runtimeStartFlights = new Map<string, { descriptorHash: string; promise: Promise<void> }>();
   const sessionBody = {
     machineId: options.machineId,
-    capabilities: capabilities(roots, credentialRefs),
+    capabilities: capabilities(roots, credentialRefs, options.executionMode),
     registrationId
   };
   try {
@@ -529,7 +624,167 @@ export async function runNode(options: NodeOptions): Promise<void> {
       throw error;
     }
     journal.sessionStarted(session);
-    while (!stopping) {
+    if (options.executionMode === "metadata-only") {
+      supervisor = new NodeWorkerSupervisor({
+        home: resolve(options.home, "worker-runtime"),
+        machineId: options.machineId,
+        sessionId: session.sessionId,
+        sessionEpoch: session.sessionEpoch,
+        roots,
+        credentialRefs,
+        forbiddenCredentialRefs: [options.tokenEnv],
+        executionEnabled: true,
+        onMailboxActivity: notifyMailboxActivity,
+        ...(options.testOnlyScripted ? { testOnlyScripted: true } : {}),
+        ...(options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
+        isLeaseCurrent: (binding) => !stopping && performance.now() < leaseDeadline &&
+          binding.machineId === options.machineId && binding.sessionId === session.sessionId &&
+          binding.sessionEpoch === session.sessionEpoch
+      });
+    }
+    const runRuntimeLoop = async (): Promise<void> => {
+      if (!supervisor) return;
+      const postRuntimeReport = async (report: ReturnType<NodeJournal["pendingRuntimeReports"]>[number]): Promise<void> => {
+        const ack = await fetchJson(coordinator, "/api/nodes/runtimes/events", token, {
+          machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch, ...report
+        }, abort.signal);
+        if (!validRuntimeReportAck(ack)) throw genericError();
+        journal.sentRuntimeReport(report.reportId);
+      };
+      let nextAssignmentPoll = 0;
+      let activeRounds = 0;
+      const mailboxFencedBindings = new Set<string>();
+      while (!stopping) {
+        const roundGeneration = mailboxActivityGeneration;
+        for (const report of journal.pendingRuntimeReports()) {
+          await postRuntimeReport(report);
+        }
+        if (Date.now() >= nextAssignmentPoll) {
+          const runtimeResponse = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {
+            machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
+          }, abort.signal);
+          if (!object(runtimeResponse) || !exactKeys(runtimeResponse, ["directives"]) ||
+              !Array.isArray(runtimeResponse.directives) || runtimeResponse.directives.length > 1) throw genericError();
+          nextAssignmentPoll = Date.now() + POLL_INTERVAL_MS;
+          for (const rawDirective of runtimeResponse.directives) {
+          if (!object(rawDirective) || typeof rawDirective.action !== "string") throw genericError();
+          if (rawDirective.action === "start" && exactKeys(rawDirective, ["action", "descriptor", "descriptorHash"])) {
+            const descriptor = parseWorkerStartSpec(rawDirective.descriptor);
+            const binding = descriptor.binding;
+            if (typeof rawDirective.descriptorHash !== "string" || workerStartSpecHash(descriptor) !== rawDirective.descriptorHash ||
+                binding.machineId !== options.machineId || binding.sessionId !== session.sessionId ||
+                binding.sessionEpoch !== session.sessionEpoch) throw genericError();
+            const priorReport = journal.runtimeReportIdentity(binding.runtimeId);
+            if (priorReport) {
+              if (priorReport.descriptorHash !== rawDirective.descriptorHash || !sameBinding(priorReport.binding, binding)) throw genericError();
+              continue;
+            }
+            const existingFlight = runtimeStartFlights.get(binding.runtimeId);
+            if (existingFlight) {
+              if (existingFlight.descriptorHash !== rawDirective.descriptorHash) throw genericError();
+              continue;
+            }
+            const descriptorHash = rawDirective.descriptorHash;
+            const flight = supervisor.start(descriptor).then(() => undefined, () => {
+              try {
+                const admitted = supervisor?.inspectBindings().some((item) => sameBinding(item.binding, binding));
+                journal.recordRuntimeReport(binding, descriptorHash, admitted ? "uncertain" : "rejected");
+              } catch {
+                runtimeFailure = genericError();
+                abort.abort();
+              }
+              notifyMailboxActivity();
+            }).finally(() => {
+              if (runtimeStartFlights.get(binding.runtimeId)?.promise === flight) runtimeStartFlights.delete(binding.runtimeId);
+            });
+            runtimeStartFlights.set(binding.runtimeId, { descriptorHash, promise: flight });
+          } else if (rawDirective.action === "stop" && exactKeys(rawDirective, ["action", "binding", "descriptorHash"])) {
+            const binding = parseWorkerBinding(rawDirective.binding);
+            if (!binding || typeof rawDirective.descriptorHash !== "string" || !/^[0-9a-f]{64}$/.test(rawDirective.descriptorHash) ||
+                binding.machineId !== options.machineId) continue;
+            const priorReport = journal.runtimeReportIdentity(binding.runtimeId);
+            if (priorReport && (priorReport.descriptorHash !== rawDirective.descriptorHash || !sameBinding(priorReport.binding, binding))) continue;
+            if (priorReport) continue;
+            const localRuntime = supervisor.inspectBindings().find((item) => item.binding.runtimeId === binding.runtimeId);
+            if (localRuntime && (!sameBinding(localRuntime.binding, binding) || localRuntime.descriptorHash !== rawDirective.descriptorHash)) {
+              continue;
+            }
+            if (!localRuntime) {
+              journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain");
+            } else {
+              try {
+                const evidence = await supervisor.stop(binding);
+                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+              } catch {
+                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain");
+              }
+            }
+            notifyMailboxActivity();
+          } else throw genericError();
+        }
+        }
+        let progress = false;
+        for (const runtime of supervisor.inspectBindings()) {
+          const { binding } = runtime;
+          if (["closed", "uncertain"].includes(runtime.state)) {
+            const outcome = runtime.confirmedStopped ? "stopped" : "uncertain";
+            const priorReport = journal.runtimeReportIdentity(binding.runtimeId);
+            if (priorReport && (!sameBinding(priorReport.binding, binding) || priorReport.descriptorHash !== runtime.descriptorHash)) throw genericError();
+            if (!journal.hasRuntimeReport(binding.runtimeId, runtime.descriptorHash, outcome)) {
+              journal.recordRuntimeReport(binding, runtime.descriptorHash, outcome);
+            }
+            continue;
+          }
+          if (mailboxFencedBindings.has(binding.runtimeId)) continue;
+          try {
+            progress = await exchangeWorkerMailbox(options.coordinator, token, supervisor.mailbox, binding, abort.signal) || progress;
+          } catch (error) {
+            if (!(error instanceof CoordinatorConflict)) throw error;
+            mailboxFencedBindings.add(binding.runtimeId);
+            try {
+              const evidence = await supervisor.stop(binding);
+              journal.recordRuntimeReport(binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+            } catch {
+              journal.recordRuntimeReport(binding, runtime.descriptorHash, "uncertain");
+            }
+            notifyMailboxActivity();
+            continue;
+          }
+          await supervisor.pump(binding);
+        }
+        if (progress || mailboxActivityGeneration !== roundGeneration) {
+          activeRounds++;
+          if (activeRounds >= MAX_ACTIVE_DRAIN_ROUNDS) {
+            activeRounds = 0;
+            await new Promise<void>((done) => setImmediate(done));
+          }
+          continue;
+        }
+        activeRounds = 0;
+        await waitForMailboxActivity(roundGeneration, MAILBOX_IDLE_INTERVAL_MS);
+      }
+    };
+    const handleRuntimeFailure = async (error: unknown): Promise<void> => {
+      if (stopping) return;
+      runtimeFailure = error;
+      stopping = true;
+      leaseDeadline = 0;
+      abort.abort();
+      if (supervisor) {
+        for (const runtime of supervisor.inspectBindings()) {
+          if (["closed", "uncertain"].includes(runtime.state)) continue;
+          try {
+            const evidence = await supervisor.stop(runtime.binding);
+            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+          } catch {
+            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, "uncertain");
+          }
+        }
+      }
+    };
+    while (true) {
+      if (runtimeFailure) throw runtimeFailure;
+      if (stopping) break;
       for (const receipt of journal.pendingReceipts(session)) {
         try {
           await fetchJson(coordinator, "/api/nodes/events", token, {
@@ -543,9 +798,15 @@ export async function runNode(options: NodeOptions): Promise<void> {
         }
       }
       if (stopping) break;
-      const polled = parseNodePoll(await fetchJson(coordinator, "/api/nodes/poll", token, {
+      const ordinaryPollStarted = performance.now();
+      const ordinaryPollResponse = await fetchJson(coordinator, "/api/nodes/poll", token, {
         machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
-      }, abort.signal), options.machineId, session);
+      }, abort.signal);
+      leaseDeadline = ordinaryPollStarted + session.leaseMs;
+      const polled = parseNodePoll(ordinaryPollResponse, options.machineId, session);
+      if (supervisor && !runtimeTask) {
+        runtimeTask = runRuntimeLoop().catch(handleRuntimeFailure);
+      }
       for (const command of polled.commands) {
         const operation = journal.operation(command, session);
         if (operation.status !== "admitted") continue;
@@ -560,8 +821,15 @@ export async function runNode(options: NodeOptions): Promise<void> {
       await delay(POLL_INTERVAL_MS, abort.signal);
     }
   } catch {
+    if (runtimeFailure) throw genericError();
     if (!stopping) throw genericError();
   } finally {
+    stopping = true;
+    leaseDeadline = 0;
+    abort.abort();
+    await runtimeTask?.catch(() => undefined);
+    await Promise.allSettled([...runtimeStartFlights.values()].map((flight) => flight.promise));
+    if (supervisor) await supervisor.close();
     journal.markAdmittedUncertain();
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);

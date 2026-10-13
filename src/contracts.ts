@@ -24,7 +24,8 @@ export interface NodeCapabilities {
   piDurable: string;
   roots: string[];
   credentialRefs: string[];
-  executionEnabled: false;
+  executionEnabled: boolean;
+  executionMode?: "metadata-only";
 }
 export interface RemoteMachine {
   id: string; name: string; kind: 'remote';
@@ -98,7 +99,7 @@ export interface Validation {
 export interface MissionStateView {
   mission: Mission; tasks: Task[]; roles: Array<{ roleId: string; name: string; kind: RoleProfile['kind']; profileId: string; modelName: string; modelId: string; profileRevision: number }>;
   agents: Agent[]; approvals: Approval[]; worktrees?: WorktreeRecord[];
-  remoteWorkspaces: Array<{ id: string; name: string; machineId: string; path: string; executionEnabled: boolean }>;
+  remoteWorkspaces: Array<{ id: string; name: string; machineId: string; path: string; executionEnabled: boolean; executionMode?: "metadata-only" }>;
   mcpServers?: Array<{ id: string; name: string; revision: number; tools: Array<{ toolName: string; mode: 'approve' | 'allow' }> }>;
   validationContract?: ValidationContract; requirementCoverage?: RequirementCoverage[];
 }

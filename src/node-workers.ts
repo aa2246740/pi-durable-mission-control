@@ -46,7 +46,9 @@ export interface NodeWorkerSupervisorOptions {
   forbiddenCredentialRefs?: string[];
   executionEnabled?: boolean;
   isLeaseCurrent: (binding: WorkerBinding) => boolean;
+  onMailboxActivity?: () => void;
   testOnlyScripted?: boolean;
+  testOnlyToolLoop?: boolean;
 }
 
 export class NodeWorkerError extends Error {}
@@ -265,6 +267,15 @@ export class NodeWorkerSupervisor {
     return rows.map((row) => this.snapshotOf(row));
   }
 
+  inspectBindings(): Array<{ binding: WorkerBinding; descriptorHash: string; state: NodeWorkerState; confirmedStopped: boolean }> {
+    return (this.db.prepare("SELECT binding_json,descriptor_hash,state,confirmed_stopped FROM node_worker_runtimes ORDER BY rowid").all() as Array<{
+      binding_json: string; descriptor_hash: string; state: NodeWorkerState; confirmed_stopped: number;
+    }>).map((row) => ({
+      binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash,
+      state: row.state, confirmedStopped: row.confirmed_stopped === 1
+    }));
+  }
+
   private note(runtimeId: string, text: string): void {
     this.diagnostics.set(runtimeId, text.slice(-1000));
   }
@@ -340,7 +351,9 @@ export class NodeWorkerSupervisor {
       workspaceStrategy: "shared" as const,
       profile: spec.profile,
       role: spec.role,
-      ...(this.options.testOnlyScripted ? { testOnlyScripted: true } : {})
+      runtimeMode: "remote-metadata-only" as const,
+      ...(this.options.testOnlyScripted ? { testOnlyScripted: true } : {}),
+      ...(this.options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {})
     };
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -613,6 +626,7 @@ export class NodeWorkerSupervisor {
     if (!checked || checked.payload.kind !== "rpc") throw new Error("Redacted worker RPC is invalid");
     this.mailbox.enqueue(handle.binding, checked.payload);
     handle.pendingRpc.add(checked.payload.rpcId);
+    this.options.onMailboxActivity?.();
   }
 
   private onChildNotice(handle: Handle, notice: WorkerNotice): void {
@@ -637,6 +651,7 @@ export class NodeWorkerSupervisor {
     if (admittedInbox && notice.type === "admitted") {
       handle.pendingDeliveries.delete(deliveryKey(notice.messageId, notice.requestId, notice.attempt));
     }
+    this.options.onMailboxActivity?.();
     if (abortInbox) handle.pendingAbort = undefined;
   }
 

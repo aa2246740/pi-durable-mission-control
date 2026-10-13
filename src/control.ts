@@ -40,6 +40,9 @@ import { mcpSecretValues, McpOperationError, McpRuntimeManager, redactMcpValue }
 import { parseScheduleSpec } from "./schedules.js";
 import { MachineRegistry, type NodeCommand, type RemoteMachine } from "./machines.js";
 import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
+import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
+import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
+import { REMOTE_RPC_METHODS } from "./remote-rpc-methods.js";
 import {
   addAgentWorktree,
   addDetachedWorktree,
@@ -58,13 +61,8 @@ import {
   type RepositoryIdentity
 } from "./worktrees.js";
 
-export const CONTROL_SCHEMA_VERSION = 6;
+export const CONTROL_SCHEMA_VERSION = 7;
 const REMOTE_OPERATION_UNAVAILABLE = "Remote operation is unavailable for this agent";
-const REMOTE_RPC_METHODS = new Set([
-  "AdmitTurn", "Transcript", "Usage", "ListAgents", "GetMissionState",
-  "SendMessage", "CreateTask", "UpdateTask", "Report", "RequestUserInput"
-]);
-
 export class HttpError extends Error {
   readonly status: number;
 
@@ -245,6 +243,7 @@ export class ControlPlane {
   private readonly activeWorkspaceOperations = new Map<string, number>();
   readonly machineRegistry: MachineRegistry;
   readonly workerMailbox: DurableWorkerMailbox;
+  readonly remoteRuntimes: RemoteRuntimeRegistry;
 
   constructor(home: string) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -254,6 +253,7 @@ export class ControlPlane {
     mkdirSync(join(home, "worktrees"), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(join(home, "control.sqlite"), { timeout: 5000 });
     this.machineRegistry = new MachineRegistry(this.db);
+    this.remoteRuntimes = new RemoteRuntimeRegistry(this.db);
     try {
       this.checkStartupCompatibility();
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
@@ -265,6 +265,15 @@ export class ControlPlane {
         this.acquireOwner();
         this.fenceRecoveredAgents();
         MachineRegistry.fenceOnCoordinatorStart(this.db);
+        const interruptedRuntimes = this.db.prepare("SELECT runtime_id,agent_id FROM remote_worker_runtimes WHERE state IN ('queued','offered','running','stopping')")
+          .all() as Array<{ runtime_id: string; agent_id: string }>;
+        this.db.prepare("UPDATE remote_worker_runtimes SET desired='stop',state='uncertain',updated_at=? WHERE state IN ('queued','offered','running','stopping')")
+          .run(Date.now());
+        for (const runtime of interruptedRuntimes) {
+          const agent = this.getAgent(runtime.agent_id);
+          if (agent) this.insertSystemBlocker(`remote-runtime:${runtime.runtime_id}`, agent.missionId, "delivery",
+            "Remote runtime ownership became uncertain after coordinator restart. Reconcile ownership and in-flight work before resuming.");
+        }
         workerMailbox.recover();
         return workerMailbox;
       });
@@ -398,6 +407,7 @@ export class ControlPlane {
     `);
     MachineRegistry.migrate(this.db);
     DurableWorkerMailbox.migrate(this.db, "coordinator");
+    RemoteRuntimeRegistry.migrate(this.db);
     const outboxColumns = this.db.prepare("PRAGMA table_info(outbox)").all() as Array<{ name: string }>;
     if (!outboxColumns.some((column) => column.name === "retry_count")) {
       this.db.exec("ALTER TABLE outbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0");
@@ -420,6 +430,10 @@ export class ControlPlane {
     }
   }
 
+  private transactionIfNeeded<T>(fn: () => T): T {
+    return this.db.isTransaction ? fn() : this.transaction(fn);
+  }
+
   private acquireOwner(): void {
     const previous = this.db.prepare("SELECT daemon_id, epoch, pid, heartbeat_at FROM daemon_owner WHERE singleton=1").get() as OwnerRow | undefined;
     this.ownerEpoch = (previous?.epoch ?? 0) + 1;
@@ -432,12 +446,27 @@ export class ControlPlane {
     for (const row of rows) {
       const agent = decode<Agent>(row.data);
       const mission = this.getMission(row.mission_id);
-      const nextStatus = mission?.status === "active" ? "recovering" : "offline";
+      const remote = agent.machineId !== "local";
+      const nextStatus = !remote && mission?.status === "active" ? "recovering" : "offline";
       const next = { ...agent, status: nextStatus as Agent["status"], epoch: row.epoch + 1, updatedAt: now() };
       this.db.prepare("UPDATE agents SET status=?,epoch=?,data=? WHERE id=?").run(next.status, next.epoch, json(next), row.id);
       if (mission && nextStatus === "recovering") this.event(mission.id, "agent_recovering", `Agent ownership advanced to epoch ${next.epoch}.`, agent.id);
+      if (remote) {
+        this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL,error='Remote delivery outcome is uncertain after coordinator restart'
+          WHERE message_id IN (SELECT id FROM messages WHERE json_extract(data,'$.recipientId')=?) AND status IN ('dispatching','admitted')`).run(agent.id);
+        this.db.prepare(`UPDATE messages SET status='uncertain',
+          data=json_set(data,'$.status','uncertain','$.error','Remote delivery outcome is uncertain after coordinator restart')
+          WHERE json_extract(data,'$.recipientId')=? AND (
+            status IN ('dispatching','admitted','delivering','delivered') OR
+            EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=messages.id AND o.status='uncertain')
+          )`).run(agent.id);
+        if (mission) this.event(mission.id, "remote_runtime_uncertain", "Remote runtime ownership is uncertain after coordinator restart; no delivery was replayed.", agent.id);
+      }
     }
-    this.db.prepare("UPDATE outbox SET status='queued',deadline_at=NULL,next_attempt_at=0 WHERE status IN ('dispatching','admitted') AND mission_id IN (SELECT id FROM missions WHERE status='active')").run();
+    this.db.prepare(`UPDATE outbox SET status='queued',deadline_at=NULL,next_attempt_at=0
+      WHERE status IN ('dispatching','admitted') AND mission_id IN (SELECT id FROM missions WHERE status='active')
+      AND COALESCE((SELECT json_extract(a.data,'$.machineId') FROM agents a
+        JOIN messages m ON json_extract(m.data,'$.recipientId')=a.id WHERE m.id=outbox.message_id),'local')='local'`).run();
   }
 
   private seedProfiles(): void {
@@ -711,25 +740,166 @@ export class ControlPlane {
     return this.machineRegistry.poll(machineId, token, sessionId, sessionEpoch);
   }
 
+  nodeRuntimePoll(machineId: string, token: string, sessionId: string, sessionEpoch: number): { directives: RemoteRuntimeDirective[] } {
+    this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
+    return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch) };
+  }
+
+  nodeRuntimeReport(machineId: string, token: string, sessionId: string, sessionEpoch: number, report: {
+    reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected";
+  }): { recorded: true; duplicate: boolean } {
+    this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
+    if (report.binding.machineId !== machineId) throw new HttpError(403, "Runtime report does not belong to this machine");
+    try {
+      return this.transaction(() => {
+        const saved = this.remoteRuntimes.report(report);
+        this.workerMailbox.fence(report.binding);
+        if (!saved.duplicate) {
+          const agent = this.getAgent(report.binding.agentId);
+          const mission = agent ? this.getMission(agent.missionId) : undefined;
+          const unexpected = saved.unexpected && mission?.status === "active";
+          if (unexpected && agent) this.markAgentInterrupted(agent.id, report.binding.epoch);
+          if (report.outcome !== "stopped" || unexpected) {
+            if (agent) this.insertSystemBlocker(`remote-runtime:${report.binding.runtimeId}`, agent.missionId, "delivery",
+              "Remote runtime ownership or in-flight work requires trusted reconciliation before resuming.");
+          }
+          if (unexpected && mission) this.event(mission.id, "remote_runtime_uncertain",
+            "An active remote runtime ended unexpectedly; delivery state is fenced and requires trusted reconciliation.", agent?.id);
+        }
+        return { recorded: true, duplicate: saved.duplicate };
+      });
+    } catch {
+      throw new HttpError(409, "Runtime report does not match its assignment or conflicts with a prior report");
+    }
+  }
+
+  remoteRuntimeSnapshots(missionId: string): Array<Record<string, unknown>> {
+    if (!this.getMission(missionId)) throw new HttpError(404, "Mission not found");
+    return this.remoteRuntimes.snapshots(missionId);
+  }
+
+  assignRemoteRuntime(agentId: string): { binding: WorkerBinding; descriptor: ReturnType<typeof parseWorkerStartSpec>; descriptorHash: string; existing: boolean } {
+    return this.transaction(() => {
+      const agent = this.getAgent(agentId);
+      const mission = agent ? this.getMission(agent.missionId) : undefined;
+      const role = agent ? this.role(agent.roleId) : undefined;
+      const profile = agent ? this.profile(agent.profileId) : undefined;
+      const workspace = agent?.workspaceId ? this.workspace(agent.workspaceId) : undefined;
+      const machine = agent && agent.machineId !== "local" ? this.machineRegistry.get(agent.machineId) : undefined;
+      if (!agent || !mission || !role || !profile || !workspace || !machine ||
+          mission.status !== "active" ||
+          role.kind !== "worker" || mission.workspaceStrategy === "worktree" ||
+          workspace.machineId !== agent.machineId || !mission.remoteWorkspaceIds?.includes(workspace.id) || !workspace.probe ||
+          machine.status !== "online" || (machine.leaseExpiresAt ?? 0) <= Date.now() ||
+          machine.sessionId === undefined || machine.capabilities?.executionMode !== "metadata-only" ||
+          machine.capabilities.executionEnabled !== true ||
+          (profile.credentialEnv && !machine.capabilities.credentialRefs.includes(profile.credentialEnv))) {
+        throw new HttpError(409, "Remote worker assignment is not valid for the current metadata-only node session");
+      }
+      const active = this.remoteRuntimes.activeForAgent(agentId);
+      if (active) {
+        if (active.state === "uncertain" || active.state === "stopping") {
+          throw new HttpError(409, "Remote runtime ownership is unresolved and requires trusted reconciliation");
+        }
+        if (active.desired !== "run" || active.machine_id !== machine.id ||
+            active.session_id !== machine.sessionId || active.session_epoch !== machine.sessionEpoch ||
+            active.epoch !== agent.epoch) {
+          throw new HttpError(409, "Remote runtime assignment no longer matches the current owner and node session");
+        }
+        const activeBinding: WorkerBinding = {
+          runtimeId: active.runtime_id, machineId: active.machine_id, sessionId: active.session_id,
+          sessionEpoch: active.session_epoch, agentId: active.agent_id, epoch: active.epoch
+        };
+        try {
+          if (this.workerMailbox.inspectBinding(activeBinding).status !== "open") throw new Error("closed");
+        } catch {
+          throw new HttpError(409, "Remote runtime mailbox binding is no longer open");
+        }
+        const descriptor = parseWorkerStartSpec(JSON.parse(active.descriptor_json));
+        return { binding: descriptor.binding, descriptor, descriptorHash: active.descriptor_hash, existing: true };
+      }
+      if (this.remoteRuntimes.byAgent(agentId)) {
+        throw new HttpError(409, "A prior remote runtime still requires trusted ownership reconciliation");
+      }
+      const openMailbox = this.db.prepare("SELECT 1 FROM worker_mailbox_bindings WHERE agent_id=? AND status IN ('open','uncertain') LIMIT 1").get(agentId);
+      if (openMailbox) throw new HttpError(409, "Remote worker ownership is uncertain and requires reconciliation");
+      if (!machine.sessionId || !machine.sessionEpoch) throw new HttpError(409, "Remote node session is unavailable");
+      const owned = this.claimAgentOwner(agentId);
+      const binding: WorkerBinding = {
+        runtimeId: randomUUID(), machineId: machine.id, sessionId: machine.sessionId,
+        sessionEpoch: machine.sessionEpoch, agentId: owned.id, epoch: owned.epoch
+      };
+      const descriptor = parseWorkerStartSpec({
+        binding, missionId: mission.id, workspacePath: workspace.path,
+        workspaceStrategy: "shared", profile, role
+      });
+      const assigned = this.remoteRuntimes.assign(descriptor);
+      this.workerMailbox.open(binding);
+      return { binding, descriptor, descriptorHash: workerStartSpecHash(descriptor), existing: assigned.existing };
+    });
+  }
+
+  remoteRuntimeReady(binding: WorkerBinding): boolean {
+    return this.remoteRuntimes.markReady(binding);
+  }
+
+  requestRemoteRuntimeStop(agentId: string): boolean {
+    return this.transactionIfNeeded(() => {
+      const active = this.remoteRuntimes.activeForAgent(agentId);
+      if (!active) return false;
+      const binding: WorkerBinding = {
+        runtimeId: active.runtime_id, machineId: active.machine_id, sessionId: active.session_id,
+        sessionEpoch: active.session_epoch, agentId: active.agent_id, epoch: active.epoch
+      };
+      this.workerMailbox.fence(binding);
+      return this.remoteRuntimes.requestStop(binding);
+    });
+  }
+
   nodeEvent(machineId: string, token: string, sessionId: string, sessionEpoch: number, commandId: string, outcome: unknown): NodeCommand {
     return this.machineRegistry.complete(machineId, token, sessionId, sessionEpoch, commandId, outcome);
   }
 
   fenceStaleWorkerBindings(): void {
-    for (const row of this.workerMailbox.inspectBindings()) {
-      if (row.status !== "open") continue;
-      const binding: WorkerBinding = {
-        runtimeId: row.runtimeId, machineId: row.machineId, sessionId: row.sessionId,
-        sessionEpoch: row.sessionEpoch, agentId: row.agentId, epoch: row.epoch
+    this.transactionIfNeeded(() => {
+      const seen = new Set<string>();
+      const fence = (binding: WorkerBinding, registered: boolean): void => {
+        const machine = this.machineRegistry.get(binding.machineId);
+        const agent = this.getAgent(binding.agentId);
+        if (machine?.status === "online" && machine.sessionId === binding.sessionId &&
+            machine.sessionEpoch === binding.sessionEpoch && (machine.leaseExpiresAt ?? 0) > Date.now() &&
+            agent?.machineId === binding.machineId && agent.epoch === binding.epoch) return;
+        if (!registered) {
+          this.workerMailbox.fence(binding);
+          return;
+        }
+        try { this.workerMailbox.fence(binding); } catch { /* the registered assignment is still fenced below */ }
+        this.remoteRuntimes.requestStop(binding);
+        if (agent) {
+          this.markAgentInterrupted(agent.id, binding.epoch);
+          this.insertSystemBlocker(`remote-runtime:${binding.runtimeId}`, agent.missionId, "delivery",
+            "Remote runtime ownership or in-flight work requires trusted reconciliation before resuming.");
+        }
+        seen.add(binding.runtimeId);
       };
-      const machine = this.machineRegistry.get(binding.machineId);
-      const agent = this.getAgent(binding.agentId);
-      if (machine?.status !== "online" || machine.sessionId !== binding.sessionId ||
-          machine.sessionEpoch !== binding.sessionEpoch || (machine.leaseExpiresAt ?? 0) <= Date.now() ||
-          agent?.machineId !== binding.machineId || agent.epoch !== binding.epoch) {
-        this.workerMailbox.fence(binding);
+      for (const row of this.workerMailbox.inspectBindings()) {
+        if (row.status !== "open") continue;
+        const binding: WorkerBinding = {
+          runtimeId: row.runtimeId, machineId: row.machineId, sessionId: row.sessionId,
+          sessionEpoch: row.sessionEpoch, agentId: row.agentId, epoch: row.epoch
+        };
+        fence(binding, Boolean(this.remoteRuntimes.byRuntime(binding.runtimeId)));
       }
-    }
+      const runtimes = this.db.prepare("SELECT * FROM remote_worker_runtimes WHERE state IN ('queued','offered','running','stopping','uncertain')")
+        .all() as RemoteRuntimeRow[];
+      for (const runtime of runtimes) {
+        if (seen.has(runtime.runtime_id)) continue;
+        fence({
+          runtimeId: runtime.runtime_id, machineId: runtime.machine_id, sessionId: runtime.session_id,
+          sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
+        }, true);
+      }
+    });
   }
 
   private authorizeWorkerMailbox(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawBinding: unknown): WorkerBinding {
@@ -1035,7 +1205,9 @@ export class ControlPlane {
           const role = this.role(roleId);
           const roleProfile = role ? this.profile(role.profileId) : undefined;
           if (!role || !roleProfile) throw new HttpError(409, `Enabled role ${roleId} has no model profile`);
-          if (roleProfile.credentialEnv && !process.env[roleProfile.credentialEnv]) throw new HttpError(409, `Missing required credential ${roleProfile.credentialEnv}`);
+          if (role.kind !== "worker" && roleProfile.credentialEnv && !process.env[roleProfile.credentialEnv]) {
+            throw new HttpError(409, `Missing required credential ${roleProfile.credentialEnv}`);
+          }
           if (!roleProfile.toolCalling) throw new HttpError(409, `Role ${role.name} requires a tool-calling model`);
           return `${role.id} (${role.name}; ${roleProfile.name}; model ${roleProfile.modelId})`;
         });
@@ -1158,6 +1330,9 @@ export class ControlPlane {
     const workspaceId = targetWorkspaceId ?? mission.workspaceId;
     const workspace = this.workspace(workspaceId);
     if (!workspace) throw new HttpError(409, "Agent workspace is unavailable");
+    if (workspace.machineId === "local" && profile.credentialEnv && !process.env[profile.credentialEnv]) {
+      throw new HttpError(409, `Missing required credential ${profile.credentialEnv}`);
+    }
     if (workspaceId === mission.workspaceId) {
       if (workspace.machineId !== "local") throw new HttpError(409, "The Mission delivery workspace must be local");
     } else {
@@ -1169,10 +1344,23 @@ export class ControlPlane {
       if (mission.workspaceStrategy === "worktree") throw new HttpError(409, "Remote worktrees are not supported yet");
       const machine = this.machineRegistry.get(workspace.machineId);
       if (machine?.status !== "online" ||
-        (machine.leaseExpiresAt !== undefined && machine.leaseExpiresAt <= Date.now()) ||
-        !machine.capabilities?.executionEnabled) {
+        (machine.leaseExpiresAt ?? 0) <= Date.now() ||
+        !machine.sessionId || !machine.sessionEpoch ||
+        machine.capabilities?.executionEnabled !== true ||
+        machine.capabilities.executionMode !== "metadata-only") {
         throw new HttpError(409, "Remote execution is not enabled on this machine");
       }
+      if (profile.credentialEnv && !machine.capabilities.credentialRefs.includes(profile.credentialEnv)) {
+        throw new HttpError(409, "Remote node has not declared this model credential reference");
+      }
+      parseWorkerStartSpec({
+        binding: {
+          runtimeId: randomUUID(), machineId: workspace.machineId,
+          sessionId: machine.sessionId ?? randomUUID(), sessionEpoch: machine.sessionEpoch || 1,
+          agentId: randomUUID(), epoch: 1
+        },
+        missionId: mission.id, workspacePath: workspace.path, workspaceStrategy: "shared", profile, role
+      });
     }
     const id = randomUUID();
     const worktree = mission.workspaceStrategy === "worktree"
@@ -1317,7 +1505,8 @@ export class ControlPlane {
         path: workspace.path,
         executionEnabled: machine?.status === "online" &&
           (machine.leaseExpiresAt === undefined || machine.leaseExpiresAt > Date.now()) &&
-          Boolean(machine.capabilities?.executionEnabled)
+          Boolean(machine.capabilities?.executionEnabled),
+        ...(machine?.capabilities?.executionMode ? { executionMode: machine.capabilities.executionMode } : {})
       };
     });
     const roles = mission.roleIds.map((roleId) => {
@@ -2287,9 +2476,103 @@ export class ControlPlane {
   }
 
   pendingOutbox(): OutboxRow[] {
-    const expired = this.db.prepare("SELECT id,retry_count FROM outbox WHERE status='dispatching' AND deadline_at IS NOT NULL AND deadline_at<?").all(Date.now()) as Array<{ id: string; retry_count: number }>;
-    for (const row of expired) this.retryOutbox(row.id, "Delivery acknowledgement deadline expired");
+    const expired = this.db.prepare(`SELECT o.id,a.id AS agent_id,a.data FROM outbox o
+      JOIN messages m ON m.id=o.message_id JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')
+      WHERE o.status='dispatching' AND o.deadline_at IS NOT NULL AND o.deadline_at<?`).all(Date.now()) as Array<{ id: string; agent_id: string; data: string }>;
+    for (const row of expired) {
+      const agent = decode<Agent>(row.data);
+      if (agent.machineId === "local") this.retryOutbox(row.id, "Delivery acknowledgement deadline expired");
+      else this.markRemoteDeliveryUncertain(row.id, agent.id);
+    }
     return this.db.prepare("SELECT id,mission_id,message_id,attempt,request_id,retry_count FROM outbox WHERE status='queued' AND COALESCE(next_attempt_at,0)<=? ORDER BY created_at").all(Date.now()) as OutboxRow[];
+  }
+
+  remoteRuntimeForAgent(agentId: string): RemoteRuntimeRow | undefined {
+    return this.remoteRuntimes.byAgent(agentId);
+  }
+
+  dispatchRemoteOutbox(row: OutboxRow, message: Message, agent: Agent): boolean {
+    return this.transaction(() => {
+      const freshAgent = this.getAgent(agent.id);
+      const freshMessage = this.message(message.id);
+      const mission = this.getMission(row.mission_id);
+      const outbox = this.db.prepare("SELECT status FROM outbox WHERE id=? AND message_id=? AND mission_id=?")
+        .get(row.id, message.id, row.mission_id) as { status: string } | undefined;
+      if (!outbox || outbox.status !== "queued" || mission?.status !== "active") return false;
+      const runtime = this.remoteRuntimes.activeForAgent(agent.id);
+      const machine = runtime ? this.machineRegistry.get(runtime.machine_id) : undefined;
+      const routeCurrent = Boolean(
+        freshAgent && freshMessage && freshMessage.recipientId === freshAgent.id &&
+        freshAgent.machineId !== "local" && freshAgent.machineId === agent.machineId &&
+        runtime && runtime.state === "running" && runtime.desired === "run" &&
+        runtime.machine_id === freshAgent.machineId && runtime.epoch === freshAgent.epoch &&
+        machine?.status === "online" && machine.sessionId === runtime.session_id &&
+        machine.sessionEpoch === runtime.session_epoch && (machine.leaseExpiresAt ?? 0) > Date.now() &&
+        machine.capabilities?.executionEnabled === true && machine.capabilities.executionMode === "metadata-only"
+      );
+      if (!routeCurrent || !runtime || !freshAgent || !freshMessage || !machine) {
+        this.blockRemoteOutboxWithinTransaction(row.id, agent.id,
+          "Remote worker routing is stale or unavailable; reconcile ownership before resuming.");
+        return false;
+      }
+      const binding: WorkerBinding = {
+        runtimeId: runtime.runtime_id, machineId: runtime.machine_id, sessionId: runtime.session_id,
+        sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
+      };
+      try {
+        if (this.workerMailbox.inspectBinding(binding).status !== "open") throw new Error("fenced");
+      } catch {
+        this.blockRemoteOutboxWithinTransaction(row.id, agent.id,
+          "Remote worker routing is stale or unavailable; reconcile ownership before resuming.");
+        return false;
+      }
+      if (!this.markOutboxDispatching(row.id, binding.epoch)) return false;
+      const digest = createHash("sha256").update(`${message.id}:${row.request_id}:${row.attempt}`).digest("hex").slice(0, 32);
+      const transportId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20)}` as ReturnType<typeof randomUUID>;
+      this.workerMailbox.enqueue(binding, {
+        kind: "deliver", messageId: freshMessage.id, requestId: row.request_id, attempt: row.attempt,
+        content: freshMessage.content, mode: freshMessage.mode
+      }, transportId);
+      return true;
+    });
+  }
+
+  blockRemoteDispatch(outboxId: string, agentId: string): boolean {
+    return this.transactionIfNeeded(() => this.blockRemoteOutboxWithinTransaction(outboxId, agentId,
+      "Remote worker routing is stale or unavailable; reconcile ownership before resuming."));
+  }
+
+  private blockRemoteOutboxWithinTransaction(outboxId: string, agentId: string, error: string): boolean {
+    const row = this.db.prepare("SELECT mission_id,message_id,attempt,status FROM outbox WHERE id=?")
+      .get(outboxId) as { mission_id: string; message_id: string; attempt: number; status: string } | undefined;
+    if (!row || row.status !== "queued") return false;
+    this.db.prepare("UPDATE outbox SET status='aborted',deadline_at=NULL,error=? WHERE id=? AND status='queued'").run(error, outboxId);
+    const message = this.message(row.message_id);
+    if (message) this.db.prepare("UPDATE messages SET status='aborted',data=? WHERE id=?")
+      .run(json({ ...message, status: "aborted", error }), message.id);
+    this.insertSystemBlocker(`remote-route:${outboxId}`, row.mission_id, "delivery",
+      "Remote worker routing is stale or unavailable. Delivery was fenced and ownership must be reconciled before resuming.");
+    this.event(row.mission_id, "remote_route_blocked",
+      "A remote delivery could not be routed to the current node binding and was not replayed.", agentId,
+      { messageId: row.message_id, attempt: row.attempt });
+    return true;
+  }
+
+  private markRemoteDeliveryUncertain(outboxId: string, agentId: string): void {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT mission_id,message_id,attempt FROM outbox WHERE id=? AND status='dispatching'").get(outboxId) as { mission_id: string; message_id: string; attempt: number } | undefined;
+      if (!row) return;
+      this.db.prepare("UPDATE outbox SET status='uncertain',deadline_at=NULL,error=? WHERE id=?").run("Remote delivery admission timed out; outcome is uncertain", outboxId);
+      const message = this.message(row.message_id);
+      if (message) this.db.prepare("UPDATE messages SET status='uncertain',data=? WHERE id=?")
+        .run(json({ ...message, status: "uncertain", error: "Remote delivery admission timed out; outcome is uncertain" }), message.id);
+      this.insertSystemBlocker(`delivery:${outboxId}`, row.mission_id, "delivery",
+        "Remote delivery admission timed out. The runtime was fenced and ownership requires trusted reconciliation; it will not be replayed.");
+      this.event(row.mission_id, "delivery_uncertain", `Remote delivery ${row.message_id} became uncertain after timeout.`, agentId, { messageId: row.message_id, attempt: row.attempt });
+      this.requestRemoteRuntimeStop(agentId);
+      const agent = this.getAgent(agentId);
+      this.markAgentInterrupted(agentId, agent?.epoch);
+    });
   }
 
   markOutboxDispatching(id: string, epoch: number): boolean {
@@ -3267,9 +3550,9 @@ export class ControlPlane {
     });
   }
 
-  markAgentInterrupted(agentId: string): void {
+  markAgentInterrupted(agentId: string, expectedEpoch?: number): void {
     const agent = this.getAgent(agentId);
-    if (!agent) return;
+    if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
     const rows = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(agent.missionId) as Row[];
     for (const row of rows) {
       const message = decode<Message>(row.data);

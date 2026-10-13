@@ -43,7 +43,8 @@ Options:
   --node-port <port>  Optional separate node-only listener for serve/start (0 selects a free port)
   --out <path>    New backup directory for backup
   --from <path>   Backup directory for restore
-  node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>]
+  node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>] [--execution-mode metadata-only]
+  --execution-mode metadata-only opts into metadata RPC only; it does not enable filesystem, shell, MCP, Git, or artifact effects
   service install --home <path> [--port <port>]
   service start --home <path>
   service status --home <path>
@@ -64,9 +65,9 @@ type Invocation =
   | { command: "restore"; home: string; from: string }
   | { command: "service-install"; home: string; port: number }
   | { command: "service-start" | "service-status" | "service-uninstall"; home: string }
-  | { command: "node"; coordinator: string; machineId: string; tokenEnv: string; home: string; roots: string[]; credentialRefs: string[] };
+  | { command: "node"; coordinator: string; machineId: string; tokenEnv: string; home: string; roots: string[]; credentialRefs: string[]; executionMode?: "metadata-only" };
 
-const VALUE_FLAGS = ["--home", "--port", "--node-port", "--lines", "--out", "--from", "--coordinator", "--machine-id", "--token-env", "--root", "--credential-ref"] as const;
+const VALUE_FLAGS = ["--home", "--port", "--node-port", "--lines", "--out", "--from", "--coordinator", "--machine-id", "--token-env", "--root", "--credential-ref", "--execution-mode"] as const;
 type ValueFlag = (typeof VALUE_FLAGS)[number];
 type CommandName = "serve" | "start" | "status" | "stop" | "logs" | "doctor" | "export" | "backup" | "restore" | "service" | "node";
 const REPEATED_FLAGS: ValueFlag[] = ["--root", "--credential-ref"];
@@ -82,7 +83,7 @@ const SPEC: Record<CommandName, { flags: ValueFlag[]; positionals: number; usage
   backup: { flags: ["--home", "--out"], positionals: 0, usage: "mission-control backup --home <path> --out <directory>" },
   restore: { flags: ["--from", "--home"], positionals: 0, usage: "mission-control restore --from <directory> --home <new-path>" },
   service: { flags: ["--home", "--port"], positionals: 1, usage: "mission-control service <install|start|status|uninstall> --home <path> [--port <port>]" },
-  node: { flags: ["--coordinator", "--machine-id", "--token-env", "--home", "--root", "--credential-ref"], positionals: 0, usage: "mission-control node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>]" }
+  node: { flags: ["--coordinator", "--machine-id", "--token-env", "--home", "--root", "--credential-ref", "--execution-mode"], positionals: 0, usage: "mission-control node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>] [--execution-mode metadata-only]" }
 };
 
 class UsageError extends Error {}
@@ -173,8 +174,10 @@ function parse(argv: string[]): Invocation {
     const coordinator = values.get("--coordinator");
     const machineId = values.get("--machine-id");
     const tokenEnv = values.get("--token-env");
+    const executionMode = values.get("--execution-mode");
     const roots = repeated.get("--root") ?? [];
     if (!coordinator || !machineId || !tokenEnv || !homeValue || roots.length === 0) throw new UsageError(`Usage: ${spec.usage}`);
+    if (executionMode !== undefined && executionMode !== "metadata-only") throw new UsageError("--execution-mode must be metadata-only");
     return {
       command,
       coordinator,
@@ -182,7 +185,8 @@ function parse(argv: string[]): Invocation {
       tokenEnv,
       home: resolve(homeValue),
       roots,
-      credentialRefs: repeated.get("--credential-ref") ?? []
+      credentialRefs: repeated.get("--credential-ref") ?? [],
+      ...(executionMode === undefined ? {} : { executionMode: "metadata-only" as const })
     };
   }
   const home = homeValue === undefined ? defaultHome() : resolve(homeValue);

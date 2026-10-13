@@ -158,6 +158,7 @@ export async function startServer(options: ServerOptions) {
       const profile = control.profile(owner.profileId);
       const secret = profile?.credentialEnv ? process.env[profile.credentialEnv] : undefined;
       const result = applyWorkerNotice(control, owner, notice, (value) => sanitizeDiagnostic(value, secret));
+      if (result.ready && control.remoteRuntimeReady(binding)) setImmediate(() => { void workers.dispatchPending(); });
       if (result.lifecycleSync) scheduleLifecycleSync(owner.missionId, { id: owner.id, epoch: owner.epoch });
     }
   });
@@ -220,6 +221,32 @@ export async function startServer(options: ServerOptions) {
             positiveSafeInteger(body.sessionEpoch, "sessionEpoch"),
             text(body.commandId, "commandId", 64),
             body.outcome
+          ));
+        }
+        if (url.pathname === "/api/nodes/runtimes/poll") {
+          const body = await readBody(request);
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch"]);
+          return jsonResponse(response, 200, control.nodeRuntimePoll(
+            text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch")
+          ));
+        }
+        if (url.pathname === "/api/nodes/runtimes/events") {
+          const body = await readBody(request);
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "reportId", "binding", "descriptorHash", "outcome"]);
+          const binding = parseWorkerBinding(body.binding);
+          if (!binding || typeof body.reportId !== "string" ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.reportId) ||
+              typeof body.descriptorHash !== "string" || !/^[0-9a-f]{64}$/.test(body.descriptorHash) ||
+              !["stopped", "uncertain", "rejected"].includes(String(body.outcome))) {
+            throw new MachineError(400, "Runtime report is invalid");
+          }
+          return jsonResponse(response, 200, control.nodeRuntimeReport(
+            text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch"), {
+              reportId: body.reportId, binding, descriptorHash: body.descriptorHash,
+              outcome: body.outcome as "stopped" | "uncertain" | "rejected"
+            }
           ));
         }
         const mailboxAction = new Map([
@@ -384,7 +411,9 @@ export async function startServer(options: ServerOptions) {
       }
       if (method === "POST" && url.pathname === "/api/missions") {
         const body = await readBody(request);
-        exactKeys(body, ["title", "goal", "acceptance", "workspaceId", "roleIds", "maxTurns", "maxCost", "autonomy", "assertions", "workspaceStrategy"]);
+        if (Object.keys(body).some((key) => !["title", "goal", "acceptance", "workspaceId", "remoteWorkspaceIds", "roleIds", "maxTurns", "maxCost", "autonomy", "assertions", "workspaceStrategy"].includes(key))) {
+          throw new HttpError(400, "Unexpected mission field");
+        }
         const mission = control.createMission(parseCreateMissionInput(body));
         return jsonResponse(response, 201, mission);
       }
@@ -460,6 +489,8 @@ export async function startServer(options: ServerOptions) {
         throw new HttpError(400, "At least one supported mission field is required");
       }
       if (missionMatch && method === "GET") return jsonResponse(response, 200, control.detail(decodeURIComponent(missionMatch[1]!)));
+      const runtimeMatch = /^\/api\/missions\/([^/]+)\/runtimes$/.exec(url.pathname);
+      if (runtimeMatch && method === "GET") return jsonResponse(response, 200, control.remoteRuntimeSnapshots(decodeURIComponent(runtimeMatch[1]!)));
       const contractMatch = /^\/api\/missions\/([^/]+)\/validation-contract$/.exec(url.pathname);
       if (contractMatch && method === "PUT") {
         const body = await readBody(request);
@@ -482,8 +513,11 @@ export async function startServer(options: ServerOptions) {
       const agentsMatch = /^\/api\/missions\/([^/]+)\/agents$/.exec(url.pathname);
       if (agentsMatch && method === "POST") {
         const body = await readBody(request);
-        exactKeys(body, ["title", "roleId", "prompt", "requestId"]);
-        const agent = control.createAgent(decodeURIComponent(agentsMatch[1]!), text(body.title, "title"), text(body.roleId, "roleId"), text(body.prompt, "prompt"), text(body.requestId, "requestId"));
+        if (Object.keys(body).some((key) => !["title", "roleId", "prompt", "requestId", "targetWorkspaceId"].includes(key))) {
+          throw new HttpError(400, "Unexpected agent field");
+        }
+        const agent = control.createAgent(decodeURIComponent(agentsMatch[1]!), text(body.title, "title"), text(body.roleId, "roleId"), text(body.prompt, "prompt"), text(body.requestId, "requestId"),
+          body.targetWorkspaceId === undefined ? undefined : text(body.targetWorkspaceId, "targetWorkspaceId", 64));
         if (control.missionForAgent(agent.id)?.status === "active") await workers.startAgent(agent);
         return jsonResponse(response, 201, agent);
       }

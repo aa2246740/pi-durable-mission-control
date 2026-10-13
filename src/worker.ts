@@ -14,6 +14,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { ModelProfile, RoleProfile } from "./contracts.js";
 import { AGENT_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS, WORKTREE_INSTRUCTIONS } from "./prompts.js";
 import type { WorkerNotice, WorkerNoticeBody } from "./worker-events.js";
+import { REMOTE_RPC_METHODS } from "./remote-rpc-methods.js";
 
 export type WorkerConfig = {
   agentId: string;
@@ -25,6 +26,7 @@ export type WorkerConfig = {
   workspaceStrategy?: "shared" | "worktree";
   profile: ModelProfile;
   role: RoleProfile;
+  runtimeMode?: "remote-metadata-only";
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
 };
@@ -210,7 +212,10 @@ function tools(config: WorkerConfig) {
     : config.role.kind === "validator"
       ? common.filter((item) => !["CompleteMission", "write_file", "bash"].includes(item.name))
       : common;
-  return defineExtension({ name: "mission-control-tools", tools: selected });
+  const runtimeTools = config.runtimeMode === "remote-metadata-only"
+    ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name))
+    : selected;
+  return defineExtension({ name: "mission-control-tools", tools: runtimeTools });
 }
 
 export async function openWorkerRuntime(
@@ -274,7 +279,7 @@ export async function openWorkerRuntime(
     const agent = {
       extensions: [extension],
       model: { provider: config.testOnlyScripted ? "faux" : `mission-${config.profile.id}`, modelId: config.testOnlyScripted ? "faux-1" : config.profile.modelId },
-      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}`,
+      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : ""}`,
       ...(extension.tools ? { tools: extension.tools } : {}),
       cwd: config.workspacePath
     };

@@ -98,6 +98,7 @@ export class WorkerManager {
     const missions = this.control.state().missions.filter((mission) => mission.status === "active");
     for (const mission of missions) {
       for (const agent of this.control.listAgents(mission.id)) {
+        if (agent.machineId !== "local" && this.control.remoteRuntimeForAgent(agent.id)) continue;
         try {
           await this.startAgent(agent);
         } catch (error) {
@@ -124,7 +125,12 @@ export class WorkerManager {
   }
 
   async refreshProfile(profileId: string): Promise<void> {
-    for (const agent of this.control.listAgents().filter((item) => item.profileId === profileId && ["idle", "offline"].includes(item.status))) {
+    for (const agent of this.control.listAgents().filter((item) => item.profileId === profileId)) {
+      if (agent.machineId !== "local") {
+        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch);
+        continue;
+      }
+      if (!["idle", "offline"].includes(agent.status)) continue;
       if (!this.handles.has(agent.id)) continue;
       await this.stopAgent(agent.id);
       const current = this.control.getAgentPublic(agent.id);
@@ -133,7 +139,12 @@ export class WorkerManager {
   }
 
   async refreshRole(roleId: string): Promise<void> {
-    for (const agent of this.control.listAgents().filter((item) => item.roleId === roleId && ["idle", "offline"].includes(item.status))) {
+    for (const agent of this.control.listAgents().filter((item) => item.roleId === roleId)) {
+      if (agent.machineId !== "local") {
+        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch);
+        continue;
+      }
+      if (!["idle", "offline"].includes(agent.status)) continue;
       if (!this.handles.has(agent.id)) continue;
       await this.stopAgent(agent.id);
       const current = this.control.getAgentPublic(agent.id);
@@ -142,7 +153,10 @@ export class WorkerManager {
   }
 
   private async startAgentOnce(agent: Agent): Promise<void> {
-    if (agent.machineId !== "local") throw new HttpError(409, "Remote execution is not enabled for this agent");
+    if (agent.machineId !== "local") {
+      this.control.assignRemoteRuntime(agent.id);
+      return;
+    }
     const existing = this.handles.get(agent.id);
     if (existing?.child.connected && existing.child.exitCode === null) {
       await existing.ready;
@@ -315,6 +329,17 @@ export class WorkerManager {
       if (!message || !agent || this.dispatching.has(row.id) || this.recoveringAgents.has(agent.id)) continue;
       this.dispatching.add(row.id);
       try {
+        if (agent.machineId !== "local") {
+          const runtime = this.control.remoteRuntimeForAgent(agent.id);
+          if (!runtime || runtime.state !== "running") {
+            await this.startAgent(agent);
+            continue;
+          }
+          if (!this.control.dispatchRemoteOutbox(row, message, agent)) {
+            this.control.blockRemoteDispatch(row.id, agent.id);
+          }
+          continue;
+        }
         let handle = this.handles.get(agent.id);
         if (!handle) {
           await this.startAgent(agent);
@@ -325,7 +350,8 @@ export class WorkerManager {
         if (!currentAgent || currentAgent.epoch !== handle.epoch || !this.control.markOutboxDispatching(row.id, handle.epoch)) continue;
         await sendToWorker(handle.child, { type: "deliver", messageId: message.id, requestId: row.request_id, attempt: row.attempt, epoch: handle.epoch, content: message.content, mode: message.mode });
       } catch (error) {
-        this.control.retryOutbox(row.id, error instanceof Error ? error.message : String(error));
+        if (agent.machineId === "local") this.control.retryOutbox(row.id, error instanceof Error ? error.message : String(error));
+        else this.control.blockRemoteDispatch(row.id, agent.id);
         await this.syncMissionLifecycle(row.mission_id);
       } finally {
         this.dispatching.delete(row.id);
@@ -362,6 +388,14 @@ export class WorkerManager {
     const agents = this.control.listAgents(missionId);
     const captured = new Map<string, Handle>();
     for (const agent of agents) {
+      if (agent.machineId !== "local") {
+        this.control.requestRemoteRuntimeStop(agent.id);
+        if (!flight.fencedAgents.has(agent.id)) {
+          flight.fencedAgents.add(agent.id);
+          this.control.markAgentInterrupted(agent.id, agent.epoch);
+        }
+        continue;
+      }
       const handle = this.handles.get(agent.id);
       if (handle) {
         handle.stopping = true;
@@ -394,7 +428,7 @@ export class WorkerManager {
       await this.stopAgent(agent.id);
       if (!flight.fencedAgents.has(agent.id)) {
         flight.fencedAgents.add(agent.id);
-        this.control.markAgentInterrupted(agent.id);
+        this.control.markAgentInterrupted(agent.id, agent.epoch);
       }
     }
     for (const [agentId, handle] of [...this.handles]) {
@@ -404,15 +438,20 @@ export class WorkerManager {
       await this.stopAgent(agentId);
       if (!flight.fencedAgents.has(agentId)) {
         flight.fencedAgents.add(agentId);
-        this.control.markAgentInterrupted(agentId);
+        this.control.markAgentInterrupted(agentId, agent.epoch);
       }
     }
   }
 
   async interruptAgent(agentId: string): Promise<void> {
-    const handle = this.handles.get(agentId);
     const agent = this.control.getAgentPublic(agentId);
     if (!agent) throw new HttpError(404, "Agent not found");
+    if (agent.machineId !== "local") {
+      this.control.requestRemoteRuntimeStop(agentId);
+      this.control.markAgentInterrupted(agentId, agent.epoch);
+      return;
+    }
+    const handle = this.handles.get(agentId);
     if (handle) handle.stopping = true;
     await this.control.stopAgentProcesses(agentId);
     if (handle) {
@@ -420,13 +459,13 @@ export class WorkerManager {
       if (!acknowledged) {
         this.control.setAgentStatus(agent.id, handle.epoch, "error", "Worker did not acknowledge interruption");
         await this.stopAgent(agent.id);
-        this.control.markAgentInterrupted(agentId);
+        this.control.markAgentInterrupted(agentId, agent.epoch);
         return;
       }
       this.control.setAgentStatus(agent.id, handle.epoch, "idle");
       await this.stopAgent(agent.id);
     }
-    this.control.markAgentInterrupted(agentId);
+    this.control.markAgentInterrupted(agentId, agent.epoch);
   }
 
   async stopMission(missionId: string): Promise<void> {
@@ -434,6 +473,11 @@ export class WorkerManager {
   }
 
   async stopAgent(agentId: string): Promise<void> {
+    const agent = this.control.getAgentPublic(agentId);
+    if (agent?.machineId !== "local") {
+      this.control.requestRemoteRuntimeStop(agentId);
+      return;
+    }
     const handle = this.handles.get(agentId);
     if (!handle || !this.control.getAgentPublic(agentId)) return;
     if (handle.close) return handle.close;
