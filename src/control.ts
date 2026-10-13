@@ -3084,7 +3084,10 @@ export class ControlPlane {
             const approval: Approval = {
               id: randomUUID(), missionId: mission.id, agentId: agent.id, tool: request.method,
               args, status: "pending", createdAt: now(),
-              remoteEffectBinding: { spec, originalRpcId: request.id!, roleRevision }
+              remoteEffectBinding: {
+                spec, originalRpcId: request.id!, roleRevision,
+                workspacePath: descriptor.workspacePath, profileRevision: descriptor.profile.revision
+              }
             };
             this.db.prepare("INSERT INTO approvals(id,mission_id,status,data) VALUES(?,?,?,?)")
               .run(approval.id, mission.id, "pending", json(approval));
@@ -4342,6 +4345,7 @@ export class ControlPlane {
         descriptor.binding.sessionEpoch !== spec.binding.sessionEpoch || descriptor.binding.agentId !== spec.binding.agentId ||
         descriptor.binding.epoch !== spec.binding.epoch || descriptor.profile.id !== profile.id ||
         descriptor.profile.revision !== profile.revision || descriptor.role.id !== role.id ||
+        descriptor.workspacePath !== remote.workspacePath || descriptor.profile.revision !== remote.profileRevision ||
         descriptor.role.profileId !== role.profileId || descriptor.role.kind !== "worker" ||
         descriptor.workspacePath !== workspace.path ||
         agent.roleId !== role.id || !mission.roleIds.includes(role.id)) return false;

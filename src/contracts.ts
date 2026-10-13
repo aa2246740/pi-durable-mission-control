@@ -88,6 +88,8 @@ export interface Approval {
     };
     originalRpcId: string;
     roleRevision: number;
+    workspacePath: string;
+    profileRevision?: number;
   };
   remoteEffectReceipt?: import("./node-effects.js").NodeEffectReceipt;
 }

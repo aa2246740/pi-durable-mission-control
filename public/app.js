@@ -376,6 +376,7 @@ function renderMessages() {
 }
 
 function approvalScope(approval) {
+  if (approval.remoteEffectBinding) return remoteApprovalScope(approval);
   const binding = approval.mcpBinding;
   if (!binding) return '';
   const server = (state.app.mcpServers || []).find((item) => item.id === binding.serverId);
@@ -383,6 +384,27 @@ function approvalScope(approval) {
   const stale = !server?.enabled || server.revision !== binding.serverRevision || actor?.epoch !== binding.actorEpoch;
   const source = approval.status === 'pending' ? '尚未批准执行' : approval.authorizationSource === 'user-approval' ? '人工批准' : '按角色权限授权';
   return `<p class="text"><b>外部工具：${e(binding.toolName)}</b><br>连接：${e(server?.name || binding.serverId)}</p><p class="small-muted mono">服务器 ID：${e(binding.serverId)} · 配置修订 ${e(binding.serverRevision)}<br>角色修订 ${e(binding.roleRevision)} · 代理代次 ${e(binding.actorEpoch)} · ${source}<br>工具定义 SHA-256：${e(binding.definitionHash)}</p>${approval.status === 'pending' ? `<div class="notice">${stale ? '配置或代理状态已变化，旧审批不能执行。' : '本次批准只用于以上工具及下面的参数；执行前会再次核对权限与工具定义。'} MCP 结果不代表独立验收通过。</div>` : ''}`;
+}
+
+function remoteApprovalScope(approval) {
+  const remote = approval.remoteEffectBinding;
+  const { binding, descriptorHash, taskId } = remote.spec;
+  const machine = state.app.machines.find((item) => item.id === binding.machineId);
+  const actor = state.detail.agents.find((item) => item.id === binding.agentId);
+  const stale = state.detail.mission.status !== 'active' || !remote.workspacePath ||
+    actor?.epoch !== binding.epoch || actor?.machineId !== binding.machineId || machine?.status !== 'online';
+  const explanations = {
+    pending: stale ? '任务或节点状态已变化，后台会重新检查，旧授权不能越过安全检查执行。' : '尚未派发执行。本次批准只允许下面这一项操作，不会批准后续操作。',
+    approved: '已批准，等待安全检查与节点接收；还不能认定已经执行。',
+    running: '已派发，等待节点回执。没有收到回执不代表没有执行。',
+    succeeded: '节点已报告执行成功；这不是独立验收通过。',
+    failed: '请查看回执，区分授权过期未派发与实际执行失败。不会自动重做。',
+    uncertain: '操作可能已经发生。请先核对目标机器，不能直接重做；迟到回执不会自动解除阻塞。',
+    denied: '已拒绝，没有为此次请求派发执行许可。'
+  };
+  return `<section class="remote-approval-scope" aria-label="远端操作授权范围"><p class="text"><b>执行位置：远端节点，不在本机执行</b><br>目标机器：${e(machine?.name || binding.machineId)}<br>绑定工作目录：<span class="mono">${e(remote.workspacePath || '旧记录未保存目录快照，不能沿用执行')}</span></p>` +
+    `<div class="notice">${e(explanations[approval.status] || '批准不等于执行成功，也不等于独立验收通过。')}${approval.tool === 'bash' ? '<br>命令以远端节点用户权限运行，不是沙箱，可能访问工作目录之外的文件或进程。' : ''}</div>` +
+    `<details data-identity="remote-approval-${e(approval.id)}"><summary class="small-muted">查看本次授权的身份与修订</summary><p class="text mono">审批 ID：${e(approval.id)}<br>机器 ID：${e(binding.machineId)}<br>代理 ID：${e(binding.agentId)} · 代次 ${e(binding.epoch)}<br>运行实例：${e(binding.runtimeId)}<br>节点会话：${e(binding.sessionId)} · 代次 ${e(binding.sessionEpoch)}<br>操作 ID：${e(taskId)}<br>角色修订：${e(remote.roleRevision)} · 模型配置修订：${e(remote.profileRevision ?? '未记录')}<br>运行配置 SHA-256：${e(descriptorHash)}</p></details></section>`;
 }
 
 function renderApprovals() {

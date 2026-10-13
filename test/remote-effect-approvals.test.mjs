@@ -78,6 +78,8 @@ test("approval request is durable and idempotent; dispatch waits for its pending
   assert.equal(control.detail(mission.id).events.filter(event => event.type === "approval_requested").length, 1);
   const saved = currentApproval(control, first.approvalId);
   assert.equal(saved.remoteEffectBinding.originalRpcId, "rpc-first");
+  assert.equal(saved.remoteEffectBinding.workspacePath, assignment.descriptor.workspacePath);
+  assert.equal(saved.remoteEffectBinding.profileRevision, assignment.descriptor.profile.revision);
   assert.deepEqual(saved.remoteEffectBinding.spec.args, args);
   control.resolveApproval(first.approvalId, "approved");
   assert.deepEqual(await control.workerCommand(request(f, "one", "write_file", args, "rpc-after-approve")),
@@ -348,6 +350,16 @@ test("legacy protocol-3 omission fails closed for approval execution", async t =
 });
 
 const staleMutations = [
+  ["display workspace snapshot", (f, id) => {
+    const approval = currentApproval(f.control, id);
+    approval.remoteEffectBinding.workspacePath = "/different-workspace";
+    f.control.db.prepare("UPDATE approvals SET data=? WHERE id=?").run(JSON.stringify(approval), id);
+  }],
+  ["display profile snapshot", (f, id) => {
+    const approval = currentApproval(f.control, id);
+    approval.remoteEffectBinding.profileRevision += 1;
+    f.control.db.prepare("UPDATE approvals SET data=? WHERE id=?").run(JSON.stringify(approval), id);
+  }],
   ["role revision", f => {
     const changedRole = { ...f.workerRole, instructions: "changed after approval" };
     const revision = f.control.db.prepare("SELECT MAX(revision) AS revision FROM role_revisions WHERE role_id=?")
