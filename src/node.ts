@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { NodeCommand, NodeCapabilities } from "./machines.js";
-import { NODE_EXECUTION_PROTOCOL_VERSION, NODE_PROTOCOL_VERSION } from "./machines.js";
+import { NODE_EXECUTION_PROTOCOL_VERSION, NODE_PROTOCOL_VERSION, NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION } from "./machines.js";
 import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding } from "./worker-mailbox.js";
 import { NodeWorkerSupervisor } from "./node-workers.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
@@ -28,9 +28,10 @@ export interface NodeOptions {
   home: string;
   roots: string[];
   credentialRefs: string[];
-  executionMode?: "metadata-only";
+  executionMode?: "metadata-only" | "workspace-effects";
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
+  testOnlyWorkspaceEffectLoop?: boolean;
 }
 
 type JournalOperation = {
@@ -486,9 +487,9 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
   }
 }
 
-function capabilities(roots: string[], credentialRefs: string[], executionMode?: "metadata-only"): NodeCapabilities {
+function capabilities(roots: string[], credentialRefs: string[], executionMode?: "metadata-only" | "workspace-effects"): NodeCapabilities {
   return {
-    protocol: executionMode ? NODE_EXECUTION_PROTOCOL_VERSION : NODE_PROTOCOL_VERSION,
+    protocol: executionMode === "workspace-effects" ? NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION : executionMode ? NODE_EXECUTION_PROTOCOL_VERSION : NODE_PROTOCOL_VERSION,
     version: productVersion,
     platform: process.platform,
     arch: process.arch,
@@ -496,7 +497,7 @@ function capabilities(roots: string[], credentialRefs: string[], executionMode?:
     piDurable: durableVersion,
     roots,
     credentialRefs,
-    executionEnabled: executionMode === "metadata-only",
+    executionEnabled: executionMode !== undefined,
     ...(executionMode ? { executionMode } : {})
   };
 }
@@ -624,7 +625,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
       throw error;
     }
     journal.sessionStarted(session);
-    if (options.executionMode === "metadata-only") {
+    if (options.executionMode) {
       supervisor = new NodeWorkerSupervisor({
         home: resolve(options.home, "worker-runtime"),
         machineId: options.machineId,
@@ -634,9 +635,11 @@ export async function runNode(options: NodeOptions): Promise<void> {
         credentialRefs,
         forbiddenCredentialRefs: [options.tokenEnv],
         executionEnabled: true,
+        executionMode: options.executionMode,
         onMailboxActivity: notifyMailboxActivity,
         ...(options.testOnlyScripted ? { testOnlyScripted: true } : {}),
         ...(options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
+        ...(options.testOnlyWorkspaceEffectLoop ? { testOnlyWorkspaceEffectLoop: true } : {}),
         isLeaseCurrent: (binding) => !stopping && performance.now() < leaseDeadline &&
           binding.machineId === options.machineId && binding.sessionId === session.sessionId &&
           binding.sessionEpoch === session.sessionEpoch

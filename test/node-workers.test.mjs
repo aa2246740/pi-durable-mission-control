@@ -8,7 +8,8 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  statSync
+  statSync,
+  writeFileSync
 } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +17,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DurableWorkerMailbox } from "../dist/worker-mailbox.js";
 import { NodeWorkerSupervisor, parseWorkerStartSpec } from "../dist/node-workers.js";
+import { nodeEffectExtinct } from "../dist/node-effect-executor.js";
 
 const waitFor = async (predicate, timeout = 15000) => {
   const deadline = Date.now() + timeout;
@@ -63,6 +65,7 @@ const specFor = (binding, workspace, credentialEnv = "MC_NODE_TEST_CREDENTIAL") 
   missionId: "node-mission-fixture",
   workspacePath: workspace,
   workspaceStrategy: "shared",
+  effects: false,
   profile: profile(credentialEnv),
   role
 });
@@ -206,6 +209,187 @@ test("starts one real node worker with isolated durable state and strict admissi
   assert.equal(stopEvidence.state, "closed");
   assertProcessGroupExtinct(stopEvidence.pid);
   assert.equal(supervisor.inspect()[0].live, false);
+});
+
+test("lease loss cancels a running node-local shell before reporting confirmed stop", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-node-worker-effect-stop-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  let leaseCurrent = true, supervisor;
+  const binding = bindingFor("effect-stop");
+  const spec = { ...specFor(binding, workspace, ""), effects: true };
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root, () => leaseCurrent),
+    executionMode: "workspace-effects"
+  });
+  const started = await supervisor.start(spec);
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle);
+  const taskId = `${binding.agentId}:long-running-shell`;
+  const args = { command: `sleep 30; printf late > '${join(workspace, "late-marker")}'` };
+  handle.child.emit("message", {
+    type: "rpc", id: "rpc-long-shell", token: handle.token, agentId: binding.agentId,
+    epoch: binding.epoch, method: "bash", args, taskId
+  });
+  await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.rpcId === "rpc-long-shell"));
+  const permit = {
+    binding, descriptorHash: started.descriptorHash, taskId, method: "bash", args, expiresAt: Date.now() + 20000
+  };
+  supervisor.mailbox.receive(binding, {
+    binding, messageId: "effect-stop-permit", sequence: 1,
+    payload: { kind: "reply", rpcId: "rpc-long-shell", ok: true, result: { effectPermit: permit } }
+  });
+  const pump = supervisor.pump(binding);
+  await waitFor(() => !nodeEffectExtinct(binding.runtimeId));
+  leaseCurrent = false;
+  supervisor.sweep();
+  await waitFor(() => supervisor.inspect()[0]?.state === "closed");
+  await pump;
+  assert.equal(supervisor.inspect()[0].confirmedStopped, true);
+  assert.equal(nodeEffectExtinct(binding.runtimeId), true);
+  assert.equal(existsSync(join(workspace, "late-marker")), false);
+  assertProcessGroupExtinct(started.pid);
+});
+
+test("effect arguments containing a configured secret are rejected before they reach the mailbox", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-node-worker-effect-redaction-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  const secret = "effect-command-secret-sentinel";
+  const previous = process.env.MC_NODE_TEST_CREDENTIAL;
+  process.env.MC_NODE_TEST_CREDENTIAL = secret;
+  let supervisor;
+  const binding = bindingFor("effect-redaction");
+  const spec = { ...specFor(binding, workspace), effects: true };
+  t.after(async () => {
+    await closeQuietly(supervisor);
+    if (previous === undefined) delete process.env.MC_NODE_TEST_CREDENTIAL;
+    else process.env.MC_NODE_TEST_CREDENTIAL = previous;
+    rmSync(home, { recursive: true, force: true });
+  });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    executionMode: "workspace-effects"
+  });
+  await supervisor.start(spec);
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle);
+  handle.child.emit("message", {
+    type: "rpc", id: "rpc-secret-effect", token: handle.token, agentId: binding.agentId,
+    epoch: binding.epoch, method: "bash",
+    args: { command: `printf '${secret}' > '${join(workspace, "secret-effect-output")}'` },
+    taskId: `${binding.agentId}:secret-effect`
+  });
+  await waitFor(() => supervisor.inspect()[0]?.state === "closed");
+  assert.equal(supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.rpcId === "rpc-secret-effect"), false);
+  assert.equal(existsSync(join(workspace, "secret-effect-output")), false);
+  assert.equal(JSON.stringify(supervisor.inspect()).includes(secret), false);
+});
+
+test("effect receipts redact configured secrets before mailbox disclosure", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-node-worker-effect-result-redaction-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  const secret = "effect-result-secret-sentinel";
+  const previous = process.env.MC_NODE_TEST_CREDENTIAL;
+  process.env.MC_NODE_TEST_CREDENTIAL = secret;
+  let supervisor;
+  const binding = bindingFor("effect-result-redaction");
+  const spec = { ...specFor(binding, workspace), effects: true };
+  writeFileSync(join(workspace, "secret.txt"), secret);
+  t.after(async () => {
+    await closeQuietly(supervisor);
+    if (previous === undefined) delete process.env.MC_NODE_TEST_CREDENTIAL;
+    else process.env.MC_NODE_TEST_CREDENTIAL = previous;
+    rmSync(home, { recursive: true, force: true });
+  });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    executionMode: "workspace-effects"
+  });
+  const started = await supervisor.start(spec);
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle);
+  const taskId = `${binding.agentId}:secret-read`;
+  const args = { path: "secret.txt" };
+  handle.child.emit("message", {
+    type: "rpc", id: "rpc-secret-read", token: handle.token, agentId: binding.agentId,
+    epoch: binding.epoch, method: "read_file", args, taskId
+  });
+  await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.rpcId === "rpc-secret-read"));
+  supervisor.mailbox.receive(binding, {
+    binding, messageId: "effect-result-redaction-permit", sequence: 1,
+    payload: {
+      kind: "reply", rpcId: "rpc-secret-read", ok: true,
+      result: { effectPermit: {
+        binding, descriptorHash: started.descriptorHash, taskId, method: "read_file", args, expiresAt: Date.now() + 20000
+      } }
+    }
+  });
+  await supervisor.pump(binding);
+  const receipt = supervisor.mailbox.inspectOutbox(binding).find(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.method === "RecordEffectReceipt")?.envelope.payload;
+  assert.ok(receipt && receipt.kind === "rpc");
+  assert.equal(receipt.args.receipt.result.content, "[REDACTED]");
+  assert.equal(JSON.stringify(receipt).includes(secret), false);
+  assert.equal(JSON.stringify(supervisor.effects.inspect()).includes(secret), false);
+});
+
+test("effect receipt is durable before a failed child reply send", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-node-worker-effect-send-failure-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  let supervisor;
+  const binding = bindingFor("effect-send-failure");
+  const spec = { ...specFor(binding, workspace, ""), effects: true };
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    executionMode: "workspace-effects"
+  });
+  const started = await supervisor.start(spec);
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle?.child);
+  const rpcId = "rpc-child-send-failure";
+  const taskId = `${binding.agentId}:write-before-send-failure`;
+  const args = { path: "durable-before-send.txt", content: "written once" };
+  handle.child.emit("message", {
+    type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId,
+    epoch: binding.epoch, method: "write_file", args, taskId
+  });
+  await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.rpcId === rpcId));
+  const permitId = "effect-send-failure-permit";
+  supervisor.mailbox.receive(binding, {
+    binding, messageId: permitId, sequence: 1,
+    payload: {
+      kind: "reply", rpcId, ok: true,
+      result: { effectPermit: {
+        binding, descriptorHash: started.descriptorHash, taskId, method: "write_file", args, expiresAt: Date.now() + 20000
+      } }
+    }
+  });
+  const originalSend = handle.child.send;
+  let failedReplySend = false;
+  handle.child.send = (message, callback) => {
+    if (message?.id === rpcId) {
+      failedReplySend = true;
+      callback(new Error("fixture child send failed"));
+      return false;
+    }
+    return originalSend.call(handle.child, message, callback);
+  };
+  await supervisor.pump(binding);
+  assert.equal(failedReplySend, true);
+  assert.equal(supervisor.inspect()[0].state, "closed");
+  assert.equal(readFileSync(join(workspace, "durable-before-send.txt"), "utf8"), "written once");
+  assert.equal(supervisor.mailbox.inspectInbox(binding).find(({ envelope }) => envelope.messageId === permitId).status, "applied");
+  assert.ok(supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.method === "RecordEffectReceipt"));
 });
 
 test("redacts IPC JSON without truncating business content and rejects invalid payloads before persistence", async (t) => {

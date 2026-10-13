@@ -102,3 +102,15 @@ test("an outer transaction cannot authorize execution before the claim is durabl
   assert.equal(journal.begin(spec).execute, true);
   assert.doesNotThrow(() => db.exec("BEGIN IMMEDIATE; ROLLBACK"));
 });
+
+test("effect receipts carry the node-local read_file content limit", t => {
+  const f = fixture(t), journal = f.open();
+  const readSpec = { ...spec, method: "read_file", args: { path: "large.txt" } };
+  const receipt = {
+    status: "succeeded",
+    result: { path: "/node/workspace/large.txt", content: "x".repeat(300000), truncated: false }
+  };
+  journal.admit(readSpec);
+  assert.equal(journal.begin(readSpec).execute, true);
+  assert.equal(journal.complete(readSpec, receipt).result.content.length, 300000);
+});

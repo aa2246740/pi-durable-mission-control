@@ -305,7 +305,12 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     const fencedResult = control.remoteRuntimeForAgent(fencedAgent.id);
     assert.equal(fencedResult.state, "closed");
     assert.equal(JSON.parse(fencedResult.last_report_json).outcome, "stopped");
-    assert.ok(control.blockers(fencedMission.id).some((blocker) => blocker.id === `remote-runtime:${fencedBinding.runtimeId}`));
+    assert.ok(control.blockers(fencedMission.id).some((blocker) => blocker.id === `remote-runtime:${fencedBinding.runtimeId}`), JSON.stringify({
+      missionStatus: control.missionById(fencedMission.id)?.status,
+      blockers: control.blockers(fencedMission.id).map(({ id, status, kind }) => ({ id, status, kind })),
+      lastReport: JSON.parse(fencedResult.last_report_json),
+      runtime: { state: fencedResult.state, desired: fencedResult.desired }
+    }));
     assert.equal(node.exitCode, null);
     assert.equal(node.signalCode, null);
     await waitFor(() => (control.machineRegistry.get(enrolled.machine.id)?.leaseExpiresAt ?? 0) > leaseBeforeFence, 10000);

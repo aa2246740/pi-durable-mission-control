@@ -5,6 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
 export const NODE_LEASE_MS = 20_000;
 export const NODE_PROTOCOL_VERSION = 1;
 export const NODE_EXECUTION_PROTOCOL_VERSION = 2;
+export const NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION = 3;
 export const NODE_COMMAND_KIND = "inspect_workspace" as const;
 
 export class MachineError extends Error {
@@ -23,7 +24,7 @@ export interface NodeCapabilities {
   roots: string[];
   credentialRefs: string[];
   executionEnabled: boolean;
-  executionMode?: "metadata-only";
+  executionMode?: "metadata-only" | "workspace-effects";
 }
 
 export interface RemoteMachine {
@@ -130,7 +131,9 @@ export function parseNodeCapabilities(value: unknown): NodeCapabilities {
   const readonly = input.protocol === NODE_PROTOCOL_VERSION && input.executionEnabled === false && !Object.hasOwn(input, "executionMode");
   const metadataOnly = input.protocol === NODE_EXECUTION_PROTOCOL_VERSION
     && input.executionEnabled === true && input.executionMode === "metadata-only";
-  if (!readonly && !metadataOnly) throw new MachineError(409, "Node protocol and execution mode are not supported");
+  const workspaceEffects = input.protocol === NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION
+    && input.executionEnabled === true && input.executionMode === "workspace-effects";
+  if (!readonly && !metadataOnly && !workspaceEffects) throw new MachineError(409, "Node protocol and execution mode are not supported");
   const roots = stringList(input.roots, "roots", (item) => item.startsWith("/") && item.length <= 4096 && !/[\u0000-\u001f]/.test(item), 32);
   if (!roots.length) throw new MachineError(400, "A node must declare at least one workspace root");
   return {
@@ -142,8 +145,8 @@ export function parseNodeCapabilities(value: unknown): NodeCapabilities {
     piDurable: shortText(input.piDurable, "piDurable", 80),
     roots,
     credentialRefs: stringList(input.credentialRefs, "credentialRefs", (item) => CREDENTIAL_REF.test(item), 64),
-    executionEnabled: metadataOnly,
-    ...(metadataOnly ? { executionMode: "metadata-only" as const } : {})
+    executionEnabled: metadataOnly || workspaceEffects,
+    ...((metadataOnly || workspaceEffects) ? { executionMode: input.executionMode as "metadata-only" | "workspace-effects" } : {})
   };
 }
 

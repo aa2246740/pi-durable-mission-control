@@ -111,11 +111,18 @@ test("runtime capability and descriptor protocol are explicit opt-ins", () => {
     missionId: "protocol-mission",
     workspacePath: "/remote/workspace",
     workspaceStrategy: "shared",
+    effects: false,
     profile,
     role
   };
   const parsed = parseWorkerStartSpec(descriptor);
   assert.equal(workerStartSpecHash(parsed).length, 64);
+  const legacy = { ...descriptor };
+  delete legacy.effects;
+  const parsedLegacy = parseWorkerStartSpec(legacy);
+  assert.deepEqual(parsedLegacy, legacy);
+  assert.equal(Object.hasOwn(parsedLegacy, "effects"), false);
+  assert.equal(workerStartSpecHash(parsedLegacy), workerStartSpecHash(legacy));
   for (const invalid of [
     { ...descriptor, testOnlyScripted: true },
     { ...descriptor, token: "private-token" },
@@ -229,6 +236,38 @@ test("runtime report IDs are idempotent and weaker late reports never downgrade 
     { recorded: false }, { recorded: true, duplicate: "true" },
     { recorded: true, duplicate: false, extra: true }, {}, null
   ]) assert.equal(validRuntimeReportAck(invalid), false);
+});
+
+test("unexpected stopped reports block an already-blocked nonterminal mission", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-runtime-report-blocked-"));
+  const fixture = createAssignedRemoteRuntime(home);
+  const { control, assignment, mission, agent } = fixture;
+  t.after(() => {
+    control.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const currentMission = control.getMission(mission.id);
+  control.db.prepare("UPDATE missions SET status='blocked',data=? WHERE id=?")
+    .run(JSON.stringify({ ...currentMission, status: "blocked" }), mission.id);
+  const priorBlocker = {
+    id: `delivery:prior-${assignment.binding.runtimeId}`, missionId: mission.id, agentId: agent.id,
+    kind: "delivery", status: "open", text: "A prior delivery requires reconciliation.", createdAt: new Date().toISOString()
+  };
+  control.db.prepare("INSERT INTO blockers(id,mission_id,status,data) VALUES(?,?,?,?)")
+    .run(priorBlocker.id, mission.id, priorBlocker.status, JSON.stringify(priorBlocker));
+
+  assert.equal(control.remoteRuntimeForAgent(agent.id).desired, "run");
+  const agentEpochBeforeReport = control.getAgentPublic(agent.id).epoch;
+  assert.deepEqual(reportToCoordinator(fixture, {
+    reportId: crypto.randomUUID(), binding: assignment.binding,
+    descriptorHash: assignment.descriptorHash, outcome: "stopped"
+  }), { recorded: true, duplicate: false });
+  assert.equal(control.getMission(mission.id).status, "blocked");
+  assert.equal(control.getAgentPublic(agent.id).epoch, agentEpochBeforeReport);
+  assert.ok(control.blockers(mission.id).some((blocker) => blocker.id === priorBlocker.id));
+  assert.ok(control.blockers(mission.id).some((blocker) => blocker.id === `remote-runtime:${assignment.binding.runtimeId}`));
+  assert.equal(control.detail(mission.id).events.some(event => event.type === "remote_runtime_uncertain"), false);
 });
 
 test("coordinator restart and lease expiry fence remote delivery without requeue or replacement", (t) => {

@@ -7,7 +7,9 @@ import {
   DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope, type JsonValue, type WorkerBinding, type WorkerEnvelope
 } from "./worker-mailbox.js";
 import { parseWorkerNotice, type WorkerNotice } from "./worker-events.js";
-import { NodeEffectJournal } from "./node-effects.js";
+import { NodeEffectJournal, type NodeEffectReceipt, type NodeEffectSpec } from "./node-effects.js";
+import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct } from "./node-effect-executor.js";
+import { REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { redactDiagnosticChunk, sanitizeDiagnostic } from "./workers.js";
 import {
   isReservedCredentialEnvironmentName, parseWorkerStartSpec, workerStartSpecHash, RESERVED_ENVIRONMENT_NAMES,
@@ -46,10 +48,12 @@ export interface NodeWorkerSupervisorOptions {
   credentialRefs: string[];
   forbiddenCredentialRefs?: string[];
   executionEnabled?: boolean;
+  executionMode?: "metadata-only" | "workspace-effects";
   isLeaseCurrent: (binding: WorkerBinding) => boolean;
   onMailboxActivity?: () => void;
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
+  testOnlyWorkspaceEffectLoop?: boolean;
 }
 
 export class NodeWorkerError extends Error {}
@@ -68,15 +72,28 @@ type RuntimeRow = {
 
 type DeliveryKey = string;
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 type Handle = {
   binding: WorkerBinding;
   descriptorHash: string;
+  workspacePath: string;
   child: ChildProcess;
   token: string;
   secret: string | undefined;
   pid: number;
   ready: Promise<void>;
   pendingRpc: Set<string>;
+  internalReceiptRpc: Set<string>;
+  pendingEffects: Map<string, { taskId: string; method: "read_file" | "write_file" | "bash"; args: { [key: string]: JsonValue } }>;
+  completedEffects: Map<string, { identity: string; receipt: string; expiresAt: number }>;
   pendingDeliveries: Map<DeliveryKey, string>;
   pendingAbort: string | undefined;
   exitObserved: Promise<void>;
@@ -159,6 +176,7 @@ export class NodeWorkerSupervisor {
   private readonly pumps = new Map<string, Promise<void>>();
   private readonly diagnostics = new Map<string, string>();
   private readonly watchdog: NodeJS.Timeout;
+  private readonly effects!: NodeEffectJournal;
   private closed = false;
   private closing: Promise<void> | undefined;
 
@@ -210,7 +228,8 @@ export class NodeWorkerSupervisor {
         confirmed_stopped INTEGER NOT NULL DEFAULT 0
       )`);
       this.mailbox = new DurableWorkerMailbox(this.db, "node");
-      new NodeEffectJournal(this.db).recover();
+      this.effects = new NodeEffectJournal(this.db);
+      this.effects.recover();
       this.recover();
     } catch (error) {
       try { this.db?.close(); } catch { /* preserve the setup error */ }
@@ -336,6 +355,9 @@ export class NodeWorkerSupervisor {
 
   private async startOnce(spec: WorkerStartSpec, hash: string): Promise<NodeWorkerSnapshot> {
     const binding = spec.binding;
+    if (spec.effects && this.options.executionMode !== "workspace-effects") {
+      throw new NodeWorkerError("Workspace effects are not enabled for this node session");
+    }
     if (!this.leaseCurrent(binding)) throw new NodeWorkerError("Node lease is not current for this binding");
     const workspace = canonicalDirectory(spec.workspacePath, "Workspace path");
     if (!this.roots.some((root) => within(root, workspace))) {
@@ -353,9 +375,10 @@ export class NodeWorkerSupervisor {
       workspaceStrategy: "shared" as const,
       profile: spec.profile,
       role: spec.role,
-      runtimeMode: "remote-metadata-only" as const,
+      runtimeMode: spec.effects ? "remote-workspace-effects" as const : "remote-metadata-only" as const,
       ...(this.options.testOnlyScripted ? { testOnlyScripted: true } : {}),
-      ...(this.options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {})
+      ...(this.options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
+      ...(this.options.testOnlyWorkspaceEffectLoop ? { testOnlyWorkspaceEffectLoop: true } : {})
     };
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -442,9 +465,12 @@ export class NodeWorkerSupervisor {
       throw new NodeWorkerError("Worker process could not be started");
     }
     const handle: Handle = {
-      binding, descriptorHash: hash, child, token, secret, pid,
+      binding, descriptorHash: hash, workspacePath: workspace, child, token, secret, pid,
       ready: Promise.resolve(),
       pendingRpc: new Set(),
+      internalReceiptRpc: new Set(),
+      pendingEffects: new Map(),
+      completedEffects: new Map(),
       pendingDeliveries: new Map(),
       pendingAbort: undefined,
       exitObserved,
@@ -619,6 +645,9 @@ export class NodeWorkerSupervisor {
       method: preflight.payload.method,
       args: this.redactStructured(handle, preflight.payload.args) as { [key: string]: JsonValue }
     };
+    if (REMOTE_EFFECT_METHODS.has(preflight.payload.method) && canonicalJson(uplink.args) !== canonicalJson(preflight.payload.args)) {
+      throw new Error("Workspace effect arguments contain a credential or private token and cannot be redacted");
+    }
     const checked = parseWorkerEnvelope({
       binding: handle.binding,
       messageId: "node-worker-rpc-redaction-check",
@@ -628,6 +657,13 @@ export class NodeWorkerSupervisor {
     if (!checked || checked.payload.kind !== "rpc") throw new Error("Redacted worker RPC is invalid");
     this.mailbox.enqueue(handle.binding, checked.payload);
     handle.pendingRpc.add(checked.payload.rpcId);
+    if (REMOTE_EFFECT_METHODS.has(checked.payload.method)) {
+      handle.pendingEffects.set(checked.payload.rpcId, {
+        taskId: checked.payload.taskId,
+        method: checked.payload.method as "read_file" | "write_file" | "bash",
+        args: checked.payload.args
+      });
+    }
     this.options.onMailboxActivity?.();
   }
 
@@ -780,8 +816,27 @@ export class NodeWorkerSupervisor {
     }
     if (payload.kind === "reply") {
       if (!handle.pendingRpc.has(payload.rpcId)) {
+        if (this.acceptDuplicateEffectReply(handle, payload.rpcId, payload)) {
+          this.mailbox.finish(binding, envelope.messageId);
+          return;
+        }
         this.note(binding.runtimeId, "A reply arrived for an RPC this worker did not issue");
         await this.stopHandle(handle, "A reply did not match an issued worker RPC");
+        return;
+      }
+      if (handle.internalReceiptRpc.has(payload.rpcId)) {
+        handle.pendingRpc.delete(payload.rpcId);
+        handle.internalReceiptRpc.delete(payload.rpcId);
+        this.mailbox.finish(binding, envelope.messageId);
+        if (!payload.ok) {
+          this.note(binding.runtimeId, "Coordinator rejected the durable workspace effect receipt");
+          await this.stopHandle(handle, "Coordinator rejected the workspace effect receipt");
+        }
+        return;
+      }
+      const effect = handle.pendingEffects.get(payload.rpcId);
+      if (effect) {
+        await this.applyEffectReply(handle, envelope, payload, effect);
         return;
       }
       try {
@@ -819,6 +874,120 @@ export class NodeWorkerSupervisor {
         // The binding is fenced; the processing claim stays as uncertain evidence.
       }
     }
+  }
+
+  private async applyEffectReply(
+    handle: Handle,
+    envelope: WorkerEnvelope,
+    payload: Extract<WorkerEnvelope["payload"], { kind: "reply" }>,
+    effect: { taskId: string; method: "read_file" | "write_file" | "bash"; args: { [key: string]: JsonValue } }
+  ): Promise<void> {
+    const binding = handle.binding;
+    const permit = payload.ok && payload.result && typeof payload.result === "object" ? (payload.result as Record<string, unknown>).effectPermit : undefined;
+    const permitRecord = permit && typeof permit === "object" ? permit as Record<string, unknown> : undefined;
+    const permitKeys = permitRecord && Reflect.ownKeys(permitRecord);
+    const args = permitRecord?.args;
+    const method = permitRecord?.method;
+    const permitBinding = parseWorkerBinding(permitRecord?.binding);
+    const bindingMatches = Boolean(permitBinding && ["runtimeId", "machineId", "sessionId", "sessionEpoch", "agentId", "epoch"].every((key) =>
+      Object.hasOwn(permitBinding, key) && permitBinding[key as keyof WorkerBinding] === binding[key as keyof WorkerBinding]));
+    const descriptorMatches = permitRecord?.descriptorHash === handle.descriptorHash;
+    const taskMatches = permitRecord?.taskId === effect.taskId;
+    const expiresAt = permitRecord?.expiresAt;
+    const exactPermit = Boolean(permitRecord && permitKeys?.length === 6 &&
+      ["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(permitRecord, key)));
+    if (!payload.ok || !exactPermit || !bindingMatches || !descriptorMatches || !taskMatches ||
+        typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) ||
+        method !== effect.method || canonicalJson(args) !== canonicalJson(effect.args)) {
+      await this.send(handle, { id: payload.rpcId, error: payload.ok ? "Coordinator effect permit did not match the requested operation" : payload.error });
+      await this.stopHandle(handle, "A workspace effect permit was rejected or mismatched");
+      return;
+    }
+    const spec = { binding, descriptorHash: handle.descriptorHash, taskId: effect.taskId, method: effect.method, args: effect.args };
+    let receipt: NodeEffectReceipt;
+    try {
+      this.effects.admit(spec);
+      const prior = this.effects.inspect().find((entry) =>
+        entry.spec.binding.runtimeId === binding.runtimeId && entry.spec.taskId === effect.taskId);
+      if (handle.stopping || !this.leaseCurrent(binding)) throw new Error("Node lease or runtime ownership was lost before the durable effect claim");
+      if (prior?.state === "prepared" && Date.now() >= expiresAt) throw new Error("Remote effect permit expired before the durable effect claim");
+      const claim = this.effects.begin(spec);
+      if (claim.execute && (handle.stopping || Date.now() >= expiresAt || !this.leaseCurrent(binding))) {
+        throw new Error("Remote effect permit expired or runtime ownership was lost before dispatch");
+      }
+      receipt = claim.execute ? await executeNodeEffect(spec, handle.workspacePath) : claim.receipt;
+      if (claim.execute && (handle.stopping || !this.leaseCurrent(binding))) receipt = { status: "uncertain", error: "Node lease or runtime ownership was lost during workspace effect execution" };
+      receipt = this.redactStructured(handle, receipt as unknown as JsonValue) as unknown as NodeEffectReceipt;
+      if (claim.execute) receipt = this.effects.complete(spec, receipt);
+    } catch (error) {
+      receipt = { status: "uncertain", error: this.safeText(handle, error) };
+      try { receipt = this.effects.complete(spec, receipt); } catch {}
+    }
+    const durable = this.effects.inspect().find(entry => canonicalJson(entry.spec) === canonicalJson(spec));
+    if (durable && durable.state !== "prepared" && durable.state !== "executing" && durable.receipt &&
+        canonicalJson(durable.receipt) === canonicalJson(receipt)) {
+      handle.completedEffects.set(payload.rpcId, {
+        identity: canonicalJson(spec), receipt: canonicalJson(receipt), expiresAt
+      });
+    }
+    const returnedReceipt = this.redactStructured(handle, receipt as unknown as JsonValue) as unknown as NodeEffectReceipt;
+    const receiptRpcId = `receipt:${payload.rpcId}`;
+    let transactionOpen = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      this.mailbox.enqueue(binding, {
+        kind: "rpc", rpcId: receiptRpcId, taskId: effect.taskId,
+        method: "RecordEffectReceipt", args: {
+          effectId: `${binding.agentId}\0${effect.taskId}`, binding: { ...binding }, descriptorHash: handle.descriptorHash,
+          taskId: effect.taskId, receipt: returnedReceipt
+        }
+      });
+      if (!this.mailbox.finish(binding, envelope.messageId)) {
+        throw new Error("Workspace effect permit reply was not processing");
+      }
+      this.db.exec("COMMIT");
+      transactionOpen = false;
+    } catch (error) {
+      if (transactionOpen) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+      }
+      throw error;
+    }
+    handle.pendingRpc.delete(payload.rpcId);
+    handle.pendingEffects.delete(payload.rpcId);
+    handle.pendingRpc.add(receiptRpcId);
+    handle.internalReceiptRpc.add(receiptRpcId);
+    this.options.onMailboxActivity?.();
+    await this.send(handle, { id: payload.rpcId, result: returnedReceipt });
+  }
+
+  private acceptDuplicateEffectReply(
+    handle: Handle,
+    rpcId: string,
+    payload: Extract<WorkerEnvelope["payload"], { kind: "reply" }>
+  ): boolean {
+    const cached = handle.completedEffects.get(rpcId);
+    if (!cached || !payload.ok || !payload.result || typeof payload.result !== "object") return false;
+    const permit = (payload.result as Record<string, unknown>).effectPermit;
+    if (!permit || typeof permit !== "object") return false;
+    const record = permit as Record<string, unknown>;
+    const keys = Reflect.ownKeys(record);
+    const binding = parseWorkerBinding(record.binding);
+    if (keys.length !== 6 || !["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(record, key)) ||
+        !binding || ["runtimeId", "machineId", "sessionId", "sessionEpoch", "agentId", "epoch"].some(key =>
+          binding[key as keyof WorkerBinding] !== handle.binding[key as keyof WorkerBinding]) ||
+        record.descriptorHash !== handle.descriptorHash || typeof record.taskId !== "string" ||
+        (record.method !== "read_file" && record.method !== "write_file" && record.method !== "bash") ||
+        !Number.isSafeInteger(record.expiresAt) || record.expiresAt !== cached.expiresAt) return false;
+    const spec: NodeEffectSpec = {
+      binding, descriptorHash: record.descriptorHash as string, taskId: record.taskId,
+      method: record.method, args: record.args as { [key: string]: JsonValue }
+    };
+    if (canonicalJson(spec) !== cached.identity) return false;
+    const entry = this.effects.inspect().find(item => canonicalJson(item.spec) === cached.identity);
+    return Boolean(entry && entry.state !== "prepared" && entry.state !== "executing" && entry.receipt &&
+      canonicalJson(entry.receipt) === cached.receipt);
   }
 
   private send(handle: Handle, message: object): Promise<void> {
@@ -876,6 +1045,7 @@ export class NodeWorkerSupervisor {
    */
   private async stopOnce(handle: Handle, reason: string): Promise<NodeWorkerStopEvidence> {
     const binding = handle.binding;
+    abortNodeEffect(binding.runtimeId);
     this.db.prepare("UPDATE node_worker_runtimes SET state='stopping' WHERE runtime_id=? AND state IN ('admitted','running')")
       .run(binding.runtimeId);
     try {
@@ -898,7 +1068,9 @@ export class NodeWorkerSupervisor {
       await this.waitForGroup(handle, STOP_KILL_MS);
     }
     if (!handle.exited) await waitForExitOrTimeout(handle.exitObserved, STOP_KILL_MS);
-    const confirmed = handle.exited && this.groupExtinct(handle);
+    const effectDeadline = Date.now() + STOP_KILL_MS;
+    while (!nodeEffectExtinct(binding.runtimeId) && Date.now() < effectDeadline) await delay(50);
+    const confirmed = handle.exited && this.groupExtinct(handle) && nodeEffectExtinct(binding.runtimeId);
     if (this.handles.get(binding.runtimeId) === handle) this.handles.delete(binding.runtimeId);
     handle.child.stderr?.destroy();
     if (handle.child.connected) handle.child.disconnect();

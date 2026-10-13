@@ -36,15 +36,16 @@ Commands:
   export <mission-id>   Write a mission export to stdout
   backup                Create a verified offline home backup
   restore               Restore a verified backup into a new home
-  node                  Connect a readonly node to a coordinator
+  node                  Connect a node to a coordinator (readonly by default)
 
 Options:
   --home <path>   Daemon home directory (default ~/.mission-control)
   --node-port <port>  Optional separate node-only listener for serve/start (0 selects a free port)
   --out <path>    New backup directory for backup
   --from <path>   Backup directory for restore
-  node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>] [--execution-mode metadata-only]
-  --execution-mode metadata-only opts into metadata RPC only; it does not enable filesystem, shell, MCP, Git, or artifact effects
+  node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>] [--execution-mode metadata-only|workspace-effects]
+  --execution-mode metadata-only enables metadata RPC only; workspace-effects additionally enables node-local read_file, write_file, and bash
+  Approval-mode remote effects remain explicitly unavailable in phase 1 and are pending phase 2.
   service install --home <path> [--port <port>]
   service start --home <path>
   service status --home <path>
@@ -65,7 +66,7 @@ type Invocation =
   | { command: "restore"; home: string; from: string }
   | { command: "service-install"; home: string; port: number }
   | { command: "service-start" | "service-status" | "service-uninstall"; home: string }
-  | { command: "node"; coordinator: string; machineId: string; tokenEnv: string; home: string; roots: string[]; credentialRefs: string[]; executionMode?: "metadata-only" };
+  | { command: "node"; coordinator: string; machineId: string; tokenEnv: string; home: string; roots: string[]; credentialRefs: string[]; executionMode?: "metadata-only" | "workspace-effects" };
 
 const VALUE_FLAGS = ["--home", "--port", "--node-port", "--lines", "--out", "--from", "--coordinator", "--machine-id", "--token-env", "--root", "--credential-ref", "--execution-mode"] as const;
 type ValueFlag = (typeof VALUE_FLAGS)[number];
@@ -83,7 +84,7 @@ const SPEC: Record<CommandName, { flags: ValueFlag[]; positionals: number; usage
   backup: { flags: ["--home", "--out"], positionals: 0, usage: "mission-control backup --home <path> --out <directory>" },
   restore: { flags: ["--from", "--home"], positionals: 0, usage: "mission-control restore --from <directory> --home <new-path>" },
   service: { flags: ["--home", "--port"], positionals: 1, usage: "mission-control service <install|start|status|uninstall> --home <path> [--port <port>]" },
-  node: { flags: ["--coordinator", "--machine-id", "--token-env", "--home", "--root", "--credential-ref", "--execution-mode"], positionals: 0, usage: "mission-control node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>] [--execution-mode metadata-only]" }
+  node: { flags: ["--coordinator", "--machine-id", "--token-env", "--home", "--root", "--credential-ref", "--execution-mode"], positionals: 0, usage: "mission-control node --coordinator <url> --machine-id <id> --token-env <NAME> --home <path> --root <abs> [--root <abs>] [--credential-ref <NAME>] [--execution-mode metadata-only|workspace-effects]" }
 };
 
 class UsageError extends Error {}
@@ -177,7 +178,7 @@ function parse(argv: string[]): Invocation {
     const executionMode = values.get("--execution-mode");
     const roots = repeated.get("--root") ?? [];
     if (!coordinator || !machineId || !tokenEnv || !homeValue || roots.length === 0) throw new UsageError(`Usage: ${spec.usage}`);
-    if (executionMode !== undefined && executionMode !== "metadata-only") throw new UsageError("--execution-mode must be metadata-only");
+    if (executionMode !== undefined && executionMode !== "metadata-only" && executionMode !== "workspace-effects") throw new UsageError("--execution-mode must be metadata-only or workspace-effects");
     return {
       command,
       coordinator,
@@ -186,7 +187,7 @@ function parse(argv: string[]): Invocation {
       home: resolve(homeValue),
       roots,
       credentialRefs: repeated.get("--credential-ref") ?? [],
-      ...(executionMode === undefined ? {} : { executionMode: "metadata-only" as const })
+      ...(executionMode === undefined ? {} : { executionMode: executionMode as "metadata-only" | "workspace-effects" })
     };
   }
   const home = homeValue === undefined ? defaultHome() : resolve(homeValue);

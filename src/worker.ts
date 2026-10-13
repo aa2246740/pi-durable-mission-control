@@ -14,7 +14,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { ModelProfile, RoleProfile } from "./contracts.js";
 import { AGENT_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS, WORKTREE_INSTRUCTIONS } from "./prompts.js";
 import type { WorkerNotice, WorkerNoticeBody } from "./worker-events.js";
-import { REMOTE_RPC_METHODS } from "./remote-rpc-methods.js";
+import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 
 export type WorkerConfig = {
   agentId: string;
@@ -26,9 +26,10 @@ export type WorkerConfig = {
   workspaceStrategy?: "shared" | "worktree";
   profile: ModelProfile;
   role: RoleProfile;
-  runtimeMode?: "remote-metadata-only";
+  runtimeMode?: "remote-metadata-only" | "remote-workspace-effects";
   testOnlyScripted?: boolean;
   testOnlyToolLoop?: boolean;
+  testOnlyWorkspaceEffectLoop?: boolean;
 };
 
 type ParentMessage = { type: "deliver"; messageId: string; requestId: string; attempt: number; epoch: number; content: string; mode: "steer" | "followUp" } | { type: "abort" } | { type: "shutdown" };
@@ -202,7 +203,7 @@ function tools(config: WorkerConfig) {
     tool("CompleteMission", "Request mission completion after domain gates pass.", {}),
     tool("read_file", "Read a file inside the mission workspace.", { path: Type.String() }),
     tool("write_file", "Write a file inside the mission workspace.", { path: Type.String(), content: Type.String() }),
-    tool("bash", "Run a command inside the mission workspace using a restricted environment.", { command: Type.String() })
+    tool("bash", "Run a command in the node user's OS context with a minimal environment. This is not a sandbox and can access files and same-user processes permitted to that OS user.", { command: Type.String() })
   ];
   const selected = config.role.kind === "orchestrator"
     ? [...common, tool("SpawnAgent", "Create a worker or validator agent in this mission.", {
@@ -214,6 +215,8 @@ function tools(config: WorkerConfig) {
       : common;
   const runtimeTools = config.runtimeMode === "remote-metadata-only"
     ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name))
+    : config.runtimeMode === "remote-workspace-effects"
+      ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name) || REMOTE_EFFECT_METHODS.has(item.name))
     : selected;
   return defineExtension({ name: "mission-control-tools", tools: runtimeTools });
 }
@@ -241,7 +244,18 @@ export async function openWorkerRuntime(
   };
   const faux = config.testOnlyScripted ? fauxProvider() : undefined;
   if (config.testOnlyScripted) {
-    faux!.setResponses(config.testOnlyToolLoop
+    faux!.setResponses(config.testOnlyWorkspaceEffectLoop
+      ? [
+          fauxAssistantMessage(fauxToolCall("GetMissionState", {}), { stopReason: "toolUse" }),
+          fauxAssistantMessage(fauxToolCall("write_file", { path: "remote-effect.txt", content: "node-only" }), { stopReason: "toolUse" }),
+          fauxAssistantMessage(fauxToolCall("bash", { command: "printf x >> effect-marker" }), { stopReason: "toolUse" }),
+          fauxAssistantMessage([
+            { type: "text", text: "test-only workspace effects completed" },
+            fauxToolCall("Report", { summary: "test-only workspace effects", evidence: "node-local effect receipt" })
+          ], { stopReason: "toolUse" }),
+          fauxAssistantMessage("test-only next durable input")
+        ]
+      : config.testOnlyToolLoop
       ? [
           fauxAssistantMessage(fauxToolCall("GetMissionState", {}), { stopReason: "toolUse" }),
           fauxAssistantMessage([
@@ -279,7 +293,7 @@ export async function openWorkerRuntime(
     const agent = {
       extensions: [extension],
       model: { provider: config.testOnlyScripted ? "faux" : `mission-${config.profile.id}`, modelId: config.testOnlyScripted ? "faux-1" : config.profile.modelId },
-      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : ""}`,
+      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : config.runtimeMode === "remote-workspace-effects" ? "\n\nThis runtime permits only node-local read_file, write_file, and bash effects in the assigned workspace. Approval-mode effects are still required by policy and are explicitly pending phase 2; they are unavailable in phase 1. bash is not an OS sandbox: it runs as the node's OS user. Only read_file/write_file paths are scoped to the assigned workspace; the shell receives no credential environment variables intentionally." : ""}`,
       ...(extension.tools ? { tools: extension.tools } : {}),
       cwd: config.workspacePath
     };

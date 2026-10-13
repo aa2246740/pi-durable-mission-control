@@ -42,7 +42,8 @@ import { MachineRegistry, type NodeCommand, type RemoteMachine } from "./machine
 import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
-import { REMOTE_RPC_METHODS } from "./remote-rpc-methods.js";
+import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
+import { parseNodeEffectReceipt } from "./node-effects.js";
 import {
   addAgentWorktree,
   addDetachedWorktree,
@@ -761,13 +762,14 @@ export class ControlPlane {
         if (!saved.duplicate) {
           const agent = this.getAgent(report.binding.agentId);
           const mission = agent ? this.getMission(agent.missionId) : undefined;
-          const unexpected = saved.unexpected && mission?.status === "active";
-          if (unexpected && agent) this.markAgentInterrupted(agent.id, report.binding.epoch);
-          if (report.outcome !== "stopped" || unexpected) {
+          const unexpectedActive = saved.unexpected && mission?.status === "active";
+          const unexpectedNonterminal = saved.unexpected && mission && !["completed", "cancelled"].includes(mission.status);
+          if (unexpectedActive && agent) this.markAgentInterrupted(agent.id, report.binding.epoch);
+          if (report.outcome !== "stopped" || unexpectedNonterminal) {
             if (agent) this.insertSystemBlocker(`remote-runtime:${report.binding.runtimeId}`, agent.missionId, "delivery",
               "Remote runtime ownership or in-flight work requires trusted reconciliation before resuming.");
           }
-          if (unexpected && mission) this.event(mission.id, "remote_runtime_uncertain",
+          if (unexpectedActive && mission) this.event(mission.id, "remote_runtime_uncertain",
             "An active remote runtime ended unexpectedly; delivery state is fenced and requires trusted reconciliation.", agent?.id);
         }
         return { recorded: true, duplicate: saved.duplicate };
@@ -795,10 +797,11 @@ export class ControlPlane {
           role.kind !== "worker" || mission.workspaceStrategy === "worktree" ||
           workspace.machineId !== agent.machineId || !mission.remoteWorkspaceIds?.includes(workspace.id) || !workspace.probe ||
           machine.status !== "online" || (machine.leaseExpiresAt ?? 0) <= Date.now() ||
-          machine.sessionId === undefined || machine.capabilities?.executionMode !== "metadata-only" ||
+          machine.sessionId === undefined || !machine.capabilities ||
+          !["metadata-only", "workspace-effects"].includes(machine.capabilities.executionMode ?? "") ||
           machine.capabilities.executionEnabled !== true ||
           (profile.credentialEnv && !machine.capabilities.credentialRefs.includes(profile.credentialEnv))) {
-        throw new HttpError(409, "Remote worker assignment is not valid for the current metadata-only node session");
+        throw new HttpError(409, "Remote worker assignment is not valid for the current node session");
       }
       const active = this.remoteRuntimes.activeForAgent(agentId);
       if (active) {
@@ -835,7 +838,7 @@ export class ControlPlane {
       };
       const descriptor = parseWorkerStartSpec({
         binding, missionId: mission.id, workspacePath: workspace.path,
-        workspaceStrategy: "shared", profile, role
+        workspaceStrategy: "shared", ...(machine.capabilities?.executionMode === "workspace-effects" ? { effects: true } : {}), profile, role
       });
       const assigned = this.remoteRuntimes.assign(descriptor);
       this.workerMailbox.open(binding);
@@ -1351,7 +1354,7 @@ export class ControlPlane {
         (machine.leaseExpiresAt ?? 0) <= Date.now() ||
         !machine.sessionId || !machine.sessionEpoch ||
         machine.capabilities?.executionEnabled !== true ||
-        machine.capabilities.executionMode !== "metadata-only") {
+        !["metadata-only", "workspace-effects"].includes(machine.capabilities.executionMode ?? "")) {
         throw new HttpError(409, "Remote execution is not enabled on this machine");
       }
       if (profile.credentialEnv && !machine.capabilities.credentialRefs.includes(profile.credentialEnv)) {
@@ -1363,7 +1366,8 @@ export class ControlPlane {
           sessionId: machine.sessionId ?? randomUUID(), sessionEpoch: machine.sessionEpoch || 1,
           agentId: randomUUID(), epoch: 1
         },
-        missionId: mission.id, workspacePath: workspace.path, workspaceStrategy: "shared", profile, role
+        missionId: mission.id, workspacePath: workspace.path, workspaceStrategy: "shared",
+        ...(machine.capabilities.executionMode === "workspace-effects" ? { effects: true } : {}), profile, role
       });
     }
     const id = randomUUID();
@@ -2512,7 +2516,7 @@ export class ControlPlane {
         runtime.machine_id === freshAgent.machineId && runtime.epoch === freshAgent.epoch &&
         machine?.status === "online" && machine.sessionId === runtime.session_id &&
         machine.sessionEpoch === runtime.session_epoch && (machine.leaseExpiresAt ?? 0) > Date.now() &&
-        machine.capabilities?.executionEnabled === true && machine.capabilities.executionMode === "metadata-only"
+        machine.capabilities?.executionEnabled === true && ["metadata-only", "workspace-effects"].includes(machine.capabilities.executionMode ?? "")
       );
       if (!routeCurrent || !runtime || !freshAgent || !freshMessage || !machine) {
         this.blockRemoteOutboxWithinTransaction(row.id, agent.id,
@@ -2923,7 +2927,7 @@ export class ControlPlane {
 
   async workerCommand(request: RpcMessage): Promise<unknown> {
     const current = this.getAgent(request.agentId);
-    if (current && current.machineId !== "local" && !REMOTE_RPC_METHODS.has(request.method)) {
+    if (current && current.machineId !== "local" && !REMOTE_RPC_METHODS.has(request.method) && !REMOTE_EFFECT_METHODS.has(request.method)) {
       throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
     }
     if (current && current.epoch !== request.epoch) {
@@ -2967,6 +2971,37 @@ export class ControlPlane {
       throw new HttpError(409, "Mission is not accepting worker commands");
     }
     const args = request.args && typeof request.args === "object" ? request.args as Record<string, unknown> : {};
+    if (current && current.machineId !== "local" && REMOTE_EFFECT_METHODS.has(request.method)) {
+      if (mission.status !== "active") throw new HttpError(409, "Mission is not accepting worker commands");
+      if (role.kind === "validator" && request.method !== "read_file") throw new HttpError(403, "Validators may only read remote workspaces");
+      if (mission.autonomy === "approve") throw new HttpError(409, "Approval-mode remote effects are pending phase 2 and unavailable in phase 1");
+      const runtime = this.remoteRuntimes.activeForAgent(agent.id);
+      const machine = runtime ? this.machineRegistry.get(runtime.machine_id) : undefined;
+      let descriptor: ReturnType<typeof parseWorkerStartSpec> | undefined;
+      try { if (runtime) descriptor = parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)); } catch { descriptor = undefined; }
+      if (!runtime || !descriptor?.effects || runtime.state !== "running" || runtime.desired !== "run" ||
+          !machine || machine.status !== "online" || machine.capabilities?.executionMode !== "workspace-effects" ||
+          machine.sessionId !== runtime.session_id || machine.sessionEpoch !== runtime.session_epoch ||
+          (machine.leaseExpiresAt ?? 0) <= Date.now()) throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
+      if (!request.taskId.startsWith(`${agent.id}:`)) throw new HttpError(400, "Remote effects require a stable worker task ID");
+      const keys = request.method === "read_file" ? ["path"] : request.method === "write_file" ? ["path", "content"] : ["command"];
+      const required = request.method === "write_file" ? ["path"] : keys;
+      if (Reflect.ownKeys(args).length !== keys.length || keys.some((key) => typeof args[key] !== "string") ||
+          required.some((key) => !String(args[key]).trim()) ||
+          keys.some((key) => Buffer.byteLength(String(args[key])) > (key === "command" ? 32000 : key === "content" ? 256 * 1024 : 4096))) {
+        throw new HttpError(400, "Invalid remote workspace effect arguments");
+      }
+      const binding = {
+        runtimeId: runtime.runtime_id, machineId: runtime.machine_id, sessionId: runtime.session_id,
+        sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
+      };
+      const expiresAt = Math.min(machine.leaseExpiresAt ?? 0, Date.now() + 20_000);
+      const permit = { effectPermit: { binding, descriptorHash: runtime.descriptor_hash, taskId: request.taskId, method: request.method, args, expiresAt } };
+      return this.command(`mission:${mission.id}:remote-effects`, request.taskId, { binding, descriptorHash: runtime.descriptor_hash, method: request.method, args }, () => {
+        this.event(mission.id, "remote_effect_authorized", `Authorized ${request.method} on the remote workspace.`, agent.id, { taskId: request.taskId, method: request.method });
+        return permit;
+      });
+    }
     const getString = (name: string, required = true): string => {
       const value = args[name];
       if (typeof value !== "string" || (required && !value.trim())) throw new HttpError(400, `${name} is required`);
@@ -3093,6 +3128,34 @@ export class ControlPlane {
         const command = getString("command");
         if (mission.autonomy === "approve") return this.createApproval(agent.id, request.epoch, request.taskId, "bash", { command });
         return this.runShellCommand(agent, request.taskId, command);
+      }
+      case "RecordEffectReceipt": {
+        const effectId = args.effectId;
+        const taskId = args.taskId;
+        const descriptorHash = args.descriptorHash;
+        const runtime = this.remoteRuntimes.activeForAgent(agent.id);
+        const descriptor = runtime ? parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)) : undefined;
+        const binding = parseWorkerBinding(args.binding);
+        const expectedBinding = descriptor?.binding;
+        const bindingMatches = Boolean(binding && expectedBinding &&
+          binding.runtimeId === expectedBinding.runtimeId && binding.machineId === expectedBinding.machineId &&
+          binding.sessionId === expectedBinding.sessionId && binding.sessionEpoch === expectedBinding.sessionEpoch &&
+          binding.agentId === expectedBinding.agentId && binding.epoch === expectedBinding.epoch);
+        const machine = runtime ? this.machineRegistry.get(runtime.machine_id) : undefined;
+        const receipt = expectedBinding ? parseNodeEffectReceipt(args.receipt, expectedBinding) : undefined;
+        const exactArgs = Reflect.ownKeys(args).length === 5 &&
+          ["effectId", "binding", "descriptorHash", "taskId", "receipt"].every(key => Object.hasOwn(args, key));
+        if (!exactArgs || !runtime || !descriptor?.effects || runtime.state !== "running" || runtime.desired !== "run" ||
+            !machine || machine.status !== "online" || machine.sessionId !== runtime.session_id ||
+            machine.sessionEpoch !== runtime.session_epoch || (machine.leaseExpiresAt ?? 0) <= Date.now() ||
+            runtime.descriptor_hash !== descriptorHash || effectId !== `${agent.id}\0${String(taskId)}` ||
+            !bindingMatches || taskId !== request.taskId || !String(taskId).startsWith(`${agent.id}:`) || !receipt) {
+          throw new HttpError(409, "Effect receipt does not match the active remote assignment");
+        }
+        return this.command(`mission:${mission.id}:effect-receipts`, request.taskId, { effectId, descriptorHash, receipt }, () => {
+          this.event(mission.id, "remote_effect_receipt", "A remote workspace effect produced a receipt.", agent.id, { effectId, receipt });
+          return { recorded: true };
+        });
       }
       default:
         throw new HttpError(400, `Unknown worker operation: ${request.method}`);

@@ -20,6 +20,8 @@ type EffectRow = {
   receipt_json: string | null; created_at: number; updated_at: number;
 };
 
+const MAX_RECEIPT_BYTES = 480 * 1024;
+
 export class NodeEffectError extends Error {}
 
 function fail(): never {
@@ -78,8 +80,17 @@ function checkedReceipt(value: unknown, binding: WorkerBinding): NodeEffectRecei
     binding, messageId: "node-effect-receipt", sequence: 1,
     payload: { kind: "reply", rpcId: "node-effect-receipt", ok: true, result: value.result }
   });
-  if (!envelope || envelope.payload.kind !== "reply" || !envelope.payload.ok || Buffer.byteLength(stable(envelope.payload.result)) > 256 * 1024) fail();
+  if (!envelope || envelope.payload.kind !== "reply" || !envelope.payload.ok ||
+      Buffer.byteLength(stable(envelope.payload.result)) > MAX_RECEIPT_BYTES) fail();
   return { status, result: envelope.payload.result };
+}
+
+export function parseNodeEffectReceipt(value: unknown, binding: WorkerBinding): NodeEffectReceipt | undefined {
+  try {
+    return checkedReceipt(value, binding);
+  } catch {
+    return undefined;
+  }
 }
 
 /** The owner must hold the node supervisor's exclusive lock. This journal does not authorize or execute effects. */

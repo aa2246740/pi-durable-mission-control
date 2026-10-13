@@ -98,13 +98,21 @@ test("node capabilities accept only readonly v1 or explicit metadata-only v2", (
   });
   assert.equal(v2.executionEnabled, true);
   assert.equal(v2.executionMode, "metadata-only");
+  const v3 = parseNodeCapabilities({
+    ...v1, protocol: 3, executionEnabled: true, executionMode: "workspace-effects"
+  });
+  assert.equal(v3.executionEnabled, true);
+  assert.equal(v3.executionMode, "workspace-effects");
   for (const invalid of [
     { ...v1, protocol: 1, executionEnabled: true },
     { ...v1, protocol: 1, executionEnabled: false, executionMode: "metadata-only" },
     { ...v1, protocol: 2, executionEnabled: false },
     { ...v1, protocol: 2, executionEnabled: true },
     { ...v1, protocol: 2, executionEnabled: true, executionMode: "full" },
-    { ...v1, protocol: 2, executionEnabled: true, executionMode: "metadata-only", testOnlyScripted: true }
+    { ...v1, protocol: 2, executionEnabled: true, executionMode: "metadata-only", testOnlyScripted: true },
+    { ...v1, protocol: 2, executionEnabled: true, executionMode: "workspace-effects" },
+    { ...v1, protocol: 3, executionEnabled: true, executionMode: "metadata-only" },
+    { ...v1, protocol: 3, executionEnabled: false, executionMode: "workspace-effects" }
   ]) assert.throws(() => parseNodeCapabilities(invalid));
 });
 
@@ -321,7 +329,7 @@ test("remote workspace assignments are mission-scoped and readonly protocol-1 no
   manager = new WorkerManager(control, true);
   await assert.rejects(
     () => manager.startAgent(forgedRemoteAgent),
-    (error) => error.status === 409 && /Remote execution is not enabled|metadata-only node session/.test(error.message)
+    (error) => error.status === 409 && error.message === "Remote worker assignment is not valid for the current node session"
   );
   assert.equal(existsSync(join(control.home, "agents", `${forgedRemoteAgent.id}.sqlite`)), false);
 });

@@ -232,12 +232,13 @@ test("help, version, and invalid arguments do not create the requested home", as
   assert.equal(help.code, 0);
   assert.match(help.stdout, /Usage: mission-control/);
   assert.match(help.stdout, /--execution-mode metadata-only/);
+  assert.match(help.stdout, /--execution-mode metadata-only\|workspace-effects/);
   const invalidExecutionMode = await runCli([
     "node", "--coordinator", "http://127.0.0.1:4310", "--machine-id", "test-node",
     "--token-env", "NODE_TEST_TOKEN", "--home", home, "--root", "/", "--execution-mode", "full"
   ]);
   assert.equal(invalidExecutionMode.code, 1);
-  assert.match(invalidExecutionMode.stderr, /--execution-mode must be metadata-only/);
+  assert.match(invalidExecutionMode.stderr, /--execution-mode must be metadata-only or workspace-effects/);
   const helpCommand = await runCli(["help", "--home", home]);
   assert.equal(helpCommand.code, 0);
   const version = await runCli(["--version", "--home", home]);
