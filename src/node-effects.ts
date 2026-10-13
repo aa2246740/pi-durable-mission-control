@@ -104,6 +104,22 @@ export class NodeEffectJournal {
     }
   }
 
+  private durableClaim<T>(fn: () => T): T {
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+    } catch (error) {
+      throw new NodeEffectError("An external effect requires a committed top-level execution claim", { cause: error });
+    }
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private identity(value: unknown): { spec: NodeEffectSpec; id: string; hash: string } {
     const spec = checkedSpec(value);
     return { spec, id: digest(spec.binding.agentId + "\0" + spec.taskId), hash: digest(stable(spec)) };
@@ -136,8 +152,7 @@ export class NodeEffectJournal {
 
   begin(value: NodeEffectSpec): { execute: true } | { execute: false; receipt: NodeEffectReceipt } {
     const { spec, id, hash } = this.identity(value);
-    if (this.db.isTransaction) throw new NodeEffectError("An external effect requires a committed top-level execution claim");
-    return this.atomic(() => {
+    return this.durableClaim(() => {
       const row = this.matching(id, hash);
       if (row.state === "executing" || row.state === "uncertain") throw new NodeEffectError("Prior effect may have executed; it will not be repeated automatically");
       if (row.state !== "prepared") {

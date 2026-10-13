@@ -100,5 +100,5 @@ test("an outer transaction cannot authorize execution before the claim is durabl
   assert.equal(journal.inspect()[0].state, "prepared");
   db.exec("ROLLBACK");
   assert.equal(journal.begin(spec).execute, true);
-  assert.equal(db.isTransaction, false);
+  assert.doesNotThrow(() => db.exec("BEGIN IMMEDIATE; ROLLBACK"));
 });
