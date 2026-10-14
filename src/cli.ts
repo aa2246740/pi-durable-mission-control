@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { spawn, type ChildProcess } from "node:child_process";
-import { timingSafeEqual } from "node:crypto";
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -267,60 +266,34 @@ function tail(path: string, lines: number): string {
   }
 }
 
-function serve(home: string, port: number, nodePort?: number): Promise<void> {
+async function serve(home: string, port: number, nodePort?: number): Promise<void> {
   const runFile = join(home, "daemon.json");
-  return startServer({ home, port, ...(nodePort === undefined ? {} : { nodePort }) }).then((service) => {
-    const info: DaemonInfo = {
-      pid: process.pid,
-      port: service.port,
-      ...(service.nodePort === undefined ? {} : { nodePort: service.nodePort }),
-      daemonId: service.control.daemonId,
-      startedAt: new Date().toISOString(),
-      log: join(home, "daemon.log")
-    };
-    writeFileSync(runFile, JSON.stringify(info), { mode: 0o600 });
-    appendFileSync(info.log, `[${info.startedAt}] Mission Control listening on 127.0.0.1:${info.port} pid=${info.pid}\n`, { mode: 0o600 });
-    process.stdout.write(`Mission Control listening on 127.0.0.1:${info.port} (pid ${info.pid})\n`);
-    if (info.nodePort !== undefined) process.stdout.write(`Node-only listener on 127.0.0.1:${info.nodePort}; tunnel only this port, never the administrator port.\n`);
-    let stopping = false;
-    const shutdown = (): void => {
-      if (stopping) return;
-      stopping = true;
-      void service.close().then(() => {
-        const current = readDaemonRecord(home);
-        if (current.state === "present" && current.info.pid === process.pid && current.info.daemonId === info.daemonId) unlinkSync(runFile);
-        appendFileSync(info.log, `[${new Date().toISOString()}] Mission Control stopped\n`);
-        process.exit(0);
-      });
-    };
-    // Keep shutdown on the administrator listener and bind it to this incarnation.
-    const token = readFileSync(join(home, "admin.token"), "utf8").trim();
-    const handlers = service.server.rawListeners("request");
-    service.server.removeAllListeners("request");
-    service.server.on("request", (request, response) => {
-      if (request.url !== "/api/daemon/stop") {
-        for (const handler of handlers) handler.call(service.server, request, response);
-        return;
-      }
-      const authorization = Buffer.from(request.headers.authorization ?? "");
-      const expected = Buffer.from(`Bearer ${token}`);
-      const localHost = request.headers.host === `127.0.0.1:${info.port}` || request.headers.host === `localhost:${info.port}`;
-      if (request.method !== "POST" || !localHost || request.headers.origin !== undefined ||
-          request.headers.cookie !== undefined || request.headers["sec-fetch-site"] !== undefined ||
-          authorization.length !== expected.length || !timingSafeEqual(authorization, expected)) {
-        response.writeHead(403).end();
-        return;
-      }
-      if (request.headers["x-mission-control-daemon-id"] !== info.daemonId) {
-        response.writeHead(409).end();
-        return;
-      }
-      response.writeHead(202, { "connection": "close", "cache-control": "no-store" }).end();
-      shutdown();
+  const service = await startServer({ home, port, ...(nodePort === undefined ? {} : { nodePort }), onDaemonStop: shutdown });
+  const info: DaemonInfo = {
+    pid: process.pid,
+    port: service.port,
+    ...(service.nodePort === undefined ? {} : { nodePort: service.nodePort }),
+    daemonId: service.control.daemonId,
+    startedAt: new Date().toISOString(),
+    log: join(home, "daemon.log")
+  };
+  writeFileSync(runFile, JSON.stringify(info), { mode: 0o600 });
+  appendFileSync(info.log, `[${info.startedAt}] Mission Control listening on 127.0.0.1:${info.port} pid=${info.pid}\n`, { mode: 0o600 });
+  process.stdout.write(`Mission Control listening on 127.0.0.1:${info.port} (pid ${info.pid})\n`);
+  if (info.nodePort !== undefined) process.stdout.write(`Node-only listener on 127.0.0.1:${info.nodePort}; tunnel only this port, never the administrator port.\n`);
+  let stopping = false;
+  function shutdown(): void {
+    if (stopping) return;
+    stopping = true;
+    void service.close().then(() => {
+      const current = readDaemonRecord(home);
+      if (current.state === "present" && current.info.pid === process.pid && current.info.daemonId === info.daemonId) unlinkSync(runFile);
+      appendFileSync(info.log, `[${new Date().toISOString()}] Mission Control stopped\n`);
+      process.exit(0);
     });
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
-  });
+  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 function describeExit(exit: { code: number | null; signal: NodeJS.Signals | null }): string {
