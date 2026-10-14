@@ -348,6 +348,35 @@ test("validation commands single-flight, replay terminal receipts, and fence unc
   }
 });
 
+test("local shared-mode mission completion still rechecks its source and snapshot", async () => {
+  const f = fixture();
+  try {
+    const { task, artifact } = validationTarget(f, "local-completion");
+    f.control.updateTask(f.orchestrator.id, f.orchestrator.epoch, "local-completion-claim", task.id, { fulfills: ["REQ-001"] });
+    const receipt = await f.control.runValidation(f.validator.id, f.validator.epoch, "local-completion-receipt", {
+      taskId: task.id, command: "printf local-completion", artifactIds: [artifact.id]
+    });
+    f.control.validateTask(f.validator.id, f.validator.epoch, "local-completion-validation",
+      task.id, receipt.id, true, "Local validation passed", [
+        { assertionId: "REQ-001", status: "passed", evidence: "The local command exited zero" }
+      ]);
+    const completeMission = async commandId => f.control.workerCommand({
+      id: commandId, token: "test-only", agentId: f.orchestrator.id, epoch: f.orchestrator.epoch,
+      method: "CompleteMission", args: {}, taskId: commandId
+    });
+    const sourceBytes = readFileSync(artifact.path);
+    writeFileSync(artifact.path, "changed local source");
+    await assert.rejects(completeMission("reject-changed-local-source"), /Artifact .* or its source has changed/);
+    assert.equal(f.control.detail(f.mission.id).events.filter(event => event.type === "mission_completed").length, 0);
+    writeFileSync(artifact.path, sourceBytes);
+    const completed = await completeMission("local-completion");
+    assert.equal(completed.status, "completed");
+    assert.equal(f.control.detail(f.mission.id).events.filter(event => event.type === "mission_completed").length, 1);
+  } finally {
+    clean(f);
+  }
+});
+
 test("approve-mode validation stores and notifies the real validator receipt", async () => {
   const f = fixture({ autonomy: "approve" });
   try {

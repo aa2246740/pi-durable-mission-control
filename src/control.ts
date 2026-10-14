@@ -3537,6 +3537,15 @@ export class ControlPlane {
           (worktreeMode && receipt.snapshotIntegrity !== true)) {
           throw new HttpError(409, `Task ${task.id} has no current accepted validation receipt`);
         }
+        const taskOwner = task.ownerId ? this.getAgent(task.ownerId) : undefined;
+        if (taskOwner && taskOwner.machineId !== "local") {
+          this.assertRemoteSnapshotInputs(task, receipt, validation, true, true);
+          continue;
+        }
+        if (receipt.workspaceKind === "remote-snapshot" ||
+            receipt.artifactIds.some((artifactId) => this.artifact(artifactId)?.remoteProvenance !== undefined)) {
+          throw new HttpError(409, "Remote snapshot artifacts cannot satisfy local task completion");
+        }
         for (const artifactId of receipt.artifactIds) {
           const artifact = this.artifact(artifactId);
           const snapshotValid = artifact?.snapshotPath &&
@@ -4280,6 +4289,81 @@ export class ControlPlane {
     return rows.some((row) => row.id !== exceptTaskId && decode<Task>(row.data).integration === true);
   }
 
+  private assertRemoteSnapshotInputs(
+    task: Task, receipt: ValidationReceipt, validation?: Validation, requireArtifacts = false, requireExitZero = false
+  ): void {
+    const owner = task.ownerId ? this.getAgent(task.ownerId) : undefined;
+    const validator = task.validatorId ? this.getAgent(task.validatorId) : undefined;
+    const taskRevision = task.revision ?? 0;
+    if (!owner || owner.machineId === "local" || this.role(owner.roleId)?.kind !== "worker" ||
+        !task.validatorId || task.validatorId === task.ownerId || !validator ||
+        this.role(validator.roleId)?.kind !== "validator" ||
+        receipt.workspaceKind !== "remote-snapshot" || receipt.snapshotIntegrity !== true || !receipt.workspacePath ||
+        receipt.missionId !== task.missionId || receipt.taskId !== task.id || receipt.validatorId !== task.validatorId ||
+        (requireExitZero && receipt.exitCode !== 0) || receipt.attempt !== task.attempt || receipt.taskRevision !== taskRevision) {
+      throw new HttpError(409, "Remote snapshot validation is not current and independently assigned");
+    }
+    if (!Array.isArray(receipt.artifactIds) || (requireArtifacts && receipt.artifactIds.length === 0) ||
+        new Set(receipt.artifactIds).size !== receipt.artifactIds.length ||
+        !receipt.artifactDigests || typeof receipt.artifactDigests !== "object" || Array.isArray(receipt.artifactDigests) ||
+        Object.keys(receipt.artifactDigests).length !== receipt.artifactIds.length ||
+        (validation !== undefined && (!validation.passed || validation.missionId !== task.missionId ||
+          validation.taskId !== task.id || validation.agentId !== task.validatorId || validation.receiptId !== receipt.id ||
+          validation.attempt !== task.attempt || validation.taskRevision !== taskRevision ||
+          !Array.isArray(validation.artifactIds) || validation.artifactIds.length !== receipt.artifactIds.length ||
+          validation.artifactIds.some((artifactId, index) => artifactId !== receipt.artifactIds[index])))) {
+      throw new HttpError(409, "Remote snapshot validation is not bound to its accepted artifacts");
+    }
+
+    try {
+      for (const artifactId of receipt.artifactIds) {
+        const artifact = this.artifact(artifactId);
+        if (!artifact || !artifact.snapshotPath || artifact.missionId !== task.missionId ||
+            artifact.agentId !== task.ownerId || artifact.taskId !== task.id ||
+            !artifact.remoteProvenance || artifact.remoteProvenance.agentId !== task.ownerId ||
+            artifact.remoteProvenance.machineId !== owner.machineId ||
+            artifact.remoteProvenance.taskAttempt !== task.attempt ||
+            receipt.artifactDigests[artifactId] !== artifact.sha256) {
+          throw new Error("Remote artifact provenance does not match the accepted task snapshot");
+        }
+        const expectedCasPath = join(resolve(this.home), "artifacts", artifact.sha256);
+        const casInfo = lstatSync(artifact.snapshotPath);
+        if (artifact.snapshotPath !== expectedCasPath || casInfo.isSymbolicLink() || !casInfo.isFile() ||
+            casInfo.size !== artifact.size ||
+            createHash("sha256").update(readFileSync(artifact.snapshotPath)).digest("hex") !== artifact.sha256) {
+          throw new Error("Remote artifact CAS snapshot is missing, unsafe, or changed");
+        }
+      }
+
+      const remoteRoot = join(resolve(this.home), "validations", "remote");
+      const workspacePath = receipt.workspacePath;
+      const leaf = basename(workspacePath);
+      if (!/^[a-f0-9]{32}$/.test(leaf) || workspacePath !== resolve(workspacePath) ||
+          !workspacePath.startsWith(remoteRoot + sep) || realpathSync(remoteRoot) !== remoteRoot ||
+          realpathSync(workspacePath) !== workspacePath || lstatSync(workspacePath).isSymbolicLink() ||
+          !lstatSync(workspacePath).isDirectory()) {
+        throw new Error("Detached validation directory escaped its coordinator-owned root");
+      }
+      for (const artifactId of receipt.artifactIds) {
+        const artifact = this.artifact(artifactId)!;
+        const relative = artifact.relativePath!;
+        if (!relative || relative.startsWith("/") || relative.includes("\\") ||
+            relative.split("/").some((part) => !part || part === "." || part === ".." || /\p{Cc}/u.test(part))) {
+          throw new Error("Remote validation artifact path is unsafe");
+        }
+        const path = join(workspacePath, ...relative.split("/"));
+        const fileStat = lstatSync(path);
+        if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.nlink !== 1 || realpathSync(path) !== path ||
+            fileStat.size !== artifact.size ||
+            createHash("sha256").update(readFileSync(path)).digest("hex") !== artifact.sha256) {
+          throw new Error("Detached validation input changed after receipt creation");
+        }
+      }
+    } catch {
+      throw new HttpError(409, "Remote artifact CAS or detached validation inputs are missing, unsafe, or changed");
+    }
+  }
+
   validateTask(agentId: string, epoch: number, commandId: string, taskId: string, receiptId: string, passed: boolean, evidence: string, assertionResults?: AssertionResult[]): Validation {
     const row = this.db.prepare("SELECT data FROM tasks WHERE id=?").get(taskId) as Row | undefined;
     if (!row) throw new HttpError(404, "Task not found");
@@ -4362,61 +4446,20 @@ export class ControlPlane {
         throw new HttpError(409, "Validation receipt is stale for the current assertion revisions");
       }
     }
-    for (const artifactId of receipt.artifactIds) {
-      const artifact = this.artifact(artifactId);
-      if (remoteSnapshot && artifact?.snapshotPath) {
-        const expectedCasPath = join(resolve(this.home), "artifacts", artifact.sha256);
-        try {
-          const info = lstatSync(artifact.snapshotPath);
-          if (artifact.snapshotPath !== expectedCasPath || info.isSymbolicLink() || !info.isFile()) {
-            throw new Error("CAS path is not a regular file");
-          }
-        } catch {
-          throw new HttpError(409, "Remote artifact CAS snapshot is missing or unsafe");
-        }
-      }
-      if (!artifact || !artifact.snapshotPath ||
-        (remoteSnapshot ? (!artifact.remoteProvenance || artifact.agentId !== task.ownerId ||
-          artifact.taskId !== task.id || artifact.remoteProvenance.taskAttempt !== task.attempt ||
-          artifact.remoteProvenance.agentId !== task.ownerId) :
-          (artifact.remoteProvenance !== undefined ||
-            (!worktreeMode && createHash("sha256").update(readFileSync(artifact.path)).digest("hex") !== artifact.sha256))) ||
-        createHash("sha256").update(readFileSync(artifact.snapshotPath)).digest("hex") !== artifact.sha256 ||
-        receipt.artifactDigests[artifactId] !== artifact.sha256 ||
-        (worktreeMode && (!artifact.workspaceCommit || !artifact.relativePath || artifact.agentId !== task.ownerId ||
-          artifact.taskId !== task.id || !isAncestor(mission.repository!.path, artifact.workspaceCommit, receipt.workspaceCommit!) ||
-          createHash("sha256").update(trackedBlobAt(mission.repository!.path, artifact.workspaceCommit, artifact.relativePath).bytes).digest("hex") !== artifact.sha256))) {
-        throw new HttpError(409, "Validation artifact is stale or has changed");
-      }
-    }
     if (remoteSnapshot) {
-      const remoteRoot = join(resolve(this.home), "validations", "remote");
-      const workspacePath = receipt.workspacePath!;
-      const leaf = basename(workspacePath);
-      try {
-        if (!/^[a-f0-9]{32}$/.test(leaf) || workspacePath !== resolve(workspacePath) ||
-            !workspacePath.startsWith(remoteRoot + sep) || realpathSync(remoteRoot) !== remoteRoot ||
-            realpathSync(workspacePath) !== workspacePath || lstatSync(workspacePath).isSymbolicLink() ||
-            !lstatSync(workspacePath).isDirectory()) {
-          throw new Error("Detached validation directory escaped its coordinator-owned root");
+      this.assertRemoteSnapshotInputs(task, receipt, undefined, false, passed);
+    } else {
+      for (const artifactId of receipt.artifactIds) {
+        const artifact = this.artifact(artifactId);
+        if (!artifact || !artifact.snapshotPath || artifact.remoteProvenance !== undefined ||
+            (!worktreeMode && createHash("sha256").update(readFileSync(artifact.path)).digest("hex") !== artifact.sha256) ||
+            createHash("sha256").update(readFileSync(artifact.snapshotPath)).digest("hex") !== artifact.sha256 ||
+            receipt.artifactDigests[artifactId] !== artifact.sha256 ||
+            (worktreeMode && (!artifact.workspaceCommit || !artifact.relativePath || artifact.agentId !== task.ownerId ||
+              artifact.taskId !== task.id || !isAncestor(mission.repository!.path, artifact.workspaceCommit, receipt.workspaceCommit!) ||
+              createHash("sha256").update(trackedBlobAt(mission.repository!.path, artifact.workspaceCommit, artifact.relativePath).bytes).digest("hex") !== artifact.sha256))) {
+          throw new HttpError(409, "Validation artifact is stale or has changed");
         }
-        for (const artifactId of receipt.artifactIds) {
-          const artifact = this.artifact(artifactId)!;
-          const relative = artifact.relativePath!;
-          if (!relative || relative.startsWith("/") || relative.includes("\\") ||
-              relative.split("/").some((part) => !part || part === "." || part === ".." || /\p{Cc}/u.test(part))) {
-            throw new Error("Remote validation artifact path is unsafe");
-          }
-          const path = join(workspacePath, ...relative.split("/"));
-          const fileStat = lstatSync(path);
-          if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.nlink !== 1 || realpathSync(path) !== path ||
-              fileStat.size !== artifact.size ||
-              createHash("sha256").update(readFileSync(path)).digest("hex") !== artifact.sha256) {
-            throw new Error("Detached validation input changed after receipt creation");
-          }
-        }
-      } catch {
-        throw new HttpError(409, "Remote detached validation inputs are missing, unsafe, or changed");
       }
     }
     if (passed && receipt.exitCode !== 0) throw new HttpError(409, "A passing validation requires a completed exit-0 command receipt");

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -21,7 +21,9 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   const home = mkdtempSync(join(tmpdir(), "remote-artifact-http-"));
   const root = join(home, "remote-root"), localPath = join(home, "local-workspace"), nodeHome = join(home, "node-home");
   mkdirSync(root); mkdirSync(localPath);
-  const service = await startServer({ home: join(home, "control"), port: 0, nodePort: 0 });
+  const service = await startServer({
+    home: join(home, "control"), port: 0, nodePort: 0, testOnlyScripted: true
+  });
   const control = service.control;
   const enrolled = control.enrollMachine("remote-artifact-node", "Remote artifact node");
   const nodeModule = new URL("../dist/node.js", import.meta.url).href;
@@ -94,7 +96,7 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   const validator = control.createAgent(mission.id, "Local validator", roles[2].id, "Validate detached input.", "artifact-validator");
   const task = control.createTask(currentOrchestrator.id, currentOrchestrator.epoch, "artifact-task", {
     missionId: mission.id, title: "Freeze evidence", description: "", acceptance: "The frozen bytes pass validation",
-    dependencies: [], ownerId: worker.id, validatorId: validator.id
+    dependencies: [], ownerId: worker.id, validatorId: validator.id, fulfills: ["REQ-001"]
   });
   const runningTask = control.updateTask(currentOrchestrator.id, currentOrchestrator.epoch, "artifact-task-running", task.id, { status: "running" });
   const original = Buffer.alloc(REMOTE_ARTIFACT_CHUNK_BYTES + 19, 0xa5);
@@ -273,7 +275,9 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   const receipt = await control.runValidation(currentValidator.id, currentValidator.epoch, "artifact-validation", validationInput);
   assert.equal(receipt.workspaceKind, "remote-snapshot");
   assert.equal(receipt.snapshotIntegrity, true);
-  assert.match(receipt.stdout, /FROZEN-SNAPSHOT-VERIFIED/);
+  const postValidationState = control.detail(mission.id);
+  assert.match(receipt.stdout, /FROZEN-SNAPSHOT-VERIFIED/,
+    `validation exited ${receipt.exitCode}: ${receipt.stderr}; mission=${postValidationState.mission.status}; turns=${postValidationState.mission.turns}; blockers=${JSON.stringify(postValidationState.blockers)}`);
   assert.match(receipt.stderr, /DETACHED-SNAPSHOT-CHECK/);
   assert.equal(JSON.stringify(receipt).includes(original.toString("base64")), false);
   assert.notEqual(receipt.workspacePath, localPath);
@@ -282,7 +286,9 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
 
   writeFileSync(join(receipt.workspacePath, "artifact.bin"), "tampered-validation-copy");
   assert.throws(() => control.validateTask(currentValidator.id, currentValidator.epoch, "artifact-validate-tampered",
-    task.id, receipt.id, true, "tampered copy"), /detached validation inputs/i);
+    task.id, receipt.id, true, "tampered copy", [
+      { assertionId: "REQ-001", status: "passed", evidence: "The detached input previously passed" }
+    ]), /detached validation inputs/i);
   writeFileSync(join(receipt.workspacePath, "artifact.bin"), original);
   const taskRow = control.db.prepare("SELECT data FROM tasks WHERE id=?").get(task.id);
   const staleTask = { ...JSON.parse(taskRow.data), attempt: runningTask.attempt + 1 };
@@ -291,6 +297,37 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
     /provenance is stale|task attempt/i);
   control.db.prepare("UPDATE tasks SET data=? WHERE id=?").run(taskRow.data, task.id);
   const validation = control.validateTask(currentValidator.id, currentValidator.epoch, "artifact-validate",
-    task.id, receipt.id, true, "detached copy matched the frozen artifact");
+    task.id, receipt.id, true, "detached copy matched the frozen artifact", [
+      { assertionId: "REQ-001", status: "passed", evidence: "The frozen artifact digest matched" }
+    ]);
   assert.equal(validation.passed, true);
+
+  const completionEvents = () => control.detail(mission.id).events.filter(event => event.type === "mission_completed").length;
+  const completeMission = async commandId => {
+    const current = control.getAgentPublic(orchestrator.id);
+    return control.workerCommand({
+      id: commandId, token: "test-only", agentId: current.id, epoch: current.epoch,
+      method: "CompleteMission", args: {}, taskId: commandId
+    });
+  };
+  assert.equal(control.detail(mission.id).mission.status, "active", "the RPC completion check requires an active mission");
+  writeFileSync(join(receipt.workspacePath, "artifact.bin"), "tampered-after-acceptance");
+  await assert.rejects(completeMission("reject-tampered-detached-completion"), /remote artifact CAS or detached validation inputs/i);
+  assert.equal(completionEvents(), 0);
+  writeFileSync(join(receipt.workspacePath, "artifact.bin"), original);
+
+  chmodSync(artifact.snapshotPath, 0o600);
+  writeFileSync(artifact.snapshotPath, "tampered coordinator CAS");
+  await assert.rejects(completeMission("reject-tampered-cas-completion"), /remote artifact CAS or detached validation inputs/i);
+  assert.equal(completionEvents(), 0);
+  writeFileSync(artifact.snapshotPath, original);
+  chmodSync(artifact.snapshotPath, 0o400);
+
+  unlinkSync(join(root, "artifact.bin"));
+  assert.equal(existsSync(join(root, "artifact.bin")), false);
+  assert.equal(existsSync(join(localPath, "artifact.bin")), false);
+  const completed = await completeMission("remote-snapshot-completion");
+  assert.equal(completed.status, "completed");
+  assert.equal(control.detail(mission.id).mission.status, "completed");
+  assert.equal(completionEvents(), 1);
 });
