@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setImmediate as nextImmediate } from "node:timers/promises";
 import { test } from "node:test";
+import { applyWorkerNotice } from "../dist/worker-events.js";
 import { ControlPlane } from "../dist/control.js";
 import { fixture } from "./fixtures/completion.mjs";
 
@@ -412,4 +413,100 @@ test("interruption rolls back both delivery records and the epoch if blocker per
     f.control.db.exec("DROP TRIGGER reject_delivery_blocker");
     f.settle();
   }
+});
+
+
+test("an answer during question settlement stays queued and reaches a new owner after pause", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pausing = requestUserInput(f);
+  const reply = await f.reply;
+  await nextImmediate();
+  const deliveries = [];
+  // Replace only the child transport; owner fencing and delivery settlement use
+  // the real control plane through the normal startAgent/dispatchPending path.
+  f.workers.startAgentOnce = async agent => {
+    if (agent.id !== f.agent.id) return;
+    const owner = f.control.claimAgentOwner(agent.id);
+    const child = new EventEmitter();
+    Object.assign(child, { connected: true, exitCode: null, signalCode: null });
+    child.send = (message, callback) => {
+      callback(null);
+      if (message.type === "deliver") {
+        deliveries.push(message);
+        assert.equal(f.control.ackOutbox(message.messageId, message.requestId, message.attempt, owner.epoch, "admitted"), true);
+        applyWorkerNotice(f.control, owner, { type: "settled", agentId: owner.id, epoch: owner.epoch,
+          messageId: message.messageId, requestId: message.requestId, attempt: message.attempt,
+          submissionId: "answer", status: "done", result: { status: "done" } }, String);
+      }
+      if (message.type === "shutdown") {
+        child.emit("message", { type: "closed", agentId: owner.id, epoch: owner.epoch });
+        child.exitCode = 0;
+        child.connected = false;
+        child.emit("exit", 0);
+      }
+    };
+    f.workers.handles.set(owner.id, { child, token: "replacement", epoch: owner.epoch, ready: Promise.resolve(), stopping: false });
+  };
+  f.control.resolveBlocker(reply.result.id, "Proceed with the next step");
+  const answerId = `blocker-resolution:${reply.result.id}`;
+  try {
+    await f.workers.dispatchPending();
+    assert.equal(f.control.message(answerId).status, "queued");
+    assert.equal(f.sent.some(message => message.type === "deliver"), false);
+  } finally {
+    f.settle();
+    t.mock.timers.tick(5000);
+    await pausing;
+  }
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.equal(f.control.message(answerId).status, "completed");
+  assert.equal(f.control.message(answerId).attempt, 1);
+  assert.deepEqual(deliveries.map(message => message.messageId), [answerId]);
+  assert.ok(deliveries[0].epoch > f.handle.epoch);
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  assert.equal(f.control.blockers(f.mission.id).some(blocker => blocker.status === "open"), false);
+});
+
+test("manual pause interrupts an existing question settlement without waiting for its deadline", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pausing = requestUserInput(f);
+  await f.reply;
+  await nextImmediate();
+  f.control.missionAction(f.mission.id, "pause");
+  const manual = f.workers.pauseMission(f.mission.id);
+  try {
+    await nextImmediate();
+    assert.equal(f.sent.some(message => message.type === "abort"), true);
+    await Promise.all([pausing, manual]);
+    assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+    assert.equal(f.control.missionById(f.mission.id).status, "paused");
+    assert.equal(Boolean(f.control.getAgentPublic(f.agent.id).error?.includes("5000 ms")), false);
+    assert.equal(f.child.listenerCount("message"), 1);
+    assert.equal(f.child.listenerCount("exit"), 0);
+  } finally {
+    t.mock.timers.tick(5000);
+    await Promise.all([pausing, manual]);
+  }
+});
+
+test("normal coordinator close cancels readiness without failing the local Mission", async t => {
+  const f = await fixture(t);
+  f.settle();
+  const ready = Promise.withResolvers();
+  f.handle.ready = ready.promise;
+  f.child.once("exit", () => ready.reject(new Error("Worker exited before readiness (0)")));
+  const starting = f.workers.startAgent(f.agent);
+  const closing = f.workers.close();
+  const results = await Promise.allSettled([starting, closing]);
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  assert.deepEqual(results.map(result => result.status), ["fulfilled", "fulfilled"]);
+  assert.equal(f.control.detail(f.mission.id).events.some(event => event.type === "worker_start_failed"), false);
+  f.control.close();
+  const reopened = new ControlPlane(join(f.home, "state"));
+  try {
+    assert.equal(reopened.missionById(f.mission.id).status, "active");
+    assert.equal(reopened.detail(f.mission.id).events.some(event => event.type === "worker_start_failed"), false);
+  } finally { reopened.close(); }
 });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { request as httpRequest } from "node:http";
 import { join } from "node:path";
@@ -199,3 +200,146 @@ for (const timeout of [0, -1, 0.5, NaN, 10001]) {
     await assert.rejects(startServer({ home: "unused", port: 0, remoteShutdownTimeoutMs: timeout }), /Remote shutdown timeout/);
   });
 }
+
+
+test("a first stop report processed after the persisted deadline is fenced before the timeout callback", async t => {
+  const f = await fixture(t, 50);
+  let clock = Date.now();
+  t.mock.method(Date, "now", () => clock);
+  const closing = f.service.close();
+  // Advance wall time without running the pending timeout. This is the exact
+  // ordering produced when the event loop handles a late report first.
+  clock += 112;
+  f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, f.report);
+  const confirmed = f.control.confirmedRemoteRuntimeStop(f.assignment.binding.runtimeId);
+  await closing;
+  assert.equal(confirmed, false, "A late report must not establish controlled stop proof");
+  const control = new ControlPlane(join(f.home, "control"));
+  try {
+    reconnect(f, control);
+    assert.equal(control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+    assert.equal(control.detail(f.mission.id).events.filter(event => event.type === "coordinator_stop_unconfirmed").length, 1);
+    resolve(f, control);
+    assert.throws(() => control.assignRemoteRuntime(f.agent.id), /uncertain/);
+    assert.equal(control.remoteRuntimeSnapshots(f.mission.id).length, 1);
+  } finally { control.close(); }
+});
+
+test("remote confirmation waiting stops an unrelated local shell and MCP immediately", async t => {
+  const f = await fixture(t, 1000);
+  const localMission = f.control.createMission({ title: "Local only", goal: "Stop immediately", acceptance: "No late write",
+    workspaceId: f.mission.workspaceId, roleIds: f.mission.roleIds, maxTurns: 20, maxCost: 0,
+    autonomy: "trusted", workspaceStrategy: "shared" });
+  const started = f.control.missionAction(localMission.id, "start");
+  const localAgent = f.control.getAgentPublic(started.orchestratorId);
+  const child = new EventEmitter();
+  Object.assign(child, { connected: true, exitCode: null, signalCode: null });
+  child.send = (message, callback) => {
+    callback(null);
+    if (message.type === "shutdown") {
+      child.emit("message", { type: "closed", agentId: localAgent.id, epoch: localAgent.epoch });
+      child.exitCode = 0;
+      child.connected = false;
+      child.emit("exit", 0);
+    }
+  };
+  f.service.workers.handles.set(localAgent.id, { child, token: "local", epoch: localAgent.epoch,
+    ready: Promise.resolve(), stopping: false });
+  const ready = join(localAgent.workspacePath, "shutdown-shell-ready");
+  const marker = join(localAgent.workspacePath, "after-close-marker");
+  const shell = f.control.workerCommand({ type: "rpc", id: "shutdown-shell", token: "", agentId: localAgent.id, epoch: localAgent.epoch,
+    method: "bash", taskId: "shutdown-shell", args: {
+      command: "printf ready > shutdown-shell-ready; sleep 0.2; printf late > after-close-marker"
+    } });
+  const deadline = Date.now() + 5000;
+  while (!existsSync(ready)) {
+    assert.ok(Date.now() < deadline, "Shell did not start");
+    await new Promise(resolveWait => setTimeout(resolveWait, 10));
+  }
+  let mcpClosed = false;
+  const closeMcp = f.control.mcpRuntime.close.bind(f.control.mcpRuntime);
+  f.control.mcpRuntime.close = async () => { mcpClosed = true; await closeMcp(); };
+  const closing = f.service.close();
+  try {
+    const result = await shell;
+    assert.equal(result.exitCode, null, "Local shell must stop before its delayed write");
+    assert.equal(existsSync(marker), false);
+    assert.equal(mcpClosed, true);
+    // Allow the local quiescence continuation after the real shell closes.
+    await new Promise(resolveImmediate => setImmediate(resolveImmediate));
+    assert.equal(child.connected, false, "Local worker must close while the remote report is still pending");
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).state, "stopping", "The node report must still be pending");
+  } finally {
+    f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, f.report);
+    await closing;
+  }
+});
+
+
+for (const firstAt of [49, 50]) {
+  test(`first shutdown confirmation at ${firstAt}ms keeps its deadline decision on retry and restart`, async t => {
+    const f = await fixture(t, 50);
+    const started = Date.now();
+    let clock = started;
+    t.mock.method(Date, "now", () => clock);
+    const closing = f.service.close();
+    const event = f.control.detail(f.mission.id).events.find(item => item.type === "coordinator_stopping");
+    assert.equal(event.data.deadlineAt, started + 50);
+    clock = started + firstAt;
+    f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, f.report);
+    clock = started + 112;
+    f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, f.report);
+    f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch,
+      { ...f.report, reportId: crypto.randomUUID() });
+    await closing;
+    const control = new ControlPlane(join(f.home, "control"));
+    try {
+      reconnect(f, control);
+      assert.equal(control.confirmedRemoteRuntimeStop(f.assignment.binding.runtimeId), firstAt < 50);
+      resolve(f, control);
+      if (firstAt < 50) assert.notEqual(control.assignRemoteRuntime(f.agent.id).binding.runtimeId, f.assignment.binding.runtimeId);
+      else assert.throws(() => control.assignRemoteRuntime(f.agent.id), /uncertain/);
+    } finally { control.close(); }
+  });
+}
+
+test("an already paused Mission also persists and enforces the shutdown deadline", async t => {
+  const f = await fixture(t, 50);
+  f.control.missionAction(f.mission.id, "pause");
+  let clock = Date.now();
+  t.mock.method(Date, "now", () => clock);
+  const closing = f.service.close();
+  clock += 112;
+  f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, f.report);
+  assert.equal(f.control.confirmedRemoteRuntimeStop(f.assignment.binding.runtimeId), false);
+  const events = f.control.detail(f.mission.id).events;
+  assert.equal(events.some(event => event.type === "coordinator_stopping"), false, "Do not change recovery notification eligibility");
+  assert.equal(events.find(event => event.type === "coordinator_stop_waiting").data.deadlineAt, clock - 62);
+  await closing;
+});
+
+test("shutdown allows node stop evidence and administrator reads while rejecting new business uploads", async t => {
+  const f = await fixture(t);
+  const adminToken = readFileSync(join(f.home, "control", "admin.token"), "utf8").trim();
+  const closing = f.service.close();
+  const read = await fetch(`http://127.0.0.1:${f.service.port}/api/missions/${f.mission.id}`, {
+    headers: { authorization: `Bearer ${adminToken}` }
+  });
+  assert.equal(read.status, 200);
+  await read.arrayBuffer();
+  for (const path of ["mailbox/upload", "mailbox/poll", "mailbox/ack", "artifacts/chunk", "artifacts/complete"]) {
+    const response = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/${path}`, {
+      method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" }, body: "{}"
+    });
+    assert.equal(response.status, 503);
+    await response.arrayBuffer();
+  }
+  const result = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/runtimes/events`, {
+    method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ machineId: f.enrolled.machine.id, sessionId: f.session.sessionId,
+      sessionEpoch: f.session.sessionEpoch, ...f.report })
+  });
+  assert.equal(result.status, 200);
+  await result.arrayBuffer();
+  await closing;
+});

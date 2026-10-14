@@ -180,6 +180,10 @@ export async function startServer(options: ServerOptions) {
   const tokenPath = join(home, tokenFileName);
   if (!existsSync(tokenPath)) writeFileSync(tokenPath, randomBytes(32).toString("hex"), { mode: 0o600, flag: "wx" });
   const token = readFileSync(tokenPath, "utf8").trim();
+  const shutdownNodeRoutes = new Set([
+    "/api/nodes/session", "/api/nodes/poll", "/api/nodes/events", "/api/nodes/runtimes/poll",
+    "/api/nodes/runtimes/events", "/api/nodes/effects/receipts", "/api/nodes/mailbox/settlement"
+  ]);
   const handleRequest = (nodeOnly: boolean) => async (request: IncomingMessage, response: ServerResponse) => {
     try {
       response.setHeader("x-content-type-options", "nosniff");
@@ -198,10 +202,10 @@ export async function startServer(options: ServerOptions) {
       const nodeRoute = url.pathname.startsWith("/api/nodes/");
       const readRequestBody = async (): Promise<Record<string, unknown>> => {
         const body = await readBody(request);
-        if (closing && !nodeRoute) throw new HttpError(503, "Coordinator is shutting down");
+        if (closing && (!nodeRoute || !shutdownNodeRoutes.has(url.pathname))) throw new HttpError(503, "Coordinator is shutting down");
         return body;
       };
-      if (closing && mutation && !nodeRoute) throw new HttpError(503, "Coordinator is shutting down");
+      if (closing && mutation && (!nodeRoute || !shutdownNodeRoutes.has(url.pathname))) throw new HttpError(503, "Coordinator is shutting down");
       if (nodeOnly && !nodeRoute) throw new HttpError(404, "Node listener does not expose administrator routes");
       if (nodeRoute) {
         if (request.headers.origin !== undefined || request.headers.cookie !== undefined) throw new MachineError(403, "Node authentication failed");
@@ -776,16 +780,20 @@ export async function startServer(options: ServerOptions) {
     close: () => closeFlight ??= (async () => {
       closing = true;
       clearInterval(heartbeat);
-      await workers.prepareCoordinatorShutdown(remoteShutdownTimeoutMs);
+      // prepareCoordinatorShutdown persists every stop request before its first
+      // await. Local cleanup starts immediately while node reports stay reachable.
+      const remoteStopped = workers.prepareCoordinatorShutdown(remoteShutdownTimeoutMs);
+      const failures: unknown[] = [];
+      const localStopped = Promise.all([
+        workers.close().catch((error) => { failures.push(error); }),
+        control.mcpRuntime.close().catch((error) => { failures.push(error); }),
+        mailboxDispatcher.close().catch((error) => { failures.push(error); })
+      ]);
+      await remoteStopped.catch((error) => { failures.push(error); });
       for (const client of sseClients) client.end();
       const listenerClosed = closeListeners();
-      const failures: unknown[] = [];
-      await mailboxDispatcher.close();
+      await localStopped;
       await Promise.all([...lifecycleFlights]);
-      await Promise.all([
-        workers.close().catch((error) => { failures.push(error); }),
-        control.mcpRuntime.close().catch((error) => { failures.push(error); })
-      ]);
       try {
         await control.settlePendingOperations();
       } catch (error) {
