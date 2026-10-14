@@ -438,6 +438,7 @@ export async function run(options) {
         if (["failed", "blocked"].includes(detail.mission.status)) return detail;
         return false;
       }
+      if (turnLimit) await turnLimit.observe(current);
       if (config && current.mission.turns >= current.mission.maxTurns) return current;
       if (["completed", "failed", "blocked"].includes(current.mission.status)) return current;
       return false;

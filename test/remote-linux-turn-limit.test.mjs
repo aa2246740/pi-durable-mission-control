@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { nextCall, startMock } from "../acceptance/remote-linux/mock.mjs";
 import { parseOptions } from "../acceptance/remote-linux/run.mjs";
-import { turnLimitMaxTurns, findLimitRpc, createTurnLimitScenario } from "../acceptance/remote-linux/scenarios/turn-limit.mjs";
+import { turnLimitMaxTurns, findLimitRpc, createTurnLimitScenario, reconcileDelivery, assertInterruptedDeliveries } from "../acceptance/remote-linux/scenarios/turn-limit.mjs";
 
 const context = { scenario: "turn-limit", acceptanceCommand: "node --test /host/test.mjs", hostTestPath: "/host/test.mjs" };
 const state = { mission: {}, roles: [], tasks: [{ id: "task", ownerId: "worker", status: "running" }], agents: [{ id: "worker", kind: "worker" }], executionEnvironment: { platform: "linux" } };
@@ -42,12 +42,19 @@ test("turn-limit worker resumes from its successful self-check without rewriting
   assert.equal(nextCall(body, context).name, "GetMissionState");
 });
 
+test("turn-limit worker waits after handing off review instead of publishing again", () => {
+  const review = { ...state, tasks: [{ ...state.tasks[0], status: "review" }] };
+  const body = request([["GetMissionState", state], selfCheck, ["PublishArtifact", { status: "succeeded", result: { id: "artifact" } }], ["GetMissionState", review]]);
+  assert.deepEqual(nextCall(body, context), { role: "worker", name: "WaitForMessage", args: {} });
+  assert.equal(nextCall(request([["GetMissionState", state], selfCheck, ["PublishArtifact", { status: "succeeded", result: { id: "artifact" } }], ["GetMissionState", review]]), { ...context, scenario: "default" }).name, "WaitForMessage");
+});
+
 function evidenceFixture() {
   const binding = { runtimeId: "runtime", machineId: "linux", sessionId: "session", sessionEpoch: 1, agentId: "worker", epoch: 2 };
-  const detail = { mission: { status: "blocked", turns: 16, maxTurns: 16 }, events: [{ seq: 2, type: "turn_admission_denied", text: "Mission turn limit exhausted", agentId: "worker", data: { generationId: "denied", turns: 16, maxTurns: 16 } },
-    { seq: 1, type: "remote_effect_receipt", agentId: "worker", data: { receipt: { status: "succeeded", result: { exitCode: 0, stdout: "LINUX-SELF-CHECK-OK" } } } }], artifacts: [], blockers: [{ id: "limit", kind: "limit", status: "open" }] };
+  const detail = { mission: { status: "blocked", turns: 16, maxTurns: 16, orchestratorId: "orchestrator" }, agents: [{ id: "orchestrator", status: "idle" }, { id: "worker", status: "offline" }], messages: [], events: [{ seq: 2, type: "turn_admission_denied", text: "Mission turn limit exhausted", agentId: "worker", data: { generationId: "denied", turns: 16, maxTurns: 16 } },
+    { seq: 1, type: "remote_effect_receipt", agentId: "worker", data: { receipt: { status: "succeeded", result: { exitCode: 0, stdout: "LINUX-SELF-CHECK-OK" } } } }, { seq: 0, type: "remote_effect_receipt", agentId: "worker", data: { receipt: { status: "succeeded", result: { bytes: 45 } } } }], artifacts: [], blockers: [{ id: "limit", kind: "limit", status: "open" }] };
   const envelope = { binding, payload: { kind: "rpc", method: "AdmitTurn", rpcId: "rpc", args: { generationId: "denied" } } };
-  const transport = { inbox: [{ message_id: "inbox", runtime_id: "runtime", status: "applied", envelope_json: JSON.stringify(envelope) }],
+  const transport = { deliveries: [], inbox: [{ message_id: "inbox", runtime_id: "runtime", status: "applied", envelope_json: JSON.stringify(envelope) }],
     outbox: [{ source_inbox_id: "inbox", envelope_json: JSON.stringify({ payload: { kind: "reply", rpcId: "rpc", ok: false, error: "Remote operation was rejected" } }) }] };
   const stopped = { binding, state: "closed", stopProvenance: "controlled", report: { outcome: "stopped" } };
   return { binding, detail, transport, stopped };
@@ -71,12 +78,17 @@ function recoveryContext(fixture, rejectResume = false) {
       if (body !== undefined) calls.push({ path, body, method });
       if (path.endsWith("/runtimes")) return [fixture.stopped];
       if (method === "PATCH") { current.mission.maxTurns = body.maxTurns; return current.mission; }
-      if (path.endsWith("/resolve")) { current.blockers[0].status = "resolved"; current.mission.status = "paused"; return current.blockers[0]; }
+      if (path.endsWith("/resolve")) {
+        const blocker = current.blockers.find((item) => item.id === path.split("/").at(-2));
+        blocker.status = "resolved";
+        if (current.blockers.every((item) => item.status === "resolved")) current.mission.status = "paused";
+        return structuredClone(blocker);
+      }
       if (path.endsWith("/resume")) {
         if (rejectResume) throw new Error("409 Resolve mission blockers before resuming");
         current.mission.status = "active";
       }
-      return current;
+      return structuredClone(current);
     } };
   return { context, calls };
 }
@@ -89,25 +101,96 @@ test("turn-limit records PATCH, limit resolution and resume as separate operator
   await scenario.recover(fixture.detail);
   assert.deepEqual(calls, [
     { path: "/api/missions/mission", body: { maxTurns: 96 }, method: "PATCH" },
-    { path: "/api/blockers/limit/resolve", body: { resolution: "Turn budget increased; continue after the controlled remote stop." }, method: "POST" },
+    { path: "/api/blockers/limit/resolve", body: { resolution: "已核对 Mission 使用 16 轮，上限已提高到 96，剩余预算足够继续。" }, method: "POST" },
     { path: "/api/missions/mission/resume", body: {}, method: "POST" }
   ]);
-  assert.deepEqual(scenario.evidence.humanActions.map((entry) => entry.action), ["raise-maxTurns", "resolve-limit", "resume"]);
+  assert.deepEqual(scenario.evidence.humanActions.map((entry) => entry.action), ["raise-maxTurns", "resolve-blocker", "resume"]);
   assert.ok(scenario.evidence.humanActions.every((entry) => entry.completedAt));
   assert.equal(scenario.evidence.limitRpc.inbox.status, "applied");
 });
 
-test("turn-limit preserves a full resume rejection and does not resolve delivery blockers", async () => {
+function interruptedFixture() {
   const fixture = evidenceFixture();
-  fixture.detail.blockers = [{ id: "delivery", kind: "delivery", status: "open", text: "uncertain delivery" }];
+  fixture.detail.blockers = [{ id: "delivery:old-outbox", kind: "delivery", status: "open", text: "uncertain delivery" }];
+  fixture.detail.messages = [{ id: "old-message", recipientId: "worker", attempt: 1, status: "uncertain", error: "Delivery state is uncertain after interrupt" }];
+  fixture.transport.deliveries = [{ id: "old-outbox", message_id: "old-message", attempt: 1, status: "uncertain" }];
+  return fixture;
+}
+
+test("turn-limit reconciles each delivery blocker and retains the full resume rejection", async () => {
+  const fixture = interruptedFixture();
   const { context, calls } = recoveryContext(fixture, true);
   const scenario = createTurnLimitScenario();
   scenario.configure(context);
   await assert.rejects(scenario.recover(fixture.detail), /409 Resolve mission blockers before resuming/);
   assert.deepEqual(scenario.evidence.limitBlockers, []);
   assert.deepEqual(scenario.evidence.otherBlockers, fixture.detail.blockers);
-  assert.deepEqual(calls.map((call) => call.path), ["/api/missions/mission", "/api/missions/mission/resume"]);
+  assert.deepEqual(calls.map((call) => call.path), ["/api/missions/mission", "/api/blockers/delivery:old-outbox/resolve", "/api/missions/mission/resume"]);
+  assert.equal(calls[1].body.resolution, "已只读核对协调端投递 old-message 的 attempt 1、远端受控停止回报及写入和 Linux 自查成功回执；尚未发布，确认该投递不需要重放，后续工作由新输入继续。");
   assert.equal(scenario.evidence.humanActions.at(-1).error, "409 Resolve mission blockers before resuming");
+  assert.equal(scenario.evidence.recoveryRejection.action, "resume");
+});
+
+test("turn-limit resolves multiple open blockers individually without changing interrupted deliveries", async () => {
+  const fixture = interruptedFixture();
+  fixture.detail.blockers.push({ id: "delivery:second-outbox", kind: "delivery", status: "open" }, { id: "limit", kind: "limit", status: "open" });
+  fixture.detail.messages.push({ id: "second-message", recipientId: "orchestrator", attempt: 1, status: "uncertain" });
+  fixture.transport.deliveries.push({ id: "second-outbox", message_id: "second-message", attempt: 1, status: "uncertain" });
+  const { context, calls } = recoveryContext(fixture);
+  const scenario = createTurnLimitScenario();
+  scenario.configure(context);
+  await scenario.recover(fixture.detail);
+  assert.deepEqual(calls.map((call) => call.path), ["/api/missions/mission", "/api/blockers/delivery:old-outbox/resolve", "/api/blockers/delivery:second-outbox/resolve", "/api/blockers/limit/resolve", "/api/missions/mission/resume"]);
+  assert.equal(scenario.evidence.deliveryReconciliations.length, 2);
+  assertInterruptedDeliveries(fixture.detail, fixture.transport, scenario.evidence);
+  for (const changed of [{ ...fixture.transport.deliveries[0], status: "queued" }, { ...fixture.transport.deliveries[0], attempt: 2 }]) {
+    assert.throws(() => assertInterruptedDeliveries(fixture.detail, { ...fixture.transport, deliveries: [changed, fixture.transport.deliveries[1]] }, scenario.evidence), /outbox attempt changed/);
+  }
+  assert.throws(() => assertInterruptedDeliveries({ ...fixture.detail, messages: [{ ...fixture.detail.messages[0], attempt: 2 }, fixture.detail.messages[1]] }, fixture.transport, scenario.evidence), /message changed/);
+});
+
+test("turn-limit refuses an unproven reconciliation rather than inventing a conclusion", () => {
+  const fixture = interruptedFixture();
+  const reconcile = (detail = fixture.detail, transport = fixture.transport, stopped = fixture.stopped) => reconcileDelivery(fixture.detail.blockers[0], detail, transport, stopped);
+  assert.throws(() => reconcile(undefined, { ...fixture.transport, deliveries: [] }), /matching persisted outbox/);
+  assert.throws(() => reconcile(undefined, undefined, { ...fixture.stopped, stopProvenance: "unproven" }));
+  const unknown = structuredClone(fixture.detail);
+  unknown.events[1].data.receipt.status = "uncertain";
+  assert.throws(() => reconcile(unknown), /unknown result/);
+  assert.throws(() => reconcileDelivery({ kind: "unsafe_execution" }, fixture.detail, fixture.transport, fixture.stopped), /unrelated blocker/);
+});
+
+test("turn-limit sends one ordinary orchestrator message only after restored team is idle", async () => {
+  const fixture = interruptedFixture();
+  const { context } = recoveryContext(fixture);
+  let clock = 0;
+  const sent = [];
+  const originalApi = context.api;
+  context.now = () => clock;
+  context.api = async (path, body, method) => {
+    if (path.endsWith("/messages")) { sent.push({ path, body, method }); return { id: "operator-message" }; }
+    return originalApi(path, body, method);
+  };
+  const scenario = createTurnLimitScenario();
+  scenario.configure(context);
+  await scenario.recover(fixture.detail);
+  const idle = { ...fixture.detail, mission: { ...fixture.detail.mission, status: "active" }, blockers: [] };
+  await scenario.observe({ ...idle, agents: [{ status: "running" }] });
+  clock = 5000;
+  await scenario.observe({ ...idle, messages: [{ status: "queued" }] });
+  assert.equal(sent.length, 0);
+  await scenario.observe(idle);
+  clock = 6999;
+  await scenario.observe(idle);
+  assert.equal(sent.length, 0);
+  clock = 7000;
+  await scenario.observe(idle);
+  assert.deepEqual(sent, [{ path: "/api/missions/mission/messages", method: "POST", body: { recipientId: "orchestrator", content: "继续完成剩余工作。已核对被打断的投递，不需要重放；请读取当前状态并继续。", mode: "followUp", requestId: "turn-limit-continue:mission" } }]);
+  await scenario.observe(idle);
+  clock = 17000;
+  await assert.rejects(scenario.observe(idle), /Mission stalled after the operator message/);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(scenario.evidence.stallSnapshot, idle);
 });
 
 test("mock forwards turn-limit hooks and resumes publication through the streaming protocol", async (t) => {

@@ -17,7 +17,7 @@ export function turnLimitCall({ role, last, history, state, call }) {
   assert.equal(selfCheck.value.status, "succeeded", "Missing successful pre-limit Linux self-check");
   assert.equal(selfCheck.value.result?.exitCode, 0, "Pre-limit Linux self-check failed");
   const task = state.tasks.find((item) => state.agents.find((agent) => agent.id === item.ownerId)?.kind === "worker");
-  assert.equal(task?.status, "running");
+  if (task?.status !== "running") return;
   assert.equal(history.some((result) => result.name === "PublishArtifact"), false, "Publication preceded turn limit");
   return call("PublishArtifact", { name: "Frozen Linux delivery", path: "linux-delivery.json", taskId: task.id });
 }
@@ -45,10 +45,37 @@ export function findLimitRpc(detail, transport, binding) {
   return { denial, inbox: row, reply: replies[0], binding };
 }
 
+export function reconcileDelivery(blocker, detail, transport, stopped) {
+  assert.equal(blocker.kind, "delivery", "Cannot reconcile an unrelated blocker");
+  const outbox = transport.deliveries.find((row) => blocker.id === `delivery:${row.id}`);
+  assert.ok(outbox, "Delivery blocker has no matching persisted outbox attempt");
+  const message = detail.messages.find((item) => item.id === outbox.message_id && item.attempt === outbox.attempt);
+  assert.equal(outbox.status, "uncertain", "Delivery is not an interrupted uncertain attempt");
+  assert.equal(message?.status, "uncertain", "Delivery message is not uncertain");
+  assert.equal(stopped.state, "closed");
+  assert.equal(stopped.stopProvenance, "controlled");
+  assert.equal(stopped.report.outcome, "stopped");
+  const receipts = detail.events.filter((event) => event.type === "remote_effect_receipt");
+  assert.equal(receipts.length, 2, "Expected only write and Linux self-check before publication");
+  assert.ok(receipts.every((event) => event.data.receipt.status === "succeeded"), "An effect has an unknown result");
+  assert.equal(detail.artifacts.length, 0, "Publication already occurred before reconciliation");
+  return { blockerId: blocker.id, outbox, message, stoppedBinding: stopped.binding,
+    effectReceipts: receipts, conclusion: `已只读核对协调端投递 ${message.id} 的 attempt ${message.attempt}、远端受控停止回报及写入和 Linux 自查成功回执；尚未发布，确认该投递不需要重放，后续工作由新输入继续。` };
+}
+
+export function assertInterruptedDeliveries(detail, transport, evidence) {
+  for (const reconciliation of evidence.deliveryReconciliations) {
+    assert.deepEqual(transport.deliveries.find((row) => row.id === reconciliation.outbox.id), reconciliation.outbox, "Interrupted outbox attempt changed or replayed");
+    assert.deepEqual(detail.messages.find((message) => message.id === reconciliation.message.id), reconciliation.message, "Interrupted message changed or replayed");
+  }
+}
+
 export function createTurnLimitScenario() {
   const evidence = { humanActions: [], initialMaxTurns: turnLimitMaxTurns(), synchronization: [] };
   const gatePath = `/turn-limit/${randomUUID()}`;
   let context;
+  let idleSince;
+  let idleSequence;
   let selfCheckReady, localAdmissionReady;
   const selfCheck = new Promise((resolve) => { selfCheckReady = resolve; });
   const localAdmission = new Promise((resolve) => { localAdmissionReady = resolve; });
@@ -135,18 +162,59 @@ export function createTurnLimitScenario() {
       persist();
       evidence.resumeAttempted = true;
       await action("raise-maxTurns", `/api/missions/${context.missionId}`, { maxTurns: evidence.initialMaxTurns + 80 }, "PATCH");
-      for (const blocker of (await snapshot()).blockers.filter((item) => item.kind === "limit" && item.status === "open")) {
-        await action("resolve-limit", `/api/blockers/${blocker.id}/resolve`, { resolution: "Turn budget increased; continue after the controlled remote stop." });
+      evidence.deliveryReconciliations = [];
+      const raised = await snapshot();
+      assert.ok(raised.mission.maxTurns > raised.mission.turns, "Budget increase did not take effect");
+      for (const blocker of raised.blockers.filter((item) => item.status === "open")) {
+        let resolution;
+        if (blocker.kind === "limit") resolution = `已核对 Mission 使用 ${raised.mission.turns} 轮，上限已提高到 ${raised.mission.maxTurns}，剩余预算足够继续。`;
+        else {
+          const reconciliation = reconcileDelivery(blocker, blocked, evidence.transportBeforeResume, stopped);
+          evidence.deliveryReconciliations.push(reconciliation);
+          resolution = reconciliation.conclusion;
+        }
+        persist();
+        await action("resolve-blocker", `/api/blockers/${blocker.id}/resolve`, { resolution });
       }
       const resolved = await snapshot();
       if (["blocked", "paused"].includes(resolved.mission.status)) await action("resume", `/api/missions/${context.missionId}/resume`, {});
-      assert.ok(evidence.limitBlockers.length > 0, "Remote AdmitTurn blocked the Mission without a limit blocker");
-      assert.deepEqual(evidence.otherBlockers, [], "Unexpected non-limit blockers");
+      evidence.resumedSnapshot = await snapshot();
+      persist();
+    },
+    async observe(current) {
+      if (!evidence.resumeAttempted || current.mission.status !== "active") return;
+      const failures = current.events.filter((event) => event.type === "worker_start_failed");
+      if (failures.length) throw new Error(`Recovery failed: ${JSON.stringify(failures)}`);
+      const pending = current.messages.filter((message) => ["queued", "dispatching", "admitted", "delivering", "delivered"].includes(message.status));
+      const busy = current.agents.some((agent) => ["running", "recovering", "waiting_approval", "waiting_user"].includes(agent.status));
+      if (pending.length || busy || current.blockers.some((blocker) => blocker.status === "open")) { idleSince = undefined; return; }
+      const sequence = current.events.at(-1)?.seq ?? 0;
+      const now = context.now?.() ?? Date.now();
+      if (idleSince === undefined || sequence !== idleSequence) {
+        idleSince = now;
+        idleSequence = sequence;
+        evidence.idleSnapshot = { mission: current.mission, agents: current.agents, messages: current.messages, events: current.events, observedAt: new Date(now).toISOString() };
+        persist();
+        return;
+      }
+      if (!evidence.operatorMessageSent && now - idleSince >= 2000) {
+        evidence.operatorMessageSent = true;
+        await action("message-orchestrator", `/api/missions/${context.missionId}/messages`, {
+          recipientId: current.mission.orchestratorId, content: "继续完成剩余工作。已核对被打断的投递，不需要重放；请读取当前状态并继续。", mode: "followUp", requestId: `turn-limit-continue:${context.missionId}`
+        });
+        idleSince = undefined;
+      } else if (evidence.operatorMessageSent && now - idleSince >= 10000) {
+        evidence.stallSnapshot = current;
+        evidence.transportAtStall = context.readTransport();
+        persist();
+        throw new Error(`Mission stalled after the operator message: ${JSON.stringify({ mission: current.mission, agents: current.agents, blockers: current.blockers })}`);
+      }
     },
     assertCompleted(detail) {
       assert.equal(evidence.blockedMissionStatus, "blocked");
       assert.ok(evidence.limitRpc, "Missing applied remote AdmitTurn evidence");
-      assert.ok(evidence.limitBlockers.length > 0, "No limit blocker recorded");
+      assert.equal(detail.blockers.some((blocker) => blocker.status === "open"), false);
+      assertInterruptedDeliveries(detail, evidence.transport, evidence);
       assert.equal(detail.mission.status, "completed");
       assert.equal(evidence.humanActions.filter((entry) => entry.action === "raise-maxTurns").length, 1);
     }

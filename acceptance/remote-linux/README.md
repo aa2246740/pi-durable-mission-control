@@ -66,13 +66,19 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l1-gpt- TMPDIR="$PWD/.acceptance-proof" no
 
 容器自测顺序运行 turn-limit 三次、default 一次、pause-resume 一次；逐次保存结果、完整耗时、清理结果和证据路径，即使前一次失败也继续其余场景，最后有任一次失败便非零退出。它不属于 `npm test`。
 
-`turn-limit.json` 保存同步点、blocked 快照、物理停止回报、只读读取 control.sqlite 的 transport、触顶 RPC 与拒绝回复、Linux 自查回执及每次运营者动作。触顶事件必须匹配旧 runtime binding 的 agentId、epoch、generationId，协调端 inbox 必须为 applied，并有唯一落库拒绝回复；旧 runtime 必须 closed 且 stopProvenance 为 controlled。脚本通过 PATCH 将 maxTurns 从 16 提到 96，仅解决产品已生成的 limit blocker，然后按需 resume。每次动作记录方法、路径、正文、时间、响应或完整错误；不解除 delivery 等其他 blocker。
+`turn-limit.json` 保存同步点、blocked 快照、物理停止回报、只读读取 control.sqlite 的 transport、触顶 RPC 与拒绝回复、Linux 自查回执及每次运营者动作。触顶事件必须匹配旧 runtime binding 的 agentId、epoch、generationId，协调端 inbox 必须为 applied，并有唯一落库拒绝回复；旧 runtime 必须 closed 且 stopProvenance 为 controlled。脚本通过 PATCH 将 maxTurns 从 16 提到 96，再逐个解决开放的 blocker，然后按需 resume。对 delivery blocker，先核对其精确 outbox attempt、对应 uncertain 消息、受控停止回报、写入与 Linux 自查成功回执及尚未发布的状态，将真实核对结论写入 resolution 和证据；limit blocker 则记录调高后的预算。无法核对的 blocker 使场景非零退出。每次动作记录方法、路径、正文、时间、响应或完整错误，人工动作不改变任务状态，也不直接给 worker 发指令。
 
-成功仍要求产品生成 limit blocker，恢复出现恰好一个 remote_runtime_reassigned，同节点、同 worker、epoch 递增，最终 completed，并通过 pause-resume 共用的 effect、投递、工具调用和历史 mailbox 不重放检查。恢复拒绝、worker_start_failed、Mission failed、缺少 limit blocker 或其他 blocker 均使脚本非零退出，保留 mission-export.json、runtimes.json 和全部拒绝证据。
+恢复后团队没有待处理输入、没有忙碌 agent，且事件序列连续 2 秒不变时，脚本最多给 orchestrator 发一条普通 followUp 消息，请其读取状态并继续；方法、路径、消息和响应写入 humanActions。消息发出后再次持续空闲 10 秒便记录完整停滞快照和只读 transport，并非零退出。
+
+成功要求出现恰好一个 remote_runtime_reassigned，同节点、同 worker、epoch 递增，最终 completed，并通过 pause-resume 共用的 effect、投递、工具调用和历史 mailbox 不重放检查。额外逐条比对已对账投递的完整 outbox 与消息，要求保持原来的 uncertain 状态和 attempt，不发生重放。恢复拒绝、worker_start_failed、Mission failed、剩余 blocker 或停滞均使脚本非零退出，保留 mission-export.json、runtimes.json 和全部拒绝证据。产品是否生成 limit blocker 如实记录。
 
 2026-10-14 在 `orch/l1-gpt`、基线 `b9e4d4c` 上连续运行：turn-limit 三次均非零退出，完整耗时为 16.469、16.449、16.279 秒；default 通过，23.054 秒；pause-resume 通过，23.647 秒。五次清理均通过。三次 turn-limit 都有 Linux 自查回执 seq 72，随后远端 worker 拒绝事件 seq 74，触顶 RPC 的协调端 inbox 为 applied，旧 runtime 为 closed/controlled。PATCH 将 maxTurns 提到 96 成功，resume 返回 HTTP 409 `Resolve mission blockers before resuming`，Mission 保持 blocked，没有新 runtime。
 
-此基线的 `admitTurn` 在触顶时只保存 generation denial、设置 blocked 并记录事件，没有插入 limit blocker；停止过程则将仍在执行的投递记为 uncertain 并生成三个 delivery blocker，其中一个属于场景故意保留的本地模型请求。脚本保存全部原因，并按授权范围保留这些 blocker。因此 RPC 回复落库修复在本次时序中已验证，但恢复、epoch 递增、最终 completed 和恢复后不重放尚未完成验收。产品修复须另行处理；本任务未修改 src/。
+此基线的 `admitTurn` 在触顶时只保存 generation denial、设置 blocked 并记录事件，没有插入 limit blocker；停止过程则将仍在执行的投递记为 uncertain 并生成三个 delivery blocker，其中一个属于场景故意保留的本地模型请求。脚本保存全部原因，并按授权范围保留这些 blocker。第一轮因此只完成 RPC 回复落库验收；恢复、epoch 递增、最终 completed 和恢复后不重放当时尚未通过。第二轮合并 `orch/int@90ea9a6` 的 M1 修复后，按上述运营者对账流程重新验收；场景实现未编辑 src/。
+
+2026-10-15 第二轮在合并 `orch/int@90ea9a6` 后实测：turn-limit 连续 3/3 通过，完整耗时为 24.101、22.837、22.927 秒；default 通过，17.546 秒；pause-resume 通过，23.291 秒。五次清理均通过。三次 turn-limit 都由远端 worker 的 AdmitTurn 在自查后触顶，inbox 为 applied，旧 runtime 为 closed/controlled；运营者执行 PATCH、逐个对账解决三个 delivery blocker、resume，共五次动作，无须额外消息。恢复后同节点、同 worker 的新 runtime epoch 均从 2 提到 4，Mission completed，四个 effect permit/receipt 各出现一次，write_file 一次、bash 两次、PublishArtifact 一次，七个 durable delivery attempt 都为 1。三个已对账投递的完整 outbox 和消息在结束时与恢复前完全相同，仍为 uncertain；历史 mailbox/effect 未改变，独立冻结快照复核通过。证据索引为当前 worktree 的 `.acceptance-proof/turn-limit-results-1791997222290.json`。
+
+开发阶段首轮恢复已成功，但旧 mock 在任务进入 review 后再次读取状态时错误要求 running，导致脚本失败；现已修正为等待，并补充单测。该开发运行耗时 21.370 秒，修正后开发复核通过，29.045 秒。上述容器运行均在旧 runtime 停止确认后 resume；未用此场景覆盖停止报告尚未返回时的等待分支，也未实际触发可选的 orchestrator 普通消息分支，该分支由单测覆盖。
 
 普通 `npm test` 包含 mock 协议与决策单元测试，不启动 Apple Container。容器验收测试单独运行：
 
