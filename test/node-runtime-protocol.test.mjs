@@ -331,7 +331,7 @@ test("requested remote stop permits epoch fencing without adding a completion bl
     (error) => error.status === 409);
   assert.deepEqual(control.blockers(mission.id), []);
   assert.deepEqual(reportToCoordinator(fixture, { reportId: crypto.randomUUID(), binding: assignment.binding,
-    descriptorHash: assignment.descriptorHash, outcome: "stopped" }), { recorded: true, duplicate: false });
+    descriptorHash: assignment.descriptorHash, outcome: "stopped", stopReason: "requested" }), { recorded: true, duplicate: false });
   assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
   assert.deepEqual(control.blockers(mission.id), []);
 });
@@ -348,4 +348,23 @@ test("requested remote stop still blocks when the machine lease expires", (t) =>
   control.fenceStaleWorkerBindings();
   assert.equal(control.getMission(mission.id).status, "blocked");
   assert.ok(control.blockers(mission.id).some((b) => b.id === `remote-runtime:${assignment.binding.runtimeId}`));
+});
+
+
+test("targeted stop polling returns only the requested runtime on that machine", t => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-runtime-targeted-stop-"));
+  const fixture = createAssignedRemoteRuntime(home);
+  const { control, mission, agent, assignment, enrolled, session } = fixture;
+  t.after(() => { control.close(); rmSync(home, { recursive: true, force: true }); });
+  const otherAgent = control.createAgent(mission.id, "Other remote worker", agent.roleId, "Metadata turn.",
+    crypto.randomUUID(), agent.workspaceId);
+  const other = control.assignRemoteRuntime(otherAgent.id);
+  const poll = runtimeId => control.nodeRuntimePoll(enrolled.machine.id, enrolled.token,
+    session.sessionId, session.sessionEpoch, runtimeId).directives;
+  assert.deepEqual(poll(other.binding.runtimeId), []);
+  control.requestRemoteRuntimeStop(agent.id);
+  control.requestRemoteRuntimeStop(otherAgent.id);
+  assert.deepEqual(poll(crypto.randomUUID()), []);
+  assert.deepEqual(poll(other.binding.runtimeId), [{ action: "stop", binding: other.binding, descriptorHash: other.descriptorHash }]);
+  assert.deepEqual(poll(assignment.binding.runtimeId), [{ action: "stop", binding: assignment.binding, descriptorHash: assignment.descriptorHash }]);
 });

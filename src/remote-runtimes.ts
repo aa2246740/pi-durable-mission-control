@@ -3,6 +3,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { parseWorkerStartSpec, workerStartSpecHash, type WorkerStartSpec } from "./node-worker-spec.js";
 import type { WorkerBinding } from "./worker-mailbox.js";
 
+export type RuntimeStopReason = "requested" | "unexpected";
+export type RuntimeReport = {
+  reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected";
+  stopReason?: RuntimeStopReason;
+};
+
 export type RemoteRuntimeState = "queued" | "offered" | "running" | "stopping" | "closed" | "uncertain";
 export type RemoteRuntimeDirective =
   | { action: "start"; descriptor: WorkerStartSpec; descriptorHash: string }
@@ -12,6 +18,7 @@ export type RemoteRuntimeRow = {
   runtime_id: string; machine_id: string; session_id: string; session_epoch: number; agent_id: string; epoch: number;
   descriptor_json: string; descriptor_hash: string; state: RemoteRuntimeState; desired: "run" | "stop";
   stop_provenance: "unproven" | "controlled" | "unexpected" | "uncertain";
+  stop_request_reason: "controlled" | "ownership-lost" | null; stop_request_epoch: number | null; stop_fenced_epoch: number | null;
   created_at: number; updated_at: number; last_offered_at: number | null; last_report_json: string | null;
 };
 
@@ -49,6 +56,26 @@ export class RemoteRuntimeRegistry {
     if (!columns.some((column) => column.name === "stop_provenance")) {
       db.exec("ALTER TABLE remote_worker_runtimes ADD COLUMN stop_provenance TEXT NOT NULL DEFAULT 'unproven' CHECK(stop_provenance IN ('unproven','controlled','unexpected','uncertain'))");
     }
+    if (!columns.some((column) => column.name === "stop_request_reason")) {
+      db.exec("ALTER TABLE remote_worker_runtimes ADD COLUMN stop_request_reason TEXT CHECK(stop_request_reason IN ('controlled','ownership-lost'))");
+    }
+    if (!columns.some((column) => column.name === "stop_request_epoch")) {
+      db.exec("ALTER TABLE remote_worker_runtimes ADD COLUMN stop_request_epoch INTEGER");
+    }
+    if (!columns.some((column) => column.name === "stop_fenced_epoch")) {
+      db.exec("ALTER TABLE remote_worker_runtimes ADD COLUMN stop_fenced_epoch INTEGER");
+    }
+    // Schema 9 inferred controlled stops without node evidence. This also
+    // stays fail-closed if an earlier migration stopped between column adds.
+    db.exec(`UPDATE remote_worker_runtimes SET stop_provenance='unproven' WHERE stop_provenance='controlled'
+      AND (stop_request_reason IS NULL OR stop_request_reason!='controlled' OR stop_request_epoch IS NULL OR stop_request_epoch!=epoch)`);
+  }
+
+  markControlledStopFence(agentId: string, priorEpoch: number): void {
+    this.db.prepare(`UPDATE remote_worker_runtimes SET stop_fenced_epoch=?
+      WHERE agent_id=? AND epoch=? AND stop_request_epoch=? AND stop_request_reason='controlled'
+        AND desired='stop' AND state='stopping' AND stop_fenced_epoch IS NULL`)
+      .run(priorEpoch + 1, agentId, priorEpoch, priorEpoch);
   }
 
   activeForAgent(agentId: string): RemoteRuntimeRow | undefined {
@@ -89,13 +116,13 @@ export class RemoteRuntimeRegistry {
     return { binding, descriptor, descriptorHash, existing: false };
   }
 
-  poll(machineId: string, sessionId: string, sessionEpoch: number): RemoteRuntimeDirective[] {
+  poll(machineId: string, sessionId: string, sessionEpoch: number, stopRuntimeId?: string): RemoteRuntimeDirective[] {
     const rows = this.db.prepare(`SELECT * FROM remote_worker_runtimes
       WHERE machine_id=? AND (
         (desired='run' AND state IN ('queued','offered') AND session_id=? AND session_epoch=?) OR
         (desired='stop' AND state IN ('stopping','offered','uncertain'))
-      ) ORDER BY COALESCE(last_offered_at,0),created_at,runtime_id LIMIT 1`)
-      .all(machineId, sessionId, sessionEpoch) as RemoteRuntimeRow[];
+      ) AND (? IS NULL OR (runtime_id=? AND desired='stop')) ORDER BY COALESCE(last_offered_at,0),created_at,runtime_id LIMIT 1`)
+      .all(machineId, sessionId, sessionEpoch, stopRuntimeId ?? null, stopRuntimeId ?? null) as RemoteRuntimeRow[];
     const row = rows[0];
     if (!row) return [];
     const at = Date.now();
@@ -119,16 +146,19 @@ export class RemoteRuntimeRegistry {
     return row ? this.setRunning(binding, row.descriptor_hash) : false;
   }
 
-  requestStop(binding: WorkerBinding): boolean {
+  requestStop(binding: WorkerBinding, reason: "controlled" | "ownership-lost", requestEpoch: number | null = null): boolean {
     const result = this.db.prepare(`UPDATE remote_worker_runtimes SET desired='stop',
-      state=CASE WHEN state IN ('closed','uncertain') THEN state ELSE 'stopping' END,updated_at=?
+      state=CASE WHEN state IN ('closed','uncertain') THEN state ELSE 'stopping' END,updated_at=?,
+      stop_request_reason=CASE WHEN ?='ownership-lost' THEN 'ownership-lost' ELSE COALESCE(stop_request_reason,?) END,
+      stop_request_epoch=COALESCE(stop_request_epoch,?),
+      stop_provenance=CASE WHEN ?='ownership-lost' THEN 'uncertain' ELSE stop_provenance END
       WHERE runtime_id=? AND machine_id=? AND session_id=? AND session_epoch=? AND agent_id=? AND epoch=?
-        AND state!='closed'`)
-      .run(Date.now(), binding.runtimeId, binding.machineId, binding.sessionId, binding.sessionEpoch, binding.agentId, binding.epoch);
+        AND (state!='closed' OR ?='ownership-lost')`)
+      .run(Date.now(), reason, reason, requestEpoch, reason, binding.runtimeId, binding.machineId, binding.sessionId, binding.sessionEpoch, binding.agentId, binding.epoch, reason);
     return result.changes === 1;
   }
 
-  report(report: { reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected" }): {
+  report(report: RuntimeReport): {
     recorded: true; duplicate: boolean; state: RemoteRuntimeState; unexpected: boolean
   } {
     const body = stable(report);
@@ -145,13 +175,14 @@ export class RemoteRuntimeRegistry {
         row.agent_id !== b.agentId || row.epoch !== b.epoch || row.descriptor_hash !== report.descriptorHash) {
       throw new Error("Runtime report does not match its assignment");
     }
-    const unexpected = row.desired === "run";
-    // A later stop request/report cannot turn an unexpected or uncertain ending
-    // into evidence of a clean coordinator-requested stop.
-    const provenance = report.outcome !== "stopped" ? "uncertain"
-      : row.stop_provenance === "unexpected" || row.stop_provenance === "uncertain" ? row.stop_provenance
-      : unexpected ? "unexpected"
-      : row.last_report_json === null && row.state === "stopping" ? "controlled" : row.stop_provenance;
+    const controlledRequest = row.desired === "stop" && row.stop_request_reason === "controlled" && row.stop_request_epoch === row.epoch;
+    // A later stop request/report cannot erase an unsafe first ending.
+    const provenance = row.stop_provenance === "unexpected" || row.stop_provenance === "uncertain" ? row.stop_provenance
+      : report.stopReason === "unexpected" ? "unexpected"
+      : report.outcome !== "stopped" ? "uncertain"
+      : row.last_report_json === null && row.state === "stopping" && controlledRequest && report.stopReason === "requested" ? "controlled"
+      : row.stop_provenance === "controlled" && controlledRequest && report.stopReason === "requested" ? "controlled" : "unproven";
+    const unexpected = row.desired === "run" || provenance === "unexpected";
     const nextState: RemoteRuntimeState = report.outcome === "stopped" ? "closed" : "uncertain";
     const state: RemoteRuntimeState = row.state === "closed" ? "closed" : nextState;
     const at = Date.now();
@@ -168,7 +199,7 @@ export class RemoteRuntimeRegistry {
     return (this.db.prepare(`SELECT r.* FROM remote_worker_runtimes r JOIN agents a ON a.id=r.agent_id
       WHERE a.mission_id=? ORDER BY r.created_at,r.runtime_id`).all(missionId) as RemoteRuntimeRow[]).map((row) => ({
       binding: rowBinding(row), descriptorHash: row.descriptor_hash, state: row.state, desired: row.desired,
-      stopProvenance: row.stop_provenance, createdAt: row.created_at, updatedAt: row.updated_at, lastOfferedAt: row.last_offered_at,
+      stopProvenance: row.stop_provenance, stopRequestReason: row.stop_request_reason, createdAt: row.created_at, updatedAt: row.updated_at, lastOfferedAt: row.last_offered_at,
       report: row.last_report_json ? JSON.parse(row.last_report_json) as { outcome: string } : undefined
     }));
   }

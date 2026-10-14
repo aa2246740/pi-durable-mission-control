@@ -3,8 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { ControlPlane } from "../dist/control.js";
+import { ControlPlane, RemoteRuntimeStopPendingError } from "../dist/control.js";
 import { WorkerManager } from "../dist/workers.js";
+import { startServer } from "../dist/server.js";
 import { nodeEffectUpload } from "../dist/node-effects.js";
 
 function fixture(t, executionMode = "workspace-effects", autonomy = "trusted", capabilityOverrides = {}) {
@@ -386,9 +387,9 @@ test("remote GetMissionState reports the live session execution environment and 
   }
 });
 
-function stopReport(f, outcome = "stopped") {
+function stopReport(f, outcome = "stopped", stopReason = "requested") {
   return f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, {
-    reportId: crypto.randomUUID(), binding: f.assignment.binding, descriptorHash: f.assignment.descriptorHash, outcome
+    reportId: crypto.randomUUID(), binding: f.assignment.binding, descriptorHash: f.assignment.descriptorHash, outcome, ...(stopReason === "missing" ? {} : { stopReason })
   });
 }
 
@@ -423,6 +424,159 @@ function assertNoReassignment(f, reason) {
   assert.deepEqual(f.control.workerMailbox.inspectOutbox(f.assignment.binding), before.mailbox);
   assert.equal(f.control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(f.agent.id).n, 1);
 }
+
+async function resumeBeforeStopReport(f, workers) {
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  const question = await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "pending-stop-question"));
+  await workers.syncMissionLifecycle(f.mission.id);
+  f.control.resolveBlocker(question.id, "Continue with a new runtime.");
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+}
+
+const waitForStopResult = async predicate => {
+  const deadline = Date.now() + 3000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for stop confirmation result");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+};
+
+test("invalid remote stop deadlines are rejected before creating server state", async t => {
+  const f = fixture(t);
+  for (const timeout of [0, -1, 0.5, NaN, Infinity, 2147483648]) {
+    assert.throws(() => new WorkerManager(f.control, false, false, timeout), /Remote runtime stop timeout/);
+    const serverHome = join(f.home, "invalid-timeout-server");
+    await assert.rejects(() => startServer({ home: serverHome, port: 0, remoteRuntimeStopTimeoutMs: timeout }), /Remote runtime stop timeout/);
+    assert.equal(existsSync(serverHome), false);
+  }
+});
+
+test("early recovery waits once for the controlled report and assigns without another resume", async t => {
+  const f = fixture(t), workers = new WorkerManager(f.control, false, false, 5000);
+  try {
+    await resumeBeforeStopReport(f, workers);
+    const epoch = f.control.getAgentPublic(f.agent.id).epoch;
+    for (let count = 0; count < 3; count++) await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).state, "stopping");
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, epoch);
+    assert.equal(f.control.workerMailbox.inspectBinding(f.assignment.binding).status, "uncertain");
+    assert.equal(f.control.detail(f.mission.id).events.some(event => event.type === "worker_start_failed"), false);
+    const pending = f.control.detail(f.mission.id).events.filter(event => event.type === "remote_runtime_stop_pending");
+    assert.equal(pending.length, 1);
+    assert.deepEqual(pending[0].data, { runtimeId: f.assignment.binding.runtimeId, timeoutMs: 5000 });
+    await workers.remoteRuntimeReported(f.agent.id, crypto.randomUUID());
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).state, "stopping");
+    stopReport(f);
+    await Promise.all([workers.remoteRuntimeReported(f.agent.id, f.assignment.binding.runtimeId),
+      workers.remoteRuntimeReported(f.agent.id, f.assignment.binding.runtimeId)]);
+    const replacement = f.control.remoteRuntimeForAgent(f.agent.id);
+    assert.notEqual(replacement.runtime_id, f.assignment.binding.runtimeId);
+    assert.equal(replacement.epoch, epoch + 1);
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+    assert.equal(f.control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(f.agent.id).n, 2);
+    assert.equal(f.control.workerMailbox.inspectBinding(f.assignment.binding).status, "closed");
+  } finally { await workers.close(); }
+});
+
+test("missing controlled stop report fails at its original deadline with an accurate diagnostic", async t => {
+  const f = fixture(t), workers = new WorkerManager(f.control, false, false, 100);
+  try {
+    await resumeBeforeStopReport(f, workers);
+    for (let count = 0; count < 3; count++) await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+    await waitForStopResult(() => f.control.missionById(f.mission.id).status === "failed");
+    const failures = f.control.detail(f.mission.id).events.filter(event => event.type === "worker_start_failed");
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].data.diagnostic,
+      `Prior remote runtime ${f.assignment.binding.runtimeId} did not confirm its stop within 0.1 seconds`);
+    assert.equal(failures[0].data.diagnostic.includes("trusted reconciliation"), false);
+    stopReport(f);
+    await workers.remoteRuntimeReported(f.agent.id, f.assignment.binding.runtimeId);
+    assert.equal(f.control.missionById(f.mission.id).status, "failed");
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+  } finally { await workers.close(); }
+});
+
+for (const ending of ["unexpected", "uncertain", "unproven"]) {
+  test(`pending controlled stop rejects a later ${ending} report permanently`, async t => {
+    const f = fixture(t), workers = new WorkerManager(f.control, false, false, 5000);
+    try {
+      await resumeBeforeStopReport(f, workers);
+      stopReport(f, ending === "uncertain" ? "uncertain" : "stopped", ending === "unexpected" ? "unexpected" : ending === "unproven" ? "missing" : "requested");
+      await workers.remoteRuntimeReported(f.agent.id, f.assignment.binding.runtimeId);
+      assert.equal(f.control.missionById(f.mission.id).status, "failed");
+      const diagnostic = f.control.detail(f.mission.id).events.find(event => event.type === "worker_start_failed").data.diagnostic;
+      assert.match(diagnostic, ending === "unproven" ? /controlled stop cannot be proven/ : new RegExp(ending));
+      assert.match(diagnostic, /trusted reconciliation is required/);
+      assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+      assert.equal(f.control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(f.agent.id).n, 1);
+    } finally { await workers.close(); }
+  });
+}
+
+for (const unsafe of ["mailbox", "delivery", "effect", "approval", "blocker", "ownership"]) {
+  test(`pending stop with unresolved ${unsafe} fails immediately instead of waiting`, async t => {
+    const f = fixture(t, "workspace-effects", unsafe === "approval" ? "approve" : "trusted", { effectApprovals: true });
+    const workers = new WorkerManager(f.control, false, false, 5000);
+    try {
+      if (unsafe === "effect" || unsafe === "approval") {
+        await f.control.workerCommand({ ...request(f.agent, "write_file", { path: "pending.txt", content: "unsafe" }), id: "pending-stop-rpc" });
+      }
+      if (unsafe === "mailbox") {
+        f.control.workerMailbox.enqueue(f.assignment.binding, { kind: "reply", rpcId: crypto.randomUUID(), ok: true, result: {} });
+        f.control.workerMailbox.pending(f.assignment.binding);
+      }
+      f.control.missionAction(f.mission.id, "pause");
+      await workers.pauseMission(f.mission.id);
+      explicitResume(f);
+      if (unsafe === "delivery") {
+        const message = f.control.sendMessage(f.mission.id, f.agent.id, "Pending delivery", "followUp", "pending-stop-delivery");
+        f.control.db.prepare("UPDATE messages SET status='uncertain' WHERE id=?").run(message.id);
+      } else if (unsafe === "blocker") {
+        const blocker = { id: "pending-stop-safety", missionId: f.mission.id, kind: "unsafe_execution", status: "open", text: "Inspect", createdAt: new Date().toISOString() };
+        f.control.db.prepare("INSERT INTO blockers VALUES(?,?,?,?)").run(blocker.id, f.mission.id, "open", JSON.stringify(blocker));
+      } else if (unsafe === "ownership") {
+        f.control.db.prepare("UPDATE remote_worker_runtimes SET stop_request_reason='ownership-lost' WHERE runtime_id=?").run(f.assignment.binding.runtimeId);
+      }
+      await assert.rejects(() => workers.startAgent(f.control.getAgentPublic(f.agent.id)), error => {
+        assert.equal(error instanceof RemoteRuntimeStopPendingError, false);
+        assert.match(error.message, /trusted reconciliation is required/);
+        return true;
+      });
+      assert.equal(f.control.missionById(f.mission.id).status, "failed");
+      assert.equal(f.control.detail(f.mission.id).events.some(event => event.type === "remote_runtime_stop_pending"), false);
+    } finally { await workers.close(); }
+  });
+}
+
+test("worker manager recovery re-arms pending controlled stops without needing queued delivery", async t => {
+  const f = fixture(t), first = new WorkerManager(f.control, false, false, 5000);
+  await resumeBeforeStopReport(f, first);
+  await first.close();
+  const workers = new WorkerManager(f.control, false, false, 5000);
+  const startAgent = workers.startAgent.bind(workers);
+  workers.startAgent = agent => agent.machineId === "local" ? Promise.resolve() : startAgent(agent);
+  try {
+    await workers.recoverActiveMissions();
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+    stopReport(f);
+    await workers.remoteRuntimeReported(f.agent.id, f.assignment.binding.runtimeId);
+    assert.notEqual(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+  } finally { await workers.close(); }
+});
+
+test("pausing again cancels the pending stop deadline", async t => {
+  const f = fixture(t), workers = new WorkerManager(f.control, false, false, 50);
+  try {
+    await resumeBeforeStopReport(f, workers);
+    f.control.missionAction(f.mission.id, "pause");
+    await workers.pauseMission(f.mission.id);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(f.control.missionById(f.mission.id).status, "paused");
+    assert.equal(f.control.detail(f.mission.id).events.some(event => event.type === "worker_start_failed"), false);
+  } finally { await workers.close(); }
+});
 
 test("clean controlled stop reassigns atomically with new owner and preserves runtime evidence", async t => {
   const f = fixture(t);
@@ -459,7 +613,7 @@ for (const ending of ["unexpected", "uncertain", "unproven"]) {
   test(`${ending} stop remains fail-closed after explicit blocker resolution and later stopped reports`, t => {
     const f = fixture(t);
     if (ending === "unexpected") {
-      stopReport(f);
+      stopReport(f, "stopped", "unexpected");
       f.control.requestRemoteRuntimeStop(f.agent.id);
       stopReport(f);
     } else if (ending === "uncertain") {
@@ -498,7 +652,7 @@ for (const kind of ["deliver", "reply", "rpc"]) {
 }
 
 for (const state of ["dispatching", "admitted", "delivering", "delivered"]) {
-  test(`interrupted ${state} durable input stays uncertain and cannot reach a replacement runtime`, t => {
+  test(`human-reconciled interrupted ${state} input stays uncertain while a replacement runtime starts`, t => {
     const f = fixture(t);
     const message = f.control.detail(f.mission.id).messages.find(item => item.recipientId === f.agent.id);
     f.control.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(state,
@@ -508,11 +662,60 @@ for (const state of ["dispatching", "admitted", "delivering", "delivered"]) {
     f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
     assert.equal(f.control.message(message.id).status, "uncertain");
     stopReport(f);
+    assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+    const row = f.control.db.prepare("SELECT * FROM outbox WHERE message_id=?").get(message.id);
+    assert.equal(f.control.blockers(f.mission.id).find(blocker => blocker.id === `delivery:${row.id}`).status, "open");
     explicitResume(f);
-    assertNoReassignment(f, /uncertain or partially executed durable delivery/);
+    const evidence = f.control.message(message.id);
+    const oldOutbox = f.control.db.prepare("SELECT * FROM outbox WHERE message_id=?").all(message.id);
+    const replacement = f.control.assignRemoteRuntime(f.agent.id);
+    assert.notEqual(replacement.binding.runtimeId, f.assignment.binding.runtimeId);
+    assert.deepEqual(f.control.message(message.id), evidence);
+    assert.deepEqual(f.control.db.prepare("SELECT * FROM outbox WHERE message_id=?").all(message.id), oldOutbox);
+    assert.equal(f.control.workerMailbox.inspectOutbox(replacement.binding).length, 0);
     assert.equal(f.control.message(message.id).status, "uncertain");
     assert.equal(f.control.message(message.id).attempt, message.attempt);
     assert.equal(f.control.pendingOutbox().some(row => row.message_id === message.id), false);
+  });
+}
+
+for (const state of ["dispatching", "admitted", "delivering", "delivered"]) {
+  for (const side of ["message", "outbox"]) {
+    test(`human delivery resolution does not admit a still-${state} ${side}`, t => {
+      const f = fixture(t);
+      const message = f.control.detail(f.mission.id).messages.find(item => item.recipientId === f.agent.id);
+      f.control.db.prepare("UPDATE outbox SET status='admitted' WHERE message_id=?").run(message.id);
+      controlledStop(f);
+      explicitResume(f);
+      if (side === "message") {
+        f.control.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(state, JSON.stringify({ ...f.control.message(message.id), status: state }), message.id);
+      } else {
+        f.control.db.prepare("UPDATE outbox SET status=? WHERE message_id=?").run(state, message.id);
+      }
+      assertNoReassignment(f, /uncertain or partially executed durable delivery/);
+    });
+  }
+}
+
+for (const evidence of ["missing-blocker", "wrong-mission", "missing-outbox", "second-unresolved-outbox"]) {
+  test(`uncertain delivery refuses ${evidence} reconciliation evidence`, t => {
+    const f = fixture(t);
+    const message = f.control.detail(f.mission.id).messages.find(item => item.recipientId === f.agent.id);
+    f.control.db.prepare("UPDATE outbox SET status='admitted' WHERE message_id=?").run(message.id);
+    controlledStop(f);
+    explicitResume(f);
+    const row = f.control.db.prepare("SELECT * FROM outbox WHERE message_id=?").get(message.id);
+    if (evidence === "missing-blocker") {
+      f.control.db.prepare("DELETE FROM blockers WHERE id=?").run(`delivery:${row.id}`);
+    } else if (evidence === "wrong-mission") {
+      f.control.db.prepare("UPDATE blockers SET mission_id='another-mission' WHERE id=?").run(`delivery:${row.id}`);
+    } else if (evidence === "missing-outbox") {
+      f.control.db.prepare("DELETE FROM outbox WHERE id=?").run(row.id);
+    } else {
+      f.control.db.prepare(`INSERT INTO outbox(id,mission_id,message_id,request_id,status,attempt,epoch,created_at)
+        VALUES(?,?,?,?,'uncertain',2,?,?)`).run(crypto.randomUUID(), f.mission.id, message.id, "second-attempt", f.agent.epoch, new Date().toISOString());
+    }
+    assertNoReassignment(f, /uncertain or partially executed durable delivery/);
   });
 }
 
@@ -585,4 +788,205 @@ test("failed replacement assignment rolls back mailbox closure and owner claim",
   assert.equal(f.control.getAgentPublic(f.agent.id).epoch, epoch);
   assert.equal(f.control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(f.agent.id).n, 1);
   assert.equal(f.control.detail(f.mission.id).events.some(event => event.type === "remote_runtime_reassigned"), false);
+});
+
+
+test("delayed unexpected stop cannot become controlled after pause and later requested reports", t => {
+  const f = fixture(t);
+  const delayed = { reportId: crypto.randomUUID(), binding: f.assignment.binding,
+    descriptorHash: f.assignment.descriptorHash, outcome: "stopped", stopReason: "unexpected" };
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+  f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, delayed);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "unexpected");
+  assert.ok(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`));
+  stopReport(f);
+  explicitResume(f);
+  assertNoReassignment(f, /unexpected stop/);
+});
+
+test("ownership loss survives lease expiry, new session, old requested stop report, and blocker resolution", t => {
+  const f = fixture(t);
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+  f.control.db.prepare("UPDATE remote_machines SET data=json_set(data,'$.leaseExpiresAt',?) WHERE id=?")
+    .run(Date.now() - 1, f.enrolled.machine.id);
+  const capabilities = f.control.machineRegistry.get(f.enrolled.machine.id).capabilities;
+  const newSession = f.control.nodeSession(f.enrolled.machine.id, f.enrolled.token, capabilities, crypto.randomUUID());
+  assert.notEqual(newSession.sessionId, f.session.sessionId);
+  f.session = newSession;
+  stopReport(f);
+  const row = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.equal(row.state, "closed");
+  assert.equal(row.stop_provenance, "uncertain");
+  assert.equal(row.stop_request_reason, "ownership-lost");
+  assert.equal(f.control.remoteRuntimeSnapshots(f.mission.id)[0].stopRequestReason, "ownership-lost");
+  explicitResume(f);
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  stopReport(f);
+  assertNoReassignment(f, /uncertain/);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+});
+
+for (const change of ["before-request", "after-controlled-fence", "after-request-owner-claim", "legacy-request"]) {
+  test(`unrelated epoch increase ${change} cannot use controlled stop relaxation`, t => {
+    const f = fixture(t);
+    if (change === "before-request") {
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+      f.control.requestRemoteRuntimeStop(f.agent.id);
+    } else if (change === "after-controlled-fence") {
+      f.control.requestRemoteRuntimeStop(f.agent.id);
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch + 1);
+    } else if (change === "after-request-owner-claim") {
+      f.control.requestRemoteRuntimeStop(f.agent.id);
+      f.control.claimAgentOwner(f.agent.id);
+    } else {
+      f.control.db.prepare("UPDATE remote_worker_runtimes SET desired='stop',state='stopping' WHERE runtime_id=?")
+        .run(f.assignment.binding.runtimeId);
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+    }
+    // Even if the report arrives before the periodic fence sweep, it must not
+    // close the runtime with apparently controlled evidence.
+    stopReport(f);
+    f.control.fenceStaleWorkerBindings();
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "uncertain");
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+    assert.ok(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`));
+    stopReport(f);
+    explicitResume(f);
+    assertNoReassignment(f, /uncertain/);
+  });
+}
+
+test("legacy stopped report without node reason cannot prove a controlled stop", t => {
+  const f = fixture(t);
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  const report = { reportId: crypto.randomUUID(), binding: f.assignment.binding,
+    descriptorHash: f.assignment.descriptorHash, outcome: "stopped" };
+  f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, report);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "unproven");
+  stopReport(f);
+  explicitResume(f);
+  assertNoReassignment(f, /cannot be proven/);
+});
+
+
+test("unexpected node reason remains unexpected when physical extinction is unconfirmed", t => {
+  const f = fixture(t);
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  stopReport(f, "uncertain", "unexpected");
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).state, "uncertain");
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "unexpected");
+  stopReport(f);
+  explicitResume(f);
+  assertNoReassignment(f, /unexpected stop/);
+});
+
+
+test("repeated blocked lifecycle sync preserves controlled stop and permits recovery", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  const question = await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-question"));
+  assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+  await workers.syncMissionLifecycle(f.mission.id);
+  const firstEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  assert.equal(firstEpoch, f.assignment.binding.epoch + 1);
+  const lateMessage = f.control.sendMessage(f.mission.id, f.agent.id, "Input queued between syncs.", "followUp", "repeat-sync-input");
+  await workers.syncMissionLifecycle(f.mission.id);
+  const secondEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  stopReport(f);
+  const stopped = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.equal(stopped.stop_provenance, "controlled", `epochs ${f.assignment.binding.epoch} -> ${firstEpoch} -> ${secondEpoch}`);
+  assert.equal(secondEpoch, firstEpoch);
+  assert.equal(stopped.stop_request_reason, "controlled");
+  assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+  assert.equal(f.control.message(lateMessage.id).status, "aborted");
+  assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE message_id=?").get(lateMessage.id).status, "aborted");
+  f.control.resolveBlocker(question.id, "Continue with a new runtime.");
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+  const replacement = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.notEqual(replacement.runtime_id, stopped.runtime_id);
+  assert.equal(replacement.state, "queued");
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  assert.deepEqual(f.control.remoteRuntimes.byRuntime(stopped.runtime_id), stopped);
+});
+
+
+for (const action of ["refreshProfile", "refreshRole", "interruptAgent"]) {
+  test(`repeated controlled ${action} preserves the fenced epoch and permits recovery`, async t => {
+    const f = fixture(t, "metadata-only");
+    const workers = new WorkerManager(f.control);
+    const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+    const question = await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, `repeat-${action}-question`));
+    const invoke = () => action === "refreshProfile" ? workers.refreshProfile(f.profile.id)
+      : action === "refreshRole" ? workers.refreshRole(f.roleIds[1]) : workers.interruptAgent(f.agent.id);
+    await invoke();
+    const fencedEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+    assert.equal(fencedEpoch, f.assignment.binding.epoch + 1);
+    const lateMessage = f.control.sendMessage(f.mission.id, f.agent.id, "New input during shutdown.", "followUp", `repeat-${action}-input`);
+    await invoke();
+    assert.equal(f.control.message(lateMessage.id).status, "aborted");
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+    stopReport(f);
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "controlled");
+    await invoke();
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+    assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+    f.control.resolveBlocker(question.id, "Continue.");
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+    await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+    assert.notEqual(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+  });
+}
+
+test("repeated controlled lifecycle sync still fences newly admitted delivery as uncertain", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-admitted-question"));
+  await workers.syncMissionLifecycle(f.mission.id);
+  const fencedEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  const input = f.control.sendMessage(f.mission.id, f.agent.id, "Delivery admission arrived late.", "followUp", "repeat-sync-admitted-input");
+  f.control.db.prepare("UPDATE messages SET status='admitted',data=? WHERE id=?")
+    .run(JSON.stringify({ ...input, status: "admitted" }), input.id);
+  f.control.db.prepare("UPDATE outbox SET status='admitted' WHERE message_id=?").run(input.id);
+  const outbox = f.control.db.prepare("SELECT id FROM outbox WHERE message_id=?").get(input.id);
+  await workers.syncMissionLifecycle(f.mission.id);
+  assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+  assert.equal(f.control.message(input.id).status, "uncertain");
+  assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE id=?").get(outbox.id).status, "uncertain");
+  assert.ok(f.control.blockers(f.mission.id).some(b => b.id === `delivery:${outbox.id}` && b.status === "open"));
+  stopReport(f);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "controlled");
+  assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+  explicitResume(f);
+  const evidence = f.control.message(input.id);
+  await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+  assert.notEqual(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+  assert.deepEqual(f.control.message(input.id), evidence);
+  assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE id=?").get(outbox.id).status, "uncertain");
+  assert.equal(f.control.pendingOutbox().some(row => row.message_id === input.id), false);
+});
+
+test("unrelated interruption between controlled lifecycle syncs remains ownership loss", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-owner-question"));
+  await workers.syncMissionLifecycle(f.mission.id);
+  f.control.markAgentInterrupted(f.agent.id, f.control.getAgentPublic(f.agent.id).epoch);
+  await workers.syncMissionLifecycle(f.mission.id);
+  stopReport(f);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "uncertain");
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+  explicitResume(f);
+  assertNoReassignment(f, /uncertain/);
 });

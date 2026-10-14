@@ -12,6 +12,7 @@ import {
   NodeEffectJournal, type NodeEffectReceipt, type NodeEffectSpec, type NodeEffectUpload
 } from "./node-effects.js";
 import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct, readNodeArtifactChunk, snapshotNodeArtifact, verifyNodeArtifactSnapshot, type NodeArtifactSnapshot } from "./node-effect-executor.js";
+import type { RuntimeStopReason } from "./remote-runtimes.js";
 import type { RemoteArtifactManifest } from "./remote-artifacts.js";
 import { REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { redactDiagnosticChunk, sanitizeDiagnostic } from "./workers.js";
@@ -31,6 +32,7 @@ export interface NodeWorkerSnapshot {
   state: NodeWorkerState;
   pid: number | null;
   confirmedStopped: boolean;
+  stopReason: RuntimeStopReason | null;
   live: boolean;
   diagnostic?: string;
 }
@@ -39,6 +41,7 @@ export interface NodeWorkerStopEvidence {
   runtimeId: string;
   state: "closed" | "uncertain";
   confirmedStopped: boolean;
+  stopReason: RuntimeStopReason | null;
   pid: number | null;
   reason: string;
 }
@@ -91,6 +94,7 @@ type RuntimeRow = {
   state: NodeWorkerState;
   pid: number | null;
   confirmed_stopped: number;
+  stop_reason: RuntimeStopReason | null;
 };
 
 type DeliveryKey = string;
@@ -103,6 +107,8 @@ function canonicalJson(value: unknown): string {
   }
   return JSON.stringify(value) ?? "null";
 }
+
+const REPLAYED_PUBLICATION_NOTICE = "This is a replay of a completed effect. The task status may have changed; use GetMissionState for the current state.";
 
 type Handle = {
   binding: WorkerBinding;
@@ -260,6 +266,10 @@ export class NodeWorkerSupervisor {
         pid INTEGER,
         confirmed_stopped INTEGER NOT NULL DEFAULT 0
       )`);
+      const runtimeColumns = this.db.prepare("PRAGMA table_info(node_worker_runtimes)").all() as Array<{ name: string }>;
+      if (!runtimeColumns.some((column) => column.name === "stop_reason")) {
+        this.db.exec("ALTER TABLE node_worker_runtimes ADD COLUMN stop_reason TEXT CHECK(stop_reason IN ('requested','unexpected'))");
+      }
       this.mailbox = new DurableWorkerMailbox(this.db, "node");
       this.db.exec(`CREATE TABLE IF NOT EXISTS node_effect_approvals(
         approval_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL
@@ -317,6 +327,7 @@ export class NodeWorkerSupervisor {
       state: row.state,
       pid: row.pid,
       confirmedStopped: row.confirmed_stopped === 1,
+      stopReason: row.stop_reason,
       live: this.handles.has(row.runtime_id),
       ...(diagnostic === undefined ? {} : { diagnostic })
     };
@@ -327,12 +338,12 @@ export class NodeWorkerSupervisor {
     return rows.map((row) => this.snapshotOf(row));
   }
 
-  inspectBindings(): Array<{ binding: WorkerBinding; descriptorHash: string; state: NodeWorkerState; confirmedStopped: boolean }> {
-    return (this.db.prepare("SELECT binding_json,descriptor_hash,state,confirmed_stopped FROM node_worker_runtimes ORDER BY rowid").all() as Array<{
-      binding_json: string; descriptor_hash: string; state: NodeWorkerState; confirmed_stopped: number;
+  inspectBindings(): Array<{ binding: WorkerBinding; descriptorHash: string; state: NodeWorkerState; confirmedStopped: boolean; stopReason: RuntimeStopReason | null }> {
+    return (this.db.prepare("SELECT binding_json,descriptor_hash,state,confirmed_stopped,stop_reason FROM node_worker_runtimes ORDER BY rowid").all() as Array<{
+      binding_json: string; descriptor_hash: string; state: NodeWorkerState; confirmed_stopped: number; stop_reason: RuntimeStopReason | null;
     }>).map((row) => ({
       binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash,
-      state: row.state, confirmedStopped: row.confirmed_stopped === 1
+      state: row.state, confirmedStopped: row.confirmed_stopped === 1, stopReason: row.stop_reason
     }));
   }
 
@@ -1001,7 +1012,7 @@ export class NodeWorkerSupervisor {
       await this.applyApprovedEffect(handle, envelope, payload.approvalId, payload.permit);
       return;
     }
-    const evidence = await this.stopHandle(handle, "A durable shutdown instruction stopped this worker");
+    const evidence = await this.stopHandle(handle, "A durable shutdown instruction stopped this worker", "requested");
     if (evidence.confirmedStopped) {
       try {
         this.mailbox.finish(binding, envelope.messageId);
@@ -1179,10 +1190,32 @@ export class NodeWorkerSupervisor {
     }
   }
 
+  /**
+   * A stored publication receipt keeps the task status and nextStep from the
+   * original coordinator response. Replaying that object can tell the worker
+   * to UpdateTask after the task has already left running. The journal row,
+   * its hash, and coordinator evidence stay unchanged; only this copy does.
+   */
+  private workerVisibleReceipt(handle: Handle, spec: NodeEffectSpec, durable: NodeEffectReceipt, replayed: boolean): NodeEffectReceipt {
+    const visible = this.redactStructured(handle, durable as unknown as JsonValue) as unknown as NodeEffectReceipt;
+    if (!replayed || spec.method !== "PublishArtifact" || visible.status === "uncertain") return visible;
+    const result = visible.result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) return visible;
+    if (!Object.hasOwn(result, "task") && !Object.hasOwn(result, "nextStep")) return visible;
+    const replayedResult: Record<string, JsonValue> = Object.create(null);
+    for (const [key, value] of Object.entries(result)) {
+      if (key === "task" || key === "nextStep") continue;
+      replayedResult[key] = value;
+    }
+    replayedResult.replayNotice = REPLAYED_PUBLICATION_NOTICE;
+    return { status: visible.status, result: replayedResult };
+  }
+
   private async executePermittedEffect(handle: Handle, spec: NodeEffectSpec, expiresAt: number): Promise<NodeEffectReceipt> {
     const binding = handle.binding;
     let receipt: NodeEffectReceipt | undefined;
     let errorText: string | undefined;
+    let replayed = false;
     try {
       this.effects.admit(spec);
       const prior = this.effects.inspect().find((entry) =>
@@ -1192,6 +1225,7 @@ export class NodeWorkerSupervisor {
       const claim = this.effects.begin(spec);
       if (!claim.execute) {
         receipt = claim.receipt;
+        replayed = true;
       } else {
         try {
           if (handle.stopping || Date.now() >= expiresAt || !this.leaseCurrent(binding)) {
@@ -1231,7 +1265,7 @@ export class NodeWorkerSupervisor {
     if (receipt && canonicalJson(receipt) !== canonicalJson(durable.receipt)) {
       throw new Error("Workspace effect terminal receipt does not match its durable journal evidence");
     }
-    return this.redactStructured(handle, durable.receipt as unknown as JsonValue) as unknown as NodeEffectReceipt;
+    return this.workerVisibleReceipt(handle, spec, durable.receipt, replayed);
   }
 
   private acceptDuplicateEffectReply(
@@ -1283,11 +1317,11 @@ export class NodeWorkerSupervisor {
     } catch {
       // Terminal bindings keep their existing evidence.
     }
-    this.db.prepare("UPDATE node_worker_runtimes SET state='uncertain' WHERE runtime_id=? AND state IN ('admitted','running','stopping')")
+    this.db.prepare("UPDATE node_worker_runtimes SET state='uncertain',stop_reason=COALESCE(stop_reason,'unexpected') WHERE runtime_id=? AND state IN ('admitted','running','stopping')")
       .run(binding.runtimeId);
   }
 
-  async stop(value: WorkerBinding): Promise<NodeWorkerStopEvidence> {
+  async stop(value: WorkerBinding, stopReason: RuntimeStopReason = "requested"): Promise<NodeWorkerStopEvidence> {
     const binding = this.checkedBinding(value);
     const handle = this.handles.get(binding.runtimeId);
     if (!handle) {
@@ -1297,15 +1331,18 @@ export class NodeWorkerSupervisor {
         runtimeId: row.runtime_id,
         state: row.state === "closed" ? "closed" : "uncertain",
         confirmedStopped: row.confirmed_stopped === 1,
+        stopReason: row.stop_reason,
         pid: row.pid,
         reason: "This runtime is no longer live on this supervisor"
       };
     }
-    return this.stopHandle(handle, "An explicit stop request ended this worker");
+    return this.stopHandle(handle, "An explicit stop request ended this worker", stopReason);
   }
 
-  private stopHandle(handle: Handle, reason: string): Promise<NodeWorkerStopEvidence> {
+  private stopHandle(handle: Handle, reason: string, stopReason: RuntimeStopReason = "unexpected"): Promise<NodeWorkerStopEvidence> {
     if (handle.stopping) return handle.stopping;
+    this.db.prepare("UPDATE node_worker_runtimes SET stop_reason=COALESCE(stop_reason,?) WHERE runtime_id=?")
+      .run(stopReason, handle.binding.runtimeId);
     const flight = this.stopOnce(handle, reason);
     handle.stopping = flight;
     return flight;
@@ -1360,6 +1397,7 @@ export class NodeWorkerSupervisor {
       runtimeId: binding.runtimeId,
       state: confirmed ? "closed" : "uncertain",
       confirmedStopped: confirmed,
+      stopReason: this.row(binding.runtimeId)?.stop_reason ?? null,
       pid: handle.pid,
       reason
     };

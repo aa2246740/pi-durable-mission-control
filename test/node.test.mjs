@@ -24,6 +24,15 @@ test("real node child receives a probe and writes an isolated journal", async (t
   const root = join(home, "root");
   const nodeHome = join(home, "node-home");
   mkdirSync(root);
+  mkdirSync(nodeHome);
+  const legacyReport = { reportId: crypto.randomUUID(), runtimeId: crypto.randomUUID(), bindingJson: "{}", descriptorHash: "a".repeat(64) };
+  const legacyJournal = new DatabaseSync(join(nodeHome, "node.sqlite"));
+  legacyJournal.exec(`CREATE TABLE node_runtime_reports (
+    report_id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, binding_json TEXT NOT NULL,
+    descriptor_hash TEXT NOT NULL, outcome TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+  legacyJournal.prepare("INSERT INTO node_runtime_reports VALUES(?,?,?,?,'stopped','sent',1)")
+    .run(legacyReport.reportId, legacyReport.runtimeId, legacyReport.bindingJson, legacyReport.descriptorHash);
+  legacyJournal.close();
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const service = await startServer({ home: join(home, "control"), port: 0 });
   t.after(() => service.close());
@@ -50,6 +59,13 @@ test("real node child receives a probe and writes an isolated journal", async (t
   const receipt = service.control.machineCommand("child-node", command.id);
   assert.deepEqual(receipt.result, { requestedPath: root, path: realpathSync(root), isDirectory: true });
   assert.equal(readFileSync(join(nodeHome, "node.sqlite")).length > 0, true);
+  const migratedJournal = new DatabaseSync(join(nodeHome, "node.sqlite"), { readOnly: true });
+  const savedReport = migratedJournal.prepare("SELECT * FROM node_runtime_reports WHERE report_id=?").get(legacyReport.reportId);
+  assert.equal(savedReport.stop_reason, null);
+  assert.equal(savedReport.binding_json, legacyReport.bindingJson);
+  assert.equal(savedReport.outcome, "stopped");
+  assert.equal(savedReport.state, "sent");
+  migratedJournal.close();
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
 });

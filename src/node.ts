@@ -9,6 +9,7 @@ import {
   DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt,
   type JsonValue, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding
 } from "./worker-mailbox.js";
+import type { RuntimeReport, RuntimeStopReason } from "./remote-runtimes.js";
 import { NodeWorkerSupervisor } from "./node-workers.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { REMOTE_ARTIFACT_CHUNK_BYTES, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
@@ -233,6 +234,10 @@ class NodeJournal {
           state TEXT NOT NULL CHECK(state IN ('pending','sent')), created_at INTEGER NOT NULL
         );
       `);
+      const reportColumns = this.db.prepare("PRAGMA table_info(node_runtime_reports)").all() as Array<{ name: string }>;
+      if (!reportColumns.some((column) => column.name === "stop_reason")) {
+        this.db.exec("ALTER TABLE node_runtime_reports ADD COLUMN stop_reason TEXT CHECK(stop_reason IN ('requested','unexpected'))");
+      }
       const existing = this.db.prepare("SELECT owner_id,pid FROM node_owner WHERE singleton=1").get() as { owner_id: string; pid: number } | undefined;
       if (existing) {
         if (!Number.isSafeInteger(existing.pid) || existing.pid < 1 || existing.pid === process.pid) {
@@ -391,23 +396,28 @@ class NodeJournal {
     this.db.prepare("UPDATE node_operations SET status='uncertain',updated_at=? WHERE status='admitted'").run(Date.now());
   }
 
-  recordRuntimeReport(binding: WorkerBinding, descriptorHash: string, outcome: "stopped" | "uncertain" | "rejected"): { reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected" } {
-    const prior = this.db.prepare("SELECT report_id,binding_json FROM node_runtime_reports WHERE runtime_id=? AND descriptor_hash=? AND outcome=? ORDER BY created_at LIMIT 1")
-      .get(binding.runtimeId, descriptorHash, outcome) as { report_id: string; binding_json: string } | undefined;
+  recordRuntimeReport(binding: WorkerBinding, descriptorHash: string, outcome: RuntimeReport["outcome"], stopReason: RuntimeStopReason | null): RuntimeReport {
+    const first = this.db.prepare("SELECT stop_reason FROM node_runtime_reports WHERE runtime_id=? ORDER BY created_at,rowid LIMIT 1")
+      .get(binding.runtimeId) as { stop_reason: RuntimeStopReason | null } | undefined;
+    const reason = first ? first.stop_reason : stopReason;
+    const prior = this.db.prepare("SELECT report_id,binding_json,stop_reason FROM node_runtime_reports WHERE runtime_id=? AND descriptor_hash=? AND outcome=? ORDER BY created_at LIMIT 1")
+      .get(binding.runtimeId, descriptorHash, outcome) as { report_id: string; binding_json: string; stop_reason: RuntimeStopReason | null } | undefined;
     if (prior) {
       const priorBinding = JSON.parse(prior.binding_json) as WorkerBinding;
       if (!sameBinding(priorBinding, binding)) throw new Error("Runtime report binding conflicts with its durable history");
-      return { reportId: prior.report_id, binding: priorBinding, descriptorHash, outcome };
+      return { reportId: prior.report_id, binding: priorBinding, descriptorHash, outcome,
+        ...(prior.stop_reason === null ? {} : { stopReason: prior.stop_reason }) };
     }
     const reportId = randomUUID();
-    this.db.prepare("INSERT INTO node_runtime_reports(report_id,runtime_id,binding_json,descriptor_hash,outcome,state,created_at) VALUES(?,?,?,?,?,'pending',?)")
-      .run(reportId, binding.runtimeId, JSON.stringify(binding), descriptorHash, outcome, Date.now());
-    return { reportId, binding, descriptorHash, outcome };
+    this.db.prepare("INSERT INTO node_runtime_reports(report_id,runtime_id,binding_json,descriptor_hash,outcome,stop_reason,state,created_at) VALUES(?,?,?,?,?,?,'pending',?)")
+      .run(reportId, binding.runtimeId, JSON.stringify(binding), descriptorHash, outcome, reason, Date.now());
+    return { reportId, binding, descriptorHash, outcome, ...(reason === null ? {} : { stopReason: reason }) };
   }
 
-  pendingRuntimeReports(): Array<{ reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected" }> {
-    return (this.db.prepare("SELECT report_id,binding_json,descriptor_hash,outcome FROM node_runtime_reports WHERE state='pending' ORDER BY created_at,report_id").all() as Array<{ report_id: string; binding_json: string; descriptor_hash: string; outcome: "stopped" | "uncertain" | "rejected" }>)
-      .map((row) => ({ reportId: row.report_id, binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash, outcome: row.outcome }));
+  pendingRuntimeReports(): RuntimeReport[] {
+    return (this.db.prepare("SELECT report_id,binding_json,descriptor_hash,outcome,stop_reason FROM node_runtime_reports WHERE state='pending' ORDER BY created_at,report_id").all() as Array<{ report_id: string; binding_json: string; descriptor_hash: string; outcome: RuntimeReport["outcome"]; stop_reason: RuntimeStopReason | null }>)
+      .map((row) => ({ reportId: row.report_id, binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash, outcome: row.outcome,
+        ...(row.stop_reason === null ? {} : { stopReason: row.stop_reason }) }));
   }
 
   sentRuntimeReport(reportId: string): void {
@@ -800,7 +810,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
             const flight = supervisor.start(descriptor, { coordinatorAssigned: true }).then(() => undefined, () => {
               try {
                 const admitted = supervisor?.inspectBindings().some((item) => sameBinding(item.binding, binding));
-                journal.recordRuntimeReport(binding, descriptorHash, admitted ? "uncertain" : "rejected");
+                journal.recordRuntimeReport(binding, descriptorHash, admitted ? "uncertain" : "rejected", "unexpected");
               } catch {
                 runtimeFailure = genericError();
                 abort.abort();
@@ -822,13 +832,13 @@ export async function runNode(options: NodeOptions): Promise<void> {
               continue;
             }
             if (!localRuntime) {
-              journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain");
+              journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain", null);
             } else {
               try {
                 const evidence = await supervisor.stop(binding);
-                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
               } catch {
-                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain");
+                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain", localRuntime.stopReason);
               }
             }
             notifyMailboxActivity();
@@ -843,7 +853,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
             const priorReport = journal.runtimeReportIdentity(binding.runtimeId);
             if (priorReport && (!sameBinding(priorReport.binding, binding) || priorReport.descriptorHash !== runtime.descriptorHash)) throw genericError();
             if (!journal.hasRuntimeReport(binding.runtimeId, runtime.descriptorHash, outcome)) {
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, outcome);
+              journal.recordRuntimeReport(binding, runtime.descriptorHash, outcome, runtime.stopReason);
             }
             continue;
           }
@@ -854,10 +864,28 @@ export async function runNode(options: NodeOptions): Promise<void> {
             if (!(error instanceof CoordinatorConflict)) throw error;
             mailboxFencedBindings.add(binding.runtimeId);
             try {
-              const evidence = await supervisor.stop(binding);
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+              // A mailbox fence can precede the regular stop-directive poll.
+              // Fetch evidence for this binding before recording a local fence.
+              const response = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {
+                machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
+                stopRuntimeId: binding.runtimeId
+              }, abort.signal);
+              if (!object(response) || !exactKeys(response, ["directives"]) || !Array.isArray(response.directives) ||
+                  response.directives.length > 1) throw genericError();
+              const directive: unknown = response.directives[0];
+              let stopReason: RuntimeStopReason = "unexpected";
+              if (directive !== undefined) {
+                if (!object(directive) || !exactKeys(directive, ["action", "binding", "descriptorHash"]) ||
+                    directive.action !== "stop" || directive.descriptorHash !== runtime.descriptorHash) throw genericError();
+                const stopBinding = parseWorkerBinding(directive.binding);
+                if (!stopBinding || !sameBinding(stopBinding, binding)) throw genericError();
+                stopReason = "requested";
+              }
+              const evidence = await supervisor.stop(binding, stopReason);
+              journal.recordRuntimeReport(binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
             } catch {
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, "uncertain");
+              await supervisor.stop(binding, "unexpected").catch(() => undefined);
+              journal.recordRuntimeReport(binding, runtime.descriptorHash, "uncertain", "unexpected");
             }
             notifyMailboxActivity();
             continue;
@@ -886,10 +914,10 @@ export async function runNode(options: NodeOptions): Promise<void> {
         for (const runtime of supervisor.inspectBindings()) {
           if (["closed", "uncertain"].includes(runtime.state)) continue;
           try {
-            const evidence = await supervisor.stop(runtime.binding);
-            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+            const evidence = await supervisor.stop(runtime.binding, "unexpected");
+            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
           } catch {
-            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, "uncertain");
+            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, "uncertain", "unexpected");
           }
         }
       }

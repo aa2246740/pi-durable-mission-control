@@ -127,7 +127,7 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
     const db = new DatabaseSync(join(nodeHome, "node.sqlite"), { readOnly: true });
     try {
       return db.prepare(`
-        SELECT report_id,runtime_id,binding_json,descriptor_hash,outcome,state
+        SELECT report_id,runtime_id,binding_json,descriptor_hash,outcome,state,stop_reason
         FROM node_runtime_reports WHERE runtime_id=? ORDER BY created_at,report_id
       `).all(runtimeId).map(row => ({ ...row, binding: JSON.parse(row.binding_json) }));
     } finally {
@@ -226,6 +226,7 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
   const localReports = readNodeReports(binding.runtimeId);
   const stopReport = localReports.find(report => report.outcome === "stopped");
   assert.ok(stopReport);
+  assert.equal(stopReport.stop_reason, "unexpected");
   const stoppedResponse = await fetch(`http://127.0.0.1:${service.nodePort}/api/nodes/runtimes/events`, {
     method: "POST",
     headers: { authorization: `Bearer ${enrolled.token}`, "content-type": "application/json" },
@@ -236,13 +237,15 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
       reportId: stopReport.report_id,
       binding: stopReport.binding,
       descriptorHash: stopReport.descriptor_hash,
-      outcome: stopReport.outcome
+      outcome: stopReport.outcome,
+      stopReason: stopReport.stop_reason
     })
   });
   const stoppedText = await stoppedResponse.text();
   assert.equal(stoppedResponse.status, 200, stoppedText);
   assert.equal(JSON.parse(stoppedText).recorded, true);
   assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
+  assert.equal(control.remoteRuntimeForAgent(agent.id).stop_provenance, "unexpected");
   assert.equal(receiptEventCount(mission.id), 0);
   const workerDb = new DatabaseSync(effectDbPath, { readOnly: true });
   let workerRuntime;

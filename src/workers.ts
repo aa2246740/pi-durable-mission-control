@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Agent } from "./contracts.js";
-import { ControlPlane, HttpError } from "./control.js";
+import { ControlPlane, HttpError, RemoteRuntimeStopPendingError } from "./control.js";
 import { remoteWorkspacePromptFlags } from "./prompts.js";
 import type { RpcMessage } from "./worker.js";
 import { applyWorkerNotice, parseWorkerNotice } from "./worker-events.js";
@@ -83,12 +83,18 @@ export class WorkerManager {
   private readonly quiescenceFlights = new Map<string, QuiescenceFlight>();
   private readonly recoveringAgents = new Set<string>();
   private readonly dispatching = new Set<string>();
+  private readonly remoteStopWaits = new Map<string, { runtimeId: string; epoch: number; timer: NodeJS.Timeout }>();
   private closing = false;
   constructor(
     private readonly control: ControlPlane,
     private readonly testOnlyScripted = false,
-    private readonly testOnlyToolLoop = false
-  ) {}
+    private readonly testOnlyToolLoop = false,
+    private readonly remoteRuntimeStopTimeoutMs = 60000
+  ) {
+    if (!Number.isSafeInteger(remoteRuntimeStopTimeoutMs) || remoteRuntimeStopTimeoutMs < 1 || remoteRuntimeStopTimeoutMs > 2147483647) {
+      throw new HttpError(400, "Remote runtime stop timeout must be an integer between 1 and 2147483647 milliseconds");
+    }
+  }
 
   async startMission(missionId: string): Promise<void> {
     for (const agent of this.control.listAgents(missionId)) await this.startAgent(agent);
@@ -99,7 +105,8 @@ export class WorkerManager {
     const missions = this.control.state().missions.filter((mission) => mission.status === "active");
     for (const mission of missions) {
       for (const agent of this.control.listAgents(mission.id)) {
-        if (agent.machineId !== "local" && this.control.remoteRuntimeForAgent(agent.id)) continue;
+        const runtime = agent.machineId !== "local" ? this.control.remoteRuntimeForAgent(agent.id) : undefined;
+        if (runtime && !(runtime.state === "stopping" && runtime.stop_request_reason === "controlled")) continue;
         try {
           await this.startAgent(agent);
         } catch (error) {
@@ -114,7 +121,12 @@ export class WorkerManager {
     if (this.closing || this.control.missionById(agent.missionId)?.status !== "active") return;
     const pending = this.starting.get(agent.id);
     if (pending) return pending;
-    const starting = this.startAgentOnce(agent).catch(async (error: unknown) => {
+    const starting = this.startAgentOnce(agent).then(() => this.clearRemoteStopWait(agent.id)).catch(async (error: unknown) => {
+      if (error instanceof RemoteRuntimeStopPendingError) {
+        this.waitForRemoteStop(agent, error.runtimeId);
+        return;
+      }
+      this.clearRemoteStopWait(agent.id);
       const profile = this.control.profile(agent.profileId);
       const secret = profile?.credentialEnv ? process.env[profile.credentialEnv] : undefined;
       this.control.failMissionStartup(agent.missionId, sanitizeDiagnostic(error, secret));
@@ -125,10 +137,64 @@ export class WorkerManager {
     return starting;
   }
 
+  private clearRemoteStopWait(agentId: string): void {
+    const waiting = this.remoteStopWaits.get(agentId);
+    if (waiting) clearTimeout(waiting.timer);
+    this.remoteStopWaits.delete(agentId);
+  }
+
+  private waitForRemoteStop(agent: Agent, runtimeId: string): void {
+    const existing = this.remoteStopWaits.get(agent.id);
+    if (existing?.runtimeId === runtimeId && existing.epoch === agent.epoch) return;
+    this.clearRemoteStopWait(agent.id);
+    this.control.recordRemoteRuntimeStopPending(agent, runtimeId, this.remoteRuntimeStopTimeoutMs);
+    const timer = setTimeout(() => {
+      this.runDetached(agent, this.retryRemoteStop(agent.id, runtimeId, true));
+    }, this.remoteRuntimeStopTimeoutMs);
+    timer.unref();
+    this.remoteStopWaits.set(agent.id, { runtimeId, epoch: agent.epoch, timer });
+  }
+
+  async remoteRuntimeReported(agentId: string, runtimeId: string): Promise<void> {
+    await this.retryRemoteStop(agentId, runtimeId, false);
+  }
+
+  private async retryRemoteStop(agentId: string, runtimeId: string, timedOut: boolean): Promise<void> {
+    await this.starting.get(agentId);
+    const waiting = this.remoteStopWaits.get(agentId);
+    if (!waiting || waiting.runtimeId !== runtimeId) return;
+    const agent = this.control.getAgentPublic(agentId);
+    const runtime = this.control.remoteRuntimeForAgent(agentId);
+    const mission = agent ? this.control.missionById(agent.missionId) : undefined;
+    if (this.closing || !agent || agent.epoch !== waiting.epoch || !runtime || runtime.runtime_id !== runtimeId ||
+        !mission || !["active", "blocked"].includes(mission.status)) {
+      this.clearRemoteStopWait(agentId);
+      return;
+    }
+    try {
+      this.control.assertRemoteRuntimeReassignable(runtime, agent);
+    } catch (error) {
+      if (error instanceof RemoteRuntimeStopPendingError && !timedOut) return;
+      this.clearRemoteStopWait(agentId);
+      const diagnostic = error instanceof RemoteRuntimeStopPendingError
+        ? `Prior remote runtime ${runtimeId} did not confirm its stop within ${this.remoteRuntimeStopTimeoutMs / 1000} seconds`
+        : sanitizeDiagnostic(error);
+      this.control.failMissionStartup(agent.missionId, diagnostic);
+      await this.stopMission(agent.missionId);
+      return;
+    }
+    this.clearRemoteStopWait(agentId);
+    if (mission.status === "active") {
+      // startAgent repeats the full assignment checks against the current session.
+      await this.startAgent(agent).catch(() => undefined);
+      await this.dispatchPending();
+    }
+  }
+
   async refreshProfile(profileId: string): Promise<void> {
     for (const agent of this.control.listAgents().filter((item) => item.profileId === profileId)) {
       if (agent.machineId !== "local") {
-        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch);
+        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
         continue;
       }
       if (!["idle", "offline"].includes(agent.status)) continue;
@@ -142,7 +208,7 @@ export class WorkerManager {
   async refreshRole(roleId: string): Promise<void> {
     for (const agent of this.control.listAgents().filter((item) => item.roleId === roleId)) {
       if (agent.machineId !== "local") {
-        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch);
+        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
         continue;
       }
       if (!["idle", "offline"].includes(agent.status)) continue;
@@ -389,13 +455,14 @@ export class WorkerManager {
 
   private async performMissionQuiescence(missionId: string, flight: QuiescenceFlight): Promise<void> {
     const agents = this.control.listAgents(missionId);
+    for (const agent of agents) this.clearRemoteStopWait(agent.id);
     const captured = new Map<string, Handle>();
     for (const agent of agents) {
       if (agent.machineId !== "local") {
         this.control.requestRemoteRuntimeStop(agent.id);
         if (!flight.fencedAgents.has(agent.id)) {
           flight.fencedAgents.add(agent.id);
-          this.control.markAgentInterrupted(agent.id, agent.epoch);
+          this.control.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
         }
         continue;
       }
@@ -451,7 +518,7 @@ export class WorkerManager {
     if (!agent) throw new HttpError(404, "Agent not found");
     if (agent.machineId !== "local") {
       this.control.requestRemoteRuntimeStop(agentId);
-      this.control.markAgentInterrupted(agentId, agent.epoch);
+      this.control.markAgentInterrupted(agentId, agent.epoch, { controlledRemoteStop: true });
       return;
     }
     const handle = this.handles.get(agentId);
@@ -476,6 +543,7 @@ export class WorkerManager {
   }
 
   async stopAgent(agentId: string): Promise<void> {
+    this.clearRemoteStopWait(agentId);
     const agent = this.control.getAgentPublic(agentId);
     if (agent?.machineId !== "local") {
       this.control.requestRemoteRuntimeStop(agentId);
@@ -611,6 +679,7 @@ export class WorkerManager {
 
   async close(): Promise<void> {
     this.closing = true;
+    for (const agentId of this.remoteStopWaits.keys()) this.clearRemoteStopWait(agentId);
     for (const handle of this.handles.values()) handle.stopping = true;
     await Promise.allSettled([...this.starting.values()]);
     for (const missionId of new Set(this.control.listAgents().map((agent) => agent.missionId))) await this.stopMission(missionId);
