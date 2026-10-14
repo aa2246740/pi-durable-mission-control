@@ -12,7 +12,7 @@ import { AssistantEntry } from "@earendil-works/pi-durable";
 import { ControlPlane } from "../dist/control.js";
 import { createRuntimeProvider, openWorkerRuntime } from "../dist/worker.js";
 import { startServer } from "../dist/server.js";
-import { redactDiagnosticChunk } from "../dist/workers.js";
+import { redactDiagnosticChunk, WorkerManager } from "../dist/workers.js";
 
 function stable(value) {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
@@ -1568,13 +1568,19 @@ for (const state of ["dispatching", "admitted", "delivered"]) {
   });
 }
 
-test("cancel retains a resolvable delivery blocker without allowing mission revival", () => {
+test("cancel retains a resolvable delivery blocker without allowing mission revival", async () => {
   const f = fixture();
   try {
     const row = f.control.pendingOutbox().find(item => item.message_id === `mission-opening:${f.mission.id}`);
     f.control.markOutboxDispatching(row.id, f.orchestrator.epoch);
     f.control.ackOutbox(row.message_id, row.request_id, row.attempt, f.orchestrator.epoch, "admitted");
     f.control.missionAction(f.mission.id, "cancel");
+    assert.equal(f.control.message(row.message_id).status, "admitted");
+    const workers = new WorkerManager(f.control);
+    await workers.stopMission(f.mission.id);
+    const epoch = f.control.getAgentPublic(f.orchestrator.id).epoch;
+    await workers.stopMission(f.mission.id);
+    assert.equal(f.control.getAgentPublic(f.orchestrator.id).epoch, epoch);
     assert.equal(f.control.blockers(f.mission.id).find(item => item.id === `delivery:${row.id}`).status, "open");
     f.control.resolveBlocker(`delivery:${row.id}`, "Reviewed cancellation; no replay.");
     assert.equal(f.control.missionById(f.mission.id).status, "cancelled");

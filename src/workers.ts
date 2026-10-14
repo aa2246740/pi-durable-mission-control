@@ -475,6 +475,17 @@ export class WorkerManager {
         captured.set(agent.id, handle);
       }
     }
+    const status = this.control.missionById(missionId)?.status;
+    if (flight.mode === "stop" && (status === "completed" || status === "cancelled")) {
+      // The completion RPC reply precedes submission.wait(). Do not close the
+      // Harness until its settlement evidence has reached the control database.
+      await Promise.all([...captured].map(async ([agentId, handle]) => {
+        const outcome = await this.waitForLocalSettlement(missionId, agentId, handle);
+        if (outcome !== "settled") this.control.recordWorkerDiagnostic(agentId, handle.epoch,
+          outcome === "timeout" ? "Local delivery did not settle within 5000 ms before terminal mission shutdown"
+            : "Local worker exited before terminal mission delivery settlement");
+      }));
+    }
     try {
       await this.control.stopMissionProcesses(missionId);
     } catch (error) {
@@ -489,7 +500,15 @@ export class WorkerManager {
     }
     for (const agent of agents) {
       const handle = captured.get(agent.id);
-      if (!handle) continue;
+      if (!handle) {
+        if (agent.machineId === "local" && (status === "completed" || status === "cancelled") && !flight.fencedAgents.has(agent.id) &&
+            this.control.db.prepare(`SELECT 1 FROM messages WHERE mission_id=? AND json_extract(data,'$.recipientId')=?
+              AND status IN ('queued','dispatching','admitted','delivering','delivered') LIMIT 1`).get(missionId, agent.id)) {
+          flight.fencedAgents.add(agent.id);
+          this.control.markAgentInterrupted(agent.id, agent.epoch);
+        }
+        continue;
+      }
       if (flight.mode === "pause" && isChildLive(handle.child)) {
         const acknowledged = await this.waitForAck(agent.id, handle, "aborted", () => sendToWorker(handle.child, { type: "abort" }));
         if (acknowledged && isChildLive(handle.child)) this.control.setAgentStatus(agent.id, handle.epoch, "idle");
@@ -514,6 +533,37 @@ export class WorkerManager {
         this.control.markAgentInterrupted(agentId, agent.epoch);
       }
     }
+  }
+
+  private async waitForLocalSettlement(missionId: string, agentId: string, handle: Handle): Promise<"settled" | "exited" | "timeout"> {
+    const pending = (): boolean => Boolean(this.control.db.prepare(`SELECT 1 FROM outbox o
+      JOIN messages m ON m.id=o.message_id
+      WHERE m.mission_id=? AND json_extract(m.data,'$.recipientId')=? AND o.epoch=?
+        AND o.status IN ('dispatching','admitted') LIMIT 1`)
+      .get(missionId, agentId, handle.epoch));
+    if (!pending()) return "settled";
+    return new Promise<"settled" | "exited" | "timeout">((resolveSettlement) => {
+      let finished = false;
+      const finish = (outcome: "settled" | "exited" | "timeout"): void => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        handle.child.off("message", onMessage);
+        handle.child.off("exit", onExit);
+        resolveSettlement(outcome);
+      };
+      const onMessage = (raw: unknown): void => {
+        const notice = parseWorkerNotice(raw);
+        if (!notice || notice.agentId !== agentId || notice.epoch !== handle.epoch ||
+            (notice.type !== "settled" && notice.type !== "delivery_error")) return;
+        if (!pending()) finish("settled");
+      };
+      const onExit = (): void => finish("exited");
+      const timer = setTimeout(() => finish("timeout"), 5000);
+      handle.child.on("message", onMessage);
+      handle.child.once("exit", onExit);
+      if (!isChildLive(handle.child)) finish("exited");
+    });
   }
 
   async interruptAgent(agentId: string): Promise<void> {
