@@ -108,6 +108,8 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+const REPLAYED_PUBLICATION_NOTICE = "This is a replay of a completed effect. The task status may have changed; use GetMissionState for the current state.";
+
 type Handle = {
   binding: WorkerBinding;
   descriptorHash: string;
@@ -1188,10 +1190,32 @@ export class NodeWorkerSupervisor {
     }
   }
 
+  /**
+   * A stored publication receipt keeps the task status and nextStep from the
+   * original coordinator response. Replaying that object can tell the worker
+   * to UpdateTask after the task has already left running. The journal row,
+   * its hash, and coordinator evidence stay unchanged; only this copy does.
+   */
+  private workerVisibleReceipt(handle: Handle, spec: NodeEffectSpec, durable: NodeEffectReceipt, replayed: boolean): NodeEffectReceipt {
+    const visible = this.redactStructured(handle, durable as unknown as JsonValue) as unknown as NodeEffectReceipt;
+    if (!replayed || spec.method !== "PublishArtifact" || visible.status === "uncertain") return visible;
+    const result = visible.result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) return visible;
+    if (!Object.hasOwn(result, "task") && !Object.hasOwn(result, "nextStep")) return visible;
+    const replayedResult: Record<string, JsonValue> = Object.create(null);
+    for (const [key, value] of Object.entries(result)) {
+      if (key === "task" || key === "nextStep") continue;
+      replayedResult[key] = value;
+    }
+    replayedResult.replayNotice = REPLAYED_PUBLICATION_NOTICE;
+    return { status: visible.status, result: replayedResult };
+  }
+
   private async executePermittedEffect(handle: Handle, spec: NodeEffectSpec, expiresAt: number): Promise<NodeEffectReceipt> {
     const binding = handle.binding;
     let receipt: NodeEffectReceipt | undefined;
     let errorText: string | undefined;
+    let replayed = false;
     try {
       this.effects.admit(spec);
       const prior = this.effects.inspect().find((entry) =>
@@ -1201,6 +1225,7 @@ export class NodeWorkerSupervisor {
       const claim = this.effects.begin(spec);
       if (!claim.execute) {
         receipt = claim.receipt;
+        replayed = true;
       } else {
         try {
           if (handle.stopping || Date.now() >= expiresAt || !this.leaseCurrent(binding)) {
@@ -1240,7 +1265,7 @@ export class NodeWorkerSupervisor {
     if (receipt && canonicalJson(receipt) !== canonicalJson(durable.receipt)) {
       throw new Error("Workspace effect terminal receipt does not match its durable journal evidence");
     }
-    return this.redactStructured(handle, durable.receipt as unknown as JsonValue) as unknown as NodeEffectReceipt;
+    return this.workerVisibleReceipt(handle, spec, durable.receipt, replayed);
   }
 
   private acceptDuplicateEffectReply(

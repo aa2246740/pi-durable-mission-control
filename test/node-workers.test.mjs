@@ -88,6 +88,39 @@ const closeQuietly = async (supervisor) => {
   await supervisor.close().catch(() => undefined);
 };
 
+const deliveredResults = (handle) => {
+  const sent = [];
+  const originalSend = handle.child.send.bind(handle.child);
+  handle.child.send = (message, callback) => {
+    if (message && typeof message === "object" && Object.hasOwn(message, "result")) sent.push(structuredClone(message));
+    return originalSend(message, callback);
+  };
+  return sent;
+};
+
+const permitEffect = async (supervisor, handle, binding, descriptorHash, effect) => {
+  const { rpcId, taskId, method, args, taskAttempt, messageId, sequence } = effect;
+  handle.child.emit("message", {
+    type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId,
+    epoch: binding.epoch, method, args, taskId
+  });
+  await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.rpcId === rpcId));
+  supervisor.mailbox.receive(binding, {
+    binding, messageId, sequence,
+    payload: {
+      kind: "reply", rpcId, ok: true,
+      result: {
+        effectPermit: {
+          binding, descriptorHash, taskId, method, args, expiresAt: Date.now() + 20000,
+          ...(taskAttempt === undefined ? {} : { taskAttempt })
+        }
+      }
+    }
+  });
+  await supervisor.pump(binding);
+};
+
 const assertProcessGroupExtinct = (pid) => {
   assert.equal(typeof pid, "number");
   let code;
@@ -1116,4 +1149,157 @@ test("legacy node runtime stop evidence stays unknown after migration and later 
   supervisor.mailbox.open(binding);
   assert.equal(supervisor.inspectBindings()[0].stopReason, null);
   assert.equal((await supervisor.stop(binding)).stopReason, null);
+});
+
+test("replayed PublishArtifact omits the stored task handoff without rewriting the journal", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-publication-replay-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(workspace, "delivery.txt"), "frozen");
+  const binding = bindingFor("publication-replay");
+  const uploads = [];
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    executionMode: "workspace-effects",
+    artifactTransfers: true,
+    uploadArtifact: async ({ spec }) => {
+      uploads.push(spec.taskId);
+      const artifact = {
+        id: `artifact-${spec.taskId}`, name: "Frozen evidence", path: "delivery.txt",
+        sha256: "abc", size: 6, createdAt: "2026-10-14T00:00:00.000Z", taskId: spec.args.taskId
+      };
+      if (!String(spec.taskId).endsWith(":with-handoff")) return artifact;
+      return {
+        ...artifact,
+        task: { id: spec.args.taskId, status: "running" },
+        nextStep: `When delivery is complete, use UpdateTask with taskId=${spec.args.taskId} and status=review, then Report to the orchestrator.`
+      };
+    }
+  });
+  const started = await supervisor.start({
+    ...specFor(binding, workspace, ""), effects: true, artifactTransfers: true
+  });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle?.child);
+  const sent = deliveredResults(handle);
+  const handoffTaskId = `${binding.agentId}:with-handoff`;
+  const plainTaskId = `${binding.agentId}:without-handoff`;
+  const handoffArgs = { name: "Frozen evidence", path: "delivery.txt", taskId: "mission-task-running" };
+  const plainArgs = { name: "Frozen evidence", path: "delivery.txt", taskId: "mission-task-settled" };
+  const notice = "This is a replay of a completed effect. The task status may have changed; use GetMissionState for the current state.";
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-handoff", taskId: handoffTaskId, method: "PublishArtifact", args: handoffArgs,
+    taskAttempt: 1, messageId: "permit-publish-handoff", sequence: 1
+  });
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-plain", taskId: plainTaskId, method: "PublishArtifact", args: plainArgs,
+    taskAttempt: 1, messageId: "permit-publish-plain", sequence: 2
+  });
+  const journalBefore = supervisor.effects.inspect().map((entry) => ({
+    effectId: entry.effectId,
+    receiptJson: supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(entry.effectId).receipt_json,
+    upload: supervisor.pendingEffectReceipts().find((item) => item.effectId === entry.effectId)
+  }));
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-handoff-replay", taskId: handoffTaskId, method: "PublishArtifact", args: handoffArgs,
+    taskAttempt: 1, messageId: "permit-publish-handoff-replay", sequence: 3
+  });
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-plain-replay", taskId: plainTaskId, method: "PublishArtifact", args: plainArgs,
+    taskAttempt: 1, messageId: "permit-publish-plain-replay", sequence: 4
+  });
+  const byId = (rpcId) => sent.find((message) => message.id === rpcId)?.result;
+  const firstHandoff = byId("rpc-publish-handoff");
+  const replayHandoff = byId("rpc-publish-handoff-replay");
+  const firstPlain = byId("rpc-publish-plain");
+  const replayPlain = byId("rpc-publish-plain-replay");
+  assert.equal(firstHandoff.status, "succeeded");
+  assert.equal(firstHandoff.result.task.status, "running");
+  assert.match(firstHandoff.result.nextStep, /UpdateTask with taskId=mission-task-running and status=review/);
+  assert.equal(Object.hasOwn(firstHandoff.result, "replayNotice"), false);
+  assert.equal(replayHandoff.status, "succeeded");
+  assert.equal(Object.hasOwn(replayHandoff.result, "task"), false);
+  assert.equal(Object.hasOwn(replayHandoff.result, "nextStep"), false);
+  assert.equal(replayHandoff.result.replayNotice, notice);
+  assert.equal(replayHandoff.result.id, firstHandoff.result.id);
+  assert.equal(replayHandoff.result.taskId, "mission-task-running");
+  assert.equal(JSON.stringify(replayHandoff).includes("UpdateTask"), false);
+  assert.equal(JSON.stringify(replayHandoff).includes("status=review"), false);
+  assert.deepEqual(firstPlain, replayPlain);
+  assert.equal(Object.hasOwn(replayPlain.result, "replayNotice"), false);
+  assert.equal(Object.hasOwn(replayPlain.result, "task"), false);
+  assert.equal(Object.hasOwn(replayPlain.result, "nextStep"), false);
+  assert.deepEqual(uploads, [handoffTaskId, plainTaskId]);
+  assert.equal(supervisor.inspect().find((row) => row.runtimeId === binding.runtimeId).state, "running");
+  for (const before of journalBefore) {
+    const row = supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(before.effectId);
+    const upload = supervisor.pendingEffectReceipts().find((item) => item.effectId === before.effectId);
+    assert.equal(row.receipt_json, before.receiptJson);
+    assert.equal(upload.receiptHash, before.upload.receiptHash);
+    assert.deepEqual(upload.receipt, before.upload.receipt);
+  }
+  const storedHandoff = journalBefore.find((entry) => entry.upload.spec.taskId === handoffTaskId).upload.receipt;
+  assert.equal(storedHandoff.result.task.status, "running");
+  assert.match(storedHandoff.result.nextStep, /status=review/);
+  assert.deepEqual(JSON.parse(JSON.stringify(firstHandoff)), JSON.parse(JSON.stringify(storedHandoff)));
+});
+
+test("replayed write_file, bash, and read_file receipts stay identical to the first result", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-effect-replay-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(workspace, "source.txt"), "original");
+  const binding = bindingFor("effect-replay");
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    executionMode: "workspace-effects"
+  });
+  const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle?.child);
+  const sent = deliveredResults(handle);
+  const cases = [
+    { method: "write_file", taskId: `${binding.agentId}:rewrite`, args: { path: "written.txt", content: "written once" } },
+    { method: "bash", taskId: `${binding.agentId}:append`, args: { command: "printf x >> effect-marker" } },
+    { method: "read_file", taskId: `${binding.agentId}:read`, args: { path: "source.txt" } }
+  ];
+  for (const [index, effect] of cases.entries()) {
+    await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+      ...effect, rpcId: `rpc-${effect.method}`, messageId: `permit-${effect.method}`, sequence: index + 1
+    });
+  }
+  writeFileSync(join(workspace, "written.txt"), "mutated after journal");
+  writeFileSync(join(workspace, "source.txt"), "changed after journal");
+  const journalBefore = supervisor.effects.inspect().map((entry) => ({
+    effectId: entry.effectId,
+    receiptJson: supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(entry.effectId).receipt_json,
+    upload: supervisor.pendingEffectReceipts().find((item) => item.effectId === entry.effectId)
+  }));
+  for (const [index, effect] of cases.entries()) {
+    await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+      ...effect, rpcId: `rpc-${effect.method}-replay`, messageId: `permit-${effect.method}-replay`, sequence: index + 4
+    });
+  }
+  for (const effect of cases) {
+    const first = sent.find((message) => message.id === `rpc-${effect.method}`).result;
+    const replay = sent.find((message) => message.id === `rpc-${effect.method}-replay`).result;
+    assert.deepEqual(replay, first);
+    assert.equal(JSON.stringify(replay).includes("replayNotice"), false);
+    assert.equal(JSON.stringify(replay).includes("nextStep"), false);
+    const stored = journalBefore.find((entry) => entry.upload.spec.method === effect.method);
+    assert.deepEqual(JSON.parse(JSON.stringify(first)), JSON.parse(JSON.stringify(stored.upload.receipt)));
+    const row = supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(stored.effectId);
+    const upload = supervisor.pendingEffectReceipts().find((item) => item.effectId === stored.effectId);
+    assert.equal(row.receipt_json, stored.receiptJson);
+    assert.equal(upload.receiptHash, stored.upload.receiptHash);
+  }
+  assert.equal(readFileSync(join(workspace, "written.txt"), "utf8"), "mutated after journal");
+  assert.equal(readFileSync(join(workspace, "effect-marker"), "utf8"), "x");
+  assert.equal(readFileSync(join(workspace, "source.txt"), "utf8"), "changed after journal");
+  assert.match(sent.find((message) => message.id === "rpc-read_file").result.result.content, /^original$/);
+  assert.equal(supervisor.inspect().find((row) => row.runtimeId === binding.runtimeId).state, "running");
 });
