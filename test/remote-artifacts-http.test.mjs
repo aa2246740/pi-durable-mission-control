@@ -142,6 +142,20 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   assert.equal(JSON.stringify(detail).includes(original.toString("base64")), false);
   assert.equal(node.exitCode, null, nodeOutput);
 
+  const base = `http://127.0.0.1:${service.port}`;
+  const page = await fetch(base);
+  const cookie = page.headers.get("set-cookie").split(";")[0];
+  await page.text();
+  const download = await fetch(`${base}/api/artifacts/${artifact.id}/content`, { headers: { cookie } });
+  assert.equal(download.status, 200);
+  assert.equal(download.headers.get("content-disposition"),
+    "attachment; filename=\"artifact.bin\"; filename*=UTF-8''artifact.bin");
+  assert.equal(download.headers.get("content-type"), "application/octet-stream");
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), original);
+  const browserDetail = await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } });
+  assert.equal(browserDetail.status, 200);
+  assert.equal((await browserDetail.json()).artifacts.find(item => item.id === artifact.id).downloadName, "artifact.bin");
+
   const transfer = control.db.prepare(
     "SELECT transfer_id,spec_json,manifest_json FROM remote_artifact_transfers WHERE status='complete'"
   ).get();
