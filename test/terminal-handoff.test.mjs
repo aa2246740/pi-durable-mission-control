@@ -215,3 +215,111 @@ for (const action of ["cancel", "close"]) {
     assert.equal(f.workers.handles.size, 0);
   });
 }
+
+function installPeer(f, { stuck = false } = {}) {
+  const child = new EventEmitter();
+  Object.assign(child, { connected: true, exitCode: null, signalCode: null });
+  const sent = [];
+  child.send = (message, callback) => {
+    sent.push(message.type);
+    callback(null);
+    if (stuck) return;
+    if (message.type === "abort") child.emit("message", { type: "aborted", agentId: f.owner.id, epoch: f.owner.epoch });
+    if (message.type === "shutdown") {
+      child.emit("message", { type: "closed", agentId: f.owner.id, epoch: f.owner.epoch });
+      child.exitCode = 0;
+      child.connected = false;
+      child.emit("exit", 0);
+    }
+  };
+  child.kill = () => true;
+  const handle = { child, token: "peer", epoch: f.owner.epoch, ready: Promise.resolve(), stopping: false };
+  f.workers.handles.set(f.owner.id, handle);
+  return { child, handle, sent };
+}
+
+function exitChildren(...children) {
+  for (const child of children) {
+    child.exitCode = 0;
+    child.connected = false;
+    child.emit("exit", 0);
+  }
+}
+
+test("question handoff stops remaining workers after a peer stop fails and preserves the answer for resume", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const peer = installPeer(f, { stuck: true });
+  const deliveries = [];
+  installReplacement(f, deliveries);
+  try {
+    const pausing = f.workers.onRpc(f.agent, f.handle, { type: "rpc", id: "question-rpc", token: f.handle.token,
+      agentId: f.agent.id, epoch: f.agent.epoch, method: "RequestUserInput", args: { question: "Proceed?" }, taskId: "question" });
+    const reply = await f.reply;
+    f.control.resolveBlocker(reply.result.id, "Proceed with the next step");
+    const answerId = `blocker-resolution:${reply.result.id}`;
+    f.settle();
+    await nextImmediate();
+    for (const ms of [5000, 5000, 1000, 2000]) { t.mock.timers.tick(ms); await nextImmediate(); }
+    await pausing;
+    assert.equal(f.child.exitCode, 0, "The asking worker must stop even when its peer did not exit");
+    assert.deepEqual(f.sent.filter(message => message.type).map(message => message.type), ["abort", "shutdown"]);
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, f.agent.epoch + 1);
+    assert.equal(f.control.getAgentPublic(f.owner.id).epoch, f.owner.epoch + 1);
+    assert.equal(f.workers.handles.get(f.owner.id), peer.handle);
+    assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+    assert.equal(f.control.message(answerId).status, "queued");
+    assert.equal(f.control.message(answerId).attempt, 1);
+    assert.deepEqual(deliveries, []);
+    const blockers = f.control.blockers(f.mission.id).filter(blocker => blocker.status === "open");
+    assert.deepEqual(blockers.map(blocker => blocker.kind), ["unsafe_execution"]);
+    exitChildren(peer.child);
+    await f.workers.stopAgent(f.owner.id);
+    f.control.resolveBlocker(blockers[0].id, "Confirmed peer exit and inspected workspace");
+    f.control.missionAction(f.mission.id, "resume");
+    await f.workers.dispatchPending();
+    await f.workers.dispatchPending();
+    assert.equal(f.control.message(answerId).status, "completed");
+    assert.deepEqual(deliveries.map(message => message.messageId), [answerId]);
+    assert.equal(deliveries[0].attempt, 1);
+    assert.ok(deliveries[0].epoch > f.agent.epoch);
+  } finally {
+    exitChildren(f.child, peer.child);
+  }
+});
+
+for (const terminal of ["completed", "cancelled"]) {
+  test(`${terminal} stops and fences remaining workers after the first worker cannot exit`, async t => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const peer = installPeer(f);
+    const message = f.control.sendMessage(f.mission.id, f.owner.id, "Already sent input", "followUp", "peer-input");
+    const row = f.control.pendingOutbox().find(item => item.message_id === message.id);
+    assert.equal(f.control.markOutboxDispatching(row.id, f.owner.epoch), true);
+    assert.equal(f.control.ackOutbox(message.id, row.request_id, row.attempt, f.owner.epoch, "admitted"), true);
+    f.child.send = (message, callback) => { f.sent.push(message); callback(null); };
+    f.child.kill = () => true;
+    try {
+      if (terminal === "completed") await f.control.workerCommand({ type: "rpc", id: "complete-rpc", token: f.handle.token,
+        agentId: f.agent.id, epoch: f.agent.epoch, method: "CompleteMission", args: {}, taskId: "complete" });
+      else f.control.missionAction(f.mission.id, "cancel");
+      const stopping = f.workers.syncMissionLifecycle(f.mission.id);
+      const rejected = assert.rejects(stopping, /Local worker exit was not confirmed|Mission quiescence did not stop all workers/);
+      await nextImmediate();
+      for (const ms of [5000, 5000, 1000, 2000]) { t.mock.timers.tick(ms); await nextImmediate(); }
+      await rejected;
+      assert.equal(peer.child.exitCode, 0, "Other workers must stop before the failure is returned");
+      assert.deepEqual(peer.sent, ["shutdown"]);
+      assert.equal(f.control.getAgentPublic(f.owner.id).epoch, f.owner.epoch + 1);
+      assert.equal(f.control.getAgentPublic(f.agent.id).epoch, f.agent.epoch + 1);
+      assert.equal(f.control.message(message.id).status, "uncertain");
+      assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE id=?").get(row.id).status, "uncertain");
+      assert.equal(f.control.missionById(f.mission.id).status, terminal);
+      assert.equal(f.workers.handles.get(f.agent.id), f.handle);
+      assert.equal(f.workers.handles.has(f.owner.id), false);
+      assert.deepEqual(f.control.blockers(f.mission.id).map(blocker => blocker.kind), terminal === "completed" ? [] : ["delivery", "delivery"]);
+    } finally {
+      exitChildren(f.child, peer.child);
+    }
+  });
+}

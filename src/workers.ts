@@ -533,6 +533,23 @@ export class WorkerManager {
         captured.set(agentId, handle);
       }
     }
+    const failures: unknown[] = [];
+    const stopAndFence = async (agent: Agent): Promise<void> => {
+      try {
+        await this.stopAgent(agent.id);
+      } catch (error) {
+        // An unconfirmed process retains its handle and blocker; peers still need to stop.
+        failures.push(error);
+      }
+      if (!flight.fencedAgents.has(agent.id)) {
+        flight.fencedAgents.add(agent.id);
+        const currentStatus = this.control.missionById(missionId)?.status;
+        this.control.markAgentInterrupted(agent.id, agent.epoch, {
+          ...(flight.settlement.kind === "question" && flight.mode === "pause" &&
+            (currentStatus === "active" || (currentStatus === "blocked" && failures.length > 0)) ? { preserveQueued: true } : {})
+        });
+      }
+    };
     // Pause peers immediately while the asking agent finishes its submission.
     const stoppingAgents = settlingAgentId
       ? [...agents.filter((agent) => agent.id !== settlingAgentId), ...agents.filter((agent) => agent.id === settlingAgentId)]
@@ -561,25 +578,15 @@ export class WorkerManager {
           this.control.setAgentStatus(agent.id, handle.epoch, "error", "Worker did not acknowledge queue cancellation");
         }
       }
-      await this.stopAgent(agent.id);
-      if (!flight.fencedAgents.has(agent.id)) {
-        flight.fencedAgents.add(agent.id);
-        this.control.markAgentInterrupted(agent.id, agent.epoch, {
-          ...(flight.settlement.kind === "question" && flight.mode === "pause" &&
-            this.control.missionById(missionId)?.status === "active" ? { preserveQueued: true } : {})
-        });
-      }
+      await stopAndFence(agent);
     }
     for (const [agentId, handle] of [...this.handles]) {
       const agent = this.control.getAgentPublic(agentId);
       if (agent?.missionId !== missionId || captured.has(agentId)) continue;
       handle.stopping = true;
-      await this.stopAgent(agentId);
-      if (!flight.fencedAgents.has(agentId)) {
-        flight.fencedAgents.add(agentId);
-        this.control.markAgentInterrupted(agentId, agent.epoch);
-      }
+      await stopAndFence(agent);
     }
+    if (failures.length) throw new AggregateError(failures, "Mission quiescence did not stop all workers");
   }
 
   private async waitForLocalSettlement(missionId: string, agentId: string, handle: Handle, signal?: AbortSignal): Promise<"settled" | "exited" | "timeout" | "interrupted"> {
