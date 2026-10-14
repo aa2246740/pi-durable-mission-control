@@ -79,7 +79,7 @@ test("local validators on a remote mission accept the frozen snapshot, not their
   assert.match(text, /takes priority over inspecting your assigned workspace/);
   assert.match(text, /do not look for that delivery in your own workspace/);
   assert.match(text, /do not use the remote workspacePath/);
-  assert.match(text, /paths relative to the snapshot root, for example totals\.mjs/);
+  assert.match(text, /relative to the snapshot root, never by an absolute path/);
   assert.match(text, /The task must be in review before RunValidation/);
   assert.match(text, /Report the actual status to the orchestrator/);
   assert.match(text, /Do not ask the user/);
@@ -104,7 +104,7 @@ test("local validators on a remote mission accept the frozen snapshot, not their
   ];
   for (const prompt of absent) {
     assert.equal(prompt.includes("takes priority over inspecting your assigned workspace"), false);
-    assert.equal(prompt.includes("totals.mjs"), false);
+    assert.equal(prompt.includes("relative to the snapshot root"), false);
   }
   assert.match(worktree, /separate detached worktree/);
   assert.match(metadataValidator, /artifact effects are unavailable/);
