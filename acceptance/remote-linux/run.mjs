@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
 import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
 import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
+import { createTurnLimitScenario, turnLimitMaxTurns } from "./scenarios/turn-limit.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const containerCLI = "/opt/homebrew/bin/container";
@@ -27,7 +28,7 @@ export function parseOptions(args) {
     else if (args[i] === "--discard") options.discard = true;
     else if (args[i] === "--scenario" && args[i + 1]) {
       options.scenario = args[++i];
-      assert.ok(["default", "pause-resume"].includes(options.scenario), "--scenario must be default or pause-resume");
+      assert.ok(["default", "pause-resume", "turn-limit"].includes(options.scenario), "--scenario must be default, pause-resume or turn-limit");
     }
     else if (args[i] === "--out" && args[i + 1]) options.out = resolve(args[++i]);
     else if (args[i] === "--timeout-ms" && args[i + 1]) {
@@ -37,7 +38,7 @@ export function parseOptions(args) {
     } else throw new Error(`Unknown or incomplete option ${args[i]}`);
   }
   if (options.real) {
-    assert.ok(!options.scenario || options.scenario === "default", "--scenario pause-resume requires mock mode");
+    assert.ok(!options.scenario || options.scenario === "default", "Non-default scenarios require mock mode");
     assert.ok(options.secretsFile, "--real requires --secrets-file");
     if (!explicitTimeout) options.timeoutMs = 1800000;
   } else assert.ok(!options.secretsFile && !options.discard, "--secrets-file and --discard require --real");
@@ -129,12 +130,16 @@ export function readPauseTransport(path, missionId) {
 }
 
 export function assertPauseResume(detail, runtimes, evidence, records, transport) {
+  assert.equal(evidence.humanActions.filter((action) => action.action === "answer").length, 1);
+  return assertRemoteResume(detail, runtimes, { ...evidence, transportBeforeResume: evidence.transportBeforeAnswer }, records, transport);
+}
+
+export function assertRemoteResume(detail, runtimes, evidence, records, transport) {
   const previous = evidence.stoppedRuntime;
-  assert.ok(previous, "No controlled pre-answer stop recorded");
+  assert.ok(previous, "No controlled pre-resume stop recorded");
   assert.equal(previous.state, "closed");
   assert.equal(previous.stopProvenance, "controlled");
   assert.equal(previous.report.outcome, "stopped");
-  assert.equal(evidence.humanActions.filter((action) => action.action === "answer").length, 1);
   const reassigned = detail.events.filter((event) => event.type === "remote_runtime_reassigned");
   assert.equal(reassigned.length, 1, "Expected exactly one replacement runtime");
   assert.equal(reassigned[0].data.previousRuntimeId, previous.binding.runtimeId);
@@ -168,7 +173,7 @@ export function assertPauseResume(detail, runtimes, evidence, records, transport
   const oldId = previous.binding.runtimeId;
   for (const key of ["inbox", "outbox", "effects"]) {
     const oldRows = (snapshot) => snapshot[key].filter((row) => key === "effects" ? JSON.parse(row.response).effectPermit.binding.runtimeId === oldId : row.runtime_id === oldId);
-    assert.deepEqual(oldRows(transport), oldRows(evidence.transportBeforeAnswer), `Old ${key} changed after replacement`);
+    assert.deepEqual(oldRows(transport), oldRows(evidence.transportBeforeResume), `Old ${key} changed after replacement`);
   }
   return { previousBinding: previous.binding, replacementBinding: replacement.binding, effectReceipts: receipts.length,
     effectPermits: permits.length, deliveries: transport.deliveries.length, deliveryAttempts: detail.messages.map(({ id, attempt }) => ({ id, attempt })) };
@@ -192,6 +197,9 @@ export async function run(options) {
   secrets.push(credential);
   let daemon, node, mock, nodeRelay, modelRelay, detail, summary;
   const pause = options.scenario === "pause-resume" ? { humanActions: [] } : undefined;
+  const turnLimit = options.scenario === "turn-limit" ? createTurnLimitScenario() : undefined;
+  const recovery = pause ?? turnLimit?.evidence;
+  const recoveryFile = pause ? "pause-resume.json" : "turn-limit.json";
   let captureMock;
   let captureReal, exportedReal, mutation, acceptance, acceptanceCommand;
   const sessions = [];
@@ -255,7 +263,7 @@ export async function run(options) {
       writeFileSync(testPath, source, { mode: 0o400 });
       acceptance = Object.defineProperty({ path: testPath, sha256: sha256(source), tests: 4 }, "source", { value: source });
       acceptanceCommand = `${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(testPath)}`;
-      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario,
+      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario, hooks: turnLimit,
         record: (record) => { records.push(record); save("mock-tools.json", records); }, fail: (error) => { mockFailure = error; } });
       modelRelay = await relay(mock.address().port);
       env.MC_ACCEPTANCE_MODEL_CREDENTIAL = credential;
@@ -265,9 +273,9 @@ export async function run(options) {
     const adminToken = readFileSync(join(home, "admin.token"), "utf8").trim();
     secrets.push(adminToken);
     const base = `http://127.0.0.1:${daemonInfo.port}`;
-    const api = async (path, body) => {
+    const api = async (path, body, method = body === undefined ? "GET" : "POST") => {
       check();
-      const response = await fetch(base + path, { method: body === undefined ? "GET" : "POST",
+      const response = await fetch(base + path, { method,
         headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(Math.max(1, Math.min(5000, deadline - Date.now()))) });
       const value = await response.json();
@@ -342,10 +350,12 @@ export async function run(options) {
       for (const role of roles) await api("/api/roles", role);
       mission = await api("/api/missions", { title: "Deterministic remote Linux frozen acceptance", goal: "Deliver on Linux and independently accept the frozen coordinator snapshot.",
         acceptance: `Host-only, read-only acceptance command: ${acceptanceCommand}. Publish ${deliveryName} with version 1, then mutate live source to version 2 before review.`,
-        workspaceId: localWorkspace.id, remoteWorkspaceIds: [remoteWorkspace.id], roleIds: roles.map((r) => r.id), maxTurns: 80, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared",
+        workspaceId: localWorkspace.id, remoteWorkspaceIds: [remoteWorkspace.id], roleIds: roles.map((r) => r.id), maxTurns: turnLimit ? turnLimitMaxTurns() : 80, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared",
         assertions: [{ id: "LINUX-FROZEN", description: "Linux self-check and frozen delivery pass independent coordinator tests even after the live source changes." }] });
     }
-    if (pause) captureMock = async () => {
+    if (turnLimit) turnLimit.configure({ api, wait, save, missionId: mission.id, modelUrl: `http://192.168.64.1:${modelRelay.port}`,
+      readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id) });
+    if (recovery) captureMock = async () => {
       const read = async (path) => {
         const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
         assert.ok(response.ok, `Evidence read failed: ${path}`);
@@ -356,10 +366,10 @@ export async function run(options) {
       save("mission.json", detail);
       save("mission-export.json", await read(`/api/missions/${mission.id}/export`));
       save("runtimes.json", runtimes);
-      pause.failures = detail.events.filter((event) => event.type === "worker_start_failed");
-      pause.blockers = detail.blockers;
-      pause.transport = readPauseTransport(join(home, "control.sqlite"), mission.id);
-      save("pause-resume.json", pause);
+      recovery.failures = detail.events.filter((event) => event.type === "worker_start_failed");
+      recovery.blockers = detail.blockers;
+      recovery.transport = readPauseTransport(join(home, "control.sqlite"), mission.id);
+      save(recoveryFile, recovery);
     };
     await api(`/api/missions/${mission.id}/start`, {});
     detail = await wait(async () => {
@@ -422,6 +432,12 @@ export async function run(options) {
         if (["failed", "blocked"].includes(detail.mission.status)) return detail;
         return false;
       }
+      if (turnLimit && current.mission.status === "blocked" && !turnLimit.evidence.resumeAttempted) {
+        await turnLimit.recover(current);
+        await captureMock();
+        if (["failed", "blocked"].includes(detail.mission.status)) return detail;
+        return false;
+      }
       if (config && current.mission.turns >= current.mission.maxTurns) return current;
       if (["completed", "failed", "blocked"].includes(current.mission.status)) return current;
       return false;
@@ -430,15 +446,15 @@ export async function run(options) {
       await captureReal();
       assert.equal(detail.mission.status, "completed");
     } else {
-      if (pause) {
+      if (recovery) {
         await captureMock();
-        assert.equal(detail.mission.status, "completed", JSON.stringify({ failures: pause.failures, blockers: detail.blockers }));
+        assert.equal(detail.mission.status, "completed", JSON.stringify({ failures: recovery.failures, blockers: detail.blockers }));
       } else assert.equal(detail.mission.status, "completed");
     }
     const runtimes = await wait(async () => {
       const current = await api(`/api/missions/${mission.id}/runtimes`);
       if (current.some((runtime) => runtime.state === "uncertain")) throw new Error("Remote runtime stop is uncertain");
-      return current.length === (pause ? 2 : 1) && current.every((runtime) => runtime.state === "closed") && current;
+      return current.length === (recovery ? 2 : 1) && current.every((runtime) => runtime.state === "closed") && current;
     });
     detail = await api(`/api/missions/${mission.id}`);
     save("mission.json", detail);
@@ -453,7 +469,7 @@ export async function run(options) {
       assert.equal(detail.mission.status, "completed");
       assert.equal(detail.tasks.length, 1);
       assert.equal(detail.tasks[0].status, "accepted");
-      assert.deepEqual(pause ? detail.blockers.filter((blocker) => blocker.status === "open") : detail.blockers, []);
+      assert.deepEqual(recovery ? detail.blockers.filter((blocker) => blocker.status === "open") : detail.blockers, []);
       const artifact = detail.artifacts[0];
       assert.equal(detail.artifacts.length, 1);
       assert.equal(artifact.remoteProvenance.machineId, machineId);
@@ -483,7 +499,13 @@ export async function run(options) {
         pause.assertions = assertPauseResume(detail, runtimes, pause, records, pause.transport);
         save("pause-resume.json", pause);
       }
-      summary = { status: "passed", scenario: options.scenario ?? "default", ...(pause ? { pauseResume: pause.assertions, humanActions: pause.humanActions } : {}), durationMs: Date.now() - startedAt, missionStatus: detail.mission.status, taskStatus: detail.tasks[0].status,
+      if (turnLimit) {
+        await captureMock();
+        recovery.assertions = assertRemoteResume(detail, runtimes, recovery, records, recovery.transport);
+        turnLimit.assertCompleted(detail);
+        save(recoveryFile, recovery);
+      }
+      summary = { status: "passed", scenario: options.scenario ?? "default", ...(recovery ? { [pause ? "pauseResume" : "turnLimit"]: recovery.assertions, humanActions: recovery.humanActions } : {}), durationMs: Date.now() - startedAt, missionStatus: detail.mission.status, taskStatus: detail.tasks[0].status,
         exitCode: receipt.exitCode, snapshotIntegrity: receipt.snapshotIntegrity, workspaceKind: receipt.workspaceKind,
         machineId, platform: machine.capabilities.platform, node: machine.capabilities.node, remoteProvenance: artifact.remoteProvenance,
         contentDisposition: disposition, linuxNodePath: "/usr/local/bin/node", liveSourceChanged: true, blockers: detail.blockers.filter((blocker) => blocker.status === "open").length,
@@ -497,7 +519,7 @@ export async function run(options) {
     if (captureMock) {
       try { await captureMock(); }
       catch (captureError) { summary.evidenceError = redact(captureError.message); }
-      Object.assign(summary, { scenario: "pause-resume", missionStatus: detail?.mission.status, rejection: pause.failures, blockers: pause.blockers, humanActions: pause.humanActions });
+      Object.assign(summary, { scenario: options.scenario, missionStatus: detail?.mission.status, rejection: recovery.failures, blockers: recovery.blockers, humanActions: recovery.humanActions });
     }
     if (captureReal) {
       try { await captureReal(); }

@@ -54,6 +54,26 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-i1-gpt- node --test acceptance/remote-linu
 
 2026-10-14 在 `orch/i1-gpt`、基线 `4dc93bd` 上实测：默认场景 1/1 通过，17.420 秒；修正后的 pause-resume 连续 5/5 通过，耗时分别为 22.670, 22.572, 21.990, 22.123, 22.083 秒（包含每次运行及清理）。5 次均由产品自动恢复，无须显式 resume；epoch 均从 2 增到 4，同节点分配新 runtime，4 个 effect permit/receipt 各执行一次，10 个 durable delivery attempt 均为 1，清理均通过，严格恢复门槛拒绝 0/5。此前一轮 5 次 Mission 均 completed，但脚本错误要求 epoch 恰好加 1，导致验收断言失败；现已按任务要求改为严格递增，并由单元测试固定覆盖 2 到 4。以上只验证此 mock 时序，不能排除其他时序的恢复拒绝。
 
+### 远端 worker 的轮次上限与恢复
+
+mock 模式新增 `--scenario turn-limit`，真实模型模式拒绝该场景。`maxTurns` 固定计算为 16：orchestrator 设置任务和成员、发送消息与等待共 11 轮，validator 初次读取状态与等待共 2 轮，worker 读取状态、写文件与选择 Linux 自查共 3 轮。场景将 worker 的首次状态读取等到任务分配完成；orchestrator 的发送消息响应则等到 Linux bash 已完成内容自查。bash 在退出前通过随机 mock 路径同步，等最后一次本地模型准入占满预算。该本地响应暂不返回，避免本地 turn_end 提前触发停止；bash 退出并落库自查回执后，下一次远端 worker AdmitTurn RPC 必须触顶。同步只用于脚本化 mock，不修改产品状态库或产品代码。
+
+```sh
+mkdir -p .acceptance-proof
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l1-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario turn-limit --keep --out "$PWD/.acceptance-proof/turn-limit-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l1-gpt- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/turn-limit-container.test.mjs
+```
+
+容器自测顺序运行 turn-limit 三次、default 一次、pause-resume 一次；逐次保存结果、完整耗时、清理结果和证据路径，即使前一次失败也继续其余场景，最后有任一次失败便非零退出。它不属于 `npm test`。
+
+`turn-limit.json` 保存同步点、blocked 快照、物理停止回报、只读读取 control.sqlite 的 transport、触顶 RPC 与拒绝回复、Linux 自查回执及每次运营者动作。触顶事件必须匹配旧 runtime binding 的 agentId、epoch、generationId，协调端 inbox 必须为 applied，并有唯一落库拒绝回复；旧 runtime 必须 closed 且 stopProvenance 为 controlled。脚本通过 PATCH 将 maxTurns 从 16 提到 96，仅解决产品已生成的 limit blocker，然后按需 resume。每次动作记录方法、路径、正文、时间、响应或完整错误；不解除 delivery 等其他 blocker。
+
+成功仍要求产品生成 limit blocker，恢复出现恰好一个 remote_runtime_reassigned，同节点、同 worker、epoch 递增，最终 completed，并通过 pause-resume 共用的 effect、投递、工具调用和历史 mailbox 不重放检查。恢复拒绝、worker_start_failed、Mission failed、缺少 limit blocker 或其他 blocker 均使脚本非零退出，保留 mission-export.json、runtimes.json 和全部拒绝证据。
+
+2026-10-14 在 `orch/l1-gpt`、基线 `b9e4d4c` 上连续运行：turn-limit 三次均非零退出，完整耗时为 16.469、16.449、16.279 秒；default 通过，23.054 秒；pause-resume 通过，23.647 秒。五次清理均通过。三次 turn-limit 都有 Linux 自查回执 seq 72，随后远端 worker 拒绝事件 seq 74，触顶 RPC 的协调端 inbox 为 applied，旧 runtime 为 closed/controlled。PATCH 将 maxTurns 提到 96 成功，resume 返回 HTTP 409 `Resolve mission blockers before resuming`，Mission 保持 blocked，没有新 runtime。
+
+此基线的 `admitTurn` 在触顶时只保存 generation denial、设置 blocked 并记录事件，没有插入 limit blocker；停止过程则将仍在执行的投递记为 uncertain 并生成三个 delivery blocker，其中一个属于场景故意保留的本地模型请求。脚本保存全部原因，并按授权范围保留这些 blocker。因此 RPC 回复落库修复在本次时序中已验证，但恢复、epoch 递增、最终 completed 和恢复后不重放尚未完成验收。产品修复须另行处理；本任务未修改 src/。
+
 普通 `npm test` 包含 mock 协议与决策单元测试，不启动 Apple Container。容器验收测试单独运行：
 
 ```sh

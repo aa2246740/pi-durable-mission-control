@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { turnLimitCall } from "./scenarios/turn-limit.mjs";
 
 export const shellQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
 
@@ -78,6 +79,10 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
     if (task.status === "review") return call("SendMessage", { recipientId: validator.id, mode: "followUp", content: `Independently accept task ${task.id} using ${acceptanceCommand} on the coordinator frozen snapshot, then Report.` });
     throw new Error(`Unexpected task status ${task.status}`);
   }
+  if (scenario === "turn-limit") {
+    const decision = turnLimitCall({ role, last, history, state, call });
+    if (decision) return decision;
+  }
   if (role === "worker") {
     assert.equal(state.executionEnvironment?.platform, "linux");
     const owned = state.tasks.find((t) => state.agents.find((a) => a.id === t.ownerId)?.kind === "worker");
@@ -133,9 +138,10 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
   throw new Error(`Unexpected ${role} tool progress after ${last?.name}`);
 }
 
-export async function startMock({ credential, acceptanceCommand, hostTestPath, scenario = "default", record, fail }) {
+export async function startMock({ credential, acceptanceCommand, hostTestPath, scenario = "default", hooks, record, fail }) {
   const server = createServer(async (request, response) => {
     try {
+      if (await hooks?.handleRequest(request, response)) return;
       assert.equal(request.method, "POST");
       assert.equal(request.url, "/v1/chat/completions");
       assert.equal(request.headers.authorization, `Bearer ${credential}`);
@@ -154,6 +160,7 @@ export async function startMock({ credential, acceptanceCommand, hostTestPath, s
         record({ role: "protocol", name: "rejected", results: transcript(body) });
         throw error;
       }
+      await hooks?.beforeReply(decision);
       record({ ...decision, results: transcript(body) });
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       const id = `chatcmpl-${randomUUID()}`;
