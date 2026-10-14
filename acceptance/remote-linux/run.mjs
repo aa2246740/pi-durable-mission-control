@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance } from "./real.mjs";
+import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
 import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
 import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
 
@@ -87,6 +87,8 @@ export function childProcess(command, args, env = process.env) {
   });
   return { child, done, stdout: () => stdout, stderr: () => stderr, output: () => stdout + stderr, error: () => error };
 }
+
+export const frozenFlagEnvironment = () => ({ PATH: process.env.PATH });
 
 export async function commandOutput(executable, args, env = process.env) {
   const handle = childProcess(executable, args, env);
@@ -194,6 +196,10 @@ export async function run(options) {
   let captureReal, exportedReal, mutation, acceptance, acceptanceCommand;
   const sessions = [];
   const seenReceipts = new Set();
+  const reviewName = `${prefix}review-${randomUUID().slice(0, 8)}`;
+  let hostRuntime, review;
+  const rejectedPublications = [];
+  const seenPublications = new Set();
   let failure;
   let mockFailure;
   let aborted;
@@ -226,13 +232,15 @@ export async function run(options) {
     const image = images.find((i) => /^(docker\.io\/library\/)?node:22-bookworm-slim$/.test(i.configuration.name));
     assert.ok(image?.variants.some((v) => v.platform.architecture === "arm64" && v.platform.os === "linux"), "Required cached node:22-bookworm-slim arm64 image missing; pulling is forbidden");
 
+    hostRuntime = { path: process.execPath, beforeSha256: sha256(readFileSync(process.execPath)) };
+    save("host-runtime.json", hostRuntime);
     const env = { PATH: process.env.PATH, HOME: proof, TMPDIR: proof };
     if (config) {
       acceptance = writeFrozenAcceptance(proof);
       acceptance.checks = [];
       acceptance.immutable = { attempted: process.platform === "darwin", applied: false };
       if (acceptance.immutable.attempted) {
-        const flags = childProcess("/bin/chflags", ["uchg", acceptance.path], env);
+        const flags = childProcess("/bin/chflags", ["uchg", acceptance.path], frozenFlagEnvironment());
         await flags.done;
         acceptance.immutable.applied = !flags.error() && flags.child.exitCode === 0;
         if (!acceptance.immutable.applied) acceptance.immutable.error = "chflags uchg failed";
@@ -243,8 +251,10 @@ export async function run(options) {
       for (const kind of ["orchestrator", "validator"]) env[config[kind].credentialEnv] = credentials[config[kind].credentialEnv];
     } else {
       const testPath = join(proof, "host-acceptance.test.mjs");
-      writeFileSync(testPath, `import assert from 'node:assert/strict';\nimport {readFileSync,statSync} from 'node:fs';\nimport {test} from 'node:test';\nimport {join} from 'node:path';\nconst file=join(process.cwd(),${JSON.stringify(deliveryName)});\ntest('frozen Linux content',()=>assert.deepEqual(JSON.parse(readFileSync(file,'utf8')),${JSON.stringify(delivery)}));\ntest('detached coordinator snapshot',()=>assert.match(process.cwd(),/validations\\/remote\\/[a-f0-9]{32}$/));\ntest('read-only host acceptance file',()=>assert.equal(statSync(new URL(import.meta.url)).mode & 0o222,0));\nconsole.log('FROZEN-SNAPSHOT-ACCEPTED');\n`, { mode: 0o400 });
-      acceptanceCommand = `${shellQuote(process.execPath)} --test ${shellQuote(testPath)}`;
+      const source = `import assert from 'node:assert/strict';\nimport {readFileSync,statSync} from 'node:fs';\nimport {test} from 'node:test';\nimport {join} from 'node:path';\nconst file=join(process.cwd(),${JSON.stringify(deliveryName)});\ntest('frozen Linux content',()=>assert.deepEqual(JSON.parse(readFileSync(file,'utf8')),${JSON.stringify(delivery)}));\ntest('detached coordinator snapshot',()=>assert.match(process.cwd(),/validations\\/remote\\/[a-f0-9]{32}$/));\ntest('read-only host acceptance file',()=>assert.equal(statSync(new URL(import.meta.url)).mode & 0o222,0));\ntest('published version remains frozen',()=>assert.equal(JSON.parse(readFileSync(file,'utf8')).version,1));\nconsole.log('FROZEN-SNAPSHOT-ACCEPTED');\n`;
+      writeFileSync(testPath, source, { mode: 0o400 });
+      acceptance = Object.defineProperty({ path: testPath, sha256: sha256(source), tests: 4 }, "source", { value: source });
+      acceptanceCommand = `${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(testPath)}`;
       mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario,
         record: (record) => { records.push(record); save("mock-tools.json", records); }, fail: (error) => { mockFailure = error; } });
       modelRelay = await relay(mock.address().port);
@@ -315,7 +325,8 @@ export async function run(options) {
           mutation.casFinalSha256 = casHashes[mutation.artifactId];
           save("fault-injection.json", mutation);
         }
-        const evidence = collectRealEvidence(exported, mutation, acceptance, casHashes, sessions);
+        const evidence = collectRealEvidence(exported, mutation, acceptance, casHashes, sessions, config);
+        Object.assign(evidence, { hostRuntime, independentReview: review, rejectedPublications });
         save("real-evidence.json", evidence);
         save("mission.json", detail);
         return evidence;
@@ -361,14 +372,12 @@ export async function run(options) {
         save("frozen-acceptance.json", acceptance);
       }
       if (config && !mutation) {
-        const published = current.events.find((event) => event.type === "artifact_published" && current.agents.some((agent) => agent.id === event.agentId && agent.kind === "worker"));
-        if (published) {
+        const publication = findRealPublication(current, machineId, seenPublications, rejectedPublications);
+        save("rejected-publications.json", rejectedPublications);
+        if (publication) {
+          const { event: published, artifact } = publication;
           acceptance.checks.push(checkFrozenAcceptance(acceptance, "publication"));
           save("frozen-acceptance.json", acceptance);
-          const artifact = current.artifacts.find((value) => value.id === published.data.artifactId);
-          assert.ok(artifact?.remoteProvenance?.machineId === machineId, "Publication did not come from the assigned Linux node");
-          assert.equal(artifact.path, "/work/totals.mjs", "Publish totals.mjs at the Linux workspace root");
-          assert.equal(published.data.sha256, artifact.sha256);
           const casPath = join(home, "artifacts", artifact.sha256);
           const casBeforeSha256 = sha256(readFileSync(casPath));
           assert.equal(casBeforeSha256, artifact.sha256);
@@ -418,8 +427,8 @@ export async function run(options) {
       return false;
     });
     if (config) {
-      const evidence = await captureReal();
-      assertRealSuccess(detail, evidence, acceptanceCommand, machineId);
+      await captureReal();
+      assert.equal(detail.mission.status, "completed");
     } else {
       if (pause) {
         await captureMock();
@@ -436,7 +445,6 @@ export async function run(options) {
     save("runtimes.json", runtimes);
     if (config) {
       const evidence = await captureReal();
-      assertRealSuccess(detail, evidence, acceptanceCommand, machineId);
       summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
         turns: evidence.turns, maxTurns: evidence.maxTurns, roles: evidence.roles, costKnown: evidence.costKnown,
         acceptance, mutation, tools: evidence.tools, blockers: detail.blockers, remoteRuntimeState: runtimes[0].state,
@@ -513,6 +521,31 @@ export async function run(options) {
       acceptance.checks.push(checkFrozenAcceptance(acceptance, "end"));
       save("frozen-acceptance.json", acceptance);
     }
+    if (hostRuntime) {
+      hostRuntime = checkHostRuntime(hostRuntime);
+      save("host-runtime.json", hostRuntime);
+      await cleanup("host node integrity", async () => assertHostRuntime(hostRuntime));
+    }
+    if (detail?.mission.status === "completed" && acceptance) await cleanup("independent container review", async () => {
+      const artifact = config ? detail.artifacts.find((value) => value.id === mutation?.artifactId) : detail.artifacts[0];
+      assert.ok(artifact, "No frozen artifact for independent review");
+      const accepted = detail.tasks.find((task) => task.status === "accepted");
+      const decision = detail.validations?.filter((value) => value.taskId === accepted?.id).at(-1);
+      const receipt = detail.validationReceipts.find((value) => value.command === acceptanceCommand && value.artifactIds.includes(artifact.id) &&
+        (!config || value.id === decision?.receiptId));
+      review = await independentReview({ proof, acceptance, artifact, receipt, casPath: join(home, "artifacts", artifact.sha256),
+        name: reviewName, image: "node:22-bookworm-slim", execute: async (args) => {
+          const handle = childProcess(containerCLI, args, { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });
+          const timer = setTimeout(() => handle.child.kill("SIGKILL"), 60000);
+          await handle.done;
+          clearTimeout(timer);
+          return { exitCode: handle.child.exitCode, signalCode: handle.child.signalCode, stdout: handle.stdout(), stderr: handle.stderr(),
+            ...(handle.error() ? { error: handle.error().message } : {}) };
+        } });
+      save("independent-review.json", review);
+      assertIndependentReview(review, acceptance, artifact, receipt);
+    });
+    Object.assign(summary, { hostRuntime, independentReview: review, ...(config ? { rejectedPublications } : {}) });
     if (config && exportedReal) {
       await cleanup("stopped export records", async () => {
         exportedReal = refreshStoppedExport(join(home, "control.sqlite"), exportedReal);
@@ -546,30 +579,34 @@ export async function run(options) {
         mutation.casFinalSha256 = casHashes[mutation.artifactId];
         save("fault-injection.json", mutation);
       }
-      const evidence = collectRealEvidence(exportedReal, mutation, acceptance, casHashes, sessions);
+      const evidence = collectRealEvidence(exportedReal, mutation, acceptance, casHashes, sessions, config);
+      Object.assign(evidence, { hostRuntime, independentReview: review, rejectedPublications });
       save("real-evidence.json", evidence);
       await cleanup("acceptance oracle", async () => {
         assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle was touched by a local shell command");
         assert.ok(acceptance.checks.every((check) => check.intact), "Frozen acceptance hash or permissions changed");
       });
       if (summary.status === "passed") await cleanup("final acceptance", async () => assertRealSuccess(exportedReal, evidence, acceptanceCommand, machineId));
-      Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches });
+      Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches,
+        modelMismatches: Object.entries(evidence.roles).filter(([, role]) => role.modelMismatch).map(([kind, role]) => ({ kind, configuredModelId: role.configuredModelId, responseModels: role.responseModels })) });
     }
-    if (acceptance?.immutable.applied) await cleanup("frozen acceptance flags", async () => {
-      const flags = childProcess("/bin/chflags", ["nouchg", acceptance.path]);
+    if (acceptance?.immutable?.applied) await cleanup("frozen acceptance flags", async () => {
+      const flags = childProcess("/bin/chflags", ["nouchg", acceptance.path], frozenFlagEnvironment());
       await flags.done;
       assert.ok(!flags.error() && flags.child.exitCode === 0, "chflags nouchg failed");
     });
     await cleanup("container", async () => {
+      for (const ownedName of [name, reviewName]) {
+        if ((await containerNames()).includes(ownedName)) {
+          try { await command(["stop", ownedName]); }
+          catch (error) { if ((await containerNames()).includes(ownedName)) throw error; }
+        }
+        if ((await containerNames()).includes(ownedName)) {
+          try { await command(["delete", ownedName]); }
+          catch (error) { if ((await containerNames()).includes(ownedName)) throw error; }
+        }
+      }
       if (!node) return;
-      if ((await containerNames()).includes(name)) {
-        try { await command(["stop", name]); }
-        catch (error) { if ((await containerNames()).includes(name)) throw error; }
-      }
-      if ((await containerNames()).includes(name)) {
-        try { await command(["delete", name]); }
-        catch (error) { if ((await containerNames()).includes(name)) throw error; }
-      }
       const timer = setTimeout(() => node.child.kill("SIGKILL"), 10000);
       await node.done;
       clearTimeout(timer);

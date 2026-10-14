@@ -8,6 +8,7 @@ export function querySession(path, Database) {
   try {
     if (db.prepare("SELECT version FROM durable_schema WHERE singleton=1").get()?.version !== 1) throw new Error("Unsupported pi-durable schema");
     const tools = [];
+    const models = [];
     let modelCalls = 0;
     const entries = db.prepare("SELECT id,commit_seq,record FROM entries ORDER BY commit_seq,id").all();
     for (const row of entries) {
@@ -16,6 +17,11 @@ export function querySession(path, Database) {
       const message = entry.model?.[0];
       if (message?.role !== "assistant" || !Array.isArray(message.content)) throw new Error("Invalid assistant evidence");
       modelCalls++;
+      const modelId = typeof message.model === "string" ? message.model : null;
+      const responseModel = typeof message.responseModel === "string" ? message.responseModel : null;
+      let identity = models.find((value) => value.modelId === modelId && value.responseModel === responseModel);
+      if (!identity) { identity = { modelId, responseModel, calls: 0 }; models.push(identity); }
+      identity.calls++;
       for (const [index, part] of message.content.entries()) {
         if (part.type === "toolCall") tools.push({ entryId: String(row.id), commitSeq: row.commit_seq, index, name: part.name });
       }
@@ -34,19 +40,26 @@ export function querySession(path, Database) {
         usage[key] += model[key];
       }
     }
-    return { complete: true, modelCalls, modelCallsScope: "committed assistant responses, including error/retry responses; auxiliary admissions counted separately", tools, usage };
+    return { complete: true, modelCalls, modelCallsScope: "committed assistant responses, including error/retry responses; auxiliary admissions counted separately", tools, usage, models };
   } finally { db.close(); }
+}
+
+export function sessionFailure(error) {
+  return { complete: false, error: "Session database unreadable or incompatible",
+    errorCategory: error instanceof SyntaxError ? "invalid-json" : "database-or-schema",
+    errorCode: typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : null,
+    modelCalls: null, usage: null, tools: [], models: [] };
 }
 
 export function readSessionEvidence(path) {
   try { return querySession(path, DatabaseSync); }
-  catch { return { complete: false, error: "Session database unreadable or incompatible", modelCalls: null, usage: null, tools: [] }; }
+  catch (error) { return sessionFailure(error); }
 }
 
 export const remoteSessionScript = `
   const {DatabaseSync}=require('node:sqlite');
   try { console.log(JSON.stringify((${querySession.toString()})(process.argv[1],DatabaseSync))); }
-  catch { console.log(JSON.stringify({complete:false,error:'Session database unreadable or incompatible',modelCalls:null,usage:null,tools:[]})); }
+  catch (error) { console.log(JSON.stringify((${sessionFailure.toString()})(error))); }
 `;
 
 export const stopNodeForEvidenceScript = `
