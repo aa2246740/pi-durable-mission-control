@@ -74,6 +74,12 @@ export class HttpError extends Error {
   }
 }
 
+export class RemoteRuntimeStopPendingError extends HttpError {
+  constructor(readonly runtimeId: string) {
+    super(409, `Prior remote runtime ${runtimeId}: waiting for the controlled stop report`);
+  }
+}
+
 type ArtifactHandoff = { task?: Pick<Task, "id" | "status">; nextStep?: string };
 
 function assertValidationStatus(task: Task): void {
@@ -981,6 +987,7 @@ export class ControlPlane {
       }
       const active = this.remoteRuntimes.activeForAgent(agentId);
       if (active) {
+        if (active.state === "stopping") this.assertRemoteRuntimeReassignable(active, agent);
         if (active.state === "uncertain" || active.state === "stopping") {
           throw new HttpError(409, active.state === "uncertain"
             ? "Prior remote runtime has an uncertain report or ownership; trusted reconciliation is required"
@@ -1004,7 +1011,12 @@ export class ControlPlane {
         return { binding: descriptor.binding, descriptor, descriptorHash: active.descriptor_hash, existing: true };
       }
       const prior = this.remoteRuntimes.byAgent(agentId);
-      if (prior) this.assertRemoteRuntimeReassignable(prior, agent);
+      if (prior) {
+        this.assertRemoteRuntimeReassignable(prior, agent);
+        // Close the old mailbox and claim the new owner in this same transaction.
+        const binding = parseWorkerStartSpec(JSON.parse(prior.descriptor_json)).binding;
+        if (this.workerMailbox.inspectBinding(binding).status !== "closed") this.workerMailbox.confirmClosed(binding);
+      }
       const openMailbox = this.db.prepare("SELECT 1 FROM worker_mailbox_bindings WHERE agent_id=? AND status IN ('open','uncertain') LIMIT 1").get(agentId);
       if (openMailbox) throw new HttpError(409, "Remote worker ownership is uncertain and requires reconciliation");
       if (!machine.sessionId || !machine.sessionEpoch) throw new HttpError(409, "Remote node session is unavailable");
@@ -1029,16 +1041,25 @@ export class ControlPlane {
     });
   }
 
-  private assertRemoteRuntimeReassignable(runtime: RemoteRuntimeRow, agent: Agent): void {
+  recordRemoteRuntimeStopPending(agent: Agent, runtimeId: string, timeoutMs: number): void {
+    this.event(agent.missionId, "remote_runtime_stop_pending", "Waiting for the prior remote runtime to confirm its controlled stop before assigning a replacement.", agent.id,
+      { runtimeId, timeoutMs });
+  }
+
+  assertRemoteRuntimeReassignable(runtime: RemoteRuntimeRow, agent: Agent): void {
     const refuse = (reason: string): never => {
       throw new HttpError(409, `Prior remote runtime ${runtime.runtime_id}: ${reason}; trusted reconciliation is required`);
     };
     if (runtime.stop_provenance === "unexpected") refuse("unexpected stop");
     if (runtime.stop_provenance === "uncertain") refuse("uncertain runtime report");
-    if (runtime.state !== "closed" || runtime.desired !== "stop") refuse("stop has not been confirmed");
-    if (runtime.stop_provenance !== "controlled") refuse("controlled stop cannot be proven from persisted evidence");
+    const stopPending = runtime.desired === "stop" && runtime.state === "stopping" &&
+      runtime.stop_request_reason === "controlled" && runtime.stop_request_epoch === runtime.epoch &&
+      (agent.epoch === runtime.epoch || (agent.epoch === runtime.epoch + 1 && runtime.stop_fenced_epoch === agent.epoch)) &&
+      runtime.stop_provenance === "unproven" && runtime.last_report_json === null;
+    if (!stopPending && (runtime.state !== "closed" || runtime.desired !== "stop")) refuse("stop has not been confirmed");
+    if (!stopPending && runtime.stop_provenance !== "controlled") refuse("controlled stop cannot be proven from persisted evidence");
     const binding = parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)).binding;
-    if (!runtime.last_report_json || JSON.parse(runtime.last_report_json).outcome !== "stopped") refuse("missing stopped report");
+    if (!stopPending && (!runtime.last_report_json || JSON.parse(runtime.last_report_json).outcome !== "stopped")) refuse("missing stopped report");
     let mailboxStatus: string;
     try { mailboxStatus = this.workerMailbox.inspectBinding(binding).status; }
     catch { return refuse("mailbox binding evidence is missing"); }
@@ -1059,8 +1080,19 @@ export class ControlPlane {
       refuse("unapplied or uncertain mailbox input/RPC");
     }
     const durableDelivery = this.db.prepare(`SELECT 1 FROM messages m WHERE json_extract(m.data,'$.recipientId')=? AND (
-      m.status IN ('dispatching','admitted','delivering','delivered','uncertain') OR
-      EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=m.id AND o.status IN ('dispatching','admitted','delivering','delivered','uncertain'))
+      m.status IN ('dispatching','admitted','delivering','delivered') OR
+      (m.status='uncertain' AND NOT EXISTS (
+        SELECT 1 FROM outbox o JOIN blockers b ON b.id='delivery:' || o.id
+          AND b.mission_id=o.mission_id AND b.status='resolved'
+        WHERE o.message_id=m.id AND o.mission_id=m.mission_id AND o.status='uncertain'
+      )) OR
+      EXISTS (
+        SELECT 1 FROM outbox o LEFT JOIN blockers b ON b.id='delivery:' || o.id
+          AND b.mission_id=o.mission_id AND b.status='resolved'
+        WHERE o.message_id=m.id AND (
+          o.status IN ('dispatching','admitted','delivering','delivered') OR (o.status='uncertain' AND b.id IS NULL)
+        )
+      )
     ) LIMIT 1`).get(agent.id);
     if (durableDelivery) refuse("uncertain or partially executed durable delivery");
     const permits = this.db.prepare(`SELECT command_id FROM commands WHERE scope=?
@@ -1082,9 +1114,10 @@ export class ControlPlane {
       item.agentId === agent.id || item.kind === "delivery" || item.kind === "approval"
     ));
     if (blocker) refuse(`unresolved blocker ${blocker.id}`);
-    // Closure and the new owner claim are committed together by assignment.
-    // No historical runtime, delivery, RPC, or effect is replayed or rebound.
-    if (mailboxStatus !== "closed") this.workerMailbox.confirmClosed(binding);
+    const otherMailbox = this.db.prepare(`SELECT 1 FROM worker_mailbox_bindings
+      WHERE agent_id=? AND runtime_id!=? AND status IN ('open','uncertain') LIMIT 1`).get(agent.id, runtime.runtime_id);
+    if (otherMailbox) refuse("another mailbox binding requires reconciliation");
+    if (stopPending) throw new RemoteRuntimeStopPendingError(runtime.runtime_id);
   }
 
   remoteRuntimeReady(binding: WorkerBinding): boolean {

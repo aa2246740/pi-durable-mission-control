@@ -90,10 +90,35 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
       testOnlyScripted: true,
       testOnlyToolLoop: true
     };
-    const script = `import { runNode } from ${JSON.stringify(nodeModule)}; process.on("SIGTERM", () => process.stderr.write("node-signal:SIGTERM\\n")); process.on("SIGINT", () => process.stderr.write("node-signal:SIGINT\\n")); runNode(${JSON.stringify(nodeOptions)}).catch((error) => { process.stderr.write("node runtime failed\\n"); process.exitCode = 1; });`;
+    let heldStopReports = 0;
+    const nodeControls = new Set();
+    const script = `import { runNode } from ${JSON.stringify(nodeModule)};
+      const nativeFetch = globalThis.fetch;
+      let heldRuntimeId;
+      let releaseReport;
+      process.on("message", (message) => {
+        if (message.action === "hold-stop-report") heldRuntimeId = message.runtimeId;
+        if (message.action === "release-stop-report") { heldRuntimeId = undefined; releaseReport?.(); }
+        process.send({ type: "control-applied", action: message.action });
+      });
+      globalThis.fetch = async (input, init) => {
+        if (String(input).endsWith("/api/nodes/runtimes/events") && JSON.parse(init.body).binding.runtimeId === heldRuntimeId) {
+          process.send({ type: "stop-report-held" });
+          await new Promise(resolve => { releaseReport = resolve; });
+        }
+        return nativeFetch(input, init);
+      };
+      process.on("SIGTERM", () => process.stderr.write("node-signal:SIGTERM\\n"));
+      process.on("SIGINT", () => process.stderr.write("node-signal:SIGINT\\n"));
+      runNode(${JSON.stringify(nodeOptions)}).catch((error) => { process.stderr.write("node runtime failed\\n"); process.exitCode = 1; })
+        .finally(() => { if (process.connected) process.disconnect(); });`;
     node = spawn(process.execPath, ["--input-type=module", "-e", script], {
       env: { ...process.env, NODE_AUTH_TOKEN: enrolled.token, [credentialName]: credentialValue },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe", "ipc"]
+    });
+    node.on("message", message => {
+      if (message.type === "stop-report-held") heldStopReports++;
+      if (message.type === "control-applied") nodeControls.add(message.action);
     });
     node.stdout.setEncoding("utf8");
     node.stderr.setEncoding("utf8");
@@ -161,6 +186,9 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     const methods = [];
     const rpcResults = [];
     const runtimeReports = [];
+    let blockDeliveryMissionId;
+    let deliveryBlockFlight;
+    let deliveryQuestion;
     const originalWorkerCommand = control.workerCommand.bind(control);
     control.workerCommand = async (request) => {
       methods.push(request.method);
@@ -168,6 +196,14 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
         const result = await originalWorkerCommand(request);
         rpcResults.push({ method: request.method, resultType: Array.isArray(result) ? "array" : typeof result,
           resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 8) : undefined });
+        if (request.method === "GetMissionState" && control.getAgentPublic(request.agentId)?.missionId === blockDeliveryMissionId && !deliveryBlockFlight) {
+          deliveryBlockFlight = new Promise(resolve => setImmediate(resolve)).then(async () => {
+            const owner = control.listAgents(blockDeliveryMissionId).find(agent => agent.kind === "orchestrator");
+            deliveryQuestion = await originalWorkerCommand({ agentId: owner.id, epoch: owner.epoch,
+              method: "RequestUserInput", args: { question: "Inspect the interrupted delivery before continuing." }, taskId: `${owner.id}:delivery-question` });
+            await service.workers.syncMissionLifecycle(blockDeliveryMissionId);
+          });
+        }
         return result;
       } catch (error) {
         rpcResults.push({ method: request.method, rejected: error instanceof Error ? error.constructor.name : "unknown" });
@@ -364,20 +400,34 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
 
     const replacementBinding = JSON.parse(replacement.descriptor_json).binding;
     await waitForCleanTransport(control, nodeHome, replacementBinding);
+    node.send({ action: "hold-stop-report", runtimeId: replacement.runtime_id });
+    await waitFor(() => nodeControls.has("hold-stop-report"));
     const currentOrchestratorForInput = control.getAgentPublic(orchestrator.id);
     const userInput = await control.workerCommand({ agentId: orchestrator.id, epoch: currentOrchestratorForInput.epoch,
       method: "RequestUserInput", args: { question: "Continue the remote work?" }, taskId: `${orchestrator.id}:recovery-question` });
     assert.equal(control.missionById(mission.id).status, "blocked");
     await service.workers.syncMissionLifecycle(mission.id);
-    await waitFor(() => control.remoteRuntimeForAgent(remoteAgent.id)?.state === "closed");
-    assert.equal(control.remoteRuntimeForAgent(remoteAgent.id).stop_provenance, "controlled");
-    assert.equal(JSON.parse(control.remoteRuntimeForAgent(remoteAgent.id).last_report_json).stopReason, "requested");
-    const userInputStop = control.remoteRuntimeForAgent(remoteAgent.id);
+    await waitFor(() => heldStopReports > 0);
+    assert.equal(control.remoteRuntimeForAgent(remoteAgent.id).state, "stopping");
+    assert.equal(control.remoteRuntimeForAgent(remoteAgent.id).last_report_json, null);
+    const epochBeforeAnswer = control.getAgentPublic(remoteAgent.id).epoch;
     await post(adminBase, adminToken, `/api/blockers/${userInput.id}/resolve`, { resolution: "Continue with a new input." });
     assert.equal(control.missionById(mission.id).status, "active");
     const answeredInput = control.sendMessage(mission.id, remoteAgent.id, "Process a new input after the answer.",
       "followUp", "real-http-answered-input");
     await service.workers.dispatchPending();
+    assert.equal(control.remoteRuntimeForAgent(remoteAgent.id).runtime_id, replacement.runtime_id);
+    assert.equal(control.getAgentPublic(remoteAgent.id).epoch, epochBeforeAnswer);
+    const pendingStopEvent = control.detail(mission.id).events.find(event => event.type === "remote_runtime_stop_pending" &&
+      event.data.runtimeId === replacement.runtime_id);
+    assert.ok(pendingStopEvent);
+    assert.equal(pendingStopEvent.data.timeoutMs, 60000);
+    assert.equal(control.detail(mission.id).events.some(event => event.type === "worker_start_failed"), false);
+    node.send({ action: "release-stop-report" });
+    await waitFor(() => control.remoteRuntimeForAgent(remoteAgent.id)?.state === "running");
+    const userInputStop = control.remoteRuntimes.byRuntime(replacement.runtime_id);
+    assert.equal(userInputStop.stop_provenance, "controlled");
+    assert.equal(JSON.parse(userInputStop.last_report_json).stopReason, "requested");
     try {
       await waitFor(() => control.message(answeredInput.id)?.status === "completed");
     } catch {
@@ -395,6 +445,64 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     assert.deepEqual(control.remoteRuntimes.byRuntime(userInputStop.runtime_id), userInputStop);
     assert.equal(control.missionById(mission.id).status, "active");
     assert.equal(control.detail(mission.id).events.some(event => event.type === "worker_start_failed"), false);
+
+    const deliveryMission = await post(adminBase, adminToken, "/api/missions", {
+      title: "Human delivery reconciliation fixture", goal: "interrupt an admitted remote turn",
+      acceptance: "a human-reconciled input is retained without replay", workspaceId: localWorkspace.id,
+      remoteWorkspaceIds: [remoteWorkspace.id], roleIds: roles.map(role => role.id), maxTurns: 50, maxCost: 0,
+      autonomy: "trusted", assertions: [{ id: "DELIVERY-RECONCILIATION", description: "Reconciled uncertain input is never replayed." }],
+      workspaceStrategy: "shared"
+    });
+    control.missionAction(deliveryMission.id, "start");
+    blockDeliveryMissionId = deliveryMission.id;
+    const deliveryAgent = await post(adminBase, adminToken, `/api/missions/${deliveryMission.id}/agents`, {
+      title: "Interrupted remote worker", roleId: "real-http-worker", prompt: "Process an input that will be interrupted.",
+      requestId: "real-http-interrupted-worker", targetWorkspaceId: remoteWorkspace.id
+    });
+    await waitFor(() => deliveryBlockFlight !== undefined);
+    await deliveryBlockFlight;
+    blockDeliveryMissionId = undefined;
+    const interrupted = control.detail(deliveryMission.id).messages.find(message => message.recipientId === deliveryAgent.id);
+    assert.equal(interrupted.status, "uncertain");
+    const interruptedOutbox = control.db.prepare("SELECT * FROM outbox WHERE message_id=?").get(interrupted.id);
+    assert.equal(interruptedOutbox.status, "uncertain");
+    const deliveryBlocker = control.blockers(deliveryMission.id).find(blocker => blocker.id === `delivery:${interruptedOutbox.id}`);
+    assert.equal(deliveryBlocker.status, "open");
+    await waitFor(() => control.remoteRuntimeForAgent(deliveryAgent.id)?.state === "closed");
+    const interruptedRuntime = control.remoteRuntimeForAgent(deliveryAgent.id);
+    assert.equal(interruptedRuntime.stop_provenance, "controlled");
+    const refusedResume = await fetch(`${adminBase}/api/missions/${deliveryMission.id}/resume`, {
+      method: "POST", headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" }, body: "{}"
+    });
+    assert.equal(refusedResume.status, 409);
+    assert.match((await refusedResume.json()).error, /Resolve mission blockers/);
+    assert.equal(control.remoteRuntimeForAgent(deliveryAgent.id).runtime_id, interruptedRuntime.runtime_id);
+    await post(adminBase, adminToken, `/api/blockers/${deliveryQuestion.id}/resolve`, { resolution: "Continue after delivery review." });
+    await post(adminBase, adminToken, `/api/blockers/${deliveryBlocker.id}/resolve`, { resolution: "Reviewed the interrupted input; retain its unknown outcome and never repeat it." });
+    assert.equal(control.missionById(deliveryMission.id).status, "paused");
+    const uncertainEvidence = control.message(interrupted.id);
+    const uncertainOutboxEvidence = control.db.prepare("SELECT * FROM outbox WHERE message_id=?").all(interrupted.id);
+    const deliveryResume = await post(adminBase, adminToken, `/api/missions/${deliveryMission.id}/resume`, {});
+    assert.equal(deliveryResume.status, "active");
+    await waitFor(() => control.remoteRuntimeForAgent(deliveryAgent.id)?.state === "running");
+    const reconciledRuntime = control.remoteRuntimeForAgent(deliveryAgent.id);
+    assert.notEqual(reconciledRuntime.runtime_id, interruptedRuntime.runtime_id);
+    const continueInput = control.sendMessage(deliveryMission.id, deliveryAgent.id, "Continue with a separate new input.",
+      "followUp", "real-http-after-delivery-review");
+    await service.workers.dispatchPending();
+    await waitFor(() => control.message(continueInput.id)?.status === "completed");
+    assert.deepEqual(control.message(interrupted.id), uncertainEvidence);
+    assert.deepEqual(control.db.prepare("SELECT * FROM outbox WHERE message_id=?").all(interrupted.id), uncertainOutboxEvidence);
+    const reconciledBinding = JSON.parse(reconciledRuntime.descriptor_json).binding;
+    assert.equal(control.workerMailbox.inspectOutbox(reconciledBinding)
+      .some(item => item.envelope.payload.kind === "deliver" && item.envelope.payload.messageId === interrupted.id), false);
+    const deliveryNodeDb = new DatabaseSync(join(nodeHome, "worker-runtime", "node-workers.sqlite"), { readOnly: true });
+    assert.equal(deliveryNodeDb.prepare(`SELECT COUNT(*) AS n FROM worker_mailbox_inbox
+      WHERE runtime_id=? AND json_extract(envelope_json,'$.payload.kind')='deliver'
+        AND json_extract(envelope_json,'$.payload.messageId')=?`).get(reconciledRuntime.runtime_id, interrupted.id).n, 0);
+    deliveryNodeDb.close();
+    assert.equal(control.missionById(deliveryMission.id).status, "active");
+    assert.equal(control.detail(deliveryMission.id).events.some(event => event.type === "worker_start_failed"), false);
 
     const fencedMission = await post(adminBase, adminToken, "/api/missions", {
       title: "Mailbox fence fixture", goal: "stop when only the mailbox is fenced",
