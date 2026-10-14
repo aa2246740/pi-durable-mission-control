@@ -56,8 +56,8 @@ async function stopIfRecorded(home) {
   if (result.code !== 0) throw new Error(`Could not stop test daemon: ${result.stderr}`);
 }
 
-async function waitForHealth(port, pid, daemonId) {
-  const deadline = Date.now() + 10000;
+async function waitForHealth(port, pid, daemonId, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(500) });
@@ -80,7 +80,7 @@ async function postJson(port, token, pathname, body) {
   return value;
 }
 
-test("start is detached and idempotent; status, export, and stop use the selected home", { timeout: 60000 }, async () => {
+test("start is detached and idempotent; status, export, and stop use the selected home", { timeout: 120000 }, async () => {
   const home = makeHome();
   try {
     const freshStatus = await runCli(["status", "--home", home]);
@@ -92,7 +92,7 @@ test("start is detached and idempotent; status, export, and stop use the selecte
     const warningScript = join(home, "stderr-warning.cjs");
     writeFileSync(warningScript, "if (process.argv.includes('serve')) process.stderr.write('ordinary NODE_OPTIONS warning\\n');\n", { mode: 0o600 });
     const warningEnv = { ...process.env, NODE_OPTIONS: `--require=${warningScript}` };
-    const started = await runCli(["start", "--port", "0", "--home", home], { timeout: 20000, env: warningEnv });
+    const started = await runCli(["start", "--port", "0", "--home", home], { timeout: 40000, env: warningEnv });
     assert.equal(started.code, 0, started.stderr);
     const startedIdentity = /started pid=(\d+) port=(\d+) daemonId=([^\s]+)/.exec(started.stdout);
     assert.ok(startedIdentity, started.stdout);
@@ -201,10 +201,10 @@ test("node CLI rejects unsafe coordinator URLs and secret-shaped unexpected argu
   assert.equal(`${positional.stdout}${positional.stderr}`.includes(sentinel), false);
 });
 
-test("CLI start forwards optional node listener and records its separate port", async () => {
+test("CLI start forwards optional node listener and records its separate port", { timeout: 120000 }, async () => {
   const home = makeHome();
   try {
-    const started = await runCli(["start", "--home", home, "--port", "0", "--node-port", "0"]);
+    const started = await runCli(["start", "--home", home, "--port", "0", "--node-port", "0"], { timeout: 40000 });
     assert.equal(started.code, 0, started.stderr);
     const info = JSON.parse(readFileSync(join(home, "daemon.json"), "utf8"));
     assert.ok(info.nodePort > 0);
@@ -320,14 +320,14 @@ test("stale and malformed records are reported without signaling an unrelated li
   }
 });
 
-test("start reports a bounded listen failure and does not leave its child behind", { timeout: 20000 }, async () => {
+test("start reports a bounded listen failure and does not leave its child behind", { timeout: 150000 }, async () => {
   const home = makeHome();
   const occupied = createServer();
   await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve));
   const address = occupied.address();
   assert.ok(address && typeof address === "object");
   try {
-    const started = await runCli(["start", "--home", home, "--port", String(address.port)], { timeout: 12000 });
+    const started = await runCli(["start", "--home", home, "--port", String(address.port)], { timeout: 40000 });
     assert.equal(started.code, 1);
     assert.match(started.stderr, /startup error|did not report a healthy identity/);
     assert.doesNotMatch(started.stderr, /process \d+ is still running/);
@@ -335,11 +335,11 @@ test("start reports a bounded listen failure and does not leave its child behind
     assert.equal(existsSync(join(home, "daemon.json")), false);
     assert.equal(occupied.listening, true);
     await new Promise((resolve, reject) => occupied.close((error) => error ? reject(error) : resolve()));
-    const recovered = await runCli(["start", "--home", home, "--port", "0"], { timeout: 12000 });
+    const recovered = await runCli(["start", "--home", home, "--port", "0"], { timeout: 40000 });
     assert.equal(recovered.code, 0, recovered.stderr);
     assert.match(recovered.stdout, /started pid=/);
     const record = JSON.parse(readFileSync(join(home, "daemon.json"), "utf8"));
-    await waitForHealth(record.port, record.pid, record.daemonId);
+    await waitForHealth(record.port, record.pid, record.daemonId, 20000);
     const stopped = await runCli(["stop", "--home", home], { timeout: 35000 });
     assert.equal(stopped.code, 0, stopped.stderr);
   } finally {

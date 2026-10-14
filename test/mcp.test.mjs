@@ -323,7 +323,10 @@ test("empty credential references fail before stdio spawn", async (t) => {
 test("timed-out dispatched call is uncertain across reopen and never replays", async (t) => {
   const f = await fixture(t, {
     grants: [{ toolName: "hang", mode: "allow" }],
-    timeoutMs: 1000
+    // The product floor is 1000ms, which under load expires during stdio startup
+    // before tools/call is sent. The hang still never returns, so this longer
+    // operation deadline is what makes the dispatched call uncertain.
+    timeoutMs: 20000
   });
   const tool = (await discover(f)).find((item) => item.name === "hang");
   const result = await f.control.createMcpApproval(
@@ -564,23 +567,23 @@ test("server close cancels an in-flight operator HTTP discovery before its deadl
     await new Promise((resolve) => remote.close(resolve));
     rmSync(root, { recursive: true, force: true });
   });
-  const startedAt = Date.now();
   const request = fetch(`http://127.0.0.1:${app.port}/api/mcp-servers/${serverConfig.id}/discover`, {
     method: "POST", headers: { authorization: token, "content-type": "application/json" },
     body: JSON.stringify({ workspaceId: workspace.id })
   });
   await listStarted;
   assert.equal(app.control.mcpRuntime.activeCount, 1);
+  const closeStarted = Date.now();
   const closing = app.close();
   const response = await request;
   await closing;
   productClosed = true;
-  assert.ok(Date.now() - startedAt < 5000);
+  assert.ok(Date.now() - closeStarted < 10000, "server close must cancel discovery well before the 30s operation deadline");
   assert.ok(response.status >= 400);
   assert.equal(handlerSettled, true);
   assert.equal(databaseClosedBeforeHandlerSettled, false);
   const remoteCloseTimeout = new Promise((_, reject) => {
-    const timer = setTimeout(() => reject(new Error("remote provider did not close")), 2000);
+    const timer = setTimeout(() => reject(new Error("remote provider did not close")), 5000);
     remoteClosed.finally(() => clearTimeout(timer));
   });
   await Promise.race([remoteClosed, remoteCloseTimeout]);

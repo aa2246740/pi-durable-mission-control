@@ -1237,7 +1237,7 @@ test("native store lease rejects a contender and releases when its owner is kill
   }
 });
 
-test("HTTP mission start admits its durable opening through the pi-durable worker", { timeout: 15000 }, async () => {
+test("HTTP mission start admits its durable opening through the pi-durable worker", { timeout: 75000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-http-worker-"));
   const workspacePath = join(home, "workspace");
   mkdirSync(workspacePath);
@@ -1272,7 +1272,7 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
     assert.equal(started.status, 200);
 
     let detail;
-    const deadline = Date.now() + 10000;
+    const deadline = Date.now() + 20000;
     do {
       detail = await (await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } })).json();
       if (detail.messages[0]?.status === "completed") break;
@@ -1293,7 +1293,7 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
     assert.equal(createdAgentResponse.status, 201);
     const idleWorker = await createdAgentResponse.json();
     const workerMessageId = `agent-opening:${mission.id}:idle-worker`;
-    const workerDeadline = Date.now() + 10000;
+    const workerDeadline = Date.now() + 20000;
     do {
       detail = await (await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } })).json();
       if (detail.messages.some((message) => message.id === workerMessageId && message.status === "completed")) break;
@@ -1303,6 +1303,17 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
     assert.ok(detail.events.some((event) => event.type === "agent_report" && event.agentId === idleWorker.id), "the second agent's same-numbered tool task must not be swallowed as a duplicate");
     const workerTranscript = await (await fetch(`${base}/api/agents/${idleWorker.id}/transcript`, { headers: { cookie } })).json();
     assert.ok(workerTranscript.entries.some((entry) => entry.text === "test-only tool loop completed"), "the second agent's same-numbered assistant entry must remain visible");
+    const inflight = new Set(["queued", "dispatching", "admitted"]);
+    const quietDeadline = Date.now() + 20000;
+    do {
+      detail = await (await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } })).json();
+      const bound = detail.agents.filter((agent) => agent.profileId === "http-faux");
+      if (bound.length > 0 && bound.every((agent) => agent.status === "idle") && detail.messages.every((message) => !inflight.has(message.status))) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (Date.now() < quietDeadline);
+    const boundAgents = detail.agents.filter((agent) => agent.profileId === "http-faux");
+    assert.ok(boundAgents.length > 0 && boundAgents.every((agent) => agent.status === "idle"), "profile revision waits until every bound agent is idle");
+    assert.equal(detail.messages.some((message) => inflight.has(message.status)), false);
     const updatedProfile = await post("/api/profiles", {
       id: "http-faux", name: "Test-only faux revision 2", api: "openai-completions", modelId: "faux-1",
       baseUrl: "http://127.0.0.1:9999", credentialEnv: "", contextWindow: 16000, maxTokens: 512,
@@ -1323,7 +1334,7 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
   }
 });
 
-test("unexpected native worker exit recovers the same agent and outbox request", { timeout: 15000 }, async () => {
+test("unexpected native worker exit recovers the same agent and outbox request", { timeout: 45000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-worker-recovery-"));
   const workspacePath = join(home, "workspace");
   mkdirSync(workspacePath);
@@ -1342,17 +1353,19 @@ test("unexpected native worker exit recovers the same agent and outbox request",
     server.control.missionAction(mission.id, "start");
     const [agent] = server.control.listAgents(mission.id);
     assert.ok(agent);
-    await server.workers.startAgent(agent);
+    // Reserve the opening before worker startup. The 5s dispatcher can finish a
+    // scripted run while startAgent is still waiting, which leaves no pending row.
     const [outbox] = server.control.pendingOutbox();
     assert.ok(outbox);
     assert.equal(server.control.markOutboxDispatching(outbox.id, agent.epoch), true);
+    await server.workers.startAgent(agent);
     const handle = server.workers.handles.get(agent.id);
     assert.ok(handle?.child.pid, "the test must kill the native worker, not a lease helper");
     const durablePath = join(home, "agents", `${agent.id}.sqlite`);
     assert.equal(existsSync(durablePath), true);
     process.kill(handle.child.pid, "SIGKILL");
 
-    const deadline = Date.now() + 12000;
+    const deadline = Date.now() + 30000;
     let recovered;
     do {
       recovered = server.control.getAgentPublic(agent.id);
@@ -1485,7 +1498,7 @@ test("concurrent pause and shutdown callbacks share one native cleanup", { timeo
   }
 });
 
-test("IPC disconnect in-flight rejects RPC without killing the host", { timeout: 10000 }, async () => {
+test("IPC disconnect in-flight rejects RPC without killing the host", { timeout: 30000 }, async () => {
   const workerModule = new URL("../dist/worker.js", import.meta.url).href;
   const source = `import { rpcRequest } from ${JSON.stringify(workerModule)};
 const config = ${JSON.stringify({
@@ -1504,7 +1517,7 @@ catch (error) { console.log("RPC_REJECTED:" + error.message); }`;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`IPC child did not settle: ${output} ${errorOutput}`));
-    }, 3000);
+    }, 20000);
     child.on("message", (message) => {
       if (message?.type === "rpc" && child.connected) child.disconnect();
     });

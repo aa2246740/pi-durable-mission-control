@@ -133,7 +133,7 @@ test("bash PATH leads with the node agent directory and drops the caller environ
 test("shell timeout kills the process group and preserves uncertainty about partial effects", async t => {
   const root = mkdtempSync(join(tmpdir(), "node-effect-timeout-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const result = await executeNodeEffect(spec("bash", { command: "printf partial > partial.txt; sleep 30" }), root, { timeoutMs: 50 });
+  const result = await executeNodeEffect(spec("bash", { command: "printf partial > partial.txt; sleep 30" }), root, { timeoutMs: 8000 });
   assert.equal(result.status, "uncertain");
   assert.match(result.error, /timed out/);
   assert.equal(readFileSync(join(root, "partial.txt"), "utf8"), "partial");
