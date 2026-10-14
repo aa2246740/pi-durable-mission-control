@@ -82,15 +82,20 @@ function exactKeys(body: Record<string, unknown>, allowed: string[]): void {
   if (unknown.length) throw new HttpError(400, `Unexpected fields: ${unknown.join(", ")}`);
 }
 
-export type ServerOptions = { home: string; port: number; nodePort?: number; testOnlyScripted?: boolean; testOnlyToolLoop?: boolean };
+export type ServerOptions = { home: string; port: number; nodePort?: number; testOnlyScripted?: boolean; testOnlyToolLoop?: boolean; remoteRuntimeStopTimeoutMs?: number };
 
 export async function startServer(options: ServerOptions) {
+  const remoteRuntimeStopTimeoutMs = options.remoteRuntimeStopTimeoutMs ?? Number(process.env.MC_REMOTE_RUNTIME_STOP_TIMEOUT_MS ?? 60000);
+  if (!Number.isSafeInteger(remoteRuntimeStopTimeoutMs) || remoteRuntimeStopTimeoutMs < 1 || remoteRuntimeStopTimeoutMs > 2147483647) {
+    throw new HttpError(400, "Remote runtime stop timeout must be an integer between 1 and 2147483647 milliseconds");
+  }
   const home = resolve(options.home);
   const control = new ControlPlane(home);
   const workers = new WorkerManager(
     control,
     options.testOnlyScripted === true,
-    options.testOnlyScripted === true && options.testOnlyToolLoop === true
+    options.testOnlyScripted === true && options.testOnlyToolLoop === true,
+    remoteRuntimeStopTimeoutMs
   );
   const lifecycleFlights = new Set<Promise<void>>();
   const scheduleLifecycleSync = (missionId: string, owner?: { id: string; epoch: number }): void => {
@@ -277,14 +282,16 @@ export async function startServer(options: ServerOptions) {
               (body.stopReason !== undefined && body.stopReason !== "requested" && body.stopReason !== "unexpected")) {
             throw new MachineError(400, "Runtime report is invalid");
           }
-          return jsonResponse(response, 200, control.nodeRuntimeReport(
+          const result = control.nodeRuntimeReport(
             text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
             positiveSafeInteger(body.sessionEpoch, "sessionEpoch"), {
               reportId: body.reportId, binding, descriptorHash: body.descriptorHash,
               outcome: body.outcome as "stopped" | "uncertain" | "rejected",
               ...(body.stopReason === undefined ? {} : { stopReason: body.stopReason })
             }
-          ));
+          );
+          await workers.remoteRuntimeReported(binding.agentId, binding.runtimeId);
+          return jsonResponse(response, 200, result);
         }
         if (url.pathname === "/api/nodes/mailbox/settlement") {
           const body = await readBody(request);
