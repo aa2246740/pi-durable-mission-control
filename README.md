@@ -171,3 +171,5 @@ The daemon binds to loopback, checks local `Host` and `Origin` values, requires 
 ## Tests
 
 `npm test` runs focused control-plane, HTTP-authentication, and pi-durable worker-runtime tests. The worker persistence case uses pi's test-only faux provider, not a production profile. It verifies runtime/storage mechanics only; it is not real-model E2E or Mission product acceptance. No provider inference is performed by the test suite.
+
+The optional [remote Linux frozen-artifact regression](acceptance/remote-linux/README.md) uses Apple Container and a deterministic mock provider to execute the full remote delivery and independent coordinator validation flow. Build first, then run `npm run acceptance:remote-linux`. It requires the cached `node:22-bookworm-slim` arm64 image and is separate from `npm test`; it does not establish real-model acceptance.

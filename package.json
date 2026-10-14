@@ -17,9 +17,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node copy-public.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint src test",
+    "lint": "eslint src test acceptance",
     "test": "npm run build && node --test test/*.test.mjs",
-    "start": "node dist/cli.js serve"
+    "start": "node dist/cli.js serve",
+    "acceptance:remote-linux": "node acceptance/remote-linux/run.mjs"
   },
   "dependencies": {
     "@earendil-works/chord": "1.1.0",
