@@ -664,6 +664,13 @@ export class DurableWorkerMailbox {
     return freeze(rows.map((row) => this.outboxRow(row)));
   }
 
+  inspectOutboxMessage(value: WorkerBinding, messageId: string): WorkerMailboxOutboxStatus | undefined {
+    const binding = this.checkedBinding(value);
+    this.bindingRow(binding);
+    const row = this.existingOutbox(messageId);
+    return row?.runtime_id === binding.runtimeId ? this.outboxRow(row) : undefined;
+  }
+
   inspectInbox(value: WorkerBinding): readonly WorkerMailboxInboxStatus[] {
     const binding = this.checkedBinding(value);
     this.bindingRow(binding);

@@ -29,7 +29,7 @@ async function fixture(t, reply) {
     db.close();
   });
   const exchange = () => exchangeWorkerMailbox(`http://127.0.0.1:${server.address().port}`, "fixture", mailbox, binding);
-  return { mailbox, exchange };
+  return { mailbox, exchange, db };
 }
 
 test("mailbox exchange isolates a local fence before offering uploads", async t => {
@@ -86,5 +86,55 @@ for (const receipt of [
     mailbox.enqueue(binding, { kind: "notice", notice: { type: "ready", agentId: binding.agentId, epoch: binding.epoch } }, "bad-receipt-message");
     await assert.rejects(exchange(), /Node connection failed/);
     assert.equal(mailbox.inspectOutbox(binding)[0].status, "uncertain");
+  });
+}
+
+test("mailbox exchange only reads the target among acknowledged outbox history", async t => {
+  const requests = [];
+  const { mailbox, exchange, db } = await fixture(t, (path, body, local) => {
+    requests.push(path);
+    if (path === "/api/nodes/mailbox/poll") return { value: { envelopes: [] } };
+    const row = local.inspectOutboxMessage(binding, body.envelope.messageId);
+    return { value: { messageId: body.envelope.messageId, sequence: body.envelope.sequence, sha256: row.sha256 } };
+  });
+  const coordinatorDb = new DatabaseSync(":memory:");
+  t.after(() => coordinatorDb.close());
+  const coordinator = new DurableWorkerMailbox(coordinatorDb, "coordinator");
+  coordinator.open(binding);
+  const payload = { kind: "notice", notice: { type: "ready", agentId: binding.agentId, epoch: binding.epoch } };
+  for (let index = 0; index < 256; index++) {
+    const envelope = mailbox.enqueue(binding, payload, `history-${index}`);
+    mailbox.pending(binding, 1);
+    mailbox.acknowledge(binding, coordinator.receive(binding, envelope));
+  }
+  const target = mailbox.enqueue(binding, payload, "target-message");
+  const expected = mailbox.inspectOutbox(binding).find(row => row.envelope.messageId === target.messageId);
+  db.prepare("UPDATE worker_mailbox_outbox SET envelope_json='invalid-json' WHERE status='acknowledged'").run();
+  assert.throws(() => mailbox.inspectOutbox(binding), /invalid envelope JSON/);
+  assert.deepEqual(mailbox.inspectOutboxMessage(binding, target.messageId), expected);
+  assert.equal(mailbox.inspectOutboxMessage(binding, "missing-message"), undefined);
+  assert.equal(await exchange(), true);
+  assert.equal(mailbox.inspectOutboxMessage(binding, target.messageId).status, "acknowledged");
+  assert.deepEqual(requests, ["/api/nodes/mailbox/upload", "/api/nodes/mailbox/poll"]);
+});
+
+for (const [label, change] of [
+  ["message ID", row => ({ messageId: "wrong-message", sequence: row.envelope.sequence, sha256: row.sha256 })],
+  ["sequence", row => ({ messageId: row.envelope.messageId, sequence: row.envelope.sequence + 1, sha256: row.sha256 })],
+  ["hash", row => ({ messageId: row.envelope.messageId, sequence: row.envelope.sequence, sha256: "0".repeat(64) })],
+  ["missing outbox record", row => ({ messageId: row.envelope.messageId, sequence: row.envelope.sequence, sha256: row.sha256 })]
+]) {
+  test(`mailbox exchange rejects ${label} before classifying a local fence`, async t => {
+    const { mailbox, exchange, db } = await fixture(t, (_path, body, local) => {
+      const row = local.inspectOutboxMessage(binding, body.envelope.messageId);
+      local.fence(binding);
+      if (label === "missing outbox record") {
+        db.prepare("DELETE FROM worker_mailbox_outbox WHERE message_id=?").run(body.envelope.messageId);
+      }
+      return { value: change(row) };
+    });
+    mailbox.enqueue(binding, { kind: "notice", notice: { type: "ready", agentId: binding.agentId, epoch: binding.epoch } }, "mismatch-message");
+    await assert.rejects(exchange(), /Node connection failed/);
+    assert.equal(mailbox.inspectOutboxMessage(binding, "mismatch-message")?.status, label === "missing outbox record" ? undefined : "uncertain");
   });
 }

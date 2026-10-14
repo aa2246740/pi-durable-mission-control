@@ -601,7 +601,7 @@ export async function exchangeWorkerMailbox(
   let progressed = false;
   for (const envelope of mailboxOperation(mailbox, binding, () => mailbox.pending(binding, 1))) {
     const receipt = parseWorkerReceipt(await fetchJson(base, "/api/nodes/mailbox/upload", token, { ...identity, envelope }, signal));
-    const offered = mailbox.inspectOutbox(binding).find(item => item.envelope.messageId === envelope.messageId);
+    const offered = mailbox.inspectOutboxMessage(binding, envelope.messageId);
     if (!receipt || receipt.messageId !== envelope.messageId || receipt.sequence !== envelope.sequence ||
         receipt.sha256 !== offered?.sha256) throw genericError();
     mailboxOperation(mailbox, binding, () => mailbox.acknowledge(binding, receipt));
