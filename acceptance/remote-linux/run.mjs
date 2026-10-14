@@ -247,7 +247,6 @@ export async function run(options) {
   const turnLimit = options.scenario === "turn-limit" ? createTurnLimitScenario() : undefined;
   const restart = createCoordinatorRestartScenario(options.scenario);
   const powerLoss = options.scenario === "node-power-loss" ? createNodePowerLossScenario(join(proof, "node-home")) : undefined;
-  const reconnects = [];
   let captureRestart;
   const recovery = pause ?? turnLimit?.evidence;
   const recoveryFile = pause ? "pause-resume.json" : "turn-limit.json";
@@ -440,13 +439,6 @@ export async function run(options) {
       daemonState: () => ({ handle: daemon, info: daemonInfo }),
       spawnDaemon: () => (daemon = childProcess(process.execPath, [join(root, "dist/cli.js"), "serve", "--home", home, "--port", "0", "--node-port", "0"], env)),
       activateDaemon: (info) => { daemonInfo = info; base = `http://127.0.0.1:${info.port}`; nodeRelay.retarget(info.nodePort); },
-      spawnNode: () => {
-        const handle = childProcess(containerCLI, ["exec", "-i", "--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1", name, "sh", "-c", nodeCredentialShell,
-          "acceptance", String(nodeRelay.port), machineId, ...credentialRefs], { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });
-        reconnects.push(handle);
-        handle.child.stdin.end(nodeInput);
-        return handle;
-      },
       containerName: name, machineId,
       assertRecovered: (final, evidence) => assertRemoteResume(final.detail, final.runtimes, evidence, records, final.transport)
     });
@@ -817,12 +809,6 @@ export async function run(options) {
       const timer = setTimeout(() => node.child.kill("SIGKILL"), 10000);
       await node.done;
       clearTimeout(timer);
-    });
-    for (const [index, handle] of reconnects.entries()) await cleanup(`node reconnect ${index}`, async () => {
-      const timer = setTimeout(() => handle.child.kill("SIGKILL"), 10000);
-      await handle.done;
-      clearTimeout(timer);
-      writeFileSync(join(proof, `node-reconnect-${index}.log`), redact(handle.output()), { mode: 0o600 });
     });
     for (const [label, server] of [["node relay", nodeRelay], ["model relay", modelRelay]]) if (server) await cleanup(label, () => server.close());
     if (mock) await cleanup("mock", async () => { mock.closeAllConnections(); await new Promise((resolve) => mock.close(resolve)); });
