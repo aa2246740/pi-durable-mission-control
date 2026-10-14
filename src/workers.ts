@@ -236,7 +236,12 @@ export class WorkerManager {
       this.control.assignRemoteRuntime(agent.id);
       return;
     }
-    const existing = this.handles.get(agent.id);
+    let existing = this.handles.get(agent.id);
+    if (existing?.stopping) {
+      await this.stopAgent(agent.id);
+      if (this.closing || this.quiescenceFlights.has(agent.missionId) || this.control.missionById(agent.missionId)?.status !== "active") return;
+      existing = this.handles.get(agent.id);
+    }
     if (existing?.child.connected && existing.child.exitCode === null) {
       await existing.ready;
       return;
@@ -554,7 +559,6 @@ export class WorkerManager {
         if (acknowledged && isChildLive(handle.child)) this.control.setAgentStatus(agent.id, handle.epoch, "idle");
         else if (isChildLive(handle.child)) {
           this.control.setAgentStatus(agent.id, handle.epoch, "error", "Worker did not acknowledge queue cancellation");
-          flight.mode = "stop";
         }
       }
       await this.stopAgent(agent.id);
@@ -657,7 +661,7 @@ export class WorkerManager {
       if (this.handles.get(agentId) === handle) this.handles.delete(agentId);
       return;
     }
-    const closing = new Promise<void>((resolve) => {
+    const closing = new Promise<void>((resolve, reject) => {
       let acknowledged = false;
       let finished = false;
       let force: NodeJS.Timeout | undefined;
@@ -675,6 +679,11 @@ export class WorkerManager {
         clearTimeout(final);
         handle.child.off("message", onMessage);
         handle.child.off("exit", finish);
+        if (isChildLive(handle.child)) {
+          this.control.blockUnconfirmedLocalWorkerStop(agentId, handle.epoch);
+          reject(new Error("Local worker exit was not confirmed; queued inputs remain held"));
+          return;
+        }
         if (!acknowledged) this.control.setAgentStatus(agentId, handle.epoch, "error", "Worker exited without a shutdown acknowledgement");
         if (this.handles.get(agentId) === handle) this.handles.delete(agentId);
         resolve();
@@ -725,7 +734,12 @@ export class WorkerManager {
       });
     });
     handle.close = closing;
-    await closing;
+    try {
+      await closing;
+    } catch (error) {
+      if (handle.close === closing) delete handle.close;
+      throw error;
+    }
   }
 
   private async waitForAck(agentId: string, handle: Handle, expected: string, send: () => Promise<void>): Promise<boolean> {
