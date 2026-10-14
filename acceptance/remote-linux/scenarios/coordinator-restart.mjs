@@ -206,7 +206,7 @@ export function createCoordinatorRestartScenario(name) {
 }
 
 export function configureCoordinatorRestartRun(restart, { missionId, home, proof, records, api, post, wait, command, save, redact,
-  readTransport, readRequest, downloadContent, containerName: name, machineId, daemonState, spawnDaemon, activateDaemon, spawnNode, setDetail, assertRecovered, assertCoordinatorExit }) {
+  readTransport, readRequest, downloadContent, containerName: name, machineId, daemonState, spawnDaemon, activateDaemon, setDetail, assertRecovered, assertCoordinatorExit }) {
   const snapshot = async () => {
     const detail = await api(`/api/missions/${missionId}`);
     setDetail(detail);
@@ -235,6 +235,11 @@ export function configureCoordinatorRestartRun(restart, { missionId, home, proof
       const entry = { signal, pid: previous.child.pid, daemonId: daemonInfo.daemonId, port: daemonInfo.port, nodePort: daemonInfo.nodePort, startedAt: new Date().toISOString() };
       evidence.restarts.push(entry);
       save("coordinator-restart.json", evidence);
+      const nodeState = async () => JSON.parse(await command(["exec", name, "node", "-e", 'const fs=require("node:fs");const pid=Number(fs.readFileSync("/node-home/acceptance-node.pid","utf8"));let alive=true;try{process.kill(pid,0)}catch{alive=false}console.log(JSON.stringify({pid,alive}))']));
+      const originalNode = await nodeState();
+      assert.equal(originalNode.alive, true, "Node must be alive before coordinator restart");
+      const originalMachine = (await api("/api/state")).machines.find((machine) => machine.id === machineId);
+      entry.nodeReconnect = { previousPid: originalNode.pid, previousSessionId: originalMachine.sessionId, previousSessionEpoch: originalMachine.sessionEpoch, explicit: false, sameHome: "/node-home", sameContainer: name };
       previous.child.kill(signal);
       const timer = setTimeout(() => previous.child.kill("SIGKILL"), 12000);
       await previous.done;
@@ -252,19 +257,16 @@ export function configureCoordinatorRestartRun(restart, { missionId, home, proof
       assert.notEqual(newInfo.daemonId, entry.daemonId);
       activateDaemon(newInfo);
       Object.assign(entry, { newPid: newInfo.pid, newDaemonId: newInfo.daemonId, newPort: newInfo.port, newNodePort: newInfo.nodePort });
-      // The product node CLI exits on lost transport. Reconnect explicitly in the
-      // same running container with the same journal, roots and credentials.
-      let reconnect;
       await wait(async () => {
-        const state = await api("/api/state");
-        if (state.machines.some((machine) => machine.id === machineId && machine.status === "online")) return true;
-        const stopped = JSON.parse(await command(["exec", name, "node", "-e", 'const fs=require("node:fs");const pid=Number(fs.readFileSync("/node-home/acceptance-node.pid","utf8"));let alive=true;try{process.kill(pid,0)}catch{alive=false}console.log(JSON.stringify({pid,alive}))']));
-        if (!stopped.alive && !reconnect) {
-          entry.nodeReconnect = { previousPid: stopped.pid, explicit: true, sameHome: "/node-home", sameContainer: name };
-          reconnect = spawnNode();
-        }
-        if (reconnect?.error() || (reconnect && (reconnect.child.exitCode !== null || reconnect.child.signalCode !== null))) throw new Error(`Node reconnect failed: ${reconnect.output()}`);
-        return false;
+        const currentNode = await nodeState();
+        assert.equal(currentNode.alive, true, "Node CLI exited instead of reconnecting");
+        assert.equal(currentNode.pid, originalNode.pid, "Node CLI was restarted");
+        const machine = (await api("/api/state")).machines.find((machine) => machine.id === machineId);
+        if (machine?.status !== "online") return false;
+        assert.notEqual(machine.sessionId, originalMachine.sessionId);
+        assert.ok(machine.sessionEpoch > originalMachine.sessionEpoch);
+        Object.assign(entry.nodeReconnect, { pid: currentNode.pid, sessionId: machine.sessionId, sessionEpoch: machine.sessionEpoch });
+        return true;
       });
       // Allow old-binding fencing and historical stop reports to settle.
       const settledAt = Date.now();

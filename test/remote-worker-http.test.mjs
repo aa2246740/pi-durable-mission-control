@@ -97,9 +97,10 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
       const nativeFetch = globalThis.fetch;
       let heldRuntimeId;
       let crashRuntimeId;
+      let crashContent;
       let releaseReport;
       process.on("message", (message) => {
-        if (message.action === "crash-during-poll") crashRuntimeId = message.runtimeId;
+        if (message.action === "crash-during-poll") { crashRuntimeId = message.runtimeId; crashContent = message.content; }
         if (message.action === "hold-stop-report") heldRuntimeId = message.runtimeId;
         if (message.action === "release-stop-report") { heldRuntimeId = undefined; releaseReport?.(); }
         process.send({ type: "control-applied", action: message.action });
@@ -112,7 +113,7 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
         const response = await nativeFetch(input, init);
         if (String(input).endsWith("/api/nodes/mailbox/poll") &&
             JSON.parse(init.body).binding.runtimeId === crashRuntimeId && response.ok &&
-            (await response.clone().json()).envelopes.length) {
+            (await response.clone().json()).envelopes.some(envelope => envelope.payload.kind === "deliver" && envelope.payload.content === crashContent)) {
           const db = new DatabaseSync(${JSON.stringify(join(nodeHome, "worker-runtime", "node-workers.sqlite"))}, { readOnly: true });
           try {
             const row = () => db.prepare("SELECT pid,state FROM node_worker_runtimes WHERE runtime_id=?").get(crashRuntimeId);
@@ -541,7 +542,7 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     await waitFor(() => control.remoteRuntimeForAgent(crashAgent.id)?.state === "running");
     const crashRuntime = control.remoteRuntimeForAgent(crashAgent.id);
     const leaseBeforeCrash = control.machineRegistry.get(enrolled.machine.id).leaseExpiresAt;
-    node.send({ action: "crash-during-poll", runtimeId: crashRuntime.runtime_id });
+    node.send({ action: "crash-during-poll", runtimeId: crashRuntime.runtime_id, content: "Do not replay this input." });
     await waitFor(() => nodeControls.has("crash-during-poll"));
     const crashMessage = control.sendMessage(crashMission.id, crashAgent.id, "Do not replay this input.",
       "followUp", "real-http-crash-input");

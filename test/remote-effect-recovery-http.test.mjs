@@ -18,7 +18,7 @@ const waitFor = async predicate => {
   throw new Error("timed out waiting for node receipt transport recovery");
 };
 
-test("runNode retries a lost receipt ACK across same-machine reenrollment without replaying the effect", async t => {
+test("runNode automatically retries a lost receipt ACK after same-machine reenrollment without replaying the effect", async t => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-effect-recovery-"));
   const root = join(home, "remote-root"), localPath = join(home, "local-workspace"), nodeHome = join(home, "node-home");
   mkdirSync(root); mkdirSync(localPath);
@@ -54,6 +54,11 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
           heldReceipts.push({ parsedBody, outgoing });
           return;
         }
+        if (receiptMode === "reject") {
+          outgoing.writeHead(400, { "content-type": "application/json" });
+          outgoing.end(JSON.stringify({ error: "Fixture protocol rejection keeps initial receipt unacknowledged" }));
+          return;
+        }
       }
       const headers = { ...incoming.headers, host: `127.0.0.1:${service.nodePort}`, "content-length": body.length };
       delete headers.connection;
@@ -70,6 +75,7 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
             if (dropNextAck) {
               dropNextAck = false;
               droppedAcks++;
+              receiptMode = "hold";
               outgoing.destroy();
               return;
             }
@@ -218,6 +224,8 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
     messages: control.detail(mission.id).messages,
     budget: control.detail(mission.id).budget
   };
+  // A protocol rejection remains fatal; transport loss alone now retries.
+  receiptMode = "reject";
   heldReceipts[0].outgoing.destroy();
   await waitFor(() => node.exitCode !== null || node.signalCode !== null);
   assert.equal(node.exitCode, 1, node.outputText);
@@ -267,8 +275,10 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
   dropNextAck = true;
   node = spawnNode(reenrolledOnce.token);
   await waitFor(() => droppedAcks === 1);
-  await waitFor(() => node.exitCode !== null || node.signalCode !== null);
-  assert.equal(node.exitCode, 1, node.outputText);
+  const reconnectPid = node.pid;
+  const reconnectSession = control.machineRegistry.get(enrolled.machine.id).sessionId;
+  await waitFor(() => node.outputText.includes("retrying"));
+  assert.equal(node.exitCode, null, node.outputText);
   assert.equal(receiptEventCount(mission.id), 1);
   assert.equal(receiptAcks.length, 1);
   assert.equal(receiptAcks[0].duplicate, false);
@@ -278,10 +288,12 @@ test("runNode retries a lost receipt ACK across same-machine reenrollment withou
   assert.equal(nodeEffectUpload(afterLostAck[0].spec, afterLostAck[0].receipt).receiptHash, originalUpload.receiptHash);
   assert.deepEqual(receiptRequests.at(-1).upload, JSON.parse(JSON.stringify(originalUpload)));
 
-  control.revokeMachine(enrolled.machine.id);
-  const reenrolledTwice = control.reenrollMachine(enrolled.machine.id);
-  node = spawnNode(reenrolledTwice.token);
+  receiptMode = "forward";
+  for (const held of heldReceipts) held.outgoing.destroy();
   await waitFor(() => receiptAcks.length === 2);
+  assert.equal(node.pid, reconnectPid);
+  assert.equal(node.exitCode, null, node.outputText);
+  assert.equal(control.machineRegistry.get(enrolled.machine.id).sessionId, reconnectSession);
   assert.equal(receiptAcks[1].duplicate, true);
   await waitFor(() => {
     try {

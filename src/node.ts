@@ -22,6 +22,8 @@ const productVersion = String((require("../package.json") as { version: string }
 const BODY_LIMIT = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 7000;
 const POLL_INTERVAL_MS = 3000;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
 const MAILBOX_IDLE_INTERVAL_MS = 150;
 const MAX_ACTIVE_DRAIN_ROUNDS = 4;
 const TOKEN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -62,6 +64,29 @@ class CoordinatorConflict extends Error {
   constructor() {
     super(genericError().message);
   }
+}
+
+export class CoordinatorUnavailable extends Error {
+  constructor() {
+    super("Node coordinator temporarily unavailable");
+  }
+}
+
+class CoordinatorSessionExpired extends Error {}
+
+export function nodeReconnectDelay(attempt: number, random = Math.random()): number {
+  const ceiling = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.min(attempt, 5));
+  return Math.floor(ceiling * (0.5 + random * 0.5));
+}
+
+function transportFailure(error: unknown): boolean {
+  if (!object(error)) return false;
+  if (typeof error.code === "string" && [
+    "ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH",
+    "ETIMEDOUT", "EPIPE", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT", "UND_ERR_SOCKET"
+  ].includes(error.code)) return true;
+  return transportFailure(error.cause) || (Array.isArray(error.errors) && error.errors.some(transportFailure));
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -451,7 +476,8 @@ class NodeJournal {
 
 export async function fetchJson(base: URL, path: string, token: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
   const onAbort = (): void => controller.abort();
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let bodyComplete = false;
@@ -467,10 +493,14 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
       body: JSON.stringify(body)
     });
     const length = Number(response.headers.get("content-length") ?? "0");
-    if (!response.ok || (Number.isFinite(length) && length > BODY_LIMIT)) {
+    if ([502, 503, 504].includes(response.status)) {
       controller.abort();
       await response.body?.cancel().catch(() => undefined);
-      if (response.status === 409) throw new CoordinatorConflict();
+      throw new CoordinatorUnavailable();
+    }
+    if ((!response.ok && response.status !== 409) || (Number.isFinite(length) && length > BODY_LIMIT)) {
+      controller.abort();
+      await response.body?.cancel().catch(() => undefined);
       throw genericError();
     }
     reader = response.body?.getReader();
@@ -491,11 +521,20 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
     bodyComplete = true;
     let parsed: unknown;
     try { parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")); } catch { throw genericError(); }
+    if (response.status === 409) {
+      if (!object(parsed) || !exactKeys(parsed, ["error"]) || typeof parsed.error !== "string") throw genericError();
+      if (["Node session is fenced; stop local work and isolate this node",
+        "Node lease expired; isolate this node and reconnect", "Registration is no longer valid"].includes(parsed.error)) {
+        throw new CoordinatorSessionExpired();
+      }
+      throw new CoordinatorConflict();
+    }
     return parsed;
   } catch (error) {
-    if (error instanceof CoordinatorConflict) throw error;
+    if (error instanceof CoordinatorConflict || error instanceof CoordinatorSessionExpired || error instanceof CoordinatorUnavailable) throw error;
     controller.abort();
     if (reader && !bodyComplete) await reader.cancel().catch(() => undefined);
+    if (!signal?.aborted && (timedOut || transportFailure(error))) throw new CoordinatorUnavailable();
     throw genericError();
   } finally {
     clearTimeout(timer);
@@ -660,7 +699,6 @@ export async function runNode(options: NodeOptions): Promise<void> {
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
-  const registrationId = journal.registrationId();
   let leaseDeadline = 0;
   let mailboxActivityGeneration = 0;
   let wakeMailboxWait: (() => void) | undefined;
@@ -689,19 +727,54 @@ export async function runNode(options: NodeOptions): Promise<void> {
   let runtimeTask: Promise<void> | undefined;
   let runtimeFailure: unknown;
   const runtimeStartFlights = new Map<string, { descriptorHash: string; promise: Promise<void> }>();
+  let retryAttempt = 0;
+  let unavailable = false;
+  const retryConnection = async (signal: AbortSignal): Promise<void> => {
+    unavailable = true;
+    const ms = nodeReconnectDelay(retryAttempt++);
+    process.stderr.write(`Node coordinator unavailable; retrying in ${ms} ms\n`);
+    await delay(ms, signal);
+  };
+  const connectionRestored = (): void => {
+    if (unavailable) process.stderr.write("Node coordinator connection restored\n");
+    unavailable = false;
+    retryAttempt = 0;
+  };
   const sessionBody = {
     machineId: options.machineId,
     capabilities: capabilities(roots, credentialRefs, options.executionMode),
-    registrationId
+    registrationId: journal.registrationId()
   };
-  try {
+  const runSession = async (): Promise<void> => {
     let session: NodeSession;
-    try {
-      session = parseNodeSession(await fetchJson(coordinator, "/api/nodes/session", token, sessionBody, abort.signal), options.machineId);
-    } catch (error) {
-      if (error instanceof CoordinatorConflict) journal.rotateRegistrationId(registrationId);
-      throw error;
+    while (true) {
+      try {
+        session = parseNodeSession(await fetchJson(coordinator, "/api/nodes/session", token, sessionBody, abort.signal), options.machineId);
+        break;
+      } catch (error) {
+        if (stopping) return;
+        if (error instanceof CoordinatorSessionExpired) {
+          journal.rotateRegistrationId(sessionBody.registrationId);
+          sessionBody.registrationId = journal.registrationId();
+          continue;
+        }
+        if (error instanceof CoordinatorConflict) journal.rotateRegistrationId(sessionBody.registrationId);
+        if (!(error instanceof CoordinatorUnavailable)) throw error;
+        await retryConnection(abort.signal);
+      }
     }
+    connectionRestored();
+    const cycleAbort = new AbortController();
+    const cycleSignal = AbortSignal.any([abort.signal, cycleAbort.signal]);
+    let endingSession = false;
+    let connected = false;
+    const endSession = (): void => {
+      endingSession = true;
+      connected = false;
+      leaseDeadline = 0;
+      cycleAbort.abort();
+      notifyMailboxActivity();
+    };
     journal.sessionStarted(session);
     if (options.executionMode) {
       const runtimeSession = session;
@@ -728,11 +801,11 @@ export async function runNode(options: NodeOptions): Promise<void> {
           const post = async (path: string, body: unknown): Promise<unknown> => {
             current();
             try {
-              return await fetchJson(coordinator, path, token, body, abort.signal);
+              return await fetchJson(coordinator, path, token, body, cycleSignal);
             } catch (error) {
-              if (error instanceof CoordinatorConflict) throw error;
+              if (!(error instanceof CoordinatorUnavailable)) throw error;
               current();
-              return fetchJson(coordinator, path, token, body, abort.signal);
+              return fetchJson(coordinator, path, token, body, cycleSignal);
             }
           };
           const base = { machineId: options.machineId, sessionId: session!.sessionId, sessionEpoch: session!.sessionEpoch, spec, manifest };
@@ -757,7 +830,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
         lookupAppliedUploads: (oldBinding, entries) => queryAppliedMailboxUploads(
           options.coordinator, token,
           { machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch },
-          oldBinding, entries, abort.signal
+          oldBinding, entries, cycleSignal
         ),
         ...(options.testOnlyScripted ? { testOnlyScripted: true } : {}),
         ...(options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
@@ -774,7 +847,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
       const postRuntimeReport = async (report: ReturnType<NodeJournal["pendingRuntimeReports"]>[number]): Promise<void> => {
         const ack = await fetchJson(coordinator, "/api/nodes/runtimes/events", token, {
           machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch, ...report
-        }, abort.signal);
+        }, cycleSignal);
         if (!validRuntimeReportAck(ack)) throw genericError();
         journal.sentRuntimeReport(report.reportId);
       };
@@ -791,7 +864,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
       let nextAssignmentPoll = 0;
       let activeRounds = 0;
       const mailboxFencedBindings = new Set<string>();
-      while (!stopping) {
+      while (!stopping && !endingSession) {
         const roundGeneration = mailboxActivityGeneration;
         for (const upload of supervisor.pendingEffectReceipts()) {
           const ack = await fetchJson(coordinator, "/api/nodes/effects/receipts", token, {
@@ -799,16 +872,16 @@ export async function runNode(options: NodeOptions): Promise<void> {
             sessionId: session.sessionId,
             sessionEpoch: session.sessionEpoch,
             upload
-          }, abort.signal);
+          }, cycleSignal);
           supervisor.acknowledgeEffectReceipt(upload, ack);
         }
         for (const report of journal.pendingRuntimeReports()) {
           await postRuntimeReport(report);
         }
-        if (Date.now() >= nextAssignmentPoll) {
+        if (connected && Date.now() >= nextAssignmentPoll) {
           const runtimeResponse = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {
             machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
-          }, abort.signal);
+          }, cycleSignal);
           if (!object(runtimeResponse) || !exactKeys(runtimeResponse, ["directives"]) ||
               !Array.isArray(runtimeResponse.directives) || runtimeResponse.directives.length > 1) throw genericError();
           nextAssignmentPoll = Date.now() + POLL_INTERVAL_MS;
@@ -883,18 +956,18 @@ export async function runNode(options: NodeOptions): Promise<void> {
           }
           if (mailboxFencedBindings.has(binding.runtimeId)) continue;
           try {
-            progress = await exchangeWorkerMailbox(options.coordinator, token, supervisor.mailbox, binding, abort.signal) || progress;
+            progress = await exchangeWorkerMailbox(options.coordinator, token, supervisor.mailbox, binding, cycleSignal) || progress;
           } catch (error) {
             if (!(error instanceof CoordinatorConflict) && !(error instanceof LocalMailboxFence)) throw error;
             mailboxFencedBindings.add(binding.runtimeId);
             let stopReason: RuntimeStopReason = "unexpected";
             if (error instanceof CoordinatorConflict) {
               // A mailbox fence can precede the regular stop-directive poll.
-              // Session and protocol failures here must still terminate the node.
+              // A session fence ends this cycle; other protocol failures remain fatal.
               const response = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {
                 machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
                 stopRuntimeId: binding.runtimeId
-              }, abort.signal);
+              }, cycleSignal);
               if (!object(response) || !exactKeys(response, ["directives"]) || !Array.isArray(response.directives) ||
                   response.directives.length > 1) throw genericError();
               const directive: unknown = response.directives[0];
@@ -925,7 +998,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
       }
     };
     const handleRuntimeFailure = async (error: unknown): Promise<void> => {
-      if (stopping) return;
+      if (stopping || endingSession) return;
       runtimeFailure = error;
       stopping = true;
       leaseDeadline = 0;
@@ -942,44 +1015,88 @@ export async function runNode(options: NodeOptions): Promise<void> {
         }
       }
     };
-    while (true) {
-      if (runtimeFailure) throw runtimeFailure;
-      if (stopping) break;
-      for (const receipt of journal.pendingReceipts(session)) {
-        try {
-          await fetchJson(coordinator, "/api/nodes/events", token, {
-            machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
-            commandId: receipt.commandId, outcome: receipt.outcome
-          }, abort.signal);
-          journal.sent(receipt.commandId, session);
-        } catch {
-          if (stopping) break;
-          throw genericError();
+    while (!endingSession) {
+      try {
+        if (runtimeFailure) throw runtimeFailure;
+        if (stopping) break;
+        for (const receipt of journal.pendingReceipts(session)) {
+          try {
+            await fetchJson(coordinator, "/api/nodes/events", token, {
+              machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
+              commandId: receipt.commandId, outcome: receipt.outcome
+            }, cycleSignal);
+            journal.sent(receipt.commandId, session);
+          } catch (error) {
+            if (stopping || endingSession) break;
+            throw error;
+          }
         }
-      }
-      if (stopping) break;
-      const ordinaryPollStarted = performance.now();
-      const ordinaryPollResponse = await fetchJson(coordinator, "/api/nodes/poll", token, {
-        machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
-      }, abort.signal);
-      leaseDeadline = ordinaryPollStarted + session.leaseMs;
-      const polled = parseNodePoll(ordinaryPollResponse, options.machineId, session);
-      if (supervisor && !runtimeTask) {
-        runtimeTask = runRuntimeLoop().catch(handleRuntimeFailure);
-      }
-      for (const command of polled.commands) {
-        const operation = journal.operation(command, session);
-        if (operation.status !== "admitted") continue;
-        let outcome: NonNullable<JournalOperation["outcome"]>;
-        try {
-          outcome = { ok: true, result: inspectWorkspace(command.payload.path, roots) };
-        } catch (error) {
-          outcome = { ok: false, error: error instanceof Error ? error.message : "workspace probe failed" };
+        if (stopping) break;
+        const ordinaryPollStarted = performance.now();
+        const ordinaryPollResponse = await fetchJson(coordinator, "/api/nodes/poll", token, {
+          machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
+        }, cycleSignal);
+        leaseDeadline = ordinaryPollStarted + session.leaseMs;
+        const polled = parseNodePoll(ordinaryPollResponse, options.machineId, session);
+        connected = true;
+        connectionRestored();
+        if (supervisor && !runtimeTask) {
+          runtimeTask = (async () => {
+            while (!stopping && !endingSession) {
+              try {
+                await runRuntimeLoop();
+              } catch (error) {
+                if (stopping || endingSession) return;
+                if (error instanceof CoordinatorSessionExpired) { endSession(); return; }
+                if (!(error instanceof CoordinatorUnavailable)) { await handleRuntimeFailure(error); return; }
+                connected = false;
+                await retryConnection(cycleSignal);
+              }
+            }
+          })();
         }
-        journal.complete(command.id, session, outcome);
+        for (const command of polled.commands) {
+          const operation = journal.operation(command, session);
+          if (operation.status !== "admitted") continue;
+          let outcome: NonNullable<JournalOperation["outcome"]>;
+          try {
+            outcome = { ok: true, result: inspectWorkspace(command.payload.path, roots) };
+          } catch (error) {
+            outcome = { ok: false, error: error instanceof Error ? error.message : "workspace probe failed" };
+          }
+          journal.complete(command.id, session, outcome);
+        }
+        await delay(POLL_INTERVAL_MS, cycleSignal);
+      } catch (error) {
+        if (stopping || endingSession) break;
+        if (error instanceof CoordinatorSessionExpired) { endSession(); break; }
+        if (!(error instanceof CoordinatorUnavailable)) throw error;
+        connected = false;
+        await retryConnection(cycleSignal);
       }
-      await delay(POLL_INTERVAL_MS, abort.signal);
     }
+    if (runtimeFailure) throw runtimeFailure;
+    if (endingSession && !stopping) {
+      await runtimeTask;
+      runtimeTask = undefined;
+      await Promise.all([...runtimeStartFlights.values()].map((flight) => flight.promise));
+      if (runtimeFailure) throw runtimeFailure;
+      if (supervisor) {
+        for (const runtime of supervisor.inspectBindings()) {
+          if (["closed", "uncertain"].includes(runtime.state) && journal.hasRuntimeReport(runtime.binding.runtimeId, runtime.descriptorHash)) continue;
+          const evidence = await supervisor.stop(runtime.binding, "unexpected");
+          journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
+        }
+        await supervisor.close();
+        supervisor = undefined;
+      }
+      journal.markAdmittedUncertain();
+      sessionBody.registrationId = journal.registrationId();
+      process.stderr.write("Node session expired; old workers stopped, obtaining a new session\n");
+    }
+  };
+  try {
+    while (!stopping) await runSession();
   } catch {
     if (runtimeFailure) throw genericError();
     if (!stopping) throw genericError();

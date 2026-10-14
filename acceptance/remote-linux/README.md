@@ -40,30 +40,30 @@ summary 必须同时满足 Mission completed、任务 accepted、验收 exitCode
 
 ```sh
 mkdir -p .acceptance-proof
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario restart-after-complete --keep --out "$PWD/.acceptance-proof/restart-complete-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-n2-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario restart-after-complete --keep --out "$PWD/.acceptance-proof/restart-complete-1"
 ```
 
 每次重启后核对 Mission 与 orchestrator ID、completed 状态、accepted 任务、验收回执的完整 JSON、artifact 下载 SHA-256 与 Content-Disposition、零开放 blocker、closed runtime 及停止来源。runtime 数量和 binding 保持原样，没有分配或重分配事件，mock 模型请求计数不增加。旧 mailbox 可以保留重启前已经存在的 uncertain 状态；全部字段及 transport 必须保持原样，binding 不能重新变成 open。
 
-产品节点 CLI 遇到连接中断会退出。此场景在原容器内使用原 `/node-home`、机器 ID、token 和根目录显式重新启动节点 CLI，凭据仍只走 stdin。`coordinator-restart.json` 记录该人工重连，不能据此宣称节点会自动重连。每次协调端重启的信号、PID、daemon ID、端口、退出结果和耗时都单独保存。
+产品节点 CLI 遇到暂时连接中断会按带抖动的指数退避自动重连，等待上限从 1 秒翻倍至 30 秒。此场景不重启节点 CLI，要求协调端重启前后节点 PID 相同、进程仍存活，并取得 session ID 不同、epoch 递增的新 session。`coordinator-restart.json` 记录 `nodeReconnect.explicit: false`、节点 PID 和新旧 session。旧 runtime 以 unexpected 停止，历史不确定性保留；已记录的首次停止原因保持不变。每次协调端重启的信号、PID、daemon ID、端口、退出结果和耗时都单独保存。
 
 ### 运行中协调端重启
 
-`--scenario coordinator-restart` 在远端 worker 第一次 Linux 自查成功后、发布之前暂停 mock 的后续发布决策，等待实际 WaitForMessage 上传结清，再对协调端发送 SIGTERM。`--scenario coordinator-restart-kill` 在同一个位置使用 SIGKILL。两个场景各运行一次独立 Mission，均使用原协调端 home 重启，并按上面的方式显式重连原容器中的节点。
+`--scenario coordinator-restart` 在远端 worker 第一次 Linux 自查成功后、发布之前暂停 mock 的后续发布决策，等待实际 WaitForMessage 上传结清，再对协调端发送 SIGTERM。`--scenario coordinator-restart-kill` 在同一个位置使用 SIGKILL。两个场景各运行一次独立 Mission，均使用原协调端 home 重启，并等待原容器中的节点自动重连，全程不重启节点 CLI。
 
 ```sh
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart --keep --out "$PWD/.acceptance-proof/restart-running-term-1"
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart-kill --keep --out "$PWD/.acceptance-proof/restart-running-kill-1"
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/coordinator-restart-container.test.mjs
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-n2-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart --keep --out "$PWD/.acceptance-proof/restart-running-term-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-n2-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart-kill --keep --out "$PWD/.acceptance-proof/restart-running-kill-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-n2-gpt- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/coordinator-restart-container.test.mjs
 ```
 
-容器自测顺序运行这三个新场景各两次，最后再运行 default；即使前一次失败也保存结果并继续。任一次场景或清理失败，整个自测非零退出。该自测不进入 `npm test`。
+容器自测顺序运行这三个新场景各两次，最后再运行 default 和 worker-crash 各一次；即使前一次失败也保存结果并继续。任一次场景或清理失败，整个自测非零退出。该自测不进入 `npm test`。
 
 运行中场景按产品实际状态检查安全边界，再模拟运营者执行 README 的正规流程。脚本先 GET 导出，检查 Linux 文件仍为原始 version 1，核对成功的写入与自查回执、runtime、mailbox 和投递，再逐个 POST resolve 开放 blocker，最后 POST resume。每一步保存请求方法、路径、正文、HTTP 状态和响应。脚本只读取状态库，不修改任务、旧 runtime、mailbox、投递或 effect，也不直接发送新的工作指令。
 
 可接受结局写入 summary 的 `outcome`。`recovered` 要求恰好一次重分配、同 worker 与同节点、epoch 严格递增、发布在新 runtime 上，并通过 pause-resume 共用的不重放断言。`irrecoverable` 要求 Mission failed、恰好一个 worker_start_failed，且带 `recoverable: false`、机器可读 reason 和非空 diagnostic。此时旧 binding、mailbox、effect、投递和消息必须保持运营者操作前的状态，worker 工具调用不能增加。effect 或投递重放、无证据的新 runtime、active 且没有 blocker 或诊断、重复生成 blocker、resume 后没有终局诊断的停滞都会使场景非零退出并保留证据。
 
-`coordinator-restart.json` 保存重启前后与每步运营者操作的只读快照，包括 mission detail、runtimes、blockers、mock 请求计数、工具记录、完整 mailbox binding 和 transport。还保留 `mission-export.json`、每次协调端日志及节点重连日志。`summary.json` 只摘录结局与 HTTP 结果，完整 GET 响应留在场景证据中。
+`coordinator-restart.json` 保存重启前后与每步运营者操作的只读快照，包括 mission detail、runtimes、blockers、mock 请求计数、工具记录、完整 mailbox binding 和 transport。还保留 `mission-export.json`、每次协调端日志及含节点重连状态的 container.log。`summary.json` 只摘录结局与 HTTP 结果，完整 GET 响应留在场景证据中。
 
 2026-10-15 在 `orch/s1-gpt`、基线 `2dbe991` 上，运行中 SIGTERM 与 SIGKILL 重启均实测为 `irrecoverable`：重启后 Mission blocked，旧 runtime closed，stopProvenance uncertain，mailbox uncertain。唯一开放 blocker 的文本为 `Remote runtime ownership became uncertain after coordinator restart. Reconcile ownership and in-flight work before resuming.`。GET 导出与 resolve 返回 200，resolve 后 Mission paused；resume 返回 409 `Prior remote runtime <id>: uncertain runtime report; trusted reconciliation is required`，随后 Mission failed，worker_start_failed 带 `recoverable: false`、`reason: remote_runtime_uncertain` 和同一 diagnostic。没有新 runtime、发布或重放，mock 请求计数保持 19。
 
