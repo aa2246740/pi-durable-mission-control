@@ -323,3 +323,219 @@ for (const terminal of ["completed", "cancelled"]) {
     }
   });
 }
+
+function refuseExit(f) {
+  const send = f.child.send;
+  f.child.send = (message, callback) => {
+    if (message.type === "abort" || message.type === "shutdown") { f.sent.push(message); callback(null); return; }
+    send(message, callback);
+  };
+  f.child.kill = () => true;
+}
+
+async function drainStops(t, count = 1) {
+  await nextImmediate();
+  for (let i = 0; i < count; i++) {
+    for (const ms of [5000, 5000, 1000, 2000]) { t.mock.timers.tick(ms); await nextImmediate(); }
+  }
+}
+
+async function failedAnsweredQuestion(t, f, count = 1) {
+  const pausing = f.workers.onRpc(f.agent, f.handle, { type: "rpc", id: "question-rpc", token: f.handle.token,
+    agentId: f.agent.id, epoch: f.agent.epoch, method: "RequestUserInput", args: { question: "Proceed?" }, taskId: "question" });
+  const reply = await f.reply;
+  f.control.resolveBlocker(reply.result.id, "Proceed");
+  f.settle();
+  await drainStops(t, count);
+  await pausing;
+  return `blocker-resolution:${reply.result.id}`;
+}
+
+function stopSnapshot(f, answerId) {
+  return {
+    agents: f.control.listAgents(f.mission.id).map(agent => ({ id: agent.id, epoch: agent.epoch, error: agent.error, updatedAt: agent.updatedAt })),
+    blockers: f.control.blockers(f.mission.id).filter(blocker => blocker.kind === "unsafe_execution"),
+    stopEvents: f.control.detail(f.mission.id).events.filter(event => event.type === "operation_uncertain"),
+    message: f.control.message(answerId),
+    outbox: { ...f.control.db.prepare("SELECT * FROM outbox WHERE message_id=?").get(answerId) }
+  };
+}
+
+for (const retry of ["sync", "rpc", "question", "pause", "close", "cancel"]) {
+  test(`unconfirmed stop remains one fence across repeated ${retry}`, async t => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    refuseExit(f);
+    try {
+      const answerId = await failedAnsweredQuestion(t, f);
+      const first = stopSnapshot(f, answerId);
+      assert.equal(first.message.status, "queued");
+      assert.equal(first.blockers.length, 1);
+      const ordinary = f.control.sendMessage(f.mission.id, f.agent.id, "Ordinary follow-up", "followUp", "ordinary");
+      for (let round = 0; round < 3; round++) {
+        let operation;
+        if (retry === "rpc") {
+          operation = f.workers.onRpc(f.agent, f.handle, { type: "rpc", id: `late-${round}`, token: f.handle.token,
+            agentId: f.agent.id, epoch: f.agent.epoch, method: "Report", args: { summary: "late result" }, taskId: `late-${round}` });
+        } else if (retry === "question") {
+          operation = f.workers.quiesceMission(f.mission.id, { kind: "question", agentId: f.agent.id });
+        } else if (retry === "close") operation = f.workers.close();
+        else if (retry === "pause") {
+          if (round === 0) f.control.missionAction(f.mission.id, "pause");
+          operation = f.workers.pauseMission(f.mission.id);
+        } else {
+          if (retry === "cancel" && round === 0) f.control.missionAction(f.mission.id, "cancel");
+          operation = f.workers.syncMissionLifecycle(f.mission.id);
+        }
+        const finished = retry === "rpc" ? operation : assert.rejects(operation, AggregateError);
+        await drainStops(t);
+        await finished;
+        const current = stopSnapshot(f, answerId);
+        assert.deepEqual(current.agents, first.agents, "Retry must not advance an already fenced process or rewrite its diagnostic");
+        assert.deepEqual(current.blockers, first.blockers, "The same process must keep one stable stop blocker");
+        assert.deepEqual(current.stopEvents, first.stopEvents);
+        if (retry === "cancel") {
+          assert.equal(current.message.status, "aborted");
+          assert.equal(current.outbox.status, "aborted");
+          assert.equal(f.control.missionById(f.mission.id).status, "cancelled");
+        } else {
+          assert.deepEqual(current.message, first.message);
+          assert.deepEqual(current.outbox, first.outbox);
+        }
+        if (retry === "pause" || retry === "cancel") assert.equal(f.control.message(ordinary.id).status, "aborted");
+        assert.equal(f.workers.quiescenceFlights.size, 0);
+        assert.equal(f.workers.handles.get(f.agent.id), f.handle);
+        assert.equal(f.sent.filter(message => message.type === "deliver").length, 0);
+      }
+    } finally { exitChildren(f.child); }
+  });
+}
+
+for (const resolveFirst of [false, true]) {
+  test(`late exit ${resolveFirst ? "after" : "before"} blocker resolution releases the answer once`, async t => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    refuseExit(f);
+    try {
+      const answerId = await failedAnsweredQuestion(t, f);
+      const blocker = f.control.blockers(f.mission.id).find(item => item.status === "open");
+      if (resolveFirst) f.control.resolveBlocker(blocker.id, "Inspected the old process; awaiting exit");
+      exitChildren(f.child);
+      await f.workers.stopAgent(f.agent.id);
+      assert.equal(f.workers.handles.has(f.agent.id), false);
+      const deliveries = [];
+      installReplacement(f, deliveries);
+      await f.workers.startAgent(f.control.getAgentPublic(f.agent.id));
+      await f.workers.dispatchPending();
+      assert.deepEqual(deliveries, []);
+      assert.equal(f.control.message(answerId).status, "queued");
+      if (!resolveFirst) {
+        assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+        f.control.resolveBlocker(blocker.id, "Confirmed exit and inspected workspace");
+      }
+      assert.equal(f.control.missionById(f.mission.id).status, "paused");
+      f.control.missionAction(f.mission.id, "resume");
+      await f.workers.dispatchPending();
+      await f.workers.dispatchPending();
+      assert.equal(f.control.message(answerId).status, "completed");
+      assert.equal(f.control.message(answerId).attempt, 1);
+      assert.deepEqual(deliveries.map(message => message.messageId), [answerId]);
+      assert.ok(deliveries[0].epoch > f.handle.epoch);
+    } finally { exitChildren(f.child); }
+  });
+}
+
+test("resolving a stop blocker before exit cannot start a replacement", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  refuseExit(f);
+  try {
+    const answerId = await failedAnsweredQuestion(t, f);
+    const blocker = f.control.blockers(f.mission.id).find(item => item.status === "open");
+    f.control.resolveBlocker(blocker.id, "Inspected process");
+    f.control.missionAction(f.mission.id, "resume");
+    const prepare = t.mock.method(f.control, "prepareAgentWorkspace", () => assert.fail("Old process is still live"));
+    const starting = assert.rejects(f.workers.startAgent(f.control.getAgentPublic(f.agent.id)), /Mission quiescence|Local worker exit/);
+    await drainStops(t, 2);
+    await starting;
+    assert.equal(prepare.mock.callCount(), 0);
+    assert.equal(f.workers.handles.get(f.agent.id), f.handle);
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, f.handle.epoch + 1);
+    assert.equal(f.control.message(answerId).status, "queued");
+    assert.equal(f.control.blockers(f.mission.id).filter(item => item.kind === "unsafe_execution").length, 1);
+    assert.equal(f.control.missionById(f.mission.id).status, "failed");
+    exitChildren(f.child);
+    await f.workers.stopAgent(f.agent.id);
+    prepare.mock.restore();
+    const deliveries = [];
+    installReplacement(f, deliveries);
+    f.control.missionAction(f.mission.id, "resume");
+    await f.workers.dispatchPending();
+    await f.workers.dispatchPending();
+    assert.deepEqual(deliveries.map(message => message.messageId), [answerId]);
+    assert.equal(f.control.message(answerId).attempt, 1);
+  } finally { exitChildren(f.child); }
+});
+
+test("two unconfirmed processes retain independent fences across three sync retries", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  refuseExit(f);
+  const peer = installPeer(f, { stuck: true });
+  try {
+    const answerId = await failedAnsweredQuestion(t, f, 2);
+    const first = stopSnapshot(f, answerId);
+    assert.equal(first.blockers.length, 2);
+    for (let round = 0; round < 3; round++) {
+      const finished = assert.rejects(f.workers.syncMissionLifecycle(f.mission.id), error => {
+        assert.ok(error instanceof AggregateError);
+        assert.equal(error.errors.length, 2);
+        return true;
+      });
+      await drainStops(t, 2);
+      await finished;
+      assert.deepEqual(stopSnapshot(f, answerId), first);
+      assert.equal(f.workers.quiescenceFlights.size, 0);
+      assert.equal(f.workers.handles.size, 2);
+    }
+    assert.ok(f.sent.some(message => message.type === "shutdown"));
+    assert.ok(peer.sent.includes("shutdown"));
+  } finally { exitChildren(f.child, peer.child); }
+});
+
+for (const failing of ["asking", "peer"]) {
+  test(`an answer received after ${failing} stop failure stays queued through manual pause`, async t => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const peer = failing === "peer" ? installPeer(f, { stuck: true }) : undefined;
+    if (!peer) refuseExit(f);
+    try {
+      const pausing = f.workers.onRpc(f.agent, f.handle, { type: "rpc", id: "question-rpc", token: f.handle.token,
+        agentId: f.agent.id, epoch: f.agent.epoch, method: "RequestUserInput", args: { question: "Proceed?" }, taskId: "question" });
+      const reply = await f.reply;
+      f.settle();
+      await drainStops(t);
+      await pausing;
+      f.control.resolveBlocker(reply.result.id, "Proceed after inspection");
+      const answerId = `blocker-resolution:${reply.result.id}`;
+      assert.equal(f.control.message(answerId).status, "queued");
+      f.control.missionAction(f.mission.id, "pause");
+      const paused = assert.rejects(f.workers.pauseMission(f.mission.id), AggregateError);
+      await drainStops(t);
+      await paused;
+      assert.equal(f.control.message(answerId).status, "queued");
+      assert.equal(f.control.message(answerId).attempt, 1);
+      const stopBlocker = f.control.blockers(f.mission.id).find(item => item.status === "open");
+      exitChildren(f.child, ...(peer ? [peer.child] : []));
+      await f.workers.stopAgent(peer ? f.owner.id : f.agent.id);
+      f.control.resolveBlocker(stopBlocker.id, "Confirmed exit");
+      const deliveries = [];
+      installReplacement(f, deliveries);
+      f.control.missionAction(f.mission.id, "resume");
+      await f.workers.dispatchPending();
+      await f.workers.dispatchPending();
+      assert.deepEqual(deliveries.map(message => message.messageId), [answerId]);
+      assert.equal(f.control.message(answerId).attempt, 1);
+    } finally { exitChildren(f.child, ...(peer ? [peer.child] : [])); }
+  });
+}
