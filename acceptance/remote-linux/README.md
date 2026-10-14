@@ -93,3 +93,17 @@ Mission 题面只提供业务规则、`/work/totals.mjs` 交付位置和独立�
 - `summary.json`：验收及清理结果；成功时有模型计数、usage 和最终 CAS hash。失败时保留已取得的 Mission/export/evidence，即使超时也尝试只读导出。最终凭据扫描覆盖 summary 及所有晚写文件，扫描失败会非零退出。
 
 普通测试中的 `test/remote-linux-real.test.mjs` 只用假凭据和本地进程，覆盖配置、文件权限、脱敏、stdin 传递、故障注入、四个业务测试、固定 hash 命令、预言触碰检测、stdout/stderr 分离、最终扫描顺序、实际 pi-durable 库的只读查询和证据判定，不调用任何外部模型。真实 MiniMax/GLM 运行须由持有凭据的运行者执行，单元测试和 mock 容器通过都不能代替这一结果。
+
+## 预检
+
+正式验收最多 60 轮，可能产生真实费用。先跑预检，确认每个不同的 `(api, baseUrl, modelId, credentialEnv)` 组合都能完成一次最小工具调用。每个组合只发一次请求，客户端重试次数为 0。预检使用产品同一套 pi-ai provider，工具名为 `ping`，并强制要求调用它。为了少发 token，这次请求关闭 reasoning，并把 `maxTokens` 设为 64。默认单次请求超时 20 秒，可用 `--timeout-ms` 修改。
+
+```sh
+npm run build
+node acceptance/remote-linux/preflight.mjs --real acceptance/remote-linux/real-minimax.json --secrets-file /私有目录/models.env
+node acceptance/remote-linux/preflight.mjs --real acceptance/remote-linux/real-glm.json --secrets-file /私有目录/models.env --from-container
+```
+
+`--from-container` 把远端 worker 那一个组合改到临时 Apple Container 里请求，用来确认容器网络能够到达 endpoint。同一组合不会在宿主上再请求一次。容器镜像必须是本机已缓存的 `node:22-bookworm-slim` arm64；缺失时直接失败，不拉取。容器名使用 `mc-acc-i2-grok-` 前缀，可用 `MC_ACCEPTANCE_CONTAINER_PREFIX` 覆盖，覆盖值仍须以 `mc-acc-` 开头。运行带 `--rm`。只读挂载 `dist`、`node_modules` 和预检脚本。密钥只经 stdin 传入容器，不进入 argv、环境变量或挂载文件。若启动前已有同前缀容器，预检拒绝运行，由该容器的所有者处理。
+
+标准输出是一行 JSON。`pass` 是总体结论。`checks` 的每一项对应一个组合，包含角色、`transport`（`host` 或 `container`）、HTTP 是否成功、状态码、延迟、是否返回名为 `ping` 的工具调用、token usage，以及 `errorCategory`。类别包括 `auth`、`timeout`、`http`、`network`、`no-tool-call`、`provider`、`container`。配置或 secrets 文件不合法时 `checks` 为空，并给出不含密钥的 `error`。任何输出都会脱敏。退出码非零表示先不要进入上面的正式验收。预检通过后再运行 `run.mjs --real`。
