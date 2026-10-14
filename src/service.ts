@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, createHash } from "node:crypto";
-import { processExists } from "./control.js";
+import { tryAcquireDaemonOwnership } from "./control.js";
 import { prepareDaemonLogFiles, probe, readDaemonRecord, type DaemonInfo, type DaemonRecord } from "./daemon.js";
 
 const LAUNCHCTL = "/bin/launchctl";
@@ -288,46 +288,55 @@ async function waitForHealthy(home: string, timeoutMs = START_TIMEOUT_MS): Promi
   throw new Error(`Mission Control did not become healthy within ${timeoutMs} ms in ${home}`);
 }
 
-async function waitForExit(pid: number, timeoutMs = STOP_TIMEOUT_MS): Promise<void> {
+function daemonOwnershipHeld(home: string): boolean {
+  const ownership = tryAcquireDaemonOwnership(home);
+  if (!ownership) return true;
+  ownership.close();
+  return false;
+}
+
+async function daemonIsLive(home: string): Promise<boolean> {
+  const record = readDaemonRecord(home);
+  return (record.state === "present" && await probe(record.info)) || daemonOwnershipHeld(home);
+}
+
+async function waitForExit(home: string, timeoutMs = STOP_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!processExists(pid)) return;
+    if (!await daemonIsLive(home)) return;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, POLL_INTERVAL_MS));
   }
-  throw new Error(`Mission Control pid ${pid} did not exit within ${timeoutMs} ms after LaunchAgent bootout`);
+  throw new Error(`Mission Control in ${home} did not release ownership within ${timeoutMs} ms after LaunchAgent bootout`);
 }
 
 async function refuseLiveUnmanagedDaemon(home: string, label: string, existingPlist: boolean): Promise<void> {
   const record = readDaemonRecord(home);
   if (record.state === "malformed") throw new Error(`The daemon record in ${home} is malformed; reconcile it before installing the login service`);
-  if (record.state !== "present") return;
-  if (await probe(record.info)) {
+  if (record.state === "present" && await probe(record.info)) {
     if (existingPlist && await loaded(label)) return;
     throw new Error(`A live daemon already exists in ${home} and is not managed by this LaunchAgent; stop it first`);
   }
-  if (processExists(record.info.pid)) {
-    throw new Error(`The daemon identity recorded in ${home} is alive but unconfirmed; reconcile it before starting or installing the login service`);
+  if (daemonOwnershipHeld(home)) {
+    throw new Error(`The daemon ownership lock in ${home} is held but its identity is unconfirmed; wait for any backup to finish or reconcile the daemon before starting or installing the login service`);
   }
 }
 
 async function cleanupBootstrappedJob(home: string, label: string, removePlist: boolean, plistPathValue: string): Promise<void> {
-  const record = readDaemonRecord(home);
-  const verifiedInfo = record.state === "present" && await probe(record.info) ? record.info : undefined;
   let cleanupError: unknown;
   try {
     await bootoutFailedInstall(label);
   } catch (error) {
     cleanupError = error;
   }
-  if (!cleanupError && verifiedInfo) {
+  if (!cleanupError) {
     try {
-      await waitForExit(verifiedInfo.pid);
+      await waitForExit(home);
     } catch (error) {
       cleanupError = error;
     }
   }
   const stillLoaded = await loaded(label);
-  const stillRecordedLive = record.state === "present" && processExists(record.info.pid);
+  const stillRecordedLive = await daemonIsLive(home);
   if (stillLoaded || stillRecordedLive) {
     cleanupError ??= new Error(`LaunchAgent cleanup remains uncertain for ${label}`);
   }
@@ -454,7 +463,7 @@ export async function serviceStatus(homeInput: string): Promise<ServiceStatus> {
   const isLoaded = await loaded(label);
   const record = readDaemonRecord(home);
   const healthy = record.state === "present" && await probe(record.info);
-  const live = record.state === "present" && processExists(record.info.pid);
+  const live = healthy || daemonOwnershipHeld(home);
   return { home, label, loaded: isLoaded, record, healthy, live };
 }
 
@@ -488,10 +497,8 @@ async function uninstallServiceLocked(home: string): Promise<{ home: string; lab
   if (existing === undefined) return { home, label, plistPath: path, removed: false };
   await readPlistIdentity(path, label, home);
 
-  const record = readDaemonRecord(home);
-  const healthyInfo = record.state === "present" && await probe(record.info) ? record.info : undefined;
   await bootout(label);
-  if (healthyInfo) await waitForExit(healthyInfo.pid);
+  await waitForExit(home);
   unlinkSync(path);
   return { home, label, plistPath: path, removed: true };
 }
