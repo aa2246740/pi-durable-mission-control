@@ -182,8 +182,8 @@ node acceptance/remote-linux/preflight.mjs --real acceptance/remote-linux/real-g
 
 ### 四场景与隔离回归
 
-构建后运行下列测试。它依次运行 default、pause-resume、worker-crash 和 turn-limit 各一次，再用新 Linux 容器核对隔离的四个 totals 用例。正确实现须通过；修改 node:assert 的错误实现须失败，且独立复核须指出它与假定成功回执的分歧。该测试只使用确定性 mock 和固定交付模块，无外部模型请求。结果、耗时与复核 TAP 保存在当前 worktree 的 `.acceptance-proof/regression-<时间戳>/`，最后核对本次前缀无残留容器。
+构建后运行下列测试。它依次运行 default、pause-resume、worker-crash 和 turn-limit 各一次，再用新 Linux 容器核对隔离的四个 totals 用例。正确实现须通过；修改 node:assert 的错误实现须失败，且独立复核须指出它与假定成功回执的分歧。该测试只使用确定性 mock 和固定交付模块，无外部模型请求。结果、耗时与复核 TAP 保存在当前 worktree 的 `.acceptance-proof/regression-<时间戳>/`。须用 `MC_ACCEPTANCE_CONTAINER_PREFIX` 指定本次独占的前缀，形如 `mc-acc-<名称>-`；默认的 `mc-acc-` 会被拒绝。测试最后核对该前缀无残留容器。
 
 ```sh
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-rv5-b-gpt- node --test acceptance/remote-linux/regression-container.test.mjs
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-regression- node --test acceptance/remote-linux/regression-container.test.mjs
 ```
