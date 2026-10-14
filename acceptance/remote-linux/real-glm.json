@@ -1,0 +1,38 @@
+{
+  "orchestrator": {
+    "contextWindow": 128000,
+    "maxTokens": 8192,
+    "reasoning": true,
+    "toolCalling": true,
+    "vision": false,
+    "name": "GLM-4.7 Coding",
+    "api": "openai-completions",
+    "modelId": "glm-4.7",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "credentialEnv": "ZHIPU_API_KEY"
+  },
+  "worker": {
+    "contextWindow": 128000,
+    "maxTokens": 8192,
+    "reasoning": true,
+    "toolCalling": true,
+    "vision": false,
+    "name": "GLM-4.7 Coding",
+    "api": "openai-completions",
+    "modelId": "glm-4.7",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "credentialEnv": "ZHIPU_API_KEY"
+  },
+  "validator": {
+    "contextWindow": 128000,
+    "maxTokens": 8192,
+    "reasoning": true,
+    "toolCalling": true,
+    "vision": false,
+    "name": "GLM-4.7 Coding",
+    "api": "openai-completions",
+    "modelId": "glm-4.7",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "credentialEnv": "ZHIPU_API_KEY"
+  }
+}
