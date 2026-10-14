@@ -1677,6 +1677,21 @@ export class ControlPlane {
     }
   }
 
+  private remoteExecutionEnvironment(agent: Agent): MissionStateView["executionEnvironment"] {
+    if (agent.machineId === "local") return undefined;
+    const machine = this.machineRegistry.get(agent.machineId);
+    const capabilities = machine?.capabilities;
+    // Capabilities remain stored after lease expiry. Only a live authenticated session may be reported.
+    if (!machine || machine.status !== "online" || !machine.sessionId || (machine.leaseExpiresAt ?? 0) <= Date.now() || !capabilities) return undefined;
+    return {
+      machineId: agent.machineId,
+      platform: capabilities.platform,
+      arch: capabilities.arch,
+      node: capabilities.node,
+      workspacePath: agent.workspacePath
+    };
+  }
+
   getMissionState(agentId: string, epoch: number): MissionStateView & Pick<MissionDetail, "artifacts" | "validationReceipts" | "blockers"> {
     const { mission } = this.authorizeAgent(agentId, epoch, this.getAgent(agentId)?.missionId ?? "");
     const agent = this.getAgent(agentId)!;
@@ -1703,10 +1718,12 @@ export class ControlPlane {
       if (!role || !profile) throw new HttpError(409, `Enabled role ${roleId} has no model profile`);
       return { roleId: role.id, name: role.name, kind: role.kind, profileId: profile.id, modelName: profile.name, modelId: profile.modelId, profileRevision: profile.revision };
     });
+    const executionEnvironment = this.remoteExecutionEnvironment(agent);
     return {
       mission, tasks: detail.tasks, roles, agents: detail.agents, approvals: detail.approvals,
       artifacts: detail.artifacts, validationReceipts: detail.validationReceipts ?? [], blockers: detail.blockers ?? [],
       remoteWorkspaces,
+      ...(executionEnvironment ? { executionEnvironment } : {}),
       worktrees: detail.worktrees ?? [],
       mcpServers: [...new Set((role?.mcpPermissions ?? []).map((grant) => grant.serverId))].flatMap((serverId) => {
         const server = this.mcpServer(serverId);
