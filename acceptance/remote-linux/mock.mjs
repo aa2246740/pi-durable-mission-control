@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { workerCrashTool } from "./scenarios/worker-crash.mjs";
 
 export const shellQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
 
@@ -82,6 +83,10 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
     assert.equal(state.executionEnvironment?.platform, "linux");
     const owned = state.tasks.find((t) => state.agents.find((a) => a.id === t.ownerId)?.kind === "worker");
     if (!owned || owned.status !== "running") return call("WaitForMessage");
+    if (scenario === "worker-crash") {
+      const decision = workerCrashTool(history);
+      if (decision) return call(decision.name, decision.args);
+    }
     if (scenario === "pause-resume" && last.name === "GetMissionState" &&
       history.some((result) => result.name === "Report" && result.args.summary === pauseReport)) {
       const answer = (state.blockers ?? []).find((blocker) => blocker.kind === "user_input" && blocker.text.startsWith(pauseQuestion));

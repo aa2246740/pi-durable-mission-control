@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import { nextCall, startMock, transcript, shellQuote, pauseReport, pauseQuestion } from "../acceptance/remote-linux/mock.mjs";
 import { parseOptions, assertPauseResume } from "../acceptance/remote-linux/run.mjs";
+import { assertWorkerCrash, assessKill, crashResolution, crashSettlePolls, crashSnapshot, nextCrashAction, observeWorkerCrash, selectWorkerProcess, workerCrashTool, workerKillSource } from "../acceptance/remote-linux/scenarios/worker-crash.mjs";
 
 const context = { acceptanceCommand: "node --test /coordinator/accept.test.mjs", hostTestPath: "/coordinator/accept.test.mjs" };
 function request(kind, state, last) {
@@ -159,7 +160,8 @@ test("pause-resume orchestrator asks once after the worker report and follows th
 test("pause-resume CLI rejects unknown scenarios and real-model pauses", () => {
   assert.equal(parseOptions(["--scenario", "pause-resume"]).scenario, "pause-resume");
   assert.equal(parseOptions(["--scenario", "default"]).scenario, "default");
-  for (const args of [["--scenario"], ["--scenario", "unknown"], ["--scenario", "pause-resume", "--real", "config.json", "--secrets-file", "secrets"]]) assert.throws(() => parseOptions(args));
+  assert.equal(parseOptions(["--scenario", "worker-crash"]).scenario, "worker-crash");
+  for (const args of [["--scenario"], ["--scenario", "unknown"], ["--scenario", "pause-resume", "--real", "config.json", "--secrets-file", "secrets"], ["--scenario", "worker-crash", "--real", "config.json", "--secrets-file", "secrets"]]) assert.throws(() => parseOptions(args));
 });
 
 test("pause-resume evidence rejects runtime, effect and delivery replay", () => {
@@ -200,6 +202,219 @@ test("pause-resume evidence rejects runtime, effect and delivery replay", () => 
   assert.throws(() => assertPauseResume(detail, [stoppedRuntime, { binding: replacement }], evidence, records, { ...transport, outbox: [{ runtime_id: "old" }] }));
 });
 
+
+test("worker-crash mock waits after the Linux self-check and does not publish or repeat effects", () => {
+  const running = state();
+  running.tasks[0].status = "running";
+  const crashContext = { ...context, scenario: "worker-crash" };
+  const selfCheck = { name: "bash", args: { command: "self-check" }, value: { status: "succeeded", result: { exitCode: 0 } } };
+  assert.equal(workerCrashTool([]), null);
+  assert.deepEqual(nextCall(request("worker", running, selfCheck), crashContext), { role: "worker", name: "WaitForMessage", args: {} });
+  assert.equal(nextCall(request("worker", running, selfCheck), context).name, "PublishArtifact");
+  assert.equal(nextCall(request("worker", running, selfCheck), { ...context, scenario: "pause-resume" }).name, "Report");
+  assert.throws(() => nextCall(request("worker", running, { ...selfCheck, value: { status: "succeeded", result: { exitCode: 1 } } }), crashContext));
+  const body = request("worker", running, selfCheck);
+  const waitId = "crash-wait";
+  body.messages.push({ role: "assistant", tool_calls: [{ id: waitId, function: { name: "WaitForMessage", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: waitId, content: "Waiting for the next durable input." });
+  body.messages.push({ role: "user", content: "orchestrator follow-up" });
+  assert.equal(nextCall(body, crashContext).name, "GetMissionState");
+  const stateId = "crash-state";
+  body.messages.push({ role: "assistant", tool_calls: [{ id: stateId, function: { name: "GetMissionState", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: stateId, content: JSON.stringify(running) });
+  assert.deepEqual(nextCall(body, crashContext), { role: "worker", name: "WaitForMessage", args: {} });
+  const orchestrator = request("orchestrator", running);
+  assert.equal(nextCall(orchestrator, crashContext).name, "SendMessage");
+});
+
+function crashProcesses() {
+  return [
+    { pid: 1, ppid: 0, command: ["/usr/local/bin/node", "/app/bootstrap.mjs"], state: "S" },
+    { pid: 10, ppid: 1, command: ["/usr/local/bin/node", "/app/dist/cli.js", "node", "--coordinator", "http://127.0.0.1:14311"], state: "S" },
+    { pid: 20, ppid: 10, command: ["/usr/local/bin/node", "/app/dist/worker.js"], state: "S" },
+    { pid: 21, ppid: 10, command: ["/bin/sh", "-c", "node -e self-check"], state: "S" },
+    { pid: 30, ppid: 1, command: ["/usr/local/bin/node", "-e", "kill-script"], state: "R" }
+  ];
+}
+
+test("worker kill selection targets only the supervisor's worker.js child", () => {
+  const selected = selectWorkerProcess(crashProcesses(), 30);
+  assert.equal(selected.ok, true);
+  assert.equal(selected.pid, 20);
+  assert.equal(selected.supervisorPid, 10);
+  assert.deepEqual(selected.command, ["/usr/local/bin/node", "/app/dist/worker.js"]);
+  assert.match(selected.basis, /worker\.js/);
+  const missing = selectWorkerProcess(crashProcesses().filter((entry) => entry.pid !== 20), 30);
+  assert.equal(missing.ok, false);
+  const extra = crashProcesses();
+  extra.push({ pid: 22, ppid: 10, command: ["/usr/local/bin/node", "/app/dist/worker.js"], state: "S" });
+  assert.equal(selectWorkerProcess(extra, 30).ok, false);
+  const orphan = crashProcesses();
+  orphan[2].ppid = 1;
+  assert.equal(selectWorkerProcess(orphan, 30).ok, false);
+  assert.equal(selectWorkerProcess(crashProcesses(), 20).ok, false);
+  const protectedPid = selectWorkerProcess([{ pid: 10, ppid: 1, command: ["/usr/local/bin/node", "/app/dist/cli.js", "node"], state: "S" }, { pid: 1, ppid: 0, command: ["/usr/local/bin/node", "/app/dist/worker.js"], state: "S" }], 99);
+  assert.equal(protectedPid.ok, false);
+  assert.equal(assessKill(selected, "Z", "S").ok, true);
+  assert.equal(assessKill(selected, "gone", "S").supervisorAlive, true);
+  assert.equal(assessKill(selected, "R", "S").ok, false);
+  assert.equal(assessKill(selected, "Z", "Z").ok, false);
+  const source = workerKillSource();
+  new Function(source);
+  assert.match(source, /SIGKILL/);
+  assert.match(source, /\/worker\.js/);
+  assert.doesNotMatch(source, /process\.kill\(-/);
+  assert.match(source, /split\("\\0"\)/);
+});
+
+function crashedMission() {
+  const runtime = { binding: { runtimeId: "rt-1", epoch: 2, agentId: "worker" }, state: "closed", stopProvenance: "unexpected" };
+  const detail = {
+    mission: { status: "failed" }, artifacts: [], tasks: [{ id: "task", status: "running" }],
+    blockers: [{ id: "remote-runtime:rt-1", kind: "delivery", status: "resolved", text: "reconcile" }],
+    messages: [{ id: "delivery", attempt: 1, status: "completed" }],
+    events: [
+      { type: "remote_effect_receipt", data: { effectId: "write" } },
+      { type: "remote_effect_receipt", data: { effectId: "bash", receipt: { status: "succeeded", result: { stdout: "LINUX-SELF-CHECK-OK" } } } },
+      { type: "worker_start_failed", data: { diagnostic: "Prior remote runtime rt-1: unexpected stop; trusted reconciliation is required" } }
+    ]
+  };
+  const records = ["GetMissionState", "write_file", "bash", "WaitForMessage"].map((name) => ({ role: "worker", name }));
+  const transport = { effects: [{ command_id: "write" }, { command_id: "bash" }], deliveries: [{ message_id: "delivery", attempt: 1, status: "completed" }] };
+  const evidence = {
+    humanActions: [{ action: "resolve", blockerId: "remote-runtime:rt-1" }, { action: "resume", status: 500 }],
+    kill: { ok: true, signal: "SIGKILL", supervisorAlive: true, pid: 20, command: ["/usr/local/bin/node", "/app/dist/worker.js"], supervisorCommand: ["/usr/local/bin/node", "/app/dist/cli.js", "node"], basis: "cmdline ends with /worker.js, supervisor excluded" },
+    snapshotBeforeResume: crashSnapshot(detail, records, transport)
+  };
+  return { runtime, detail, records, transport, evidence };
+}
+
+test("worker-crash evidence accepts only an unreplaced unexpected stop", () => {
+  const ok = crashedMission();
+  assert.equal(assertWorkerCrash(ok.detail, [ok.runtime], ok.evidence, ok.records, ok.transport).stopProvenance, "unexpected");
+  for (const diagnostic of ["controlled stop cannot be proven from persisted evidence", "uncertain runtime report"]) {
+    const changed = structuredClone(ok.detail);
+    changed.events.at(-1).data.diagnostic = `Prior remote runtime rt-1: ${diagnostic}; trusted reconciliation is required`;
+    assert.equal(assertWorkerCrash(changed, [{ ...ok.runtime, stopProvenance: diagnostic.startsWith("uncertain") ? "uncertain" : "unproven" }], ok.evidence, ok.records, ok.transport).diagnostic.includes(diagnostic), true);
+  }
+  const mutations = [
+    (fixture) => { fixture.runtimes.push({ ...fixture.runtimes[0], binding: { ...fixture.runtimes[0].binding, runtimeId: "new" } }); },
+    (fixture) => { fixture.runtimes[0].stopProvenance = "controlled"; },
+    (fixture) => { fixture.detail.events.push({ type: "remote_runtime_reassigned", data: { runtimeId: "new" } }); },
+    (fixture) => { fixture.detail.artifacts.push({ id: "artifact" }); },
+    (fixture) => { fixture.detail.events.push({ type: "artifact_published" }); },
+    (fixture) => { fixture.detail.events.push({ type: "delivery_resumed", data: { messageId: "delivery", attempt: 2 } }); },
+    (fixture) => { fixture.detail.messages[0].attempt = 2; },
+    (fixture) => { fixture.transport.effects.push(fixture.transport.effects[0]); },
+    (fixture) => { fixture.records.push({ role: "worker", name: "write_file" }); },
+    (fixture) => { fixture.detail.events.push(fixture.detail.events[0]); },
+    (fixture) => { fixture.detail.events = fixture.detail.events.filter((event) => event.type !== "worker_start_failed"); },
+    (fixture) => { fixture.detail.blockers = []; },
+    (fixture) => { fixture.evidence.kill.supervisorAlive = false; },
+    (fixture) => { fixture.evidence.humanActions = fixture.evidence.humanActions.filter((action) => action.action !== "resume"); }
+  ];
+  for (const mutate of mutations) {
+    const fixture = crashedMission();
+    const runtimes = [structuredClone(fixture.runtime)];
+    const box = { detail: structuredClone(fixture.detail), records: structuredClone(fixture.records), transport: structuredClone(fixture.transport), evidence: structuredClone(fixture.evidence), runtimes };
+    mutate(box);
+    assert.throws(() => assertWorkerCrash(box.detail, box.runtimes, box.evidence, box.records, box.transport));
+  }
+});
+
+test("worker-crash operator kills once, resolves every blocker, then resumes", async () => {
+  const crash = { humanActions: [] };
+  const detail = { mission: { status: "active" }, artifacts: [], events: [], blockers: [], messages: [{ id: "delivery", attempt: 1, status: "completed" }], tasks: [{ status: "running" }] };
+  const records = ["GetMissionState", "write_file", "bash", "WaitForMessage"].map((name) => ({ role: "worker", name }));
+  let runtimes = [];
+  const posts = [];
+  const execs = [];
+  const observe = () => observeWorkerCrash({
+    crash, current: detail, missionId: "mission-1", containerName: "mc-acc-l2-grok-test", records,
+    api: async (path) => { assert.match(path, /\/runtimes$/); return runtimes; },
+    post: async (path, body) => { posts.push({ path, body }); return { status: path.endsWith("/resume") ? 500 : 200, body: { error: "unexpected stop" } }; },
+    exec: async (args) => {
+      execs.push(args);
+      return `${JSON.stringify({ ok: true, basis: "cmdline ends with /worker.js", pid: 20, command: ["/usr/local/bin/node", "/app/dist/worker.js"], supervisorPid: 10, supervisorCommand: ["/usr/local/bin/node", "/app/dist/cli.js", "node"], signal: "SIGKILL", gone: true, supervisorAlive: true, targetState: "Z", supervisorState: "S" })}\n`;
+    },
+    transport: () => ({ effects: [{ command_id: "write" }], deliveries: [{ message_id: "delivery", attempt: 1, status: "completed" }] }),
+    save: () => undefined
+  });
+  assert.equal(await observe(), null);
+  assert.equal(execs.length, 0);
+  assert.equal(nextCrashAction(crash, detail, [], records).type, "wait");
+  detail.events.push({ type: "remote_effect_receipt", data: { effectId: "bash", receipt: { status: "succeeded", result: { stdout: "/usr/local/bin/node\nLINUX-SELF-CHECK-OK\n" } } } });
+  assert.equal(nextCrashAction(crash, detail, [], records).type, "wait");
+  crash.settlePolls = crashSettlePolls;
+  assert.equal(await observe(), null);
+  assert.equal(crash.killed, true);
+  assert.deepEqual(execs[0].slice(0, 3), ["exec", "mc-acc-l2-grok-test", "node"]);
+  assert.equal(execs[0][3], "-e");
+  assert.match(execs[0][4], /SIGKILL/);
+  assert.equal(await observe(), null);
+  runtimes = [{ binding: { runtimeId: "rt-1" }, state: "running", stopProvenance: "unproven" }];
+  assert.equal(await observe(), null);
+  assert.equal(posts.length, 0);
+  runtimes = [{ binding: { runtimeId: "rt-1" }, state: "closed", stopProvenance: "unexpected", report: { outcome: "stopped" } }];
+  detail.mission.status = "blocked";
+  detail.blockers = [
+    { id: "delivery:other", kind: "delivery", status: "open", text: "delivery needs reconciliation" },
+    { id: "remote-runtime:rt-1", kind: "delivery", status: "open", text: "Remote runtime ownership or in-flight work requires trusted reconciliation before resuming." }
+  ];
+  assert.equal(await observe(), null);
+  assert.equal(posts[0].path, "/api/blockers/remote-runtime:rt-1/resolve");
+  assert.equal(posts[0].body.resolution, crashResolution);
+  detail.blockers[1].status = "resolved";
+  assert.equal(await observe(), null);
+  assert.equal(posts[1].path, "/api/blockers/delivery:other/resolve");
+  detail.blockers[0].status = "resolved";
+  detail.mission.status = "paused";
+  assert.equal(await observe(), null);
+  assert.equal(posts[2].path, "/api/missions/mission-1/resume");
+  assert.deepEqual(posts[2].body, {});
+  assert.equal(crash.resumeAttempted, true);
+  assert.equal(crash.snapshotBeforeResume.workerTools.filter((name) => name === "bash").length, 1);
+  detail.mission.status = "failed";
+  assert.equal(await observe(), detail);
+  const refused = { humanActions: [], killed: true };
+  const blocked = { mission: { status: "paused" }, artifacts: [], events: [], blockers: [{ id: "remote-runtime:rt-1", status: "resolved" }], messages: [], tasks: [] };
+  let failed = false;
+  assert.equal(await observeWorkerCrash({
+    crash: refused, current: blocked, missionId: "mission-1", containerName: "c", records,
+    api: async () => [{ binding: { runtimeId: "rt-1" }, state: "closed", stopProvenance: "unexpected" }],
+    post: async () => { failed = true; return { status: 409, body: { error: "Prior remote runtime rt-1: unexpected stop; trusted reconciliation is required" } }; },
+    exec: async () => { throw new Error("unexpected kill"); },
+    transport: () => ({ effects: [], deliveries: [] }),
+    save: () => undefined
+  }), null);
+  assert.equal(refused.resumeAttempted, true);
+  assert.equal(failed, true);
+  await assert.rejects(() => observeWorkerCrash({
+    crash: { humanActions: [], killed: true, nodeExitedAfterKill: { exitCode: 1 } }, current: blocked, missionId: "mission-1", containerName: "c", records,
+    api: async () => [{ binding: { runtimeId: "rt-1" }, state: "stopping", stopProvenance: "unproven" }],
+    post: async () => { throw new Error("should not resume"); },
+    exec: async () => { throw new Error("unexpected kill"); },
+    transport: () => ({ effects: [], deliveries: [] }),
+    save: () => undefined
+  }), /Node supervisor exited/);
+  blocked.mission.status = "failed";
+  assert.equal(await observeWorkerCrash({
+    crash: refused, current: blocked, missionId: "mission-1", containerName: "c", records,
+    api: async () => [{ binding: { runtimeId: "rt-1" }, state: "closed", stopProvenance: "unexpected" }],
+    post: async () => { throw new Error("resume twice"); },
+    exec: async () => { throw new Error("unexpected kill"); },
+    transport: () => ({ effects: [], deliveries: [] }),
+    save: () => undefined
+  }), blocked);
+  const reassigned = structuredClone(detail);
+  reassigned.mission.status = "active";
+  reassigned.events.push({ type: "remote_runtime_reassigned" });
+  await assert.rejects(() => observeWorkerCrash({
+    crash: { humanActions: [], killed: true, resumeAttempted: true }, current: reassigned, missionId: "mission-1", containerName: "c", records, 
+    api: async () => runtimes, post: async () => ({ status: 200, body: {} }), exec: async () => { throw new Error("unexpected kill"); },
+    transport: () => ({ effects: [], deliveries: [] }), save: () => undefined
+  }), /remote_runtime_reassigned/);
+});
 
 test("mock server forwards the pause-resume scenario into tool decisions", async (t) => {
   const records = [];

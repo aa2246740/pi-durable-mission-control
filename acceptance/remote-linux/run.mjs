@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
 import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
 import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
+import { assertWorkerCrash, observeWorkerCrash } from "./scenarios/worker-crash.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const containerCLI = "/opt/homebrew/bin/container";
@@ -27,7 +28,7 @@ export function parseOptions(args) {
     else if (args[i] === "--discard") options.discard = true;
     else if (args[i] === "--scenario" && args[i + 1]) {
       options.scenario = args[++i];
-      assert.ok(["default", "pause-resume"].includes(options.scenario), "--scenario must be default or pause-resume");
+      assert.ok(["default", "pause-resume", "worker-crash"].includes(options.scenario), "--scenario must be default, pause-resume, or worker-crash");
     }
     else if (args[i] === "--out" && args[i + 1]) options.out = resolve(args[++i]);
     else if (args[i] === "--timeout-ms" && args[i + 1]) {
@@ -37,7 +38,7 @@ export function parseOptions(args) {
     } else throw new Error(`Unknown or incomplete option ${args[i]}`);
   }
   if (options.real) {
-    assert.ok(!options.scenario || options.scenario === "default", "--scenario pause-resume requires mock mode");
+    assert.ok(!options.scenario || options.scenario === "default", "--scenario other than default requires mock mode");
     assert.ok(options.secretsFile, "--real requires --secrets-file");
     if (!explicitTimeout) options.timeoutMs = 1800000;
   } else assert.ok(!options.secretsFile && !options.discard, "--secrets-file and --discard require --real");
@@ -192,7 +193,8 @@ export async function run(options) {
   secrets.push(credential);
   let daemon, node, mock, nodeRelay, modelRelay, detail, summary;
   const pause = options.scenario === "pause-resume" ? { humanActions: [] } : undefined;
-  let captureMock;
+  const crash = options.scenario === "worker-crash" ? { humanActions: [] } : undefined;
+  let captureMock, captureCrash;
   let captureReal, exportedReal, mutation, acceptance, acceptanceCommand;
   const sessions = [];
   const seenReceipts = new Set();
@@ -214,6 +216,10 @@ export async function run(options) {
     if (mockFailure) throw mockFailure;
     if (Date.now() >= deadline) throw new Error(`Acceptance timed out after ${options.timeoutMs} ms`);
     for (const handle of [daemon, node]) if (handle && (handle.error() || handle.child.exitCode !== null || handle.child.signalCode !== null)) {
+      if (crash?.killed && handle === node) {
+        crash.nodeExitedAfterKill ??= { exitCode: node.child.exitCode, signalCode: node.child.signalCode, output: redact(node.output()).slice(-4000) };
+        continue;
+      }
       throw new Error(`Acceptance subprocess exited early: ${redact(handle.error()?.message ?? handle.output())}`);
     }
   };
@@ -273,6 +279,14 @@ export async function run(options) {
       const value = await response.json();
       assert.ok(response.ok, redact(`${path}: ${response.status} ${JSON.stringify(value)}`));
       return value;
+    };
+    const post = async (path, body, timeoutMs = 5000) => {
+      check();
+      const response = await fetch(base + path, { method: "POST",
+        headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, deadline - Date.now()))) });
+      const value = await response.json().catch(() => ({ error: "Unreadable response" }));
+      return { status: response.status, body: value };
     };
     const enrolled = await api("/api/machines", { id: machineId, name: config ? "Real model Linux acceptance" : "Deterministic Linux acceptance" });
     secrets.push(enrolled.token);
@@ -361,6 +375,23 @@ export async function run(options) {
       pause.transport = readPauseTransport(join(home, "control.sqlite"), mission.id);
       save("pause-resume.json", pause);
     };
+    if (crash) captureCrash = async () => {
+      const read = async (path) => {
+        const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
+        assert.ok(response.ok, `Evidence read failed: ${path}`);
+        return response.json();
+      };
+      detail = await read(`/api/missions/${mission.id}`);
+      crash.runtimes = await read(`/api/missions/${mission.id}/runtimes`);
+      save("mission.json", detail);
+      save("mission-export.json", await read(`/api/missions/${mission.id}/export`));
+      save("runtimes.json", crash.runtimes);
+      crash.failures = detail.events.filter((event) => event.type === "worker_start_failed");
+      crash.blockers = detail.blockers;
+      crash.missionStatus = detail.mission.status;
+      crash.transport = readPauseTransport(join(home, "control.sqlite"), mission.id);
+      save("worker-crash.json", crash);
+    };
     await api(`/api/missions/${mission.id}/start`, {});
     detail = await wait(async () => {
       const current = await api(`/api/missions/${mission.id}`);
@@ -390,6 +421,15 @@ export async function run(options) {
           assert.notEqual(mutation.beforeSha256, mutation.afterSha256);
           assert.equal(mutation.casAfterSha256, artifact.sha256, "CAS changed during fault injection");
         }
+      }
+      if (crash) {
+        const finished = await observeWorkerCrash({
+          crash, current, missionId: mission.id, containerName: name, records, api, post, exec: command,
+          transport: () => readPauseTransport(join(home, "control.sqlite"), mission.id),
+          save: () => save("worker-crash.json", crash)
+        });
+        if (finished) return finished;
+        return false;
       }
       if (pause && current.mission.status === "blocked" && !pause.answerAttempted) {
         const blocker = current.blockers.find((item) => item.kind === "user_input" && item.status === "open" && item.text === pauseQuestion);
@@ -429,6 +469,8 @@ export async function run(options) {
     if (config) {
       await captureReal();
       assert.equal(detail.mission.status, "completed");
+    } else if (crash) {
+      assert.equal(detail.mission.status, "failed", JSON.stringify({ failures: crash.failures, blockers: detail.blockers, humanActions: crash.humanActions }));
     } else {
       if (pause) {
         await captureMock();
@@ -437,13 +479,26 @@ export async function run(options) {
     }
     const runtimes = await wait(async () => {
       const current = await api(`/api/missions/${mission.id}/runtimes`);
+      if (crash) {
+        if (current.length === 1 && current[0].stopProvenance === "controlled") throw new Error("Remote runtime stop provenance is controlled");
+        return current.length === 1 && ["closed", "uncertain"].includes(current[0].state) && current[0].stopProvenance !== "controlled" && current;
+      }
       if (current.some((runtime) => runtime.state === "uncertain")) throw new Error("Remote runtime stop is uncertain");
       return current.length === (pause ? 2 : 1) && current.every((runtime) => runtime.state === "closed") && current;
     });
     detail = await api(`/api/missions/${mission.id}`);
     save("mission.json", detail);
     save("runtimes.json", runtimes);
-    if (config) {
+    if (crash) {
+      await captureCrash();
+      crash.assertions = assertWorkerCrash(detail, crash.runtimes, crash, records, crash.transport);
+      save("worker-crash.json", crash);
+      summary = { status: "passed", scenario: "worker-crash", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
+        taskStatus: detail.tasks[0]?.status ?? null, artifacts: detail.artifacts.length, stopProvenance: crash.assertions.stopProvenance,
+        remoteRuntimeState: crash.runtimes[0].state, diagnostic: crash.assertions.diagnostic, humanActions: crash.humanActions,
+        effectReceipts: crash.assertions.effectReceipts, blockers: detail.blockers.length, mockCost: 0,
+        image: { name: image.configuration.name, digest: image.id }, tools: records.map(({ role, name }) => ({ role, name })) };
+    } else if (config) {
       const evidence = await captureReal();
       summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
         turns: evidence.turns, maxTurns: evidence.maxTurns, roles: evidence.roles, costKnown: evidence.costKnown,
@@ -498,6 +553,12 @@ export async function run(options) {
       try { await captureMock(); }
       catch (captureError) { summary.evidenceError = redact(captureError.message); }
       Object.assign(summary, { scenario: "pause-resume", missionStatus: detail?.mission.status, rejection: pause.failures, blockers: pause.blockers, humanActions: pause.humanActions });
+    }
+    if (captureCrash) {
+      try { await captureCrash(); }
+      catch (captureError) { summary.evidenceError = redact(captureError.message); }
+      Object.assign(summary, { scenario: "worker-crash", missionStatus: detail?.mission.status, stopProvenance: crash.stoppedRuntime?.stopProvenance,
+        diagnostic: crash.failures?.map((event) => event.data?.diagnostic), blockers: crash.blockers, humanActions: crash.humanActions, kill: crash.kill, failure: crash.failure });
     }
     if (captureReal) {
       try { await captureReal(); }

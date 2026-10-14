@@ -54,6 +54,28 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-i1-gpt- node --test acceptance/remote-linu
 
 2026-10-14 在 `orch/i1-gpt`、基线 `4dc93bd` 上实测：默认场景 1/1 通过，17.420 秒；修正后的 pause-resume 连续 5/5 通过，耗时分别为 22.670, 22.572, 21.990, 22.123, 22.083 秒（包含每次运行及清理）。5 次均由产品自动恢复，无须显式 resume；epoch 均从 2 增到 4，同节点分配新 runtime，4 个 effect permit/receipt 各执行一次，10 个 durable delivery attempt 均为 1，清理均通过，严格恢复门槛拒绝 0/5。此前一轮 5 次 Mission 均 completed，但脚本错误要求 epoch 恰好加 1，导致验收断言失败；现已按任务要求改为严格递增，并由单元测试固定覆盖 2 到 4。以上只验证此 mock 时序，不能排除其他时序的恢复拒绝。
 
+### 远端 worker 意外死亡
+
+mock 模式可用 `--scenario worker-crash`。默认场景和 `pause-resume` 不变，真实模型模式不接受此场景。
+
+```sh
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l2-grok- node acceptance/remote-linux/run.mjs --scenario worker-crash --keep --out "$PWD/.acceptance-proof/worker-crash-1"
+```
+
+证据父目录须事先创建。worker 第一次 Linux bash 自查成功后只调用 WaitForMessage，不发布。脚本看到 `LINUX-SELF-CHECK-OK` 回执、worker 已回到 WaitForMessage、且尚无 artifact 后，再等几个轮询让节点 supervisor 离开当次 mailbox，然后用 `container exec` 在容器内读取 `/proc`：只选择命令行以 `/worker.js` 结尾、且父进程是唯一的 `cli.js node` supervisor 的那个进程，对它 `kill -9`。不杀 supervisor、bootstrap 或当前 exec。定位依据、PID、命令行、supervisor PID 和信号结果写入 `worker-crash.json`。
+
+随后脚本等待该 runtime 的停止来源落成 `unexpected`、`uncertain` 或 `unproven`，且不是 `controlled`。Mission 必须被阻塞，并存在 id 为 `remote-runtime:<runtimeId>` 的 blocker。脚本逐个 resolve 开放 blocker，再调用 resume；每一次的路径、正文、时间和 HTTP 结果都写入 `worker-crash.json`。resume 若因意外停止被拒绝，产品会先把 Mission 标为 failed 再返回 409；脚本把该 409 当作 fail-closed 结果继续读取 Mission，不把它当成需要重试的恢复。
+
+成功要求：停止来源不是 controlled；恰好一条 `worker_start_failed`，其 `data.diagnostic` 说明意外停止、停止无法证明或 runtime 报告不确定；Mission 为 failed；全程没有 `remote_runtime_reassigned`；没有发布（artifacts 为 0）；worker 的 write_file 与自查 bash 各一次，没有第二次，也没有 PublishArtifact；effect permit、回执、durable delivery 和 message attempt 在 resume 前后不变，没有 `delivery_resumed`。任一偏差都以非零退出保留证据。若节点 supervisor 自己在终止回报落成之前退出，runtime 会停在 `stopping` / `unproven`，脚本立即失败并保留容器输出，不把这种情况当成通过。
+
+连续 3 次可运行独立容器自测，证据留在当前 worktree 的 `.acceptance-proof/`。它不进入 `npm test`：
+
+```sh
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l2-grok- node --test acceptance/remote-linux/worker-crash-container.test.mjs
+```
+
+2026-10-14 在 `orch/l2-grok`、基线 `b9e4d4c` 上实测：worker-crash 连续 3/3 通过，耗时 18.606、15.789、14.898 秒（含清理）。3 次停止来源都是 unexpected，runtime 为 closed，Mission failed，artifacts 为 0，effect receipt 为 2，resume 返回 409，diagnostic 说明 unexpected stop，没有 `remote_runtime_reassigned`，清理均通过，无残留容器。同前缀接着跑的 default 1/1 通过，18.351 秒，Mission completed。此前一轮连续运行的第 3 次在杀掉 worker 后，节点 supervisor 打印 `Node connection failed` 并退出，runtime 留在 stopping/unproven，Mission 仅 blocked，没有进入 resume；脚本现已把这种情况立即判失败。上面的 3/3 不包含那一次。这只验证此 mock 时序。
+
 普通 `npm test` 包含 mock 协议与决策单元测试，不启动 Apple Container。容器验收测试单独运行：
 
 ```sh
