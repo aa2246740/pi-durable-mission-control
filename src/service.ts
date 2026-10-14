@@ -31,6 +31,7 @@ export type ServiceStatus = {
   loaded: boolean;
   record: DaemonRecord;
   healthy: boolean;
+  // A confirmed health identity or a held ownership lock, including an offline backup.
   live: boolean;
 };
 

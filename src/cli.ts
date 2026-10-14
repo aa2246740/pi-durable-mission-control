@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { backupHome, restoreHome } from "./backup.js";
-import { processExists } from "./control.js";
+import { tryAcquireDaemonOwnership } from "./control.js";
 import { openLogFile, probe, readDaemonRecord, type DaemonInfo } from "./daemon.js";
 import { startServer } from "./server.js";
 import { installService, serviceStart, serviceStatus, uninstallService } from "./service.js";
@@ -292,6 +293,31 @@ function serve(home: string, port: number, nodePort?: number): Promise<void> {
         process.exit(0);
       });
     };
+    // Keep shutdown on the administrator listener and bind it to this incarnation.
+    const token = readFileSync(join(home, "admin.token"), "utf8").trim();
+    const handlers = service.server.rawListeners("request");
+    service.server.removeAllListeners("request");
+    service.server.on("request", (request, response) => {
+      if (request.url !== "/api/daemon/stop") {
+        for (const handler of handlers) handler.call(service.server, request, response);
+        return;
+      }
+      const authorization = Buffer.from(request.headers.authorization ?? "");
+      const expected = Buffer.from(`Bearer ${token}`);
+      const localHost = request.headers.host === `127.0.0.1:${info.port}` || request.headers.host === `localhost:${info.port}`;
+      if (request.method !== "POST" || !localHost || request.headers.origin !== undefined ||
+          request.headers.cookie !== undefined || request.headers["sec-fetch-site"] !== undefined ||
+          authorization.length !== expected.length || !timingSafeEqual(authorization, expected)) {
+        response.writeHead(403).end();
+        return;
+      }
+      if (request.headers["x-mission-control-daemon-id"] !== info.daemonId) {
+        response.writeHead(409).end();
+        return;
+      }
+      response.writeHead(202, { "connection": "close", "cache-control": "no-store" }).end();
+      shutdown();
+    });
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
   });
@@ -316,18 +342,20 @@ function disconnectChild(child: ChildProcess): void {
   if (child.connected) child.disconnect();
 }
 
-async function terminateOwnChild(pid: number): Promise<boolean> {
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return !processExists(pid);
-  }
-  const deadline = Date.now() + CHILD_CLEANUP_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (!processExists(pid)) return true;
-    await delay(POLL_INTERVAL_MS);
-  }
-  return false;
+export async function terminateOwnChild(child: ChildProcess): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return true;
+  return new Promise((resolveStopped) => {
+    const finish = (stopped: boolean): void => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolveStopped(stopped);
+    };
+    const onExit = (): void => finish(true);
+    const timer = setTimeout(() => finish(false), CHILD_CLEANUP_TIMEOUT_MS);
+    child.once("exit", onExit);
+    // Node refuses to signal a child whose exit has already been observed.
+    child.kill("SIGTERM");
+  });
 }
 
 async function start(home: string, port: number, nodePort?: number): Promise<void> {
@@ -371,7 +399,7 @@ async function start(home: string, port: number, nodePort?: number): Promise<voi
     if (spawnError) throw new Error(`Could not spawn the daemon: ${spawnError.message}`);
     if (startupError) {
       disconnectChild(child);
-      const stopped = child.pid === undefined ? true : await terminateOwnChild(child.pid);
+      const stopped = await terminateOwnChild(child);
       const reason = `The daemon reported a startup error: ${startupError}`;
       throw startFailure(stopped ? reason : `${reason} and its process ${child.pid} is still running`, errPath, 20);
     }
@@ -385,7 +413,7 @@ async function start(home: string, port: number, nodePort?: number): Promise<voi
     await delay(POLL_INTERVAL_MS);
   }
   disconnectChild(child);
-  const stopped = child.pid === undefined ? true : await terminateOwnChild(child.pid);
+  const stopped = await terminateOwnChild(child);
   const reason = `The daemon did not report a healthy identity within ${START_TIMEOUT_MS} ms`;
   throw startFailure(stopped ? reason : `${reason} and its process ${child.pid} is still running`, errPath, 20);
 }
@@ -418,19 +446,24 @@ async function stop(home: string): Promise<void> {
   if (!(await probe(info))) {
     throw new Error(`Daemon identity at port ${info.port} could not be confirmed; refusing to signal pid ${info.pid}`);
   }
-  try {
-    process.kill(info.pid, "SIGTERM");
-    process.stdout.write(`sent SIGTERM to pid=${info.pid}\n`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    process.stdout.write(`daemon pid=${info.pid} exited before SIGTERM\n`);
+  const token = readFileSync(join(home, "admin.token"), "utf8").trim();
+  const response = await fetch(`http://127.0.0.1:${info.port}/api/daemon/stop`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId },
+    redirect: "error",
+    signal: AbortSignal.timeout(5000)
+  });
+  await response.body?.cancel();
+  if (response.status !== 202) {
+    throw new Error(`Daemon ${info.daemonId} rejected authenticated shutdown (HTTP ${response.status}); refusing to signal pid ${info.pid}`);
   }
+  process.stdout.write(`requested shutdown daemonId=${info.daemonId}\n`);
   const deadline = Date.now() + STOP_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const current = readDaemonRecord(home);
-    const recordCleared = current.state === "absent" || (current.state === "present" && (current.info.pid !== info.pid || current.info.daemonId !== info.daemonId));
-    if (!processExists(info.pid) && recordCleared) {
-      process.stdout.write(`stopped pid=${info.pid}\n`);
+    const ownership = tryAcquireDaemonOwnership(home);
+    if (ownership) {
+      ownership.close();
+      process.stdout.write(`stopped pid=${info.pid} (ownership lock released)\n`);
       return;
     }
     await delay(POLL_INTERVAL_MS);
@@ -557,10 +590,10 @@ async function main(): Promise<void> {
       process.stdout.write(`LaunchAgent ${result.label}: ${result.loaded ? "loaded" : "not loaded"} (per-user login configuration; login/logout behavior not verified).\n`);
       if (result.healthy && result.record.state === "present") {
         process.stdout.write(`Daemon: running pid=${result.record.info.pid} port=${result.record.info.port}.\n`);
+      } else if (result.live) {
+        process.stdout.write("Daemon: unavailable/unconfirmed (daemon ownership lock is held; identity could not be confirmed).\n");
       } else if (result.record.state === "malformed") {
         process.stdout.write("Daemon: stopped or unavailable (daemon.json is malformed).\n");
-      } else if (result.live && result.record.state === "present") {
-        process.stdout.write(`Daemon: unavailable/unconfirmed (recorded pid=${result.record.info.pid} is still alive; refusing to signal or replace it).\n`);
       } else {
         process.stdout.write(`Daemon: stopped (${result.record.state === "absent" ? "no daemon record" : `stale pid=${result.record.info.pid}`} in ${result.home}).\n`);
       }
@@ -604,4 +637,6 @@ function reportStartupError(error: unknown): void {
   }
 }
 
-void main().catch(reportStartupError);
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  void main().catch(reportStartupError);
+}
