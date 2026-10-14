@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { setImmediate as nextImmediate } from "node:timers/promises";
 import { test } from "node:test";
+import { join } from "node:path";
+import { writeFileSync } from "node:fs";
+import { ControlPlane } from "../dist/control.js";
+import { backupHome, restoreHome } from "../dist/backup.js";
 import { applyWorkerNotice } from "../dist/worker-events.js";
 import { fixture } from "./fixtures/completion.mjs";
 
@@ -453,17 +457,15 @@ test("resolving a stop blocker before exit cannot start a replacement", async t 
     const answerId = await failedAnsweredQuestion(t, f);
     const blocker = f.control.blockers(f.mission.id).find(item => item.status === "open");
     f.control.resolveBlocker(blocker.id, "Inspected process");
-    f.control.missionAction(f.mission.id, "resume");
     const prepare = t.mock.method(f.control, "prepareAgentWorkspace", () => assert.fail("Old process is still live"));
-    const starting = assert.rejects(f.workers.startAgent(f.control.getAgentPublic(f.agent.id)), /Mission quiescence|Local worker exit/);
-    await drainStops(t, 2);
-    await starting;
+    assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Local worker exit.*not.*confirmed/);
+    await f.workers.startAgent(f.control.getAgentPublic(f.agent.id));
     assert.equal(prepare.mock.callCount(), 0);
     assert.equal(f.workers.handles.get(f.agent.id), f.handle);
     assert.equal(f.control.getAgentPublic(f.agent.id).epoch, f.handle.epoch + 1);
     assert.equal(f.control.message(answerId).status, "queued");
     assert.equal(f.control.blockers(f.mission.id).filter(item => item.kind === "unsafe_execution").length, 1);
-    assert.equal(f.control.missionById(f.mission.id).status, "failed");
+    assert.equal(f.control.missionById(f.mission.id).status, "paused");
     exitChildren(f.child);
     await f.workers.stopAgent(f.agent.id);
     prepare.mock.restore();
@@ -539,3 +541,178 @@ for (const failing of ["asking", "peer"]) {
     } finally { exitChildren(f.child, ...(peer ? [peer.child] : [])); }
   });
 }
+
+for (const failure of ["exited", "live", "peer", "none"]) {
+  test(`${failure === "none" ? "normal answer automatically continues" : `stop blocker resolved before question answer (${failure}) still requires explicit resume`}`, async t => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const peer = failure === "peer" ? installPeer(f, { stuck: true }) : undefined;
+    if (failure === "exited" || failure === "live") refuseExit(f);
+    try {
+      const pausing = f.workers.onRpc(f.agent, f.handle, { type: "rpc", id: "question-rpc", token: f.handle.token,
+        agentId: f.agent.id, epoch: f.agent.epoch, method: "RequestUserInput", args: { question: "Proceed?" }, taskId: "question" });
+      const question = (await f.reply).result;
+      f.settle();
+      if (failure !== "none") await drainStops(t);
+      await pausing;
+      const stoppedId = peer ? f.owner.id : f.agent.id;
+      if (failure === "exited") {
+        exitChildren(f.child);
+        await f.workers.stopAgent(stoppedId);
+      }
+      if (failure !== "none") {
+        const blocker = f.control.blockers(f.mission.id).find(item => item.id.startsWith("worker-stop:"));
+        f.control.resolveBlocker(blocker.id, "Inspected old process");
+      }
+      f.control.resolveBlocker(question.id, "Continue");
+      const answerId = `blocker-resolution:${question.id}`;
+      const deliveries = [];
+      installReplacement(f, deliveries);
+      if (failure !== "none") {
+        assert.notEqual(f.control.missionById(f.mission.id).status, "active", "Answering must not bypass explicit resume after a failed stop");
+        await f.workers.dispatchPending();
+        assert.deepEqual(deliveries, []);
+        assert.equal(f.control.message(answerId).status, "queued");
+        if (failure !== "exited") {
+          assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Local worker exit.*not.*confirmed/);
+          assert.equal(f.control.message(answerId).status, "queued");
+          exitChildren(peer ? peer.child : f.child);
+          await f.workers.stopAgent(stoppedId);
+        }
+        f.control.missionAction(f.mission.id, "resume");
+      } else assert.equal(f.control.missionById(f.mission.id).status, "active");
+      await f.workers.dispatchPending();
+      await f.workers.dispatchPending();
+      assert.deepEqual(deliveries.map(message => message.messageId), [answerId]);
+      assert.ok(deliveries[0].epoch > f.handle.epoch);
+      assert.equal(f.control.message(answerId).attempt, 1);
+    } finally { exitChildren(f.child, ...(peer ? [peer.child] : [])); }
+  });
+}
+
+for (const recovery of ["restart", "backup"]) {
+  for (const confirmed of [false, true]) {
+    test(`${recovery} retains explicit resume and ${confirmed ? "confirmed" : "unconfirmed"} old process exit`, async t => {
+      const f = await fixture(t);
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      refuseExit(f);
+      try {
+        const pausing = f.workers.onRpc(f.agent, f.handle, { type: "rpc", id: "question-rpc", token: f.handle.token,
+          agentId: f.agent.id, epoch: f.agent.epoch, method: "RequestUserInput", args: { question: "Proceed?" }, taskId: "question" });
+        const question = (await f.reply).result;
+        f.settle();
+        await drainStops(t);
+        await pausing;
+        if (confirmed) { exitChildren(f.child); await f.workers.stopAgent(f.agent.id); }
+        const blocker = f.control.blockers(f.mission.id).find(item => item.id.startsWith("worker-stop:"));
+        f.control.resolveBlocker(blocker.id, "Inspected old process");
+        const stateHome = f.control.home;
+        writeFileSync(join(stateHome, "admin.token"), "test-backup-token\n", { mode: 0o600 });
+        f.control.close();
+        t.mock.timers.reset();
+        let reopenedHome = stateHome;
+        if (recovery === "backup") {
+          const backup = join(f.home, "backup");
+          await backupHome(stateHome, backup, "0.1.0", async () => {});
+          reopenedHome = join(f.home, "restored");
+          restoreHome(backup, reopenedHome);
+        }
+        const reopened = new ControlPlane(reopenedHome);
+        try {
+          for (const item of reopened.blockers(f.mission.id).filter(item => item.status === "open" && item.id !== question.id)) {
+            reopened.resolveBlocker(item.id, "Inspected restored workspace");
+          }
+          reopened.resolveBlocker(question.id, "Continue after restart");
+          const answerId = `blocker-resolution:${question.id}`;
+          assert.equal(reopened.missionById(f.mission.id).status, "paused");
+          assert.equal(reopened.message(answerId).status, "queued");
+          if (confirmed) {
+            reopened.missionAction(f.mission.id, "resume");
+            assert.equal(reopened.missionById(f.mission.id).status, "active");
+            assert.equal(reopened.message(answerId).attempt, 1);
+          } else {
+            assert.throws(() => reopened.missionAction(f.mission.id, "resume"), /Local worker exit.*not.*confirmed/);
+            assert.equal(reopened.message(answerId).status, "queued");
+            reopened.missionAction(f.mission.id, "cancel");
+            assert.equal(reopened.message(answerId).status, "aborted");
+          }
+        } finally { reopened.close(); }
+      } finally { exitChildren(f.child); }
+    });
+  }
+}
+
+test("legacy stop blockers without exit evidence cannot bypass resume after upgrade", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  refuseExit(f);
+  try {
+    await failedAnsweredQuestion(t, f);
+    const blocker = f.control.blockers(f.mission.id).find(item => item.id.startsWith("worker-stop:"));
+    f.control.resolveBlocker(blocker.id, "Legacy inspection");
+    f.control.db.prepare("UPDATE missions SET data=json_remove(data,'$.localWorkerStops') WHERE id=?").run(f.mission.id);
+    f.control.close();
+    const reopened = new ControlPlane(join(f.home, "state"));
+    try {
+      assert.throws(() => reopened.missionAction(f.mission.id, "resume"), /Local worker exit.*not.*confirmed/);
+      assert.equal(reopened.missionById(f.mission.id).status, "paused");
+    } finally { reopened.close(); }
+  } finally { exitChildren(f.child); }
+});
+
+test("resume clears the stop hold durably without disabling later normal questions", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  refuseExit(f);
+  try {
+    await failedAnsweredQuestion(t, f);
+    exitChildren(f.child);
+    await f.workers.stopAgent(f.agent.id);
+    f.control.resolveBlocker(f.control.blockers(f.mission.id).find(item => item.id.startsWith("worker-stop:")).id, "Exited");
+    f.control.missionAction(f.mission.id, "resume");
+    f.control.close();
+    const reopened = new ControlPlane(join(f.home, "state"));
+    try {
+      assert.equal(reopened.missionById(f.mission.id).status, "active");
+      const agent = reopened.getAgentPublic(f.agent.id);
+      const question = await reopened.workerCommand({ type: "rpc", id: "new-question", token: "test", agentId: agent.id,
+        epoch: agent.epoch, method: "RequestUserInput", args: { question: "Normal next question?" }, taskId: "new-question" });
+      reopened.resolveBlocker(question.id, "Continue normally");
+      assert.equal(reopened.missionById(f.mission.id).status, "active");
+      assert.equal(reopened.message(`blocker-resolution:${question.id}`).status, "queued");
+    } finally { reopened.close(); }
+  } finally { exitChildren(f.child); }
+});
+
+test("a failed stop commits its hold, fence, diagnostic and blocker atomically", async t => {
+  const f = await fixture(t);
+  f.settle();
+  const mission = f.control.missionById(f.mission.id);
+  const agent = f.control.getAgentPublic(f.agent.id);
+  const write = t.mock.method(f.control, "insertSystemBlocker", () => { throw new Error("blocker write failed"); });
+  assert.throws(() => f.control.blockUnconfirmedLocalWorkerStop(f.agent.id, f.handle.epoch), /blocker write failed/);
+  assert.deepEqual(f.control.missionById(f.mission.id), mission);
+  assert.deepEqual(f.control.getAgentPublic(f.agent.id), agent);
+  assert.deepEqual(f.control.blockers(f.mission.id), []);
+  write.mock.restore();
+});
+
+test("resume waits for every failed process and ignores a different epoch confirmation", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  refuseExit(f);
+  const peer = installPeer(f, { stuck: true });
+  try {
+    const answerId = await failedAnsweredQuestion(t, f, 2);
+    for (const blocker of f.control.blockers(f.mission.id).filter(item => item.status === "open")) f.control.resolveBlocker(blocker.id, "Inspected");
+    f.control.confirmLocalWorkerExit(f.owner.id, peer.handle.epoch + 1);
+    exitChildren(f.child);
+    await f.workers.stopAgent(f.agent.id);
+    assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Local worker exit.*not.*confirmed/);
+    assert.equal(f.control.message(answerId).status, "queued");
+    exitChildren(peer.child);
+    await f.workers.stopAgent(f.owner.id);
+    f.control.missionAction(f.mission.id, "resume");
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+  } finally { exitChildren(f.child, peer.child); }
+});
