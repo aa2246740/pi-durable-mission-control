@@ -1749,6 +1749,7 @@ export class ControlPlane {
     const updated = { ...mission, status, updatedAt: now() };
     this.putMission(updated);
     if (action === "pause" || action === "cancel") {
+      if (action === "cancel") this.clearLocalDeliveryDeadlines(id);
       this.db.prepare("UPDATE outbox SET status='aborted' WHERE mission_id=? AND status='queued'").run(id);
       this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL
         WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')
@@ -1761,8 +1762,6 @@ export class ControlPlane {
         if (action === "cancel" && this.getAgent(message.recipientId)?.machineId === "local" &&
             this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status IN ('dispatching','admitted','delivering','delivered') LIMIT 1").get(message.id)) {
           // A sent input can still have a queued message until admission arrives.
-          // Its timeout must not requeue it during terminal settlement.
-          this.db.prepare("UPDATE outbox SET deadline_at=NULL WHERE message_id=? AND status IN ('dispatching','admitted','delivering','delivered')").run(message.id);
           continue;
         }
         const uncertain = message.status === "delivered" || this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status='uncertain' LIMIT 1").get(message.id);
@@ -3001,6 +3000,13 @@ export class ControlPlane {
     return processed;
   }
 
+  private clearLocalDeliveryDeadlines(missionId: string): void {
+    this.db.prepare(`UPDATE outbox SET deadline_at=NULL
+      WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')
+        AND message_id IN (SELECT m.id FROM messages m JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')
+          WHERE COALESCE(json_extract(a.data,'$.machineId'),'local')='local')`).run(missionId);
+  }
+
   pendingOutbox(): OutboxRow[] {
     const expired = this.db.prepare(`SELECT o.id,a.id AS agent_id,a.data FROM outbox o
       JOIN messages m ON m.id=o.message_id JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')
@@ -3249,8 +3255,16 @@ export class ControlPlane {
   }
 
   retryOutbox(id: string, error: string): void {
-    const row = this.db.prepare("SELECT retry_count,mission_id FROM outbox WHERE id=?").get(id) as { retry_count: number; mission_id: string } | undefined;
+    const row = this.db.prepare(`SELECT o.retry_count,o.mission_id,m.status AS mission_status
+      FROM outbox o JOIN missions m ON m.id=o.mission_id WHERE o.id=?`).get(id) as {
+        retry_count: number; mission_id: string; mission_status: Mission["status"];
+      } | undefined;
     if (!row) return;
+    // A terminal settlement must retain sent evidence, even for older deadlines or late delivery errors.
+    if (row.mission_status === "completed" || row.mission_status === "cancelled") {
+      this.db.prepare("UPDATE outbox SET deadline_at=NULL WHERE id=?").run(id);
+      return;
+    }
     const retries = row.retry_count + 1;
     const delay = Math.min(60000, 1000 * (2 ** Math.min(retries, 6)));
     this.db.prepare("UPDATE outbox SET retry_count=?,next_attempt_at=?,deadline_at=NULL WHERE id=?").run(retries, Date.now() + delay, id);
@@ -3923,6 +3937,7 @@ export class ControlPlane {
       }
       const completed = { ...detail.mission, status: "completed" as const, updatedAt: now() };
       this.putMission(completed);
+      this.clearLocalDeliveryDeadlines(completed.id);
       this.event(completed.id, "mission_completed", "Mission passed completion gates.", agent.id);
       return completed;
     });
@@ -4256,6 +4271,19 @@ export class ControlPlane {
         diagnostic: diagnostic.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(-1000),
         ...recovery
       });
+    });
+  }
+
+  blockUnconfirmedLocalWorkerStop(agentId: string, epoch: number): void {
+    this.transactionIfNeeded(() => {
+      const agent = this.getAgent(agentId);
+      if (!agent || agent.machineId !== "local") return;
+      const terminal = ["completed", "cancelled"].includes(this.getMission(agent.missionId)?.status ?? "");
+      this.markAgentInterrupted(agentId, epoch, terminal ? {} : { preserveQueued: true });
+      const diagnostic = "Local worker exit was not confirmed after shutdown and termination signals. Inspect the old process before resolving this blocker and resuming; queued inputs have not been sent.";
+      const current = this.getAgent(agentId)!;
+      this.recordWorkerDiagnostic(agentId, current.epoch, diagnostic);
+      if (!terminal) this.insertSystemBlocker(`worker-stop:${agentId}:${current.epoch}`, agent.missionId, "unsafe_execution", diagnostic);
     });
   }
 
