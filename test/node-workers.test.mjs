@@ -819,6 +819,7 @@ test("asynchronous ENOENT fork errors are handled and leave one uncertain admiss
   const [row] = supervisor.inspect();
   assert.ok(row);
   assert.equal(row.state, "uncertain");
+  assert.equal(row.stopReason, "unexpected");
   assert.equal(row.pid, null);
   assert.equal(row.live, false);
   assert.equal(missingExecutableErrorObserved, true);
@@ -989,6 +990,7 @@ test("watchdog fences a lease-lost worker and restart preserves uncertain eviden
   assert.equal(stopped.confirmedStopped, true);
   assert.equal(stopped.state, "closed");
   assert.equal(stopped.live, false);
+  assert.equal(stopped.stopReason, "unexpected");
   assertProcessGroupExtinct(started.pid);
 
   lease = true;
@@ -1068,3 +1070,50 @@ for (const evidence of ["clean", "new-session", "uncertain-mailbox", "missing-ef
     }
   });
 }
+
+
+for (const first of ["requested", "unexpected"]) {
+  test(`node persists first ${first} stop reason across later stop requests and supervisor restart`, async t => {
+    const home = mkdtempSync(join(tmpdir(), "node-stop-reason-"));
+    const workspace = join(home, "workspace");
+    const nodeHome = join(home, "node");
+    mkdirSync(workspace);
+    let supervisor;
+    t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+    const binding = bindingFor(`first-${first}`);
+    supervisor = new NodeWorkerSupervisor(supervisorOptions(nodeHome, home));
+    const started = await supervisor.start(specFor(binding, workspace, ""));
+    if (first === "unexpected") {
+      process.kill(started.pid, "SIGKILL");
+      await waitFor(() => supervisor.inspect()[0]?.stopReason === "unexpected");
+    }
+    const evidence = await supervisor.stop(binding);
+    assert.equal(evidence.stopReason, first);
+    assert.equal(evidence.confirmedStopped, true);
+    assertProcessGroupExtinct(started.pid);
+    assert.equal((await supervisor.stop(binding, "unexpected")).stopReason, first);
+    assert.equal(supervisor.inspectBindings()[0].stopReason, first);
+    await supervisor.close();
+    supervisor = new NodeWorkerSupervisor(supervisorOptions(nodeHome, home));
+    assert.equal(supervisor.inspect()[0].stopReason, first);
+    assert.equal((await supervisor.stop(binding)).stopReason, first);
+  });
+}
+
+test("legacy node runtime stop evidence stays unknown after migration and later requests", async t => {
+  const home = mkdtempSync(join(tmpdir(), "node-legacy-stop-reason-"));
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor(supervisorOptions(home, home));
+  await supervisor.close();
+  const binding = bindingFor("legacy-stop");
+  const db = new DatabaseSync(join(home, "node-workers.sqlite"));
+  db.exec("ALTER TABLE node_worker_runtimes DROP COLUMN stop_reason");
+  db.prepare(`INSERT INTO node_worker_runtimes(runtime_id,agent_id,epoch,binding_json,descriptor_hash,workspace_path,state,pid,confirmed_stopped)
+    VALUES(?,?,?,?,?,?,'closed',NULL,1)`).run(binding.runtimeId, binding.agentId, binding.epoch, JSON.stringify(binding), "a".repeat(64), home);
+  db.close();
+  supervisor = new NodeWorkerSupervisor(supervisorOptions(home, home));
+  supervisor.mailbox.open(binding);
+  assert.equal(supervisor.inspectBindings()[0].stopReason, null);
+  assert.equal((await supervisor.stop(binding)).stopReason, null);
+});

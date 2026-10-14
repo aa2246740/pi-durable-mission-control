@@ -60,7 +60,7 @@ function fixture(t, executionMode = "metadata-only", limits = {}) {
   return { control, home, remotePath, enrolled, session, mission, agent, assignment };
 }
 
-// One place builds the stopped report. A parallel change adds a stop-reason field here.
+// A controlled stop requires both the coordinator request and node stop reason.
 function reportControlledStop(f) {
   const requested = f.control.requestRemoteRuntimeStop(f.agent.id);
   const report = f.control.nodeRuntimeReport(
@@ -68,7 +68,8 @@ function reportControlledStop(f) {
       reportId: crypto.randomUUID(),
       binding: f.assignment.binding,
       descriptorHash: f.assignment.descriptorHash,
-      outcome: "stopped"
+      outcome: "stopped",
+      stopReason: "requested"
     }
   );
   return { requested, report };

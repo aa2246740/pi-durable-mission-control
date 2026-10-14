@@ -203,3 +203,31 @@ test("schema 8 closed runtimes retain evidence but cannot prove a controlled sto
     upgraded.close();
   }
 });
+
+
+test("schema 9 inferred controlled stop is downgraded without request and node evidence", t => {
+  const f = fixture(t);
+  const initial = new ControlPlane(f.home);
+  const binding = { runtimeId: crypto.randomUUID(), machineId: "legacy-node", sessionId: "legacy-session",
+    sessionEpoch: 1, agentId: "legacy-agent", epoch: 2 };
+  const report = { reportId: crypto.randomUUID(), binding, descriptorHash: "a".repeat(64), outcome: "stopped" };
+  initial.db.prepare(`INSERT INTO remote_worker_runtimes(runtime_id,machine_id,session_id,session_epoch,agent_id,epoch,
+    descriptor_json,descriptor_hash,state,desired,created_at,updated_at,last_report_json,stop_provenance)
+    VALUES(?,?,?,?,?,?,?,?,'closed','stop',1,2,?,'controlled')`).run(binding.runtimeId, binding.machineId, binding.sessionId,
+      binding.sessionEpoch, binding.agentId, binding.epoch, "{}", report.descriptorHash, JSON.stringify(report));
+  initial.close();
+  const old = new DatabaseSync(f.path);
+  old.exec("ALTER TABLE remote_worker_runtimes DROP COLUMN stop_request_reason; ALTER TABLE remote_worker_runtimes DROP COLUMN stop_request_epoch; ALTER TABLE remote_worker_runtimes DROP COLUMN stop_fenced_epoch; PRAGMA user_version=9");
+  old.close();
+  const upgraded = new ControlPlane(f.home);
+  try {
+    const row = upgraded.remoteRuntimes.byRuntime(binding.runtimeId);
+    assert.equal(row.stop_provenance, "unproven");
+    assert.equal(row.stop_request_reason, null);
+    assert.equal(row.stop_request_epoch, null);
+    assert.equal(row.last_report_json, JSON.stringify(report));
+    assert.equal(upgraded.remoteRuntimes.requestStop(binding, "controlled", binding.epoch), false);
+    upgraded.remoteRuntimes.report({ ...report, reportId: crypto.randomUUID(), stopReason: "requested" });
+    assert.equal(upgraded.remoteRuntimes.byRuntime(binding.runtimeId).stop_provenance, "unproven");
+  } finally { upgraded.close(); }
+});

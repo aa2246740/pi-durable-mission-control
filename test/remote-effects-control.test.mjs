@@ -386,9 +386,9 @@ test("remote GetMissionState reports the live session execution environment and 
   }
 });
 
-function stopReport(f, outcome = "stopped") {
+function stopReport(f, outcome = "stopped", stopReason = "requested") {
   return f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, {
-    reportId: crypto.randomUUID(), binding: f.assignment.binding, descriptorHash: f.assignment.descriptorHash, outcome
+    reportId: crypto.randomUUID(), binding: f.assignment.binding, descriptorHash: f.assignment.descriptorHash, outcome, ...(stopReason === undefined ? {} : { stopReason })
   });
 }
 
@@ -459,7 +459,7 @@ for (const ending of ["unexpected", "uncertain", "unproven"]) {
   test(`${ending} stop remains fail-closed after explicit blocker resolution and later stopped reports`, t => {
     const f = fixture(t);
     if (ending === "unexpected") {
-      stopReport(f);
+      stopReport(f, "stopped", "unexpected");
       f.control.requestRemoteRuntimeStop(f.agent.id);
       stopReport(f);
     } else if (ending === "uncertain") {
@@ -585,4 +585,200 @@ test("failed replacement assignment rolls back mailbox closure and owner claim",
   assert.equal(f.control.getAgentPublic(f.agent.id).epoch, epoch);
   assert.equal(f.control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(f.agent.id).n, 1);
   assert.equal(f.control.detail(f.mission.id).events.some(event => event.type === "remote_runtime_reassigned"), false);
+});
+
+
+test("delayed unexpected stop cannot become controlled after pause and later requested reports", t => {
+  const f = fixture(t);
+  const delayed = { reportId: crypto.randomUUID(), binding: f.assignment.binding,
+    descriptorHash: f.assignment.descriptorHash, outcome: "stopped", stopReason: "unexpected" };
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+  f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, delayed);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "unexpected");
+  assert.ok(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`));
+  stopReport(f);
+  explicitResume(f);
+  assertNoReassignment(f, /unexpected stop/);
+});
+
+test("ownership loss survives lease expiry, new session, old requested stop report, and blocker resolution", t => {
+  const f = fixture(t);
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+  f.control.db.prepare("UPDATE remote_machines SET data=json_set(data,'$.leaseExpiresAt',?) WHERE id=?")
+    .run(Date.now() - 1, f.enrolled.machine.id);
+  const capabilities = f.control.machineRegistry.get(f.enrolled.machine.id).capabilities;
+  const newSession = f.control.nodeSession(f.enrolled.machine.id, f.enrolled.token, capabilities, crypto.randomUUID());
+  assert.notEqual(newSession.sessionId, f.session.sessionId);
+  f.session = newSession;
+  stopReport(f);
+  const row = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.equal(row.state, "closed");
+  assert.equal(row.stop_provenance, "uncertain");
+  assert.equal(row.stop_request_reason, "ownership-lost");
+  assert.equal(f.control.remoteRuntimeSnapshots(f.mission.id)[0].stopRequestReason, "ownership-lost");
+  explicitResume(f);
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  stopReport(f);
+  assertNoReassignment(f, /uncertain/);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+});
+
+for (const change of ["before-request", "after-controlled-fence", "after-request-owner-claim", "legacy-request"]) {
+  test(`unrelated epoch increase ${change} cannot use controlled stop relaxation`, t => {
+    const f = fixture(t);
+    if (change === "before-request") {
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+      f.control.requestRemoteRuntimeStop(f.agent.id);
+    } else if (change === "after-controlled-fence") {
+      f.control.requestRemoteRuntimeStop(f.agent.id);
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch + 1);
+    } else if (change === "after-request-owner-claim") {
+      f.control.requestRemoteRuntimeStop(f.agent.id);
+      f.control.claimAgentOwner(f.agent.id);
+    } else {
+      f.control.db.prepare("UPDATE remote_worker_runtimes SET desired='stop',state='stopping' WHERE runtime_id=?")
+        .run(f.assignment.binding.runtimeId);
+      f.control.markAgentInterrupted(f.agent.id, f.agent.epoch);
+    }
+    // Even if the report arrives before the periodic fence sweep, it must not
+    // close the runtime with apparently controlled evidence.
+    stopReport(f);
+    f.control.fenceStaleWorkerBindings();
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "uncertain");
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+    assert.ok(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`));
+    stopReport(f);
+    explicitResume(f);
+    assertNoReassignment(f, /uncertain/);
+  });
+}
+
+test("legacy stopped report without node reason cannot prove a controlled stop", t => {
+  const f = fixture(t);
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  const report = { reportId: crypto.randomUUID(), binding: f.assignment.binding,
+    descriptorHash: f.assignment.descriptorHash, outcome: "stopped" };
+  f.control.nodeRuntimeReport(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, report);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "unproven");
+  stopReport(f);
+  explicitResume(f);
+  assertNoReassignment(f, /cannot be proven/);
+});
+
+
+test("unexpected node reason remains unexpected when physical extinction is unconfirmed", t => {
+  const f = fixture(t);
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  stopReport(f, "uncertain", "unexpected");
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).state, "uncertain");
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "unexpected");
+  stopReport(f);
+  explicitResume(f);
+  assertNoReassignment(f, /unexpected stop/);
+});
+
+
+test("repeated blocked lifecycle sync preserves controlled stop and permits recovery", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  const question = await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-question"));
+  assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+  await workers.syncMissionLifecycle(f.mission.id);
+  const firstEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  assert.equal(firstEpoch, f.assignment.binding.epoch + 1);
+  const lateMessage = f.control.sendMessage(f.mission.id, f.agent.id, "Input queued between syncs.", "followUp", "repeat-sync-input");
+  await workers.syncMissionLifecycle(f.mission.id);
+  const secondEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  stopReport(f);
+  const stopped = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.equal(stopped.stop_provenance, "controlled", `epochs ${f.assignment.binding.epoch} -> ${firstEpoch} -> ${secondEpoch}`);
+  assert.equal(secondEpoch, firstEpoch);
+  assert.equal(stopped.stop_request_reason, "controlled");
+  assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+  assert.equal(f.control.message(lateMessage.id).status, "aborted");
+  assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE message_id=?").get(lateMessage.id).status, "aborted");
+  f.control.resolveBlocker(question.id, "Continue with a new runtime.");
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+  const replacement = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.notEqual(replacement.runtime_id, stopped.runtime_id);
+  assert.equal(replacement.state, "queued");
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  assert.deepEqual(f.control.remoteRuntimes.byRuntime(stopped.runtime_id), stopped);
+});
+
+
+for (const action of ["refreshProfile", "refreshRole", "interruptAgent"]) {
+  test(`repeated controlled ${action} preserves the fenced epoch and permits recovery`, async t => {
+    const f = fixture(t, "metadata-only");
+    const workers = new WorkerManager(f.control);
+    const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+    const question = await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, `repeat-${action}-question`));
+    const invoke = () => action === "refreshProfile" ? workers.refreshProfile(f.profile.id)
+      : action === "refreshRole" ? workers.refreshRole(f.roleIds[1]) : workers.interruptAgent(f.agent.id);
+    await invoke();
+    const fencedEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+    assert.equal(fencedEpoch, f.assignment.binding.epoch + 1);
+    const lateMessage = f.control.sendMessage(f.mission.id, f.agent.id, "New input during shutdown.", "followUp", `repeat-${action}-input`);
+    await invoke();
+    assert.equal(f.control.message(lateMessage.id).status, "aborted");
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+    stopReport(f);
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "controlled");
+    await invoke();
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+    assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+    f.control.resolveBlocker(question.id, "Continue.");
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+    await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+    assert.notEqual(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+  });
+}
+
+test("repeated controlled lifecycle sync still fences newly admitted delivery as uncertain", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-admitted-question"));
+  await workers.syncMissionLifecycle(f.mission.id);
+  const fencedEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  const input = f.control.sendMessage(f.mission.id, f.agent.id, "Delivery admission arrived late.", "followUp", "repeat-sync-admitted-input");
+  f.control.db.prepare("UPDATE messages SET status='admitted',data=? WHERE id=?")
+    .run(JSON.stringify({ ...input, status: "admitted" }), input.id);
+  f.control.db.prepare("UPDATE outbox SET status='admitted' WHERE message_id=?").run(input.id);
+  const outbox = f.control.db.prepare("SELECT id FROM outbox WHERE message_id=?").get(input.id);
+  await workers.syncMissionLifecycle(f.mission.id);
+  assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+  assert.equal(f.control.message(input.id).status, "uncertain");
+  assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE id=?").get(outbox.id).status, "uncertain");
+  assert.ok(f.control.blockers(f.mission.id).some(b => b.id === `delivery:${outbox.id}` && b.status === "open"));
+  stopReport(f);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "controlled");
+  assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+  explicitResume(f);
+  assertNoReassignment(f, /uncertain or partially executed durable delivery/);
+});
+
+test("unrelated interruption between controlled lifecycle syncs remains ownership loss", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-owner-question"));
+  await workers.syncMissionLifecycle(f.mission.id);
+  f.control.markAgentInterrupted(f.agent.id, f.control.getAgentPublic(f.agent.id).epoch);
+  await workers.syncMissionLifecycle(f.mission.id);
+  stopReport(f);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "uncertain");
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+  explicitResume(f);
+  assertNoReassignment(f, /uncertain/);
 });
