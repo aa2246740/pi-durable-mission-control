@@ -64,6 +64,37 @@ import {
 } from "./worktrees.js";
 
 export const CONTROL_SCHEMA_VERSION = 10;
+// Both startup and backup restore hold a transaction while fencing ownership and deliveries.
+export function quarantineTerminalLocalDeliveries(db: DatabaseSync): void {
+  if (!db.isTransaction) throw new Error("Terminal delivery recovery requires a transaction");
+  const rows = db.prepare(`SELECT o.id,o.message_id,o.mission_id,t.status AS mission_status
+    FROM outbox o JOIN missions t ON t.id=o.mission_id
+    JOIN messages m ON m.id=o.message_id
+    JOIN agents a ON a.id=json_extract(m.data,'$.recipientId') AND a.mission_id=t.id
+    WHERE t.status IN ('completed','cancelled') AND COALESCE(json_extract(a.data,'$.machineId'),'local')='local'
+    AND o.status IN ('dispatching','admitted','delivering','delivered')`).all() as Array<{
+      id: string; message_id: string; mission_id: string; mission_status: "completed" | "cancelled";
+    }>;
+  if (!rows.length) return;
+  // A backup may precede the deadline column; restore must not migrate its schema.
+  const hasDeadline = (db.prepare("PRAGMA table_info(outbox)").all() as Array<{ name: string }>).some((column) => column.name === "deadline_at");
+  const updateOutbox = db.prepare(`UPDATE outbox SET status='uncertain',error=?${hasDeadline ? ",deadline_at=NULL" : ""} WHERE id=?`);
+  const updateMessage = db.prepare("UPDATE messages SET status='uncertain',data=json_set(data,'$.status','uncertain','$.error',?) WHERE id=?");
+  const text = "Local delivery outcome is uncertain after coordinator interruption or backup restore; it will not be replayed.";
+  const createdAt = new Date().toISOString();
+  for (const row of rows) {
+    updateOutbox.run(text, row.id);
+    updateMessage.run(text, row.message_id);
+    if (row.mission_status === "cancelled") {
+      const blocker: Blocker = { id: `delivery:${row.id}`, missionId: row.mission_id, kind: "delivery", status: "open", text, createdAt };
+      db.prepare("INSERT OR IGNORE INTO blockers(id,mission_id,status,data) VALUES(?,?,?,?)")
+        .run(blocker.id, row.mission_id, blocker.status, JSON.stringify(blocker));
+    }
+    const event = { missionId: row.mission_id, type: "delivery_uncertain", text, createdAt, data: { messageId: row.message_id, outboxId: row.id } };
+    db.prepare("INSERT INTO events(mission_id,type,data) VALUES(?,?,?)").run(row.mission_id, event.type, JSON.stringify(event));
+  }
+}
+
 const REMOTE_OPERATION_UNAVAILABLE = "Remote operation is unavailable for this agent";
 export class HttpError extends Error {
   readonly status: number;
@@ -520,6 +551,7 @@ export class ControlPlane {
         if (mission) this.event(mission.id, "remote_runtime_uncertain", "Remote runtime ownership is uncertain after coordinator restart; no delivery was replayed.", agent.id);
       }
     }
+    quarantineTerminalLocalDeliveries(this.db);
     this.db.prepare(`UPDATE outbox SET status='queued',deadline_at=NULL,next_attempt_at=0
       WHERE status IN ('dispatching','admitted') AND mission_id IN (SELECT id FROM missions WHERE status='active')
       AND COALESCE((SELECT json_extract(a.data,'$.machineId') FROM agents a

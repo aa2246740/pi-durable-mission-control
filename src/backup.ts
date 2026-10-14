@@ -25,7 +25,7 @@ import { DatabaseSync } from "node:sqlite";
 import { DurableWorkerMailbox } from "./worker-mailbox.js";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import type { WorktreeRecord } from "./contracts.js";
-import { CONTROL_SCHEMA_VERSION, tryAcquireDaemonOwnership } from "./control.js";
+import { CONTROL_SCHEMA_VERSION, quarantineTerminalLocalDeliveries, tryAcquireDaemonOwnership } from "./control.js";
 
 const BACKUP_FORMAT = "mission-control-backup";
 const BACKUP_FORMAT_VERSION = 1;
@@ -803,6 +803,8 @@ function quarantineRestoredControl(path: string, manifest: BackupManifest, targe
         db.prepare("UPDATE artifacts SET data=? WHERE id=?").run(JSON.stringify(artifact), row.id);
       }
     }
+
+    quarantineTerminalLocalDeliveries(db);
 
     const missions = tableExists(db, "missions")
       ? db.prepare("SELECT id,status,data FROM missions WHERE status IN ('active','validating','paused','blocked','failed')").all() as Array<{ id: string; status: string; data: string }>
