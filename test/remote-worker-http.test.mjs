@@ -92,11 +92,14 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     };
     let heldStopReports = 0;
     const nodeControls = new Set();
-    const script = `import { runNode } from ${JSON.stringify(nodeModule)};
+    const script = `import { DatabaseSync } from "node:sqlite";
+      import { runNode } from ${JSON.stringify(nodeModule)};
       const nativeFetch = globalThis.fetch;
       let heldRuntimeId;
+      let crashRuntimeId;
       let releaseReport;
       process.on("message", (message) => {
+        if (message.action === "crash-during-poll") crashRuntimeId = message.runtimeId;
         if (message.action === "hold-stop-report") heldRuntimeId = message.runtimeId;
         if (message.action === "release-stop-report") { heldRuntimeId = undefined; releaseReport?.(); }
         process.send({ type: "control-applied", action: message.action });
@@ -106,7 +109,24 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
           process.send({ type: "stop-report-held" });
           await new Promise(resolve => { releaseReport = resolve; });
         }
-        return nativeFetch(input, init);
+        const response = await nativeFetch(input, init);
+        if (String(input).endsWith("/api/nodes/mailbox/poll") &&
+            JSON.parse(init.body).binding.runtimeId === crashRuntimeId && response.ok &&
+            (await response.clone().json()).envelopes.length) {
+          const db = new DatabaseSync(${JSON.stringify(join(nodeHome, "worker-runtime", "node-workers.sqlite"))}, { readOnly: true });
+          try {
+            const row = () => db.prepare("SELECT pid,state FROM node_worker_runtimes WHERE runtime_id=?").get(crashRuntimeId);
+            process.kill(row().pid, "SIGKILL");
+            const deadline = Date.now() + 10000;
+            while (!["closed", "uncertain"].includes(row().state)) {
+              if (Date.now() >= deadline) throw new Error("Killed worker did not stop");
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            process.send({ type: "control-applied", action: "crashed-during-poll" });
+            crashRuntimeId = undefined;
+          } finally { db.close(); }
+        }
+        return response;
       };
       process.on("SIGTERM", () => process.stderr.write("node-signal:SIGTERM\\n"));
       process.on("SIGINT", () => process.stderr.write("node-signal:SIGINT\\n"));
@@ -503,6 +523,53 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     deliveryNodeDb.close();
     assert.equal(control.missionById(deliveryMission.id).status, "active");
     assert.equal(control.detail(deliveryMission.id).events.some(event => event.type === "worker_start_failed"), false);
+
+    const crashMission = await post(adminBase, adminToken, "/api/missions", {
+      title: "Worker crash during mailbox exchange", goal: "Contain a local worker failure",
+      acceptance: "The node reports an unexpected stop and keeps serving other workers", workspaceId: localWorkspace.id,
+      remoteWorkspaceIds: [remoteWorkspace.id], roleIds: roles.map(role => role.id),
+      maxTurns: 10, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared"
+    });
+    const crashStarted = control.missionAction(crashMission.id, "start");
+    const crashOrchestrator = control.getAgentPublic(crashStarted.orchestratorId);
+    control.markAgentInterrupted(crashOrchestrator.id, crashOrchestrator.epoch);
+    const crashAgent = await post(adminBase, adminToken, `/api/missions/${crashMission.id}/agents`, {
+      title: "Crash worker", roleId: "real-http-worker", prompt: "Wait for an input.",
+      requestId: "real-http-crash-worker", targetWorkspaceId: remoteWorkspace.id
+    });
+    await service.workers.startAgent(control.getAgentPublic(crashAgent.id));
+    await waitFor(() => control.remoteRuntimeForAgent(crashAgent.id)?.state === "running");
+    const crashRuntime = control.remoteRuntimeForAgent(crashAgent.id);
+    const leaseBeforeCrash = control.machineRegistry.get(enrolled.machine.id).leaseExpiresAt;
+    node.send({ action: "crash-during-poll", runtimeId: crashRuntime.runtime_id });
+    await waitFor(() => nodeControls.has("crash-during-poll"));
+    const crashMessage = control.sendMessage(crashMission.id, crashAgent.id, "Do not replay this input.",
+      "followUp", "real-http-crash-input");
+    await service.workers.dispatchPending();
+    await waitFor(() => nodeControls.has("crashed-during-poll"));
+    await waitFor(() => {
+      assert.equal(node.exitCode, null, nodeOutput);
+      return ["closed", "uncertain"].includes(control.remoteRuntimeForAgent(crashAgent.id)?.state);
+    });
+    const crashResult = control.remoteRuntimeForAgent(crashAgent.id);
+    assert.equal(crashResult.stop_provenance, "unexpected");
+    assert.equal(JSON.parse(crashResult.last_report_json).stopReason, "unexpected");
+    assert.equal(control.missionById(crashMission.id).status, "blocked");
+    assert.ok(control.blockers(crashMission.id).some(item => item.id === `remote-runtime:${crashRuntime.runtime_id}`));
+    assert.equal(control.message(crashMessage.id).status, "uncertain");
+    assert.equal(control.message(crashMessage.id).attempt, 1);
+    const crashMessageEvidence = control.message(crashMessage.id);
+    const crashOutboxEvidence = control.db.prepare("SELECT * FROM outbox WHERE message_id=?").all(crashMessage.id);
+    const healthyInput = control.sendMessage(mission.id, remoteAgent.id, "The other worker still serves new input.",
+      "followUp", "real-http-after-worker-crash");
+    await service.workers.dispatchPending();
+    await waitFor(() => control.message(healthyInput.id)?.status === "completed");
+    await waitFor(() => control.machineRegistry.get(enrolled.machine.id).leaseExpiresAt > leaseBeforeCrash);
+    assert.equal(node.exitCode, null);
+    assert.equal(node.signalCode, null);
+    assert.deepEqual(control.message(crashMessage.id), crashMessageEvidence);
+    assert.deepEqual(control.db.prepare("SELECT * FROM outbox WHERE message_id=?").all(crashMessage.id), crashOutboxEvidence);
+    assert.equal(control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(crashAgent.id).n, 1);
 
     const fencedMission = await post(adminBase, adminToken, "/api/missions", {
       title: "Mailbox fence fixture", goal: "stop when only the mailbox is fenced",

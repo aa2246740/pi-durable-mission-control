@@ -6,7 +6,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { NodeCommand, NodeCapabilities } from "./machines.js";
 import { NODE_EXECUTION_PROTOCOL_VERSION, NODE_PROTOCOL_VERSION, NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION } from "./machines.js";
 import {
-  DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt,
+  DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope, parseWorkerReceipt,
   type JsonValue, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding
 } from "./worker-mailbox.js";
 import type { RuntimeReport, RuntimeStopReason } from "./remote-runtimes.js";
@@ -579,6 +579,15 @@ export async function queryAppliedMailboxUploads(
   return answers;
 }
 
+class LocalMailboxFence extends Error {}
+
+function mailboxOperation<T>(mailbox: DurableWorkerMailbox, binding: WorkerBinding, operation: () => T): T {
+  if (mailbox.inspectBinding(binding).status !== "open") {
+    throw new LocalMailboxFence("Worker mailbox was fenced during exchange");
+  }
+  return operation();
+}
+
 export async function exchangeWorkerMailbox(
   coordinator: string,
   token: string,
@@ -590,10 +599,12 @@ export async function exchangeWorkerMailbox(
   const base = safeCoordinatorUrl(coordinator);
   const identity = { machineId: binding.machineId, sessionId: binding.sessionId, sessionEpoch: binding.sessionEpoch, binding };
   let progressed = false;
-  for (const envelope of mailbox.pending(binding, 1)) {
+  for (const envelope of mailboxOperation(mailbox, binding, () => mailbox.pending(binding, 1))) {
     const receipt = parseWorkerReceipt(await fetchJson(base, "/api/nodes/mailbox/upload", token, { ...identity, envelope }, signal));
-    if (!receipt) throw genericError();
-    mailbox.acknowledge(binding, receipt);
+    const offered = mailbox.inspectOutbox(binding).find(item => item.envelope.messageId === envelope.messageId);
+    if (!receipt || receipt.messageId !== envelope.messageId || receipt.sequence !== envelope.sequence ||
+        receipt.sha256 !== offered?.sha256) throw genericError();
+    mailboxOperation(mailbox, binding, () => mailbox.acknowledge(binding, receipt));
     progressed = true;
   }
   const response = await fetchJson(base, "/api/nodes/mailbox/poll", token, identity, signal);
@@ -602,8 +613,11 @@ export async function exchangeWorkerMailbox(
       !("envelopes" in response) || !Array.isArray(response.envelopes) || response.envelopes.length > 1) {
     throw genericError();
   }
-  for (const envelope of response.envelopes) {
-    const receipt = mailbox.receive(binding, envelope);
+  for (const rawEnvelope of response.envelopes) {
+    const envelope = parseWorkerEnvelope(rawEnvelope);
+    if (!envelope || !sameBinding(envelope.binding, binding) ||
+        envelope.payload.kind === "notice" || envelope.payload.kind === "rpc") throw genericError();
+    const receipt = mailboxOperation(mailbox, binding, () => mailbox.receive(binding, envelope));
     const result = await fetchJson(base, "/api/nodes/mailbox/ack", token, { ...identity, receipt }, signal);
     if (!result || typeof result !== "object" || Array.isArray(result) ||
         Object.keys(result).length !== 1 || !("acknowledged" in result) || result.acknowledged !== true) {
@@ -764,6 +778,16 @@ export async function runNode(options: NodeOptions): Promise<void> {
         if (!validRuntimeReportAck(ack)) throw genericError();
         journal.sentRuntimeReport(report.reportId);
       };
+      const stopAndReport = async (runtime: ReturnType<NodeWorkerSupervisor["inspectBindings"]>[number], stopReason: RuntimeStopReason): Promise<void> => {
+        let evidence;
+        try {
+          evidence = await supervisor!.stop(runtime.binding, stopReason);
+        } catch {
+          journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, "uncertain", "unexpected");
+          return;
+        }
+        journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
+      };
       let nextAssignmentPoll = 0;
       let activeRounds = 0;
       const mailboxFencedBindings = new Set<string>();
@@ -861,11 +885,12 @@ export async function runNode(options: NodeOptions): Promise<void> {
           try {
             progress = await exchangeWorkerMailbox(options.coordinator, token, supervisor.mailbox, binding, abort.signal) || progress;
           } catch (error) {
-            if (!(error instanceof CoordinatorConflict)) throw error;
+            if (!(error instanceof CoordinatorConflict) && !(error instanceof LocalMailboxFence)) throw error;
             mailboxFencedBindings.add(binding.runtimeId);
-            try {
+            let stopReason: RuntimeStopReason = "unexpected";
+            if (error instanceof CoordinatorConflict) {
               // A mailbox fence can precede the regular stop-directive poll.
-              // Fetch evidence for this binding before recording a local fence.
+              // Session and protocol failures here must still terminate the node.
               const response = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {
                 machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
                 stopRuntimeId: binding.runtimeId
@@ -873,7 +898,6 @@ export async function runNode(options: NodeOptions): Promise<void> {
               if (!object(response) || !exactKeys(response, ["directives"]) || !Array.isArray(response.directives) ||
                   response.directives.length > 1) throw genericError();
               const directive: unknown = response.directives[0];
-              let stopReason: RuntimeStopReason = "unexpected";
               if (directive !== undefined) {
                 if (!object(directive) || !exactKeys(directive, ["action", "binding", "descriptorHash"]) ||
                     directive.action !== "stop" || directive.descriptorHash !== runtime.descriptorHash) throw genericError();
@@ -881,12 +905,8 @@ export async function runNode(options: NodeOptions): Promise<void> {
                 if (!stopBinding || !sameBinding(stopBinding, binding)) throw genericError();
                 stopReason = "requested";
               }
-              const evidence = await supervisor.stop(binding, stopReason);
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
-            } catch {
-              await supervisor.stop(binding, "unexpected").catch(() => undefined);
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, "uncertain", "unexpected");
             }
+            await stopAndReport(runtime, stopReason);
             notifyMailboxActivity();
             continue;
           }
