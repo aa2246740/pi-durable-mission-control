@@ -124,11 +124,19 @@ function renderRoles() {
     (state.app.roles.length ? `<div class="cards">${state.app.roles.map((r) => `<article class="panel"><div class="card-top"><span class="avatar">${e(r.name.slice(0, 1))}</span><span class="badge">${e(roleNames[r.kind])}</span></div><h3>${e(r.name)}</h3><p class="agent-meta">${e(profileName(r.profileId))}</p><p class="text">${e(r.instructions)}</p>${button('编辑角色', 'edit-role', r.id, 'secondary small')}</article>`).join('')}</div>` : empty('定义你的团队', '至少配置一位负责人、一位执行者和一位独立验收者。', button('添加角色', 'new-role')));
 }
 
+function remoteWorkspaceStatus(workspace) {
+  const machine = state.app.machines.find((item) => item.id === workspace.machineId);
+  if (machine?.status !== 'online' || !(machine.leaseExpiresAt > Date.now())) return '节点未在线，暂不能派工';
+  if (!machine.capabilities?.executionEnabled) return '只读目录检查，未启用代理执行';
+  if (machine.capabilities.executionMode !== 'workspace-effects') return '仅代理消息，不支持文件操作';
+  return machine.capabilities.artifactTransfers ? '支持远端执行与成果传回' : '支持远端执行，未启用成果传回';
+}
+
 function renderWorkspaces() {
   return heading('WORKSPACE BOUNDARIES', '工作有明确的目录', '文件工具限定目录，命令在该目录启动。共享目录不等于隔离工作树或系统沙箱。', button('＋ 添加工作区', 'new-workspace')) +
-    `<div class="notice">本地工具不是操作系统级沙箱。仅将可信项目交给代理；“自主执行”允许它在本机执行命令，不要用于不受信任的提示词或仓库。</div>` +
-    '<p class="small-muted">远端目录请到“执行机器”完成只读检查，再从成功回执登记。登记只保存目录与机器的对应关系，代理执行尚未启用；Mission 的主交付目录和初始独立验收仍在本机。</p>' +
-    (state.app.workspaces.length ? `<div class="table-wrap"><table><thead><tr><th>工作区</th><th>完整路径</th><th>执行机器</th><th>目录依据</th></tr></thead><tbody>${state.app.workspaces.map((w) => `<tr><td>${e(w.name)}</td><td class="mono">${e(w.path)}</td><td>${e(state.app.machines.find((m) => m.id === w.machineId)?.name || w.machineId)}</td><td>${w.machineId === 'local' ? '本机目录' : `远端代理执行未启用<br><span class="small-muted">检查时间：${date(w.probe?.verifiedAt)}<br>会话代次：${e(w.probe?.sessionEpoch ?? '未记录')}<br>回执：${e(w.probe?.commandId ?? '未记录')}</span>`}</td></tr>`).join('')}</tbody></table></div>` : empty('还没有工作区', '选择一个实际存在的本地目录。代理的文件、命令与交付物都属于这个工作区。', button('添加工作区', 'new-workspace')));
+    `<div class="notice">工具不是操作系统级沙箱。仅将可信项目交给代理；“自主执行”允许它在目标机器执行命令，不要用于不受信任的提示词或仓库。</div>` +
+    '<p class="small-muted">远端目录请到“执行机器”完成只读检查，再从成功回执登记。创建 Mission 时需明确勾选允许使用的远端工作区；实际能力取决于节点配置。主交付目录与独立成果验收仍在本机，远端 Git 工作树尚不支持。</p>' +
+    (state.app.workspaces.length ? `<div class="table-wrap"><table><thead><tr><th>工作区</th><th>完整路径</th><th>执行机器</th><th>目录依据</th></tr></thead><tbody>${state.app.workspaces.map((w) => `<tr><td>${e(w.name)}</td><td class="mono">${e(w.path)}</td><td>${e(state.app.machines.find((m) => m.id === w.machineId)?.name || w.machineId)}</td><td>${w.machineId === 'local' ? '本机目录' : `${e(remoteWorkspaceStatus(w))}<br><span class="small-muted">检查时间：${date(w.probe?.verifiedAt)}<br>会话代次：${e(w.probe?.sessionEpoch ?? '未记录')}<br>回执：${e(w.probe?.commandId ?? '未记录')}</span>`}</td></tr>`).join('')}</tbody></table></div>` : empty('还没有工作区', '选择一个实际存在的本地目录。代理的文件、命令与交付物都属于这个工作区。', button('添加工作区', 'new-workspace')));
 }
 
 function mcpCatalog(server) {
@@ -289,8 +297,9 @@ function renderAgents(agents) {
 }
 
 function worktreeCommit(receipt) {
-  if (!receipt?.workspaceCommit) return '';
+  if (!receipt?.workspaceCommit && receipt?.workspaceKind !== 'remote-snapshot') return '';
   const integrity = receipt.snapshotIntegrity === true ? '已检查，输入未被改写' : receipt.snapshotIntegrity === false ? '失败，不可用于通过验收' : '未记录，不推断通过';
+  if (receipt.workspaceKind === 'remote-snapshot') return `<div class="notice ${receipt.snapshotIntegrity === false ? '' : 'neutral'}"><strong>本机独立验收 · 远端冻结成果</strong><p class="small-muted">仅验证传回并校验摘要的快照，不读取远端源目录，也不代表远端最新文件通过验收。</p><p class="small-muted mono digest">命令执行目录：${e(receipt.workspacePath || '未记录')}<br>副本输入完整性：${e(integrity)}</p>${receipt.snapshotError ? `<p class="text danger-text">${e(receipt.snapshotError)}</p>` : ''}</div>`;
   return `<div class="notice ${receipt.snapshotIntegrity === false ? '' : 'neutral'}"><strong>验收运行在独立副本</strong><p class="small-muted mono digest">提交：${e(receipt.workspaceCommit)}<br>来源分支：${e(receipt.workspaceBranch || '未记录')}<br>命令执行目录：${e(receipt.workspacePath || '未记录')}<br>副本输入完整性：${e(integrity)}</p>${receipt.snapshotError ? `<p class="text danger-text">${e(receipt.snapshotError)}</p>` : ''}</div>`;
 }
 
@@ -304,7 +313,10 @@ function renderWorktreeSummary() {
 
 function renderWorktrees() {
   const { mission, tasks, agents } = state.detail;
-  if (mission.workspaceStrategy !== 'worktree') return `<section class="panel"><h2>共享工作目录</h2><p class="text">此 Mission 保留共享目录模式，没有自动搬迁历史文件或代理。多个代理可能修改同一份文件，需要协调分工。</p><p class="small-muted">如需隔离，请创建新的 Mission 并选择“独立 Git 工作树”。工作目录模式不能在运行途中切换。</p></section>`;
+  if (mission.workspaceStrategy !== 'worktree') return `<section class="panel"><h2>共享工作目录</h2><p class="text">此 Mission 保留共享目录模式，没有自动搬迁历史文件或代理。多个代理可能修改同一份文件，需要协调分工。</p><p class="small-muted">如需本机 Git 隔离，请创建新的 Mission 并选择“独立 Git 工作树”。工作目录模式不能在运行途中切换；远端 Git 工作树尚不支持。</p></section><section class="panel"><h2>已授权的远端工作区</h2><p class="small-muted">仅执行者可使用这些目录；实际派工仍会检查节点在线状态、能力和凭证引用。主交付与独立成果验收在本机。</p>${(mission.remoteWorkspaceIds || []).length ? mission.remoteWorkspaceIds.map((id) => {
+    const workspace = state.app.workspaces.find((item) => item.id === id);
+    return workspace ? `<p class="text">${e(workspace.name)} · ${e(workspace.machineId)}<br><span class="mono">${e(workspace.path)}</span><br>${e(remoteWorkspaceStatus(workspace))}</p>` : `<p class="text">${e(id)} · 工作区已不可用</p>`;
+  }).join('') : '<p class="small-muted">未授权远端工作区。</p>'}</section>`;
   const records = state.detail.worktrees || [];
   const agentTrees = records.filter((record) => record.kind === 'agent');
   const validationTrees = records.filter((record) => record.kind === 'validation');
@@ -820,6 +832,7 @@ function roleDialog(id) {
 
 function missionDialog() {
   const localWorkspaces = state.app.workspaces.filter((workspace) => workspace.machineId === 'local');
+  const remoteWorkspaces = state.app.workspaces.filter((workspace) => workspace.machineId !== 'local' && workspace.probe);
   if (!localWorkspaces.length) { location.hash = '#workspaces'; return toast('先添加一个本地交付工作区，再创建 Mission。'); }
   if (!state.app.roles.some((r) => r.kind === 'orchestrator')) { location.hash = '#roles'; return toast('先配置负责人角色与模型。'); }
   const fields = field('title', 'Mission 名称', '', { required: true, placeholder: '例如：实现可导出的书签管理器' }) +
@@ -828,18 +841,21 @@ function missionDialog() {
     field('assertionLines', '另外单列的验收要求（每行一条，可留空）', '', { multiline: true, rows: 3, help: '上面的完整标准始终保留为 REQ-001。这些补充要求也必须被任务认领并独立验证，不能遗漏。' }) +
     field('workspaceId', '本地主交付工作区', localWorkspaces[0].id, { choices: localWorkspaces.map((w) => [w.id, `${w.name} · ${w.path}`]) }) +
     field('workspaceStrategy', '代理如何使用工作目录？', 'worktree', { choices: [['worktree', '独立 Git 工作树（推荐：并行开发互不覆盖）'], ['shared', '共享目录（可用于非 Git 目录，需要协调修改）']], help: '独立模式需要已有提交、没有待提交改动的 Git 仓库根目录。启动后各自使用本地分支，最终必须合并并独立验收；不会切换原目录或推送远端。子模块、LFS 等特殊检出方式目前不支持，检查不通过不会偷偷改成共享模式。' }) +
+    `<fieldset class="role-fieldset"><legend>允许使用的远端工作区（可选）</legend><p class="small-muted">默认不授权任何远端目录。仅执行者可使用勾选的目录；需选择上方“共享目录”模式。负责人、主交付目录与独立成果验收仍在本机。节点离线或未声明执行能力时不会派工。</p>${remoteWorkspaces.length ? `<div class="remote-workspace-choices">${remoteWorkspaces.map((w) => `<label class="check"><input type="checkbox" name="remoteWorkspaceIds" value="${e(w.id)}"><span>${e(w.name)} · ${e(state.app.machines.find((m) => m.id === w.machineId)?.name || w.machineId)}<br><small class="mono">${e(w.path)}</small><br><small>${e(remoteWorkspaceStatus(w))}</small></span></label>`).join('')}</div>` : '<p class="small-muted">尚无已登记的远端工作区。请先到“执行机器”检查并登记目录。</p>'}</fieldset>` +
     `<fieldset class="role-fieldset"><legend>参与角色</legend><div class="role-choices">${state.app.roles.map((r) => `<label class="check"><input type="checkbox" name="roleIds" value="${e(r.id)}" checked>${e(r.name)} · ${e(profileName(r.profileId))}</label>`).join('')}</div></fieldset>` +
     `<div class="form-grid">${field('maxTurns', '最大执行轮次', 60, { type: 'number', min: 1, required: true })}${field('maxCost', '模型费用上限（美元）', 0, { type: 'number', min: 0, step: 'any', required: true, help: '0 表示不设费用上限，仍限制轮次。有费用上限时，所有参与模型必须填写费率。' })}</div>` +
-    field('autonomy', '工具权限', 'approve', { choices: [['approve', '逐次审批写入与命令（推荐）'], ['trusted', '可信自主执行（允许本机命令）']], help: '自主执行不是沙箱，只能用于你信任的任务。费用为按配置费率估算，并非供应商账单。' });
+    field('autonomy', '工具权限', 'approve', { choices: [['approve', '逐次审批写入与命令（推荐）'], ['trusted', '可信自主执行（允许目标机器命令）']], help: '自主执行不是沙箱，只能用于你信任的任务。费用为按配置费率估算，并非供应商账单。' });
   dialog('给团队一个明确的目标', fields, async (data) => {
     const selected = state.app.roles.filter((role) => data.getAll('roleIds').includes(role.id));
     if (selected.filter((role) => role.kind === 'orchestrator').length !== 1) throw new Error('请选择且只选择一个负责人角色。');
     if (!selected.some((role) => role.kind === 'worker') || !selected.some((role) => role.kind === 'validator')) throw new Error('请同时选择执行者和独立验收者，才能完成交付闭环。');
+    const remoteWorkspaceIds = data.getAll('remoteWorkspaceIds');
+    if (remoteWorkspaceIds.length && data.get('workspaceStrategy') !== 'shared') throw new Error('远端工作区暂不支持独立 Git 工作树。请明确选择“共享目录”，或取消远端工作区授权。');
     const payload = Object.fromEntries(data);
     const additional = String(data.get('assertionLines')).split('\n').map((line) => line.trim()).filter(Boolean);
     delete payload.assertionLines;
     const assertions = [String(data.get('acceptance')), ...additional].map((description, index) => ({ id: `REQ-${String(index + 1).padStart(3, '0')}`, description }));
-    const mission = await api('/api/missions', 'POST', { ...payload, assertions, roleIds: data.getAll('roleIds'), maxTurns: Number(data.get('maxTurns')), maxCost: Number(data.get('maxCost')) });
+    const mission = await api('/api/missions', 'POST', { ...payload, assertions, remoteWorkspaceIds, roleIds: data.getAll('roleIds'), maxTurns: Number(data.get('maxTurns')), maxCost: Number(data.get('maxCost')) });
     location.hash = `#missions/${mission.id}`;
     toast('Mission 已保存。确认后点击启动。');
   }, '创建 Mission');
