@@ -39,7 +39,7 @@ import { parseMcpPermissions, parseMcpServer, type McpServerConfig } from "./mcp
 import { mcpSecretValues, McpOperationError, McpRuntimeManager, redactMcpValue } from "./mcp-runtime.js";
 import { parseScheduleSpec } from "./schedules.js";
 import { MachineRegistry, type NodeCommand, type RemoteMachine } from "./machines.js";
-import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
+import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
 import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
@@ -1045,12 +1045,19 @@ export class ControlPlane {
     if (mailboxStatus !== "uncertain" && mailboxStatus !== "closed") refuse("mailbox binding is not fenced or closed");
     // Cancelled entries were fenced before admission. They remain historical
     // evidence and are never moved to the replacement binding.
-    const unsettledOutbox = this.db.prepare(`SELECT 1 FROM worker_mailbox_outbox
-      WHERE runtime_id=? AND status NOT IN ('acknowledged','cancelled') LIMIT 1`).get(runtime.runtime_id);
-    if (unsettledOutbox) refuse("unacknowledged or uncertain mailbox delivery/RPC reply");
-    const unsettledInbox = this.db.prepare(`SELECT 1 FROM worker_mailbox_inbox
-      WHERE runtime_id=? AND status NOT IN ('applied','cancelled') LIMIT 1`).get(runtime.runtime_id);
-    if (unsettledInbox) refuse("unapplied or uncertain mailbox input/RPC");
+    // An uncertain reply to an already-applied non-authorizing RPC is the same
+    // kind of historical evidence: the request is durable, the reply grants
+    // nothing, and this check does not acknowledge, replay, or rebind it.
+    // Effect permits, approvals, task changes, publish receipts, and durable
+    // deliveries stay fail-closed below and in the mailbox predicate.
+    const outbox = this.workerMailbox.inspectOutbox(binding);
+    if (outbox.some((item) => !this.workerMailbox.outboxSettledForStop(binding, item.envelope.messageId))) {
+      refuse("unacknowledged or uncertain mailbox delivery/RPC reply");
+    }
+    const inbox = this.workerMailbox.inspectInbox(binding);
+    if (inbox.some((item) => !this.workerMailbox.inboxSettledForStop(binding, item.envelope.messageId))) {
+      refuse("unapplied or uncertain mailbox input/RPC");
+    }
     const durableDelivery = this.db.prepare(`SELECT 1 FROM messages m WHERE json_extract(m.data,'$.recipientId')=? AND (
       m.status IN ('dispatching','admitted','delivering','delivered','uncertain') OR
       EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=m.id AND o.status IN ('dispatching','admitted','delivering','delivered','uncertain'))
@@ -1186,6 +1193,67 @@ export class ControlPlane {
   nodeWorkerPoll(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawBinding: unknown): { envelopes: readonly WorkerEnvelope[] } {
     const binding = this.authorizeWorkerMailbox(machineId, token, sessionId, sessionEpoch, rawBinding);
     return { envelopes: this.workerMailbox.pending(binding, 1) };
+  }
+
+  /**
+   * Read-only answer for whether specific uploads on an old binding were applied.
+   * Authentication is the current node session. The binding may already be fenced
+   * and its agent epoch may have advanced. This method never receives, finishes,
+   * acknowledges, fences, or otherwise applies input.
+   */
+  nodeWorkerMailboxSettlement(
+    machineId: string,
+    token: string,
+    sessionId: string,
+    sessionEpoch: number,
+    rawBinding: unknown,
+    rawEntries: unknown
+  ): { entries: MailboxSettlementAnswer[] } {
+    this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
+    const binding = parseWorkerBinding(rawBinding);
+    if (!binding || binding.machineId !== machineId || binding.sessionId !== sessionId || binding.sessionEpoch !== sessionEpoch) {
+      throw new HttpError(403, "Worker binding does not belong to this node session");
+    }
+    const entries = this.settlementQueries(rawEntries);
+    let known = true;
+    try {
+      this.workerMailbox.inspectBinding(binding);
+    } catch {
+      known = false;
+    }
+    const entriesOut = entries.map((entry) => {
+      if (!known) return { ...entry, applied: false };
+      const row = this.db.prepare(
+        "SELECT status, sequence, sha256 FROM worker_mailbox_inbox WHERE message_id=? AND runtime_id=?"
+      ).get(entry.messageId, binding.runtimeId) as { status: string; sequence: number; sha256: string } | undefined;
+      const applied = Boolean(row && row.status === "applied" && row.sequence === entry.sequence && row.sha256 === entry.sha256);
+      return { messageId: entry.messageId, sequence: entry.sequence, sha256: entry.sha256, applied };
+    });
+    return { entries: entriesOut };
+  }
+
+  private settlementQueries(value: unknown): MailboxSettlementQuery[] {
+    if (!Array.isArray(value) || value.length > 32) throw new HttpError(400, "Mailbox settlement entries are invalid");
+    const seen = new Set<string>();
+    return value.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new HttpError(400, "Mailbox settlement entries are invalid");
+      const record = entry as Record<string, unknown>;
+      const keys = Object.keys(record);
+      if (keys.length !== 3 || !keys.includes("messageId") || !keys.includes("sequence") || !keys.includes("sha256")) {
+        throw new HttpError(400, "Mailbox settlement entries are invalid");
+      }
+      const messageId = record.messageId;
+      const sequence = record.sequence;
+      const sha256 = record.sha256;
+      if (typeof messageId !== "string" || messageId.length < 1 || messageId.length > 240 || /\p{Cc}/u.test(messageId) ||
+          typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 1 ||
+          typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) {
+        throw new HttpError(400, "Mailbox settlement entries are invalid");
+      }
+      if (seen.has(messageId)) throw new HttpError(400, "Mailbox settlement entries are invalid");
+      seen.add(messageId);
+      return { messageId, sequence, sha256 };
+    });
   }
 
   nodeWorkerAck(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawBinding: unknown, rawReceipt: unknown): { acknowledged: boolean } {

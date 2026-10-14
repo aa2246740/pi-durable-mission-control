@@ -4,6 +4,7 @@ import { realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Agent } from "./contracts.js";
 import { ControlPlane, HttpError } from "./control.js";
+import { remoteWorkspacePromptFlags } from "./prompts.js";
 import type { RpcMessage } from "./worker.js";
 import { applyWorkerNotice, parseWorkerNotice } from "./worker-events.js";
 type Handle = { child: ChildProcess; token: string; epoch: number; ready: Promise<void>; close?: Promise<void>; stopping: boolean };
@@ -183,6 +184,7 @@ export class WorkerManager {
     if (profile.credentialEnv && !process.env[profile.credentialEnv]) throw new HttpError(409, `Missing required credential ${profile.credentialEnv}`);
     if (!profile.toolCalling) throw new HttpError(409, "Agent model profile does not support tool calling");
     const token = randomBytes(32).toString("hex");
+    const promptMission = this.control.missionById(owner.missionId);
     const config = {
       agentId: owner.id,
       missionId: owner.missionId,
@@ -190,7 +192,8 @@ export class WorkerManager {
       token,
       durablePath: join(this.control.home, "agents", `${agent.id}.sqlite`),
       workspacePath: owner.workspacePath,
-      workspaceStrategy: this.control.missionById(owner.missionId)?.workspaceStrategy ?? "shared",
+      workspaceStrategy: promptMission?.workspaceStrategy ?? "shared",
+      ...remoteWorkspacePromptFlags(role.kind, promptMission?.remoteWorkspaceIds),
       profile,
       role,
       ...(this.testOnlyScripted ? { testOnlyScripted: true } : {}),

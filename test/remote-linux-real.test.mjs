@@ -4,9 +4,9 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assertCoordinatorExit, commandOutput, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
-import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, touchedOracle, oracleTouches } from "../acceptance/remote-linux/real.mjs";
-import { readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
+import { assertCoordinatorExit, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
+import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
+import { sessionFailure, readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
 import { ControlPlane } from "../dist/control.js";
 import { shellQuote } from "../acceptance/remote-linux/mock.mjs";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -181,7 +181,7 @@ test("stopped pi-durable SQLite evidence retains assistant tool order and cumula
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage([{type:"thinking",thinking:fakeKey}, fauxToolCall("Probe",{secret:fakeKey})], {stopReason:"toolUse"}),
-    fauxAssistantMessage([{type:"text",text:"completed"},fauxToolCall("Finish",{})], {stopReason:"toolUse"})
+    {...fauxAssistantMessage([{type:"text",text:"completed"},fauxToolCall("Finish",{})], {stopReason:"toolUse"}), responseModel:"unit-actual-model"}
   ]);
   const models = createModels(); models.setProvider(faux.provider);
   const registry = createRegistry();
@@ -205,6 +205,7 @@ test("stopped pi-durable SQLite evidence retains assistant tool order and cumula
   const session = readSessionEvidence(path);
   assert.equal(session.complete,true);
   assert.equal(session.modelCalls,2);
+  assert.deepEqual(session.models,[{modelId:"faux-1",responseModel:null,calls:1},{modelId:"faux-1",responseModel:"unit-actual-model",calls:1}]);
   assert.deepEqual(session.tools.map((tool)=>tool.name),["Probe","Finish"]);
   assert.ok(session.tools[0].commitSeq < session.tools[1].commitSeq);
   assert.deepEqual(session.usage,Object.fromEntries(["input","output","cacheRead","cacheWrite","totalTokens"].map((key)=>[key,expected[key]])));
@@ -215,8 +216,11 @@ test("stopped pi-durable SQLite evidence retains assistant tool order and cumula
   assert.equal(sha256(readFileSync(path)),before,"the read-only query must leave the actual database unchanged");
   const exported = {mission:{status:"blocked",turns:3,maxTurns:60,costKnown:false,cost:0},agents:[{id:"o",kind:"orchestrator",machineId:"local"},{id:"w",kind:"worker",machineId:"linux"}],
     generationAdmissions:[{agent_id:"o"},{agent_id:"o",generation_id:"auxiliary:unit"},{agent_id:"w"}],transcripts:[],artifacts:[],validationReceipts:[],blockers:[{kind:"user_input"}],events:[]};
-  const evidence = collectRealEvidence(exported,undefined,{path:"/host/totals.acceptance.test.mjs"},{},[{agentId:"o",...session},{agentId:"w",...readSessionEvidence(join(directory,"missing.sqlite"))}]);
+  const evidence = collectRealEvidence(exported,undefined,{path:"/host/totals.acceptance.test.mjs"},{},[{agentId:"o",...session},{agentId:"w",...readSessionEvidence(join(directory,"missing.sqlite"))}],{orchestrator:{modelId:"configured-model"}});
   assert.equal(evidence.roles.orchestrator.modelCalls,2);
+  assert.deepEqual(evidence.roles.orchestrator.responseModels,["unit-actual-model"]);
+  assert.equal(evidence.roles.orchestrator.modelMismatch,true);
+  assert.equal(evidence.roles.orchestrator.unreportedModelCalls,1);
   assert.equal(evidence.roles.orchestrator.admittedModelCalls,2);
   assert.deepEqual(evidence.roles.orchestrator.usage,session.usage);
   assert.equal(evidence.roles.worker.modelCalls,null);
@@ -233,14 +237,25 @@ test("stopped pi-durable SQLite evidence retains assistant tool order and cumula
 
 test("real success gate rejects absent injection, changed CAS, wrong receipts and oracle touches without guest clock ordering", () => {
   const digest = "a".repeat(64);
-  const detail = {mission:{status:"completed"},tasks:[{status:"accepted"}],blockers:[],artifacts:[{id:"a",sha256:digest,agentId:"w",remoteProvenance:{machineId:"linux"}}],
+  const detail = {mission:{status:"completed"},tasks:[{id:"task",status:"accepted",ownerId:"w",validatorId:"v"}],blockers:[],artifacts:[{id:"a",path:"/work/totals.mjs",taskId:"task",sha256:digest,agentId:"w",remoteProvenance:{machineId:"linux"}}],validations:[{taskId:"task",passed:true,receiptId:"receipt-1"}],
     agents:[{id:"w",kind:"worker",machineId:"linux"},{id:"v",kind:"validator",machineId:"local"}],
-    validationReceipts:[{id:"receipt-1",validatorId:"v",command:"unit-command",artifactIds:["a"],artifactDigests:{a:digest},exitCode:0,snapshotIntegrity:true,workspaceKind:"remote-snapshot",stdout:"# tests 4\n# pass 4\n# fail 0",createdAt:"2026-10-14T00:00:02Z"}]};
-  const evidence = {tools:[],oracleTouches:[],acceptance:{checks:[{phase:"publication",intact:true},{phase:"receipt",receiptId:"receipt-1",intact:true}]},mutation:{artifactId:"a",beforeSha256:digest,afterSha256:"b".repeat(64),casBeforeSha256:digest,casAfterSha256:digest,casFinalSha256:digest,completedAt:"2026-10-14T00:00:01Z"}};
+    validationReceipts:[{id:"receipt-1",taskId:"task",validatorId:"v",command:"unit-command",artifactIds:["a"],artifactDigests:{a:digest},exitCode:0,snapshotIntegrity:true,workspaceKind:"remote-snapshot",stdout:"# tests 4\n# pass 4\n# fail 0",createdAt:"2026-10-14T00:00:02Z"}]};
+  const evidence = {tools:[],oracleTouches:[],hostRuntime:{beforeSha256:digest,afterSha256:digest},independentReview:{artifactId:"a",artifactSha256:digest,casSha256:digest,acceptanceSha256:digest,tests:4,receiptId:"receipt-1",receiptPassed:true,agreesWithReceipt:true,passed:true},acceptance:{sha256:digest,tests:4,checks:[{phase:"publication",intact:true},{phase:"receipt",receiptId:"receipt-1",intact:true}]},mutation:{artifactId:"a",beforeSha256:digest,afterSha256:"b".repeat(64),casBeforeSha256:digest,casAfterSha256:digest,casFinalSha256:digest,completedAt:"2026-10-14T00:00:01Z"}};
   assert.doesNotThrow(()=>assertRealSuccess(detail,evidence,"unit-command","linux"));
+  const extra = [{id:"idle",status:"ready",attempt:0},{id:"cancelled",status:"cancelled",attempt:1}];
+  assert.doesNotThrow(()=>assertRealSuccess({...detail,tasks:[...detail.tasks,...extra]},evidence,"unit-command","linux"));
+  assert.doesNotThrow(()=>assertRealSuccess({...detail,artifacts:[{id:"wrong",path:"/work/wrong.mjs"},...detail.artifacts]},evidence,"unit-command","linux"));
+  for (const task of [{id:"two",status:"accepted"},{id:"started",status:"ready",attempt:1},{id:"running",status:"running",attempt:0},{id:"review",status:"review",attempt:0}]) {
+    assert.throws(()=>assertRealSuccess({...detail,tasks:[...detail.tasks,task]},evidence,"unit-command","linux"));
+  }
+  assert.throws(()=>assertRealSuccess({...detail,validations:[{taskId:"task",passed:false,receiptId:"receipt-1"}]},evidence,"unit-command","linux"));
+  for (const independentReview of [undefined,{...evidence.independentReview,passed:false,agreesWithReceipt:false},{...evidence.independentReview,receiptId:"unrelated"}]) {
+    assert.throws(()=>assertRealSuccess(detail,{...evidence,independentReview},"unit-command","linux"));
+  }
+  assert.throws(()=>assertRealSuccess(detail,{...evidence,hostRuntime:{beforeSha256:digest,afterSha256:"changed"}},"unit-command","linux"));
   for (const patch of [{mutation:undefined},{mutation:{...evidence.mutation,casAfterSha256:"bad"}},{oracleTouches:[{command:"chmod"}]},{acceptance:{checks:[{phase:"end",intact:false}]}},{tools:[{name:"RequestUserInput"}]}]) assert.throws(()=>assertRealSuccess(detail,{...evidence,...patch},"unit-command","linux"));
   assert.doesNotThrow(()=>assertRealSuccess(detail,{...evidence,mutation:{...evidence.mutation,completedAt:"2026-10-14T00:00:03Z"}},"unit-command","linux"));
-  for (const patch of [{exitCode:1},{command:"changed"},{workspaceKind:"local"},{snapshotIntegrity:false},{artifactDigests:{a:"bad"}}]) {
+  for (const patch of [{exitCode:1},{command:"changed"},{workspaceKind:"local"},{snapshotIntegrity:false},{artifactDigests:{a:"bad"}},{taskId:"other"},{validatorId:"w"},{stdout:"# tests 40\n# pass 40\n# fail 0"},{stdout:"forged # tests 4\n# pass 4 extra\n# fail 0"}]) {
     assert.throws(()=>assertRealSuccess({...detail,validationReceipts:[{...detail.validationReceipts[0],...patch}]},evidence,"unit-command","linux"));
   }
 });
@@ -350,4 +365,120 @@ test("secrets rejections distinguish metadata, missing references and format wit
   assert.throws(()=>readSecrets(path,["MISSING"]),/Secrets file rejected: missing referenced credential/);
   writeFileSync(path,`MINIMAX_CN=${fakeKey}\nMINIMAX_CN=${fakeKey}\n`);
   assert.throws(()=>readSecrets(path,["MINIMAX_CN"]),(error)=>error.message==="Secrets file rejected: referenced KEY=VALUE format" && !error.message.includes(fakeKey));
+});
+
+
+test("independent review runs original in-memory tests against verified CAS bytes and preserves disagreement", async (t) => {
+  const directory = temporary(t);
+  const acceptance = writeFrozenAcceptance(directory);
+  const original = acceptance.source;
+  assert.equal(touchedOracle('python3 -c \'import os; p=os.environ["HOME"]+"/"+"totals."+"acceptance.test.mjs"; os.system("chflags nouchg "+p)\'',acceptance.path),false);
+  const casPath = join(directory,"cas");
+  const tap = "# tests 4\n# pass 4\n# fail 0\n";
+  const receipt = {id:"validator-receipt",exitCode:0,stdout:tap};
+  // Replacing the host oracle and reporting fake TAP cannot change the retained source.
+  chmodSync(acceptance.path,0o600);
+  writeFileSync(acceptance.path,"console.log('forged host tests');");
+  let launches = 0;
+  const execute = async (args) => {
+    launches++;
+    assert.deepEqual(args.slice(0,5),["run","--rm","--name","mc-acc-k2-gpt-unit-review","--arch"]);
+    assert.equal(args.filter((value)=>value === "-v").length,2);
+    const mounts = args.filter((value,index)=>args[index-1] === "-v");
+    assert.ok(mounts.every((value)=>value.endsWith(":ro")));
+    const hostTest = mounts[0].split(":")[0], snapshot = mounts[1].split(":")[0];
+    assert.equal(readFileSync(hostTest,"utf8"),original);
+    assert.equal(sha256(readFileSync(join(snapshot,"totals.mjs"))),sha256(readFileSync(casPath)));
+    assert.equal(statSync(hostTest).mode & 0o222,0);
+    assert.equal(statSync(join(snapshot,"totals.mjs")).mode & 0o222,0);
+    assert.equal(args[args.indexOf("--workdir")+1].startsWith("/validations/remote/"),true);
+    assert.equal(args.includes(process.execPath),false);
+    assert.equal(args.includes("node:22-bookworm-slim"),true);
+    const result = spawnSync(process.execPath,["--test","--test-reporter=tap",hostTest],{cwd:snapshot,env:{PATH:process.env.PATH},encoding:"utf8"});
+    return {exitCode:result.status,stdout:result.stdout,stderr:result.stderr};
+  };
+  const run = async (source, index, overrides = {}) => {
+    writeFileSync(casPath,source);
+    const proof = join(directory,`proof-${index}`); mkdirSync(proof);
+    const artifact = {id:"totals",path:"/work/totals.mjs",sha256:sha256(source)};
+    const review = await independentReview({proof,acceptance,artifact,casPath,receipt,name:"mc-acc-k2-gpt-unit-review",image:"node:22-bookworm-slim",execute,...overrides});
+    return {review,artifact};
+  };
+  const good = await run(goodTotals,1);
+  assert.equal(good.review.passed,true);
+  assert.equal(good.review.agreesWithReceipt,true);
+  assert.doesNotThrow(()=>assertIndependentReview(good.review,acceptance,good.artifact,receipt));
+  const bad = await run("export const totalCents = () => 0;",2);
+  assert.equal(bad.review.passed,false);
+  assert.equal(bad.review.exitCode,1);
+  assert.equal(bad.review.receiptPassed,true);
+  assert.equal(bad.review.agreesWithReceipt,false);
+  assert.match(bad.review.stdout,/not ok/);
+  assert.throws(()=>assertIndependentReview(bad.review,acceptance,bad.artifact,receipt),/disagrees/);
+  const rejectedReceipt = await run(goodTotals,3,{receipt:{...receipt,exitCode:1}});
+  assert.equal(rejectedReceipt.review.passed,true);
+  assert.equal(rejectedReceipt.review.agreesWithReceipt,false);
+  assert.throws(()=>assertIndependentReview(rejectedReceipt.review,acceptance,rejectedReceipt.artifact,receipt));
+  const corrupt = await run(goodTotals,4,{artifact:{id:"totals",path:"/work/totals.mjs",sha256:"a".repeat(64)}});
+  assert.equal(corrupt.review.passed,false);
+  assert.match(corrupt.review.error,/CAS hash mismatch/);
+  const changedOracle = await run(goodTotals,5,{acceptance:{...acceptance,source:"forged"}});
+  assert.equal(changedOracle.review.passed,false);
+  assert.match(changedOracle.review.error,/In-memory frozen acceptance hash mismatch/);
+  assert.equal(launches,3,"Hash failures must never launch the runner");
+});
+
+test("host runtime hashing rejects changed and missing binaries using a local fixture", (t) => {
+  const directory = temporary(t), path = join(directory,"node-fixture");
+  writeFileSync(path,"original node fixture");
+  const runtime = {path,beforeSha256:sha256(readFileSync(path))};
+  assert.doesNotThrow(()=>assertHostRuntime(checkHostRuntime(runtime)));
+  writeFileSync(path,"forged node wrapper");
+  assert.throws(()=>assertHostRuntime(checkHostRuntime(runtime)),/Host node binary changed/);
+  rmSync(path);
+  assert.equal(checkHostRuntime(runtime).afterSha256,null);
+  assert.throws(()=>assertHostRuntime(checkHostRuntime(runtime)));
+});
+
+test("publication observation records wrong paths and lets later correct publication proceed", () => {
+  const detail = {agents:[{id:"w",kind:"worker"}],artifacts:[
+    {id:"wrong",path:"/work/nested/totals.mjs",sha256:"wrong",remoteProvenance:{machineId:"linux"}},
+    {id:"right",path:"/work/totals.mjs",sha256:"right",remoteProvenance:{machineId:"linux"}}],events:[
+    {seq:1,type:"artifact_published",agentId:"w",data:{artifactId:"wrong",sha256:"wrong"}},
+    {seq:2,type:"artifact_published",agentId:"w",data:{artifactId:"right",sha256:"right"}}]};
+  const seen = new Set(), rejected = [];
+  assert.equal(findRealPublication({...detail,events:detail.events.slice(0,1)},"linux",seen,rejected),undefined);
+  assert.deepEqual(rejected,[{eventSeq:1,artifactId:"wrong",path:"/work/nested/totals.mjs",reason:"Expected /work/totals.mjs"}]);
+  assert.equal(findRealPublication(detail,"linux",seen,rejected).artifact.id,"right");
+  assert.equal(findRealPublication(detail,"linux",seen,rejected),undefined);
+  assert.equal(rejected.length,1);
+  assert.throws(()=>findRealPublication(detail,"foreign",new Set(),[]),/assigned Linux node/);
+});
+
+test("session read errors retain safe error codes or categories without database contents", async (t) => {
+  const directory = temporary(t), path = join(directory,"bad.sqlite");
+  writeFileSync(path,fakeKey);
+  const local = readSessionEvidence(path);
+  assert.equal(local.complete,false);
+  assert.equal(local.errorCode,"ERR_SQLITE_ERROR");
+  assert.equal(local.errorCategory,"database-or-schema");
+  const remote = JSON.parse(await commandOutput(process.execPath,["-e",remoteSessionScript,path],{PATH:process.env.PATH}));
+  assert.deepEqual(remote,local);
+  assert.equal(JSON.stringify(local).includes(fakeKey),false);
+  assert.equal(sessionFailure(new SyntaxError(fakeKey)).errorCategory,"invalid-json");
+  assert.equal(sessionFailure({code:fakeKey,message:fakeKey}).errorCode,null);
+});
+
+
+test("frozen flag subprocess environment excludes inherited fake role credentials", async (t) => {
+  const previous = process.env.UNIT_ACCEPTANCE_FLAG_KEY;
+  process.env.UNIT_ACCEPTANCE_FLAG_KEY = fakeKey;
+  t.after(()=> { if (previous === undefined) delete process.env.UNIT_ACCEPTANCE_FLAG_KEY; else process.env.UNIT_ACCEPTANCE_FLAG_KEY = previous; });
+  const output = await commandOutput(process.execPath,["-e","console.log(JSON.stringify(process.env))"],frozenFlagEnvironment());
+  const inherited = JSON.parse(output);
+  assert.equal(inherited.PATH,process.env.PATH);
+  assert.equal(inherited.UNIT_ACCEPTANCE_FLAG_KEY,undefined);
+  // macOS spawn adds this system variable even when the caller supplies only PATH.
+  assert.ok(Object.keys(inherited).every((key)=>key === "PATH" || (process.platform === "darwin" && key === "__CF_USER_TEXT_ENCODING")));
+  assert.equal(output.includes(fakeKey),false);
 });

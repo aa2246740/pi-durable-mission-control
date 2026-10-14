@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { nextCall, startMock, transcript, shellQuote } from "../acceptance/remote-linux/mock.mjs";
-import { parseOptions } from "../acceptance/remote-linux/run.mjs";
+import { nextCall, startMock, transcript, shellQuote, pauseReport, pauseQuestion } from "../acceptance/remote-linux/mock.mjs";
+import { parseOptions, assertPauseResume } from "../acceptance/remote-linux/run.mjs";
 
 const context = { acceptanceCommand: "node --test /coordinator/accept.test.mjs", hostTestPath: "/coordinator/accept.test.mjs" };
 function request(kind, state, last) {
-  const names = kind === "orchestrator" ? ["SpawnAgent", "GetMissionState", "CreateTask", "UpdateTask", "SendMessage", "WaitForMessage", "CompleteMission"]
+  const names = kind === "orchestrator" ? ["SpawnAgent", "GetMissionState", "CreateTask", "UpdateTask", "SendMessage", "WaitForMessage", "CompleteMission", "RequestUserInput"]
     : kind === "worker" ? ["bash", "GetMissionState", "write_file", "PublishArtifact", "UpdateTask", "Report", "WaitForMessage"]
       : ["GetMissionState", "RunValidation", "ValidateTask", "Report", "WaitForMessage"];
   const body = { model: "mock", stream: true, tools: names.map((name) => ({ type: "function", function: { name } })), messages: [
@@ -109,4 +109,110 @@ test("acceptance shell paths preserve quotes, spaces and shell metacharacters", 
   for (const path of paths) {
     assert.equal(execFileSync("/bin/sh", ["-c", `printf '%s' ${shellQuote(path)}`], { encoding: "utf8" }), path);
   }
+});
+
+
+test("pause-resume mock reports the successful self-check and waits before publication", () => {
+  const running = state();
+  running.tasks[0].status = "running";
+  const pauseContext = { ...context, scenario: "pause-resume" };
+  const selfCheck = { name: "bash", args: { command: "self-check" }, value: { status: "succeeded", result: { exitCode: 0 } } };
+  const report = nextCall(request("worker", running, selfCheck), pauseContext);
+  assert.equal(report.name, "Report");
+  assert.equal(report.args.summary, pauseReport);
+  assert.throws(() => nextCall(request("worker", running, { ...selfCheck, value: { status: "succeeded", result: { exitCode: 1 } } }), pauseContext));
+  const body = request("worker", running, selfCheck);
+  const add = (name, args, value) => {
+    const id = `pause-${body.messages.length}`;
+    body.messages.push({ role: "assistant", tool_calls: [{ id, function: { name, arguments: JSON.stringify(args) } }] },
+      { role: "tool", tool_call_id: id, content: JSON.stringify(value) });
+  };
+  add("Report", report.args, { recorded: true });
+  assert.equal(nextCall(body, pauseContext).name, "WaitForMessage");
+  add("GetMissionState", {}, running);
+  assert.equal(nextCall(body, pauseContext).name, "WaitForMessage");
+  add("GetMissionState", {}, { ...running, blockers: [{ kind: "user_input", text: pauseQuestion, status: "open" }] });
+  assert.equal(nextCall(body, pauseContext).name, "WaitForMessage");
+  add("GetMissionState", {}, { ...running, blockers: [{ kind: "user_input", text: pauseQuestion + "\nResolution: continue", status: "resolved" }] });
+  assert.deepEqual(nextCall(body, pauseContext), { role: "worker", name: "PublishArtifact", args: { name: "Frozen Linux delivery", path: "linux-delivery.json", taskId: "real-task" } });
+});
+
+test("pause-resume orchestrator asks once after the worker report and follows the human answer", () => {
+  const running = state();
+  running.tasks[0].status = "running";
+  const body = request("orchestrator", running);
+  body.messages[1].content = pauseReport;
+  assert.equal(nextCall(body, context).name, "SendMessage", "Default scenario must not pause");
+  const pauseContext = { ...context, scenario: "pause-resume" };
+  assert.deepEqual(nextCall(body, pauseContext), { role: "orchestrator", name: "RequestUserInput", args: { question: pauseQuestion } });
+  const afterQuestion = request("orchestrator", running, { name: "RequestUserInput", value: { id: "blocker" }, args: { question: pauseQuestion } });
+  afterQuestion.messages[1].content = pauseReport;
+  assert.equal(nextCall(afterQuestion, pauseContext).name, "WaitForMessage");
+  running.blockers = [{ kind: "user_input", text: pauseQuestion + "\nResolution: continue", status: "resolved" }];
+  const answered = request("orchestrator", running);
+  answered.messages[1].content = pauseReport;
+  assert.equal(nextCall(answered, pauseContext).name, "SendMessage");
+  const beforeReport = request("orchestrator", { ...running, blockers: [] });
+  assert.equal(nextCall(beforeReport, pauseContext).name, "SendMessage");
+});
+
+test("pause-resume CLI rejects unknown scenarios and real-model pauses", () => {
+  assert.equal(parseOptions(["--scenario", "pause-resume"]).scenario, "pause-resume");
+  assert.equal(parseOptions(["--scenario", "default"]).scenario, "default");
+  for (const args of [["--scenario"], ["--scenario", "unknown"], ["--scenario", "pause-resume", "--real", "config.json", "--secrets-file", "secrets"]]) assert.throws(() => parseOptions(args));
+});
+
+test("pause-resume evidence rejects runtime, effect and delivery replay", () => {
+  const old = { runtimeId: "old", epoch: 2, machineId: "linux", agentId: "worker" };
+  const replacement = { ...old, runtimeId: "new", epoch: 4 };
+  const stoppedRuntime = { binding: old, state: "closed", stopProvenance: "controlled", report: { outcome: "stopped" } };
+  const methods = ["write_file", "bash", "PublishArtifact", "bash"];
+  const effects = methods.map((method, i) => ({ command_id: `effect-${i}`, response: JSON.stringify({ effectPermit: { method, binding: i < 2 ? old : replacement } }) }));
+  const detail = { mission: { status: "completed" }, messages: [{ id: "delivery", attempt: 1 }], events: [
+    { type: "remote_runtime_reassigned", data: { previousRuntimeId: "old", runtimeId: "new" } },
+    ...effects.map((row) => ({ type: "remote_effect_receipt", data: { effectId: row.command_id, receipt: { status: "succeeded" } } })),
+    { type: "delivery_completed", data: { messageId: "delivery", attempt: 1 } }
+  ] };
+  const transport = { inbox: [], outbox: [], deliveries: [{ message_id: "delivery", attempt: 1 }], effects };
+  const evidence = { stoppedRuntime, humanActions: [{ action: "answer" }], transportBeforeAnswer: { inbox: [], outbox: [], effects: effects.slice(0, 2) } };
+  const records = methods.map((name) => ({ role: "worker", name }));
+  assert.equal(assertPauseResume(detail, [stoppedRuntime, { binding: replacement }], evidence, records, transport).effectReceipts, 4);
+  const mutations = [
+    (d) => d.events.push(d.events.at(-1)),
+    (d) => d.events[2].data.effectId = d.events[1].data.effectId,
+    (d) => d.events[1].data.receipt.status = "uncertain",
+    (d) => d.messages[0].attempt = 2,
+    (d) => d.events.push({ type: "worker_start_failed" }),
+    (d) => d.mission.status = "failed"
+  ];
+  for (const mutate of mutations) {
+    const changed = structuredClone(detail);
+    mutate(changed);
+    assert.throws(() => assertPauseResume(changed, [stoppedRuntime, { binding: replacement }], evidence, records, transport));
+  }
+  assert.throws(() => assertPauseResume(detail, [stoppedRuntime, { binding: { ...replacement, epoch: 2 } }], evidence, records, transport));
+  assert.throws(() => assertPauseResume(detail, [stoppedRuntime, { binding: { ...replacement, machineId: "other" } }], evidence, records, transport));
+  const wrongPublication = structuredClone(transport);
+  wrongPublication.effects[2].response = JSON.stringify({ effectPermit: { method: "PublishArtifact", binding: old } });
+  assert.throws(() => assertPauseResume(detail, [stoppedRuntime, { binding: replacement }], evidence, records, wrongPublication));
+  assert.throws(() => assertPauseResume(detail, [stoppedRuntime, { binding: replacement }], evidence, [...records, records[0]], transport));
+  assert.throws(() => assertPauseResume(detail, [stoppedRuntime, { binding: replacement }], evidence, records, { ...transport, deliveries: [...transport.deliveries, transport.deliveries[0]] }));
+  assert.throws(() => assertPauseResume(detail, [stoppedRuntime, { binding: replacement }], evidence, records, { ...transport, outbox: [{ runtime_id: "old" }] }));
+});
+
+
+test("mock server forwards the pause-resume scenario into tool decisions", async (t) => {
+  const records = [];
+  const server = await startMock({ ...context, scenario: "pause-resume", credential: "pause-credential", record: (record) => records.push(record), fail: (error) => assert.fail(error.message) });
+  t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }));
+  const running = state();
+  running.tasks[0].status = "running";
+  const body = request("orchestrator", running);
+  body.messages[1].content = pauseReport;
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, {
+    method: "POST", headers: { authorization: "Bearer pause-credential" }, body: JSON.stringify(body)
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(records.map(({ role, name, args }) => ({ role, name, args })), [{ role: "orchestrator", name: "RequestUserInput", args: { question: pauseQuestion } }]);
 });

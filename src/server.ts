@@ -127,7 +127,6 @@ export async function startServer(options: ServerOptions) {
       return enabled === true;
     },
     rpc: async (binding, payload: WorkerRpcPayload) => {
-      const owner = control.getAgentPublic(binding.agentId);
       try {
         const result = await control.workerCommand({
           type: "rpc",
@@ -145,11 +144,14 @@ export async function startServer(options: ServerOptions) {
           return { kind: "reply", rpcId: payload.rpcId, ok: false, error: "Remote operation was rejected" };
         }
         throw error;
-      } finally {
-        if (owner && owner.missionId) {
-          scheduleLifecycleSync(owner.missionId, { id: owner.id, epoch: owner.epoch });
-        }
       }
+    },
+    // Lifecycle sync can fence this binding. It must run only after the
+    // dispatcher has stored finishWithReply, including when the RPC itself
+    // blocked the mission. The error path still schedules sync after fence.
+    afterRpc: (binding) => {
+      const owner = control.getAgentPublic(binding.agentId);
+      if (owner?.missionId) scheduleLifecycleSync(owner.missionId, { id: owner.id, epoch: owner.epoch });
     },
     notice: (binding, notice) => {
       const owner = control.getAgentPublic(binding.agentId);
@@ -282,6 +284,18 @@ export async function startServer(options: ServerOptions) {
               outcome: body.outcome as "stopped" | "uncertain" | "rejected",
               ...(body.stopReason === undefined ? {} : { stopReason: body.stopReason })
             }
+          ));
+        }
+        if (url.pathname === "/api/nodes/mailbox/settlement") {
+          const body = await readBody(request);
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "binding", "entries"]);
+          return jsonResponse(response, 200, control.nodeWorkerMailboxSettlement(
+            text(body.machineId, "machineId", 64),
+            nodeToken,
+            text(body.sessionId, "sessionId", 64),
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch"),
+            body.binding,
+            body.entries
           ));
         }
         const mailboxAction = new Map([

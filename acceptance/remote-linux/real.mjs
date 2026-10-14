@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { constants, closeSync, fstatSync, openSync, readFileSync, readdirSync, writeFileSync, statSync } from "node:fs";
+import { constants, closeSync, fstatSync, openSync, readFileSync, readdirSync, writeFileSync, statSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { shellQuote } from "./mock.mjs";
 
@@ -108,7 +108,7 @@ test('reject invalid fields and unsafe amounts', () => {
 });
 `;
   writeFileSync(path, source, { mode: 0o400, flag: "wx" });
-  return { path, sha256: sha256(readFileSync(path)), tests: 4 };
+  return Object.defineProperty({ path, sha256: sha256(readFileSync(path)), tests: 4 }, "source", { value: source });
 }
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
@@ -162,8 +162,8 @@ export function realMission({ acceptanceCommand, localWorkspaceId, remoteWorkspa
     assertions: [{ id: "TOTALS-FROZEN", description: `${businessRules} Independent validation of the published Linux snapshot passes all four host tests.` }] };
 }
 
-export function collectRealEvidence(exported, mutation, acceptance, casHashes = {}, sessions = []) {
-  const roles = Object.fromEntries(kinds.map((kind) => [kind, { modelCalls: 0, admittedModelCalls: 0, usage: null, evidenceComplete: true }]));
+export function collectRealEvidence(exported, mutation, acceptance, casHashes = {}, sessions = [], config = {}) {
+  const roles = Object.fromEntries(kinds.map((kind) => [kind, { modelCalls: 0, admittedModelCalls: 0, usage: null, evidenceComplete: true, configuredModelId: config[kind]?.modelId ?? null, responseModels: [], modelMismatch: false, unreportedModelCalls: 0 }]));
   const tools = [];
   const agents = exported.agents.map((agent) => {
     const session = sessions.find((value) => value.agentId === agent.id) ?? { agentId: agent.id, complete: false, error: "Session evidence not collected" };
@@ -171,6 +171,12 @@ export function collectRealEvidence(exported, mutation, acceptance, casHashes = 
     const role = roles[agent.kind];
     if (role) {
       role.admittedModelCalls += admittedModelCalls;
+      for (const model of session.models ?? []) {
+        if (model.responseModel) {
+          if (!role.responseModels.includes(model.responseModel)) role.responseModels.push(model.responseModel);
+          if (role.configuredModelId && model.responseModel !== role.configuredModelId) role.modelMismatch = true;
+        } else role.unreportedModelCalls += model.calls;
+      }
       role.evidenceComplete &&= session.complete;
       if (session.complete) {
         role.modelCalls += session.modelCalls;
@@ -191,14 +197,30 @@ export function collectRealEvidence(exported, mutation, acceptance, casHashes = 
     validationReceipts: exported.validationReceipts, blockers: exported.blockers };
 }
 
+export function realAcceptanceSelection(detail, acceptanceCommand, machineId, artifactId) {
+  const accepted = detail.tasks.filter((task) => task.status === "accepted");
+  assert.equal(accepted.length, 1, "Expected exactly one accepted task");
+  const task = accepted[0];
+  assert.ok(detail.tasks.every((other) => other === task || other.status === "cancelled" ||
+    (other.attempt === 0 && ["pending", "ready", "assigned", "blocked"].includes(other.status))), "Another task has started without acceptance");
+  const artifact = detail.artifacts.find((value) => value.id === artifactId);
+  assert.ok(artifact, "Frozen totals artifact missing");
+  assert.equal(artifact.path, "/work/totals.mjs");
+  assert.equal(artifact.taskId, task.id);
+  assert.equal(artifact.agentId, task.ownerId);
+  assert.equal(artifact.remoteProvenance.machineId, machineId);
+  const validation = detail.validations.filter((value) => value.taskId === task.id).at(-1);
+  assert.ok(validation?.passed, "Accepted task has no successful validator decision");
+  const receipt = detail.validationReceipts.find((value) => value.id === validation.receiptId && value.taskId === task.id &&
+    value.validatorId === task.validatorId && value.command === acceptanceCommand && value.artifactIds.includes(artifact.id));
+  assert.ok(receipt, "No exact frozen acceptance receipt for the accepted task");
+  return { task, artifact, receipt };
+}
+
 export function assertRealSuccess(detail, evidence, acceptanceCommand, machineId) {
   assert.equal(detail.mission.status, "completed");
-  assert.equal(detail.tasks.length, 1);
-  assert.equal(detail.tasks[0].status, "accepted");
   assert.deepEqual(detail.blockers, []);
-  assert.equal(detail.artifacts.length, 1);
-  const artifact = detail.artifacts[0];
-  assert.equal(artifact.remoteProvenance.machineId, machineId);
+  const { artifact, receipt } = realAcceptanceSelection(detail, acceptanceCommand, machineId, evidence.mutation?.artifactId);
   const mutation = evidence.mutation;
   assert.ok(mutation, "No post-publication fault injection observed");
   assert.equal(mutation.artifactId, artifact.id);
@@ -206,15 +228,15 @@ export function assertRealSuccess(detail, evidence, acceptanceCommand, machineId
   assert.equal(mutation.casBeforeSha256, artifact.sha256);
   assert.equal(mutation.casAfterSha256, artifact.sha256);
   assert.equal(mutation.casFinalSha256, artifact.sha256);
-  const receipt = detail.validationReceipts.find((value) => value.command === acceptanceCommand && value.artifactIds.includes(artifact.id));
-  assert.ok(receipt, "No exact frozen acceptance receipt");
   assert.equal(receipt.exitCode, 0);
   assert.equal(receipt.snapshotIntegrity, true);
   assert.equal(receipt.workspaceKind, "remote-snapshot");
   assert.equal(receipt.artifactDigests[artifact.id], artifact.sha256);
-  assert.match(receipt.stdout, /# tests 4/);
-  assert.match(receipt.stdout, /# pass 4/);
-  assert.match(receipt.stdout, /# fail 0/);
+  assert.match(receipt.stdout, /^# tests 4$/m);
+  assert.match(receipt.stdout, /^# pass 4$/m);
+  assert.match(receipt.stdout, /^# fail 0$/m);
+  assertHostRuntime(evidence.hostRuntime);
+  assertIndependentReview(evidence.independentReview, evidence.acceptance, artifact, receipt);
   assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle was touched by a local shell command");
   assert.ok(evidence.acceptance.checks.some((check) => check.phase === "publication"), "Publication hash check missing");
   assert.ok(evidence.acceptance.checks.some((check) => check.phase === "receipt" && check.receiptId === receipt.id), "Receipt hash check missing");
@@ -227,6 +249,75 @@ export function assertRealSuccess(detail, evidence, acceptanceCommand, machineId
   assert.equal(validator.machineId, "local");
   assert.notEqual(worker.id, validator.id);
   assert.equal(evidence.tools.some((tool) => tool.name === "RequestUserInput"), false);
+}
+
+export function findRealPublication(detail, machineId, seen, rejected) {
+  for (const event of detail.events) {
+    if (event.type !== "artifact_published" || seen.has(event.seq) || !detail.agents.some((agent) => agent.id === event.agentId && agent.kind === "worker")) continue;
+    seen.add(event.seq);
+    const artifact = detail.artifacts.find((value) => value.id === event.data.artifactId);
+    assert.ok(artifact, "Published artifact missing");
+    if (artifact.path !== "/work/totals.mjs") {
+      rejected.push({ eventSeq: event.seq, artifactId: artifact.id, path: artifact.path, reason: "Expected /work/totals.mjs" });
+      continue;
+    }
+    assert.equal(artifact.remoteProvenance?.machineId, machineId, "Publication did not come from the assigned Linux node");
+    assert.equal(event.data.sha256, artifact.sha256);
+    return { event, artifact };
+  }
+}
+
+export function checkHostRuntime(runtime) {
+  try { return { ...runtime, afterSha256: sha256(readFileSync(runtime.path)) }; }
+  catch { return { ...runtime, afterSha256: null, error: "Host node binary unreadable" }; }
+}
+
+export function assertHostRuntime(runtime) {
+  assert.match(runtime?.beforeSha256 ?? "", /^[a-f0-9]{64}$/);
+  assert.equal(runtime.afterSha256, runtime.beforeSha256, "Host node binary changed during acceptance");
+}
+
+export const tapPassed = (stdout, tests) => [new RegExp(`^# tests ${tests}$`, "m"), new RegExp(`^# pass ${tests}$`, "m"), /^# fail 0$/m].every((pattern) => pattern.test(stdout));
+
+// The coordinator must be stopped before preparing these fresh inputs.
+export async function independentReview({ proof, acceptance, artifact, casPath, receipt, name, image, execute }) {
+  const review = { name, image, artifactId: artifact.id, artifactSha256: artifact.sha256, acceptanceSha256: acceptance.sha256,
+    tests: acceptance.tests, receiptId: receipt?.id ?? null, receiptPassed: receipt?.exitCode === 0 && tapPassed(receipt.stdout, acceptance.tests), passed: false };
+  try {
+    assert.equal(sha256(acceptance.source), acceptance.sha256, "In-memory frozen acceptance hash mismatch");
+    assert.match(artifact.sha256, /^[a-f0-9]{64}$/);
+    const bytes = readFileSync(casPath);
+    review.casSha256 = sha256(bytes);
+    assert.equal(review.casSha256, artifact.sha256, "Published CAS hash mismatch");
+    const inputs = join(proof, "independent-inputs");
+    mkdirSync(inputs, { mode: 0o700 });
+    const testPath = join(inputs, "frozen.test.mjs"), snapshot = join(inputs, "snapshot");
+    mkdirSync(snapshot, { mode: 0o700 });
+    writeFileSync(testPath, acceptance.source, { flag: "wx", mode: 0o400 });
+    writeFileSync(join(snapshot, artifact.path.split("/").at(-1)), bytes, { flag: "wx", mode: 0o400 });
+    const guestSnapshot = "/validations/remote/" + artifact.sha256.slice(0, 32);
+    // Linux Node also checks the mounted bytes before importing the snapshot.
+    const check = `const fs=require('node:fs'),crypto=require('node:crypto');for(const [path,hash] of ${JSON.stringify([["/oracle/frozen.test.mjs", acceptance.sha256], [guestSnapshot + "/" + artifact.path.split("/").at(-1), artifact.sha256]])}){if(crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')!==hash)process.exit(1)}`;
+    Object.assign(review, await execute(["run", "--rm", "--name", name, "--arch", "arm64", "--cpus", "1", "--memory", "256M",
+      "-v", `${testPath}:/oracle/frozen.test.mjs:ro`, "-v", `${snapshot}:${guestSnapshot}:ro`, "--workdir", guestSnapshot,
+      image, "sh", "-c", `node -e ${shellQuote(check)} && node --test --test-reporter=tap /oracle/frozen.test.mjs`]));
+    review.passed = review.exitCode === 0 && tapPassed(review.stdout, acceptance.tests);
+  } catch (error) { review.error = error.message; }
+  review.agreesWithReceipt = review.passed === review.receiptPassed;
+  return review;
+}
+
+export function assertIndependentReview(review, acceptance, artifact, receipt) {
+  assert.ok(review, "Independent container review missing");
+  assert.equal(review.artifactId, artifact.id);
+  assert.equal(review.artifactSha256, artifact.sha256);
+  assert.equal(review.casSha256, artifact.sha256);
+  assert.equal(review.acceptanceSha256, acceptance.sha256);
+  assert.equal(review.tests, acceptance.tests);
+  assert.equal(review.receiptId, receipt.id);
+  assert.equal(review.receiptPassed, true, "Product validator did not pass the frozen tests");
+  assert.equal(review.agreesWithReceipt, true, "Independent review disagrees with product validator");
+  assert.equal(review.passed, true, review.error ?? "Independent container tests failed");
 }
 
 export const nodeCredentialShell = 'IFS= read -r MC_ACCEPTANCE_NODE_TOKEN || exit 1; export MC_ACCEPTANCE_NODE_TOKEN; relay_port=$1; machine_id=$2; shift 2; for ref in "$@"; do IFS= read -r value || exit 1; export "$ref=$value"; done; unset value; exec node /app/bootstrap.mjs "$relay_port" "$machine_id" "$@"';

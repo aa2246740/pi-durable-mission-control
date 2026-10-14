@@ -4,6 +4,9 @@ import { createServer } from "node:http";
 
 export const shellQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
 
+export const pauseReport = "LINUX-SELF-CHECK-PAUSE-READY";
+export const pauseQuestion = "Linux self-check passed. Continue publication on a replacement runtime?";
+
 export const deliveryName = "linux-delivery.json";
 export const delivery = { platform: "linux", answer: 42, version: 1 };
 
@@ -27,7 +30,7 @@ export function transcript(body) {
   return results;
 }
 
-export function nextCall(body, { acceptanceCommand, hostTestPath }) {
+export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "default" }) {
   const names = new Set(body.tools.map((tool) => tool.function.name));
   const system = body.messages.filter((m) => ["system", "developer"].includes(m.role)).map((m) => m.content).join("\n");
   const role = names.has("SpawnAgent") ? "orchestrator" : names.has("bash") ? "worker" : "validator";
@@ -64,6 +67,12 @@ export function nextCall(body, { acceptanceCommand, hostTestPath }) {
       }
     }
     if (!task.ownerId || !task.validatorId) return call("UpdateTask", { taskId: task.id, ownerId: worker.id, validatorId: validator.id, status: "running" });
+    if (last.name === "RequestUserInput") return call("WaitForMessage");
+    if (scenario === "pause-resume" && task.status === "running" &&
+      body.messages.some((message) => message.role === "user" && message.content.includes(pauseReport)) &&
+      !(state.blockers ?? []).some((blocker) => blocker.kind === "user_input" && blocker.text.startsWith(pauseQuestion))) {
+      return call("RequestUserInput", { question: pauseQuestion });
+    }
     if (task.status === "accepted") return call("CompleteMission");
     if (task.status === "running") return call("SendMessage", { recipientId: worker.id, mode: "followUp", content: `Implement task ${task.id}. Self-check on Linux, PublishArtifact, UpdateTask review, then Report.` });
     if (task.status === "review") return call("SendMessage", { recipientId: validator.id, mode: "followUp", content: `Independently accept task ${task.id} using ${acceptanceCommand} on the coordinator frozen snapshot, then Report.` });
@@ -73,6 +82,13 @@ export function nextCall(body, { acceptanceCommand, hostTestPath }) {
     assert.equal(state.executionEnvironment?.platform, "linux");
     const owned = state.tasks.find((t) => state.agents.find((a) => a.id === t.ownerId)?.kind === "worker");
     if (!owned || owned.status !== "running") return call("WaitForMessage");
+    if (scenario === "pause-resume" && last.name === "GetMissionState" &&
+      history.some((result) => result.name === "Report" && result.args.summary === pauseReport)) {
+      const answer = (state.blockers ?? []).find((blocker) => blocker.kind === "user_input" && blocker.text.startsWith(pauseQuestion));
+      if (answer?.status !== "resolved") return call("WaitForMessage");
+      assert.ok(history.some((result) => result.name === "bash" && result.value.status === "succeeded" && result.value.result?.exitCode === 0), "Missing pre-pause Linux self-check");
+      return call("PublishArtifact", { name: "Frozen Linux delivery", path: deliveryName, taskId: owned.id });
+    }
     if (last.name === "GetMissionState") return call("write_file", { path: deliveryName, content: JSON.stringify(delivery) + "\n" });
     if (last.name === "write_file") {
       const code = `const a=require("node:assert/strict");a.equal(process.platform,"linux");a.deepEqual(require("./${deliveryName}"),${JSON.stringify(delivery)});a.equal(require("node:fs").existsSync(${JSON.stringify(hostTestPath)}),false);a.equal(process.env.MC_ACCEPTANCE_MODEL_CREDENTIAL,undefined);console.log("LINUX-SELF-CHECK-OK")`;
@@ -81,6 +97,7 @@ export function nextCall(body, { acceptanceCommand, hostTestPath }) {
     if (last.name === "bash" && !last.args.command.includes("LIVE-SOURCE-CHANGED")) {
       assert.equal(last.value.status, "succeeded", "Linux self-check effect failed");
       assert.equal(last.value.result?.exitCode, 0, "Linux self-check failed");
+      if (scenario === "pause-resume") return call("Report", { summary: pauseReport, evidence: "LINUX-SELF-CHECK-OK; await the orchestrator's user input before publishing." });
       return call("PublishArtifact", { name: "Frozen Linux delivery", path: deliveryName, taskId: owned.id });
     }
     if (last.name === "PublishArtifact") {
@@ -93,6 +110,7 @@ export function nextCall(body, { acceptanceCommand, hostTestPath }) {
       assert.equal(last.value.result?.exitCode, 0, "Live mutation failed");
       return call("UpdateTask", { taskId: owned.id, status: "review", evidence: "Linux self-check passed; frozen artifact published; live source then changed." });
     }
+    if (last.name === "Report" && last.args.summary === pauseReport) return call("WaitForMessage");
     if (last.name === "UpdateTask") return call("Report", { summary: "Linux delivery ready for independent review", evidence: "LINUX-SELF-CHECK-OK; frozen snapshot published before live mutation." });
   } else {
     if (!task || task.status !== "review") return call("WaitForMessage");
@@ -115,7 +133,7 @@ export function nextCall(body, { acceptanceCommand, hostTestPath }) {
   throw new Error(`Unexpected ${role} tool progress after ${last?.name}`);
 }
 
-export async function startMock({ credential, acceptanceCommand, hostTestPath, record, fail }) {
+export async function startMock({ credential, acceptanceCommand, hostTestPath, scenario = "default", record, fail }) {
   const server = createServer(async (request, response) => {
     try {
       assert.equal(request.method, "POST");
@@ -131,7 +149,7 @@ export async function startMock({ credential, acceptanceCommand, hostTestPath, r
       const body = JSON.parse(Buffer.concat(chunks).toString());
       assert.equal(body.stream, true);
       let decision;
-      try { decision = nextCall(body, { acceptanceCommand, hostTestPath }); }
+      try { decision = nextCall(body, { acceptanceCommand, hostTestPath, scenario }); }
       catch (error) {
         record({ role: "protocol", name: "rejected", results: transcript(body) });
         throw error;

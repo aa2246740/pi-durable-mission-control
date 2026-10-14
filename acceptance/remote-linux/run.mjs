@@ -3,12 +3,13 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, connect } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance } from "./real.mjs";
+import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
 import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
-import { delivery, deliveryName, shellQuote, startMock } from "./mock.mjs";
+import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const containerCLI = "/opt/homebrew/bin/container";
@@ -24,6 +25,10 @@ export function parseOptions(args) {
     else if (args[i] === "--real" && args[i + 1]) options.real = resolve(args[++i]);
     else if (args[i] === "--secrets-file" && args[i + 1]) options.secretsFile = resolve(args[++i]);
     else if (args[i] === "--discard") options.discard = true;
+    else if (args[i] === "--scenario" && args[i + 1]) {
+      options.scenario = args[++i];
+      assert.ok(["default", "pause-resume"].includes(options.scenario), "--scenario must be default or pause-resume");
+    }
     else if (args[i] === "--out" && args[i + 1]) options.out = resolve(args[++i]);
     else if (args[i] === "--timeout-ms" && args[i + 1]) {
       explicitTimeout = true;
@@ -32,6 +37,7 @@ export function parseOptions(args) {
     } else throw new Error(`Unknown or incomplete option ${args[i]}`);
   }
   if (options.real) {
+    assert.ok(!options.scenario || options.scenario === "default", "--scenario pause-resume requires mock mode");
     assert.ok(options.secretsFile, "--real requires --secrets-file");
     if (!explicitTimeout) options.timeoutMs = 1800000;
   } else assert.ok(!options.secretsFile && !options.discard, "--secrets-file and --discard require --real");
@@ -82,6 +88,8 @@ export function childProcess(command, args, env = process.env) {
   return { child, done, stdout: () => stdout, stderr: () => stderr, output: () => stdout + stderr, error: () => error };
 }
 
+export const frozenFlagEnvironment = () => ({ PATH: process.env.PATH });
+
 export async function commandOutput(executable, args, env = process.env) {
   const handle = childProcess(executable, args, env);
   const timer = setTimeout(() => handle.child.kill("SIGKILL"), 20000);
@@ -108,6 +116,64 @@ export function finalizeEvidence(proof, secrets, summary, save) {
   }
 }
 
+// Read persisted transport state without acknowledging, retrying or reconciling it.
+export function readPauseTransport(path, missionId) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const runtimes = db.prepare("SELECT runtime_id FROM remote_worker_runtimes r JOIN agents a ON a.id=r.agent_id WHERE a.mission_id=?").all(missionId).map((row) => row.runtime_id);
+    const mailbox = (table) => runtimes.flatMap((id) => db.prepare(`SELECT * FROM ${table} WHERE runtime_id=? ORDER BY sequence`).all(id));
+    return { inbox: mailbox("worker_mailbox_inbox"), outbox: mailbox("worker_mailbox_outbox"),
+      deliveries: db.prepare("SELECT * FROM outbox WHERE mission_id=? ORDER BY created_at").all(missionId),
+      effects: db.prepare("SELECT command_id,response FROM commands WHERE scope=? ORDER BY rowid").all(`mission:${missionId}:remote-effects`) };
+  } finally { db.close(); }
+}
+
+export function assertPauseResume(detail, runtimes, evidence, records, transport) {
+  const previous = evidence.stoppedRuntime;
+  assert.ok(previous, "No controlled pre-answer stop recorded");
+  assert.equal(previous.state, "closed");
+  assert.equal(previous.stopProvenance, "controlled");
+  assert.equal(previous.report.outcome, "stopped");
+  assert.equal(evidence.humanActions.filter((action) => action.action === "answer").length, 1);
+  const reassigned = detail.events.filter((event) => event.type === "remote_runtime_reassigned");
+  assert.equal(reassigned.length, 1, "Expected exactly one replacement runtime");
+  assert.equal(reassigned[0].data.previousRuntimeId, previous.binding.runtimeId);
+  const replacement = runtimes.find((runtime) => runtime.binding.runtimeId === reassigned[0].data.runtimeId);
+  assert.ok(replacement, "Replacement runtime missing");
+  assert.notEqual(replacement.binding.runtimeId, previous.binding.runtimeId);
+  assert.ok(replacement.binding.epoch > previous.binding.epoch, "Replacement epoch did not increase");
+  assert.equal(replacement.binding.machineId, previous.binding.machineId);
+  assert.equal(replacement.binding.agentId, previous.binding.agentId);
+  assert.equal(detail.mission.status, "completed");
+  assert.equal(detail.events.some((event) => event.type === "worker_start_failed"), false);
+  const receipts = detail.events.filter((event) => event.type === "remote_effect_receipt");
+  assert.equal(receipts.length, 4, "Expected write, self-check, publication and mutation exactly once");
+  assert.equal(new Set(receipts.map((event) => event.data.effectId)).size, receipts.length, "Effect receipt replayed");
+  assert.ok(receipts.every((event) => event.data.receipt.status === "succeeded"), "An effect did not succeed");
+  assert.equal(transport.effects.length, 4, "Effect permit replayed");
+  assert.equal(new Set(transport.deliveries.map((row) => `${row.message_id}:${row.attempt}`)).size, transport.deliveries.length, "Durable outbox attempt replayed");
+  const permits = transport.effects.map((row) => JSON.parse(row.response).effectPermit);
+  const publication = permits.find((permit) => permit.method === "PublishArtifact");
+  assert.ok(publication, "Publication permit missing");
+  assert.equal(publication.binding.runtimeId, replacement.binding.runtimeId, "Publication did not execute on replacement runtime");
+  for (const [name, count] of [["write_file", 1], ["bash", 2], ["PublishArtifact", 1]]) {
+    assert.equal(records.filter((record) => record.role === "worker" && record.name === name).length, count, `${name} replayed`);
+  }
+  for (const type of ["delivery_admitted", "delivery_delivered", "delivery_completed"]) {
+    const events = detail.events.filter((event) => event.type === type);
+    assert.equal(new Set(events.map((event) => `${event.data.messageId}:${event.data.attempt}`)).size, events.length, `${type} replayed`);
+  }
+  assert.ok(detail.messages.every((message) => message.attempt === 1), "Durable delivery retried");
+  assert.equal(detail.events.some((event) => event.type === "delivery_resumed"), false, "Old delivery replayed");
+  const oldId = previous.binding.runtimeId;
+  for (const key of ["inbox", "outbox", "effects"]) {
+    const oldRows = (snapshot) => snapshot[key].filter((row) => key === "effects" ? JSON.parse(row.response).effectPermit.binding.runtimeId === oldId : row.runtime_id === oldId);
+    assert.deepEqual(oldRows(transport), oldRows(evidence.transportBeforeAnswer), `Old ${key} changed after replacement`);
+  }
+  return { previousBinding: previous.binding, replacementBinding: replacement.binding, effectReceipts: receipts.length,
+    effectPermits: permits.length, deliveries: transport.deliveries.length, deliveryAttempts: detail.messages.map(({ id, attempt }) => ({ id, attempt })) };
+}
+
 export async function run(options) {
   const config = options.real ? readConfig(options.real) : undefined;
   const credentials = config ? readSecrets(options.secretsFile, kinds.map((kind) => config[kind].credentialEnv)) : undefined;
@@ -125,9 +191,15 @@ export async function run(options) {
   const credential = randomUUID();
   secrets.push(credential);
   let daemon, node, mock, nodeRelay, modelRelay, detail, summary;
+  const pause = options.scenario === "pause-resume" ? { humanActions: [] } : undefined;
+  let captureMock;
   let captureReal, exportedReal, mutation, acceptance, acceptanceCommand;
   const sessions = [];
   const seenReceipts = new Set();
+  const reviewName = `${prefix}review-${randomUUID().slice(0, 8)}`;
+  let hostRuntime, review;
+  const rejectedPublications = [];
+  const seenPublications = new Set();
   let failure;
   let mockFailure;
   let aborted;
@@ -160,13 +232,15 @@ export async function run(options) {
     const image = images.find((i) => /^(docker\.io\/library\/)?node:22-bookworm-slim$/.test(i.configuration.name));
     assert.ok(image?.variants.some((v) => v.platform.architecture === "arm64" && v.platform.os === "linux"), "Required cached node:22-bookworm-slim arm64 image missing; pulling is forbidden");
 
+    hostRuntime = { path: process.execPath, beforeSha256: sha256(readFileSync(process.execPath)) };
+    save("host-runtime.json", hostRuntime);
     const env = { PATH: process.env.PATH, HOME: proof, TMPDIR: proof };
     if (config) {
       acceptance = writeFrozenAcceptance(proof);
       acceptance.checks = [];
       acceptance.immutable = { attempted: process.platform === "darwin", applied: false };
       if (acceptance.immutable.attempted) {
-        const flags = childProcess("/bin/chflags", ["uchg", acceptance.path], env);
+        const flags = childProcess("/bin/chflags", ["uchg", acceptance.path], frozenFlagEnvironment());
         await flags.done;
         acceptance.immutable.applied = !flags.error() && flags.child.exitCode === 0;
         if (!acceptance.immutable.applied) acceptance.immutable.error = "chflags uchg failed";
@@ -177,9 +251,11 @@ export async function run(options) {
       for (const kind of ["orchestrator", "validator"]) env[config[kind].credentialEnv] = credentials[config[kind].credentialEnv];
     } else {
       const testPath = join(proof, "host-acceptance.test.mjs");
-      writeFileSync(testPath, `import assert from 'node:assert/strict';\nimport {readFileSync,statSync} from 'node:fs';\nimport {test} from 'node:test';\nimport {join} from 'node:path';\nconst file=join(process.cwd(),${JSON.stringify(deliveryName)});\ntest('frozen Linux content',()=>assert.deepEqual(JSON.parse(readFileSync(file,'utf8')),${JSON.stringify(delivery)}));\ntest('detached coordinator snapshot',()=>assert.match(process.cwd(),/validations\\/remote\\/[a-f0-9]{32}$/));\ntest('read-only host acceptance file',()=>assert.equal(statSync(new URL(import.meta.url)).mode & 0o222,0));\nconsole.log('FROZEN-SNAPSHOT-ACCEPTED');\n`, { mode: 0o400 });
-      acceptanceCommand = `${shellQuote(process.execPath)} --test ${shellQuote(testPath)}`;
-      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath,
+      const source = `import assert from 'node:assert/strict';\nimport {readFileSync,statSync} from 'node:fs';\nimport {test} from 'node:test';\nimport {join} from 'node:path';\nconst file=join(process.cwd(),${JSON.stringify(deliveryName)});\ntest('frozen Linux content',()=>assert.deepEqual(JSON.parse(readFileSync(file,'utf8')),${JSON.stringify(delivery)}));\ntest('detached coordinator snapshot',()=>assert.match(process.cwd(),/validations\\/remote\\/[a-f0-9]{32}$/));\ntest('read-only host acceptance file',()=>assert.equal(statSync(new URL(import.meta.url)).mode & 0o222,0));\ntest('published version remains frozen',()=>assert.equal(JSON.parse(readFileSync(file,'utf8')).version,1));\nconsole.log('FROZEN-SNAPSHOT-ACCEPTED');\n`;
+      writeFileSync(testPath, source, { mode: 0o400 });
+      acceptance = Object.defineProperty({ path: testPath, sha256: sha256(source), tests: 4 }, "source", { value: source });
+      acceptanceCommand = `${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(testPath)}`;
+      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario,
         record: (record) => { records.push(record); save("mock-tools.json", records); }, fail: (error) => { mockFailure = error; } });
       modelRelay = await relay(mock.address().port);
       env.MC_ACCEPTANCE_MODEL_CREDENTIAL = credential;
@@ -249,7 +325,8 @@ export async function run(options) {
           mutation.casFinalSha256 = casHashes[mutation.artifactId];
           save("fault-injection.json", mutation);
         }
-        const evidence = collectRealEvidence(exported, mutation, acceptance, casHashes, sessions);
+        const evidence = collectRealEvidence(exported, mutation, acceptance, casHashes, sessions, config);
+        Object.assign(evidence, { hostRuntime, independentReview: review, rejectedPublications });
         save("real-evidence.json", evidence);
         save("mission.json", detail);
         return evidence;
@@ -268,6 +345,22 @@ export async function run(options) {
         workspaceId: localWorkspace.id, remoteWorkspaceIds: [remoteWorkspace.id], roleIds: roles.map((r) => r.id), maxTurns: 80, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared",
         assertions: [{ id: "LINUX-FROZEN", description: "Linux self-check and frozen delivery pass independent coordinator tests even after the live source changes." }] });
     }
+    if (pause) captureMock = async () => {
+      const read = async (path) => {
+        const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
+        assert.ok(response.ok, `Evidence read failed: ${path}`);
+        return response.json();
+      };
+      detail = await read(`/api/missions/${mission.id}`);
+      const runtimes = await read(`/api/missions/${mission.id}/runtimes`);
+      save("mission.json", detail);
+      save("mission-export.json", await read(`/api/missions/${mission.id}/export`));
+      save("runtimes.json", runtimes);
+      pause.failures = detail.events.filter((event) => event.type === "worker_start_failed");
+      pause.blockers = detail.blockers;
+      pause.transport = readPauseTransport(join(home, "control.sqlite"), mission.id);
+      save("pause-resume.json", pause);
+    };
     await api(`/api/missions/${mission.id}/start`, {});
     detail = await wait(async () => {
       const current = await api(`/api/missions/${mission.id}`);
@@ -279,14 +372,12 @@ export async function run(options) {
         save("frozen-acceptance.json", acceptance);
       }
       if (config && !mutation) {
-        const published = current.events.find((event) => event.type === "artifact_published" && current.agents.some((agent) => agent.id === event.agentId && agent.kind === "worker"));
-        if (published) {
+        const publication = findRealPublication(current, machineId, seenPublications, rejectedPublications);
+        save("rejected-publications.json", rejectedPublications);
+        if (publication) {
+          const { event: published, artifact } = publication;
           acceptance.checks.push(checkFrozenAcceptance(acceptance, "publication"));
           save("frozen-acceptance.json", acceptance);
-          const artifact = current.artifacts.find((value) => value.id === published.data.artifactId);
-          assert.ok(artifact?.remoteProvenance?.machineId === machineId, "Publication did not come from the assigned Linux node");
-          assert.equal(artifact.path, "/work/totals.mjs", "Publish totals.mjs at the Linux workspace root");
-          assert.equal(published.data.sha256, artifact.sha256);
           const casPath = join(home, "artifacts", artifact.sha256);
           const casBeforeSha256 = sha256(readFileSync(casPath));
           assert.equal(casBeforeSha256, artifact.sha256);
@@ -300,25 +391,60 @@ export async function run(options) {
           assert.equal(mutation.casAfterSha256, artifact.sha256, "CAS changed during fault injection");
         }
       }
+      if (pause && current.mission.status === "blocked" && !pause.answerAttempted) {
+        const blocker = current.blockers.find((item) => item.kind === "user_input" && item.status === "open" && item.text === pauseQuestion);
+        assert.ok(blocker, `Unexpected blockers: ${JSON.stringify(current.blockers)}`);
+        assert.equal(current.artifacts.length, 0, "Publication occurred before pause");
+        assert.ok(current.events.some((event) => event.type === "remote_effect_receipt" && event.data.receipt.result?.stdout?.includes("LINUX-SELF-CHECK-OK")), "Pause preceded Linux self-check");
+        const stopped = await wait(async () => {
+          const runtimes = await api(`/api/missions/${mission.id}/runtimes`);
+          save("runtimes.json", runtimes);
+          assert.equal(runtimes.length, 1);
+          if (runtimes[0].state === "uncertain") throw new Error("Pre-answer stop is uncertain");
+          return runtimes[0].state === "closed" && runtimes[0];
+        });
+        pause.stoppedRuntime = stopped;
+        pause.blockedMissionStatus = current.mission.status;
+        pause.blockerId = blocker.id;
+        pause.transportBeforeAnswer = readPauseTransport(join(home, "control.sqlite"), mission.id);
+        pause.answerAttempted = true;
+        const resolution = "Continue publication after the controlled stop; use the replacement runtime.";
+        pause.humanActions.push({ action: "answer", path: `/api/blockers/${blocker.id}/resolve`, resolution, attemptedAt: new Date().toISOString() });
+        save("pause-resume.json", pause);
+        await api(`/api/blockers/${blocker.id}/resolve`, { resolution });
+        const answered = await api(`/api/missions/${mission.id}`);
+        if (answered.mission.status === "paused" && !answered.blockers.some((item) => item.status === "open")) {
+          pause.humanActions.push({ action: "resume", path: `/api/missions/${mission.id}/resume`, attemptedAt: new Date().toISOString() });
+          save("pause-resume.json", pause);
+          await api(`/api/missions/${mission.id}/resume`, {});
+        }
+        await captureMock();
+        if (["failed", "blocked"].includes(detail.mission.status)) return detail;
+        return false;
+      }
       if (config && current.mission.turns >= current.mission.maxTurns) return current;
       if (["completed", "failed", "blocked"].includes(current.mission.status)) return current;
       return false;
     });
     if (config) {
-      const evidence = await captureReal();
-      assertRealSuccess(detail, evidence, acceptanceCommand, machineId);
-    } else assert.equal(detail.mission.status, "completed");
+      await captureReal();
+      assert.equal(detail.mission.status, "completed");
+    } else {
+      if (pause) {
+        await captureMock();
+        assert.equal(detail.mission.status, "completed", JSON.stringify({ failures: pause.failures, blockers: detail.blockers }));
+      } else assert.equal(detail.mission.status, "completed");
+    }
     const runtimes = await wait(async () => {
       const current = await api(`/api/missions/${mission.id}/runtimes`);
       if (current.some((runtime) => runtime.state === "uncertain")) throw new Error("Remote runtime stop is uncertain");
-      return current.length === 1 && current.every((runtime) => runtime.state === "closed") && current;
+      return current.length === (pause ? 2 : 1) && current.every((runtime) => runtime.state === "closed") && current;
     });
     detail = await api(`/api/missions/${mission.id}`);
     save("mission.json", detail);
     save("runtimes.json", runtimes);
     if (config) {
       const evidence = await captureReal();
-      assertRealSuccess(detail, evidence, acceptanceCommand, machineId);
       summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
         turns: evidence.turns, maxTurns: evidence.maxTurns, roles: evidence.roles, costKnown: evidence.costKnown,
         acceptance, mutation, tools: evidence.tools, blockers: detail.blockers, remoteRuntimeState: runtimes[0].state,
@@ -327,7 +453,7 @@ export async function run(options) {
       assert.equal(detail.mission.status, "completed");
       assert.equal(detail.tasks.length, 1);
       assert.equal(detail.tasks[0].status, "accepted");
-      assert.deepEqual(detail.blockers, []);
+      assert.deepEqual(pause ? detail.blockers.filter((blocker) => blocker.status === "open") : detail.blockers, []);
       const artifact = detail.artifacts[0];
       assert.equal(detail.artifacts.length, 1);
       assert.equal(artifact.remoteProvenance.machineId, machineId);
@@ -352,10 +478,15 @@ export async function run(options) {
       const disposition = response.headers.get("content-disposition");
       assert.equal(disposition, `attachment; filename="${deliveryName}"; filename*=UTF-8''${deliveryName}`);
       assert.deepEqual(JSON.parse(await response.text()), delivery);
-      summary = { status: "passed", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status, taskStatus: detail.tasks[0].status,
+      if (pause) {
+        await captureMock();
+        pause.assertions = assertPauseResume(detail, runtimes, pause, records, pause.transport);
+        save("pause-resume.json", pause);
+      }
+      summary = { status: "passed", scenario: options.scenario ?? "default", ...(pause ? { pauseResume: pause.assertions, humanActions: pause.humanActions } : {}), durationMs: Date.now() - startedAt, missionStatus: detail.mission.status, taskStatus: detail.tasks[0].status,
         exitCode: receipt.exitCode, snapshotIntegrity: receipt.snapshotIntegrity, workspaceKind: receipt.workspaceKind,
         machineId, platform: machine.capabilities.platform, node: machine.capabilities.node, remoteProvenance: artifact.remoteProvenance,
-        contentDisposition: disposition, linuxNodePath: "/usr/local/bin/node", liveSourceChanged: true, blockers: detail.blockers.length,
+        contentDisposition: disposition, linuxNodePath: "/usr/local/bin/node", liveSourceChanged: true, blockers: detail.blockers.filter((blocker) => blocker.status === "open").length,
         validatorRequestedUserInput: false, remoteRuntimeState: runtimes[0].state, mockCost: 0, image: { name: image.configuration.name, digest: image.id },
         tools: records.map(({ role, name }) => ({ role, name })) };
     }
@@ -363,6 +494,11 @@ export async function run(options) {
     error = normalizeFailure(error, { aborted, deadline, timeoutMs: options.timeoutMs });
     failure = error;
     summary = { status: "failed", durationMs: Date.now() - startedAt, error: redact(error.message), missionStatus: detail?.mission.status };
+    if (captureMock) {
+      try { await captureMock(); }
+      catch (captureError) { summary.evidenceError = redact(captureError.message); }
+      Object.assign(summary, { scenario: "pause-resume", missionStatus: detail?.mission.status, rejection: pause.failures, blockers: pause.blockers, humanActions: pause.humanActions });
+    }
     if (captureReal) {
       try { await captureReal(); }
       catch (captureError) { summary.evidenceError = redact(captureError.message); }
@@ -385,6 +521,31 @@ export async function run(options) {
       acceptance.checks.push(checkFrozenAcceptance(acceptance, "end"));
       save("frozen-acceptance.json", acceptance);
     }
+    if (hostRuntime) {
+      hostRuntime = checkHostRuntime(hostRuntime);
+      save("host-runtime.json", hostRuntime);
+      await cleanup("host node integrity", async () => assertHostRuntime(hostRuntime));
+    }
+    if (detail?.mission.status === "completed" && acceptance) await cleanup("independent container review", async () => {
+      const artifact = config ? detail.artifacts.find((value) => value.id === mutation?.artifactId) : detail.artifacts[0];
+      assert.ok(artifact, "No frozen artifact for independent review");
+      const accepted = detail.tasks.find((task) => task.status === "accepted");
+      const decision = detail.validations?.filter((value) => value.taskId === accepted?.id).at(-1);
+      const receipt = detail.validationReceipts.find((value) => value.command === acceptanceCommand && value.artifactIds.includes(artifact.id) &&
+        (!config || value.id === decision?.receiptId));
+      review = await independentReview({ proof, acceptance, artifact, receipt, casPath: join(home, "artifacts", artifact.sha256),
+        name: reviewName, image: "node:22-bookworm-slim", execute: async (args) => {
+          const handle = childProcess(containerCLI, args, { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });
+          const timer = setTimeout(() => handle.child.kill("SIGKILL"), 60000);
+          await handle.done;
+          clearTimeout(timer);
+          return { exitCode: handle.child.exitCode, signalCode: handle.child.signalCode, stdout: handle.stdout(), stderr: handle.stderr(),
+            ...(handle.error() ? { error: handle.error().message } : {}) };
+        } });
+      save("independent-review.json", review);
+      assertIndependentReview(review, acceptance, artifact, receipt);
+    });
+    Object.assign(summary, { hostRuntime, independentReview: review, ...(config ? { rejectedPublications } : {}) });
     if (config && exportedReal) {
       await cleanup("stopped export records", async () => {
         exportedReal = refreshStoppedExport(join(home, "control.sqlite"), exportedReal);
@@ -418,30 +579,34 @@ export async function run(options) {
         mutation.casFinalSha256 = casHashes[mutation.artifactId];
         save("fault-injection.json", mutation);
       }
-      const evidence = collectRealEvidence(exportedReal, mutation, acceptance, casHashes, sessions);
+      const evidence = collectRealEvidence(exportedReal, mutation, acceptance, casHashes, sessions, config);
+      Object.assign(evidence, { hostRuntime, independentReview: review, rejectedPublications });
       save("real-evidence.json", evidence);
       await cleanup("acceptance oracle", async () => {
         assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle was touched by a local shell command");
         assert.ok(acceptance.checks.every((check) => check.intact), "Frozen acceptance hash or permissions changed");
       });
       if (summary.status === "passed") await cleanup("final acceptance", async () => assertRealSuccess(exportedReal, evidence, acceptanceCommand, machineId));
-      Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches });
+      Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches,
+        modelMismatches: Object.entries(evidence.roles).filter(([, role]) => role.modelMismatch).map(([kind, role]) => ({ kind, configuredModelId: role.configuredModelId, responseModels: role.responseModels })) });
     }
-    if (acceptance?.immutable.applied) await cleanup("frozen acceptance flags", async () => {
-      const flags = childProcess("/bin/chflags", ["nouchg", acceptance.path]);
+    if (acceptance?.immutable?.applied) await cleanup("frozen acceptance flags", async () => {
+      const flags = childProcess("/bin/chflags", ["nouchg", acceptance.path], frozenFlagEnvironment());
       await flags.done;
       assert.ok(!flags.error() && flags.child.exitCode === 0, "chflags nouchg failed");
     });
     await cleanup("container", async () => {
+      for (const ownedName of [name, reviewName]) {
+        if ((await containerNames()).includes(ownedName)) {
+          try { await command(["stop", ownedName]); }
+          catch (error) { if ((await containerNames()).includes(ownedName)) throw error; }
+        }
+        if ((await containerNames()).includes(ownedName)) {
+          try { await command(["delete", ownedName]); }
+          catch (error) { if ((await containerNames()).includes(ownedName)) throw error; }
+        }
+      }
       if (!node) return;
-      if ((await containerNames()).includes(name)) {
-        try { await command(["stop", name]); }
-        catch (error) { if ((await containerNames()).includes(name)) throw error; }
-      }
-      if ((await containerNames()).includes(name)) {
-        try { await command(["delete", name]); }
-        catch (error) { if ((await containerNames()).includes(name)) throw error; }
-      }
       const timer = setTimeout(() => node.child.kill("SIGKILL"), 10000);
       await node.done;
       clearTimeout(timer);

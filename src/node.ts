@@ -5,7 +5,10 @@ import { chmodSync, existsSync, mkdirSync, realpathSync, statSync } from "node:f
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { NodeCommand, NodeCapabilities } from "./machines.js";
 import { NODE_EXECUTION_PROTOCOL_VERSION, NODE_PROTOCOL_VERSION, NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION } from "./machines.js";
-import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type JsonValue, type WorkerBinding } from "./worker-mailbox.js";
+import {
+  DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt,
+  type JsonValue, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding
+} from "./worker-mailbox.js";
 import type { RuntimeReport, RuntimeStopReason } from "./remote-runtimes.js";
 import { NodeWorkerSupervisor } from "./node-workers.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
@@ -530,6 +533,52 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function parseMailboxSettlement(value: unknown, requested: readonly MailboxSettlementQuery[]): MailboxSettlementAnswer[] {
+  if (!object(value) || !exactKeys(value, ["entries"]) || !Array.isArray(value.entries) || value.entries.length !== requested.length) {
+    throw genericError();
+  }
+  const entries = value.entries;
+  return requested.map((entry, index) => {
+    const row = entries[index];
+    if (!object(row) || !exactKeys(row, ["messageId", "sequence", "sha256", "applied"]) ||
+        row.messageId !== entry.messageId || row.sequence !== entry.sequence || row.sha256 !== entry.sha256 ||
+        typeof row.applied !== "boolean") {
+      throw genericError();
+    }
+    return { messageId: entry.messageId, sequence: entry.sequence, sha256: entry.sha256, applied: row.applied };
+  });
+}
+
+/**
+ * Asks the coordinator whether specific uploads on an old binding were applied.
+ * Uses the current session credential. A conflict or malformed answer fails
+ * closed and never treats the upload as applied.
+ */
+export async function queryAppliedMailboxUploads(
+  coordinator: string,
+  token: string,
+  session: { machineId: string; sessionId: string; sessionEpoch: number },
+  binding: WorkerBinding,
+  entries: readonly MailboxSettlementQuery[],
+  signal?: AbortSignal
+): Promise<MailboxSettlementAnswer[]> {
+  if (entries.length === 0) return [];
+  const base = safeCoordinatorUrl(coordinator);
+  const answers: MailboxSettlementAnswer[] = [];
+  for (let offset = 0; offset < entries.length; offset += 32) {
+    const batch = entries.slice(offset, offset + 32);
+    const parsed = parseMailboxSettlement(await fetchJson(base, "/api/nodes/mailbox/settlement", token, {
+      machineId: session.machineId,
+      sessionId: session.sessionId,
+      sessionEpoch: session.sessionEpoch,
+      binding,
+      entries: batch
+    }, signal), batch);
+    answers.push(...parsed);
+  }
+  return answers;
+}
+
 export async function exchangeWorkerMailbox(
   coordinator: string,
   token: string,
@@ -691,6 +740,11 @@ export async function runNode(options: NodeOptions): Promise<void> {
           return (completed as { artifact: JsonValue }).artifact;
         },
         onMailboxActivity: notifyMailboxActivity,
+        lookupAppliedUploads: (oldBinding, entries) => queryAppliedMailboxUploads(
+          options.coordinator, token,
+          { machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch },
+          oldBinding, entries, abort.signal
+        ),
         ...(options.testOnlyScripted ? { testOnlyScripted: true } : {}),
         ...(options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
         ...(options.testOnlyWorkspaceEffectLoop ? { testOnlyWorkspaceEffectLoop: true } : {}),
