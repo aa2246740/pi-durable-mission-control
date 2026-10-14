@@ -11,6 +11,7 @@ import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets,
 import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
 import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
 import { assertWorkerCrash, observeWorkerCrash } from "./scenarios/worker-crash.mjs";
+import { createCoordinatorRestartScenario, restartScenarios, configureCoordinatorRestartRun } from "./scenarios/coordinator-restart.mjs";
 import { createTurnLimitScenario, turnLimitMaxTurns } from "./scenarios/turn-limit.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
@@ -29,7 +30,7 @@ export function parseOptions(args) {
     else if (args[i] === "--discard") options.discard = true;
     else if (args[i] === "--scenario" && args[i + 1]) {
       options.scenario = args[++i];
-      assert.ok(["default", "pause-resume", "worker-crash", "turn-limit"].includes(options.scenario), "--scenario must be default, pause-resume, worker-crash, or turn-limit");
+      assert.ok(["default", "pause-resume", "worker-crash", "turn-limit", ...restartScenarios].includes(options.scenario), "--scenario must be default, pause-resume, worker-crash, turn-limit, restart-after-complete, coordinator-restart, or coordinator-restart-kill");
     }
     else if (args[i] === "--out" && args[i + 1]) options.out = resolve(args[++i]);
     else if (args[i] === "--timeout-ms" && args[i + 1]) {
@@ -92,7 +93,10 @@ async function relay(targetPort) {
     socket.pipe(upstream).pipe(socket);
   });
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "192.168.64.1", resolve); });
-  return { port: server.address().port, close: async () => {
+  return { port: server.address().port, retarget(port) {
+    targetPort = port;
+    for (const socket of sockets) socket.destroy();
+  }, close: async () => {
     for (const socket of sockets) socket.destroy();
     await new Promise((resolve) => server.close(resolve));
   } };
@@ -222,6 +226,9 @@ export async function run(options) {
   const pause = options.scenario === "pause-resume" ? { humanActions: [] } : undefined;
   const crash = options.scenario === "worker-crash" ? { humanActions: [] } : undefined;
   const turnLimit = options.scenario === "turn-limit" ? createTurnLimitScenario() : undefined;
+  const restart = createCoordinatorRestartScenario(options.scenario);
+  const reconnects = [];
+  let captureRestart;
   const recovery = pause ?? turnLimit?.evidence;
   const recoveryFile = pause ? "pause-resume.json" : "turn-limit.json";
   let captureMock, captureCrash;
@@ -291,16 +298,16 @@ export async function run(options) {
       writeFileSync(testPath, source, { mode: 0o400 });
       acceptance = Object.defineProperty({ path: testPath, sha256: sha256(source), tests: 4 }, "source", { value: source });
       acceptanceCommand = `${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(testPath)}`;
-      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario, hooks: turnLimit,
+      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario, hooks: turnLimit ?? restart,
         record: (record) => { records.push(record); save("mock-tools.json", records); }, fail: (error) => { mockFailure = error; } });
       modelRelay = await relay(mock.address().port);
       env.MC_ACCEPTANCE_MODEL_CREDENTIAL = credential;
     }
     daemon = childProcess(process.execPath, [join(root, "dist/cli.js"), "serve", "--home", home, "--port", "0", "--node-port", "0"], env);
-    const daemonInfo = await wait(() => existsSync(join(home, "daemon.json")) && JSON.parse(readFileSync(join(home, "daemon.json"), "utf8")));
+    let daemonInfo = await wait(() => existsSync(join(home, "daemon.json")) && JSON.parse(readFileSync(join(home, "daemon.json"), "utf8")));
     const adminToken = readFileSync(join(home, "admin.token"), "utf8").trim();
     secrets.push(adminToken);
-    const base = `http://127.0.0.1:${daemonInfo.port}`;
+    let base = `http://127.0.0.1:${daemonInfo.port}`;
     const api = async (path, body, method = body === undefined ? "GET" : "POST") => {
       check();
       const response = await fetch(base + path, { method,
@@ -324,7 +331,7 @@ export async function run(options) {
     const credentialRefs = config ? [config.worker.credentialEnv] : ["MC_ACCEPTANCE_MODEL_CREDENTIAL"];
     // Values travel only over stdin; the shell reads one value for each explicitly allowed name.
     const nodeInput = [enrolled.token, ...credentialRefs.map((ref) => config ? credentials[ref] : credential)].join("\n") + "\n";
-    node = childProcess(containerCLI, ["run", "--rm", "-i", ...(config ? ["--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1"] : []), "--name", name, "--arch", "arm64", "--cpus", "2", "--memory", "512M",
+    node = childProcess(containerCLI, ["run", "--rm", "-i", ...((config || restart) ? ["--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1"] : []), "--name", name, "--arch", "arm64", "--cpus", "2", "--memory", "512M",
       "-v", `${join(root, "dist")}:/app/dist:ro`, "-v", `${join(root, "package.json")}:/app/package.json:ro`,
       "-v", `${realpathSync(join(root, "node_modules"))}:/app/node_modules:ro`,
       "-v", `${join(root, "acceptance/remote-linux/bootstrap.mjs")}:/app/bootstrap.mjs:ro`,
@@ -389,6 +396,28 @@ export async function run(options) {
         workspaceId: localWorkspace.id, remoteWorkspaceIds: [remoteWorkspace.id], roleIds: roles.map((r) => r.id), maxTurns: turnLimit ? turnLimitMaxTurns() : 80, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared",
         assertions: [{ id: "LINUX-FROZEN", description: "Linux self-check and frozen delivery pass independent coordinator tests even after the live source changes." }] });
     }
+    if (restart) captureRestart = configureCoordinatorRestartRun(restart, {
+      missionId: mission.id, home, proof, records, api, post, wait, command, save, redact, assertCoordinatorExit,
+      readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id),
+      readRequest: async (path) => {
+        const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
+        return { status: response.status, body: await response.json() };
+      },
+      downloadContent: (id) => fetch(`${base}/api/artifacts/${id}/content`, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) }),
+      setDetail: (value) => { detail = value; },
+      daemonState: () => ({ handle: daemon, info: daemonInfo }),
+      spawnDaemon: () => (daemon = childProcess(process.execPath, [join(root, "dist/cli.js"), "serve", "--home", home, "--port", "0", "--node-port", "0"], env)),
+      activateDaemon: (info) => { daemonInfo = info; base = `http://127.0.0.1:${info.port}`; nodeRelay.retarget(info.nodePort); },
+      spawnNode: () => {
+        const handle = childProcess(containerCLI, ["exec", "-i", "--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1", name, "sh", "-c", nodeCredentialShell,
+          "acceptance", String(nodeRelay.port), machineId, ...credentialRefs], { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });
+        reconnects.push(handle);
+        handle.child.stdin.end(nodeInput);
+        return handle;
+      },
+      containerName: name, machineId,
+      assertRecovered: (final, evidence) => assertRemoteResume(final.detail, final.runtimes, evidence, records, final.transport)
+    });
     if (turnLimit) turnLimit.configure({ api, wait, save, missionId: mission.id, modelUrl: `http://192.168.64.1:${modelRelay.port}`,
       readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id) });
     if (recovery) captureMock = async () => {
@@ -454,6 +483,11 @@ export async function run(options) {
           assert.equal(mutation.casAfterSha256, artifact.sha256, "CAS changed during fault injection");
         }
       }
+      if (restart && !restart.completed) {
+        const finished = await restart.observe(current);
+        if (finished) return finished;
+        return false;
+      }
       if (crash) {
         const finished = await observeWorkerCrash({
           crash, current, missionId: mission.id, containerName: name, records, api, post, exec: command,
@@ -507,6 +541,9 @@ export async function run(options) {
     if (config) {
       await captureReal();
       assert.equal(detail.mission.status, "completed");
+    } else if (restart && !restart.completed) {
+      await captureRestart();
+      summary = { status: "passed", scenario: options.scenario, ...restart.summary(), mockCost: 0 };
     } else if (crash) {
       assert.equal(detail.mission.status, "failed", JSON.stringify({ failures: crash.failures, blockers: detail.blockers, humanActions: crash.humanActions }));
     } else {
@@ -515,86 +552,97 @@ export async function run(options) {
         assert.equal(detail.mission.status, "completed", JSON.stringify({ failures: recovery.failures, blockers: detail.blockers }));
       } else assert.equal(detail.mission.status, "completed");
     }
-    const runtimes = await wait(async () => {
-      const current = await api(`/api/missions/${mission.id}/runtimes`);
+    if (!restart || restart.completed) {
+      const runtimes = await wait(async () => {
+        const current = await api(`/api/missions/${mission.id}/runtimes`);
+        if (crash) {
+          if (current.length === 1 && current[0].stopProvenance === "controlled") throw new Error("Remote runtime stop provenance is controlled");
+          return current.length === 1 && ["closed", "uncertain"].includes(current[0].state) && current[0].stopProvenance !== "controlled" && current;
+        }
+        if (config) return stoppedRealRuntimes(current, detail, mutation?.artifactId, machineId) && current;
+        if (current.some((runtime) => runtime.state === "uncertain")) throw new Error("Remote runtime stop is uncertain");
+        return current.length === (recovery ? 2 : 1) && current.every((runtime) => runtime.state === "closed") && current;
+      });
+      detail = await api(`/api/missions/${mission.id}`);
+      save("mission.json", detail);
+      save("runtimes.json", runtimes);
+      const deliveryRuntime = config ? stoppedRealRuntimes(runtimes, detail, mutation?.artifactId, machineId) : undefined;
       if (crash) {
-        if (current.length === 1 && current[0].stopProvenance === "controlled") throw new Error("Remote runtime stop provenance is controlled");
-        return current.length === 1 && ["closed", "uncertain"].includes(current[0].state) && current[0].stopProvenance !== "controlled" && current;
+        await captureCrash();
+        crash.assertions = assertWorkerCrash(detail, crash.runtimes, crash, records, crash.transport);
+        save("worker-crash.json", crash);
+        summary = { status: "passed", scenario: "worker-crash", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
+          taskStatus: detail.tasks[0]?.status ?? null, artifacts: detail.artifacts.length, stopProvenance: crash.assertions.stopProvenance,
+          remoteRuntimeState: crash.runtimes[0].state, diagnostic: crash.assertions.diagnostic, humanActions: crash.humanActions,
+          effectReceipts: crash.assertions.effectReceipts, blockers: detail.blockers.length, mockCost: 0,
+          image: { name: image.configuration.name, digest: image.id }, tools: records.map(({ role, name }) => ({ role, name })) };
+      } else if (config) {
+        const evidence = await captureReal();
+        summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
+          turns: evidence.turns, maxTurns: evidence.maxTurns, roles: evidence.roles, costKnown: evidence.costKnown,
+          acceptance, mutation, tools: evidence.tools, blockers: detail.blockers, remoteRuntimeState: deliveryRuntime.state, remoteRuntimeId: deliveryRuntime.binding.runtimeId, remoteRuntimeCount: runtimes.length,
+          image: { name: image.configuration.name, digest: image.id } };
+      } else {
+        assert.equal(detail.mission.status, "completed");
+        assert.equal(detail.tasks.length, 1);
+        assert.equal(detail.tasks[0].status, "accepted");
+        assert.deepEqual(recovery ? detail.blockers.filter((blocker) => blocker.status === "open") : detail.blockers, []);
+        const artifact = detail.artifacts[0];
+        assert.equal(detail.artifacts.length, 1);
+        assert.equal(artifact.remoteProvenance.machineId, machineId);
+        const receipt = detail.validationReceipts[0];
+        assert.equal(receipt.exitCode, 0);
+        assert.equal(receipt.snapshotIntegrity, true);
+        assert.equal(receipt.workspaceKind, "remote-snapshot");
+        assert.equal(receipt.command, acceptanceCommand);
+        const worker = detail.agents.find((a) => a.kind === "worker");
+        const validator = detail.agents.find((a) => a.kind === "validator");
+        assert.equal(worker.machineId, machineId);
+        assert.equal(validator.machineId, "local");
+        assert.notEqual(worker.id, validator.id);
+        assert.equal(receipt.validatorId, validator.id);
+        const effects = detail.events.filter((e) => e.type === "remote_effect_receipt" && e.agentId === worker.id).map((e) => e.data.receipt).filter((r) => r.status === "succeeded").map((r) => r.result);
+        assert.ok(effects.some((r) => r.exitCode === 0 && r.stdout?.includes("/usr/local/bin/node") && r.stdout.includes("LINUX-SELF-CHECK-OK")), "No successful Linux PATH/self-check receipt");
+        assert.ok(effects.some((r) => r.exitCode === 0 && r.stdout?.includes("LIVE-SOURCE-CHANGED")), "No live source mutation receipt");
+        assert.ok(records.some((r) => r.role === "validator" && r.name === "RunValidation"));
+        assert.equal(records.some((r) => r.role === "validator" && r.name === "RequestUserInput"), false);
+        const response = await fetch(`${base}/api/artifacts/${artifact.id}/content`, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
+        assert.equal(response.status, 200);
+        const disposition = response.headers.get("content-disposition");
+        assert.equal(disposition, `attachment; filename="${deliveryName}"; filename*=UTF-8''${deliveryName}`);
+        assert.deepEqual(JSON.parse(await response.text()), delivery);
+        if (pause) {
+          await captureMock();
+          pause.assertions = assertPauseResume(detail, runtimes, pause, records, pause.transport);
+          save("pause-resume.json", pause);
+        }
+        if (turnLimit) {
+          await captureMock();
+          recovery.assertions = assertRemoteResume(detail, runtimes, recovery, records, recovery.transport);
+          turnLimit.assertCompleted(detail);
+          save(recoveryFile, recovery);
+        }
+        if (restart?.completed) {
+          await restart.afterComplete();
+          await captureRestart();
+        }
+        summary = { status: "passed", scenario: options.scenario ?? "default", ...(restart ? { coordinatorRestart: restart.evidence.assertions } : {}), ...(recovery ? { [pause ? "pauseResume" : "turnLimit"]: recovery.assertions, humanActions: recovery.humanActions } : {}), durationMs: Date.now() - startedAt, missionStatus: detail.mission.status, taskStatus: detail.tasks[0].status,
+          exitCode: receipt.exitCode, snapshotIntegrity: receipt.snapshotIntegrity, workspaceKind: receipt.workspaceKind,
+          machineId, platform: machine.capabilities.platform, node: machine.capabilities.node, remoteProvenance: artifact.remoteProvenance,
+          contentDisposition: disposition, linuxNodePath: "/usr/local/bin/node", liveSourceChanged: true, blockers: detail.blockers.filter((blocker) => blocker.status === "open").length,
+          validatorRequestedUserInput: false, remoteRuntimeState: runtimes[0].state, mockCost: 0, image: { name: image.configuration.name, digest: image.id },
+          tools: records.map(({ role, name }) => ({ role, name })) };
       }
-      if (config) return stoppedRealRuntimes(current, detail, mutation?.artifactId, machineId) && current;
-      if (current.some((runtime) => runtime.state === "uncertain")) throw new Error("Remote runtime stop is uncertain");
-      return current.length === (recovery ? 2 : 1) && current.every((runtime) => runtime.state === "closed") && current;
-    });
-    detail = await api(`/api/missions/${mission.id}`);
-    save("mission.json", detail);
-    save("runtimes.json", runtimes);
-    const deliveryRuntime = config ? stoppedRealRuntimes(runtimes, detail, mutation?.artifactId, machineId) : undefined;
-    if (crash) {
-      await captureCrash();
-      crash.assertions = assertWorkerCrash(detail, crash.runtimes, crash, records, crash.transport);
-      save("worker-crash.json", crash);
-      summary = { status: "passed", scenario: "worker-crash", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
-        taskStatus: detail.tasks[0]?.status ?? null, artifacts: detail.artifacts.length, stopProvenance: crash.assertions.stopProvenance,
-        remoteRuntimeState: crash.runtimes[0].state, diagnostic: crash.assertions.diagnostic, humanActions: crash.humanActions,
-        effectReceipts: crash.assertions.effectReceipts, blockers: detail.blockers.length, mockCost: 0,
-        image: { name: image.configuration.name, digest: image.id }, tools: records.map(({ role, name }) => ({ role, name })) };
-    } else if (config) {
-      const evidence = await captureReal();
-      summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
-        turns: evidence.turns, maxTurns: evidence.maxTurns, roles: evidence.roles, costKnown: evidence.costKnown,
-        acceptance, mutation, tools: evidence.tools, blockers: detail.blockers, remoteRuntimeState: deliveryRuntime.state, remoteRuntimeId: deliveryRuntime.binding.runtimeId, remoteRuntimeCount: runtimes.length,
-        image: { name: image.configuration.name, digest: image.id } };
-    } else {
-      assert.equal(detail.mission.status, "completed");
-      assert.equal(detail.tasks.length, 1);
-      assert.equal(detail.tasks[0].status, "accepted");
-      assert.deepEqual(recovery ? detail.blockers.filter((blocker) => blocker.status === "open") : detail.blockers, []);
-      const artifact = detail.artifacts[0];
-      assert.equal(detail.artifacts.length, 1);
-      assert.equal(artifact.remoteProvenance.machineId, machineId);
-      const receipt = detail.validationReceipts[0];
-      assert.equal(receipt.exitCode, 0);
-      assert.equal(receipt.snapshotIntegrity, true);
-      assert.equal(receipt.workspaceKind, "remote-snapshot");
-      assert.equal(receipt.command, acceptanceCommand);
-      const worker = detail.agents.find((a) => a.kind === "worker");
-      const validator = detail.agents.find((a) => a.kind === "validator");
-      assert.equal(worker.machineId, machineId);
-      assert.equal(validator.machineId, "local");
-      assert.notEqual(worker.id, validator.id);
-      assert.equal(receipt.validatorId, validator.id);
-      const effects = detail.events.filter((e) => e.type === "remote_effect_receipt" && e.agentId === worker.id).map((e) => e.data.receipt).filter((r) => r.status === "succeeded").map((r) => r.result);
-      assert.ok(effects.some((r) => r.exitCode === 0 && r.stdout?.includes("/usr/local/bin/node") && r.stdout.includes("LINUX-SELF-CHECK-OK")), "No successful Linux PATH/self-check receipt");
-      assert.ok(effects.some((r) => r.exitCode === 0 && r.stdout?.includes("LIVE-SOURCE-CHANGED")), "No live source mutation receipt");
-      assert.ok(records.some((r) => r.role === "validator" && r.name === "RunValidation"));
-      assert.equal(records.some((r) => r.role === "validator" && r.name === "RequestUserInput"), false);
-      const response = await fetch(`${base}/api/artifacts/${artifact.id}/content`, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
-      assert.equal(response.status, 200);
-      const disposition = response.headers.get("content-disposition");
-      assert.equal(disposition, `attachment; filename="${deliveryName}"; filename*=UTF-8''${deliveryName}`);
-      assert.deepEqual(JSON.parse(await response.text()), delivery);
-      if (pause) {
-        await captureMock();
-        pause.assertions = assertPauseResume(detail, runtimes, pause, records, pause.transport);
-        save("pause-resume.json", pause);
-      }
-      if (turnLimit) {
-        await captureMock();
-        recovery.assertions = assertRemoteResume(detail, runtimes, recovery, records, recovery.transport);
-        turnLimit.assertCompleted(detail);
-        save(recoveryFile, recovery);
-      }
-      summary = { status: "passed", scenario: options.scenario ?? "default", ...(recovery ? { [pause ? "pauseResume" : "turnLimit"]: recovery.assertions, humanActions: recovery.humanActions } : {}), durationMs: Date.now() - startedAt, missionStatus: detail.mission.status, taskStatus: detail.tasks[0].status,
-        exitCode: receipt.exitCode, snapshotIntegrity: receipt.snapshotIntegrity, workspaceKind: receipt.workspaceKind,
-        machineId, platform: machine.capabilities.platform, node: machine.capabilities.node, remoteProvenance: artifact.remoteProvenance,
-        contentDisposition: disposition, linuxNodePath: "/usr/local/bin/node", liveSourceChanged: true, blockers: detail.blockers.filter((blocker) => blocker.status === "open").length,
-        validatorRequestedUserInput: false, remoteRuntimeState: runtimes[0].state, mockCost: 0, image: { name: image.configuration.name, digest: image.id },
-        tools: records.map(({ role, name }) => ({ role, name })) };
     }
   } catch (error) {
     error = normalizeFailure(error, { aborted, deadline, timeoutMs: options.timeoutMs });
     failure = error;
     summary = { status: "failed", durationMs: Date.now() - startedAt, error: redact(error.message), missionStatus: detail?.mission.status };
+    if (captureRestart) {
+      try { await captureRestart(); }
+      catch (captureError) { summary.evidenceError = redact(captureError.message); }
+      Object.assign(summary, { scenario: options.scenario, coordinatorRestart: restart.evidence.assertions, ...restart.summary() });
+    }
     if (captureMock) {
       try { await captureMock(); }
       catch (captureError) { summary.evidenceError = redact(captureError.message); }
@@ -717,6 +765,12 @@ export async function run(options) {
       const timer = setTimeout(() => node.child.kill("SIGKILL"), 10000);
       await node.done;
       clearTimeout(timer);
+    });
+    for (const [index, handle] of reconnects.entries()) await cleanup(`node reconnect ${index}`, async () => {
+      const timer = setTimeout(() => handle.child.kill("SIGKILL"), 10000);
+      await handle.done;
+      clearTimeout(timer);
+      writeFileSync(join(proof, `node-reconnect-${index}.log`), redact(handle.output()), { mode: 0o600 });
     });
     for (const [label, server] of [["node relay", nodeRelay], ["model relay", modelRelay]]) if (server) await cleanup(label, () => server.close());
     if (mock) await cleanup("mock", async () => { mock.closeAllConnections(); await new Promise((resolve) => mock.close(resolve)); });
