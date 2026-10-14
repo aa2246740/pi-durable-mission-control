@@ -92,11 +92,11 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s2-astra- node --test acceptance/remote-li
 
 `node-power-loss.json` 包含断电前、租约丢失、重连和最终快照、SIGKILL 记录、节点 journal、进程列表、耗时和运营者操作；失败时仍保存 Mission 导出、runtime、transport、节点退出日志和可读取的持久 journal。任一断言失败或重启退出均返回非零，不修改 journal 来绕过故障。持久 home 跟随整个证据目录：成功默认删除，`--keep` 或失败保留。独立容器自测连续运行新场景 3 次，再各运行一次 default 和 worker-crash；第三次新场景设为成功时删除证据，并检查 home 同步删除，失败则保留。此自测不进入 `npm test`。
 
-2026-10-15 在 `orch/s2-astra`、基线 `2dbe991` 上正式连续复测：node-power-loss **0/3 通过**，总耗时依次为 38.259、38.183、38.409 秒；从 SIGKILL 请求到观察到租约丢失依次为 22.439、22.059、21.810 秒。3 次都在断电后得到 offline、Mission blocked、runtime stopping / uncertain、artifacts 0，无重放和重新分配；随后同 home 重启因 `another node owner is already running` 退出。原 journal owner PID 和新节点 PID 都是 9，旧 runtime 的本地 journal 仍为 running。新 session、后续心跳、journal uncertain，以及运营者 resolve/resume 后的不可恢复 failed 均未验证通过。脚本以非零退出保留上述缺口，没有把 blocked 判成通过。
+2026-10-15 在 `orch/s2-astra`、基线 `8a5f3c3` 上修复节点所有者锁后，node-power-loss 连续 **3/3 通过**，总耗时依次为 41.514、41.325、41.383 秒；从 SIGKILL 请求到观察到租约丢失依次为 21.331、22.188、22.065 秒。3 次均用同一 home、machine 和 token 重连，取得新 session 并收到后续心跳；旧 binding 未被认领，旧 worker 未重启，节点 journal 和协调端 runtime 均为 uncertain。运营者 resolve 后显式 resume，得到不可恢复的 Mission failed、`worker_start_failed.recoverable: false`、`reason: remote_runtime_uncertain`，artifacts 为 0，无 effect、投递或 worker 工具调用重放。保留的两次证据中，重启前后节点 PID 均为 9，resume 均返回 HTTP 409。
 
-随后 default 通过，18.068 秒、Mission completed；worker-crash 通过，14.868 秒、Mission failed。5 次均 cleanupVerified=true，`mc-acc-s2-astra-` 前缀无残留。3 次失败的节点 home 均随证据目录保留，包括第三次未设 keep 的运行；新场景成功后的自动删除路径因产品缺陷未在容器中执行。结果汇总为 `.acceptance-proof/node-power-loss-results-1792006210613.json`。此前开发试跑另有 2 次失败：2.708 秒发现挂载根目录 chmod 限制；改用子目录后 38.573 秒复现 PID 冲突，租约丢失耗时 21.809 秒。这两次不计入正式 3 次，两次清理也均通过。
+随后 default 通过，17.656 秒、Mission completed；worker-crash 通过，14.901 秒、Mission failed。5 次均 cleanupVerified=true，`mc-acc-s2-astra-` 前缀无残留。第三次新场景没有 keep，已验证成功后证据目录及持久 node home 一并删除；其余四次保留证据。结果汇总为 `.acceptance-proof/node-power-loss-results-1792006901622.json`。额外的 `test/node-owner.test.mjs` 在 macOS 和 Linux 均为 6/6 通过；Linux 容器整体耗时 48.007 秒，覆盖陈旧 PID、活所有者互斥、SIGKILL、正常退出及启动失败后的接管，结束后同样无残留。
 
-当前产品阻塞点是节点进程的 PID 复用：`src/node.ts:241-256` 按持久 PID 判断 owner，`existing.pid === process.pid` 直接抛出 `another node owner is already running`。NodeJournal 在 `src/node.ts:653` 创建，早于 session 注册和 supervisor 构造（`src/node.ts:700-709`），因此 `src/node-workers.ts:297-304` 将旧 runtime 标为 uncertain 的恢复逻辑没有执行。建议产品用进程退出后自动释放的独占锁，或结合 boot identity 与进程启动身份识别旧 owner；保留旧 runtime 的不确定性，不自动认领 binding。本场景没有实施此修复。
+修复使用 `node.ownership.sqlite` 的生命周期独占锁。进程退出、SIGKILL 或重启后由操作系统释放，不再以旧 PID 是否存活判断所有权。`node_owner` 表保留兼容记录；取得锁后仍按原有规则将旧 runtime 恢复为 uncertain，不生成 controlled/stopped 证明，不重放旧工作。新版本之间的同进程重复打开和不同进程并发打开都会拒绝；升级前须停止不参与新锁协议的旧节点程序。修复前的 0/3 失败记录仍保留在 `.acceptance-proof/node-power-loss-results-1792006210613.json`，供比较。
 
 ### 远端 worker 的轮次上限与恢复
 

@@ -211,94 +211,93 @@ export function inspectWorkspace(requestedPath: string, roots: string[]): { requ
 
 class NodeJournal {
   readonly db: DatabaseSync;
+  private readonly ownership: DatabaseSync;
   private readonly ownerId = randomUUID();
 
   constructor(readonly home: string, coordinatorId: string, machineId: string) {
     if (existsSync(home) && !statSync(home).isDirectory()) throw new Error("node home must be a directory");
     mkdirSync(home, { recursive: true, mode: 0o700 });
-    const databasePath = resolve(home, "node.sqlite");
-    this.db = new DatabaseSync(databasePath, { timeout: 5000 });
-    this.db.exec("BEGIN IMMEDIATE");
+    const ownershipPath = resolve(home, "node.ownership.sqlite");
+    this.ownership = new DatabaseSync(ownershipPath, { timeout: 0 });
     try {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS node_owner (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner_id TEXT NOT NULL, pid INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS node_operations (
-          command_id TEXT PRIMARY KEY, requested_path TEXT NOT NULL, status TEXT NOT NULL,
-          outcome TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS node_runtime_reports (
-          report_id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, binding_json TEXT NOT NULL,
-          descriptor_hash TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('stopped','uncertain','rejected')),
-          state TEXT NOT NULL CHECK(state IN ('pending','sent')), created_at INTEGER NOT NULL
-        );
-      `);
-      const reportColumns = this.db.prepare("PRAGMA table_info(node_runtime_reports)").all() as Array<{ name: string }>;
-      if (!reportColumns.some((column) => column.name === "stop_reason")) {
-        this.db.exec("ALTER TABLE node_runtime_reports ADD COLUMN stop_reason TEXT CHECK(stop_reason IN ('requested','unexpected'))");
-      }
-      const existing = this.db.prepare("SELECT owner_id,pid FROM node_owner WHERE singleton=1").get() as { owner_id: string; pid: number } | undefined;
-      if (existing) {
-        if (!Number.isSafeInteger(existing.pid) || existing.pid < 1 || existing.pid === process.pid) {
-          throw new Error("another node owner is already running");
-        }
-        try {
-          process.kill(existing.pid, 0);
-        } catch (error) {
-          if (!(error && typeof error === "object" && "code" in error && error.code === "ESRCH")) {
-            throw new Error("another node owner is already running");
-          }
-          this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?")
-            .run(existing.owner_id, existing.pid);
-        }
-        if (this.db.prepare("SELECT 1 FROM node_owner WHERE singleton=1").get()) {
-          throw new Error("another node owner is already running");
-        }
-      }
-      this.db.prepare("INSERT INTO node_owner(singleton,owner_id,pid) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET owner_id=excluded.owner_id,pid=excluded.pid")
-        .run(this.ownerId, process.pid);
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS node_identity (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          coordinator_id TEXT NOT NULL,
-          machine_id TEXT NOT NULL,
-          registration_id TEXT
-        );
-      `);
-      const operationColumns = this.db.prepare("PRAGMA table_info(node_operations)").all() as Array<{ name: string }>;
-      if (!operationColumns.some((column) => column.name === "session_id")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_id TEXT");
-      if (!operationColumns.some((column) => column.name === "session_epoch")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_epoch INTEGER");
-      const identity = this.db.prepare("SELECT coordinator_id,machine_id FROM node_identity WHERE singleton=1").get() as {
-        coordinator_id: string; machine_id: string;
-      } | undefined;
-      if (identity && (identity.coordinator_id !== coordinatorId || identity.machine_id !== machineId)) {
-        throw new Error("node home is bound to a different coordinator or machine");
-      }
-      if (!identity) {
-        this.db.prepare("INSERT INTO node_identity(singleton,coordinator_id,machine_id,registration_id) VALUES(1,?,?,NULL)")
-          .run(coordinatorId, machineId);
-      }
-      this.db.prepare("UPDATE node_operations SET status='uncertain',updated_at=? WHERE status='admitted'").run(Date.now());
-      this.db.exec("COMMIT");
+      // A separate rollback-mode database keeps journal writes independent of
+      // the lifetime lock. The OS releases the lock even after SIGKILL or reboot.
+      this.ownership.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;");
     } catch (error) {
-      try { this.db.exec("ROLLBACK"); } catch {}
-      this.db.close();
-      throw error;
+      this.ownership.close();
+      throw new Error("another node owner is already running", { cause: error });
     }
     try {
-      this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
-      chmodSync(home, 0o700);
-      chmodSync(databasePath, 0o600);
-    } catch (error) {
+      chmodSync(ownershipPath, 0o600);
+      const databasePath = resolve(home, "node.sqlite");
+      this.db = new DatabaseSync(databasePath, { timeout: 5000 });
       try {
         this.db.exec("BEGIN IMMEDIATE");
-        this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?").run(this.ownerId, process.pid);
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS node_owner (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner_id TEXT NOT NULL, pid INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS node_operations (
+            command_id TEXT PRIMARY KEY, requested_path TEXT NOT NULL, status TEXT NOT NULL,
+            outcome TEXT, updated_at INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS node_runtime_reports (
+            report_id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, binding_json TEXT NOT NULL,
+            descriptor_hash TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('stopped','uncertain','rejected')),
+            state TEXT NOT NULL CHECK(state IN ('pending','sent')), created_at INTEGER NOT NULL
+          );
+        `);
+        const reportColumns = this.db.prepare("PRAGMA table_info(node_runtime_reports)").all() as Array<{ name: string }>;
+        if (!reportColumns.some((column) => column.name === "stop_reason")) {
+          this.db.exec("ALTER TABLE node_runtime_reports ADD COLUMN stop_reason TEXT CHECK(stop_reason IN ('requested','unexpected'))");
+        }
+        this.db.prepare("INSERT INTO node_owner(singleton,owner_id,pid) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET owner_id=excluded.owner_id,pid=excluded.pid")
+          .run(this.ownerId, process.pid);
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS node_identity (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            coordinator_id TEXT NOT NULL,
+            machine_id TEXT NOT NULL,
+            registration_id TEXT
+          );
+        `);
+        const operationColumns = this.db.prepare("PRAGMA table_info(node_operations)").all() as Array<{ name: string }>;
+        if (!operationColumns.some((column) => column.name === "session_id")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_id TEXT");
+        if (!operationColumns.some((column) => column.name === "session_epoch")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_epoch INTEGER");
+        const identity = this.db.prepare("SELECT coordinator_id,machine_id FROM node_identity WHERE singleton=1").get() as {
+          coordinator_id: string; machine_id: string;
+        } | undefined;
+        if (identity && (identity.coordinator_id !== coordinatorId || identity.machine_id !== machineId)) {
+          throw new Error("node home is bound to a different coordinator or machine");
+        }
+        if (!identity) {
+          this.db.prepare("INSERT INTO node_identity(singleton,coordinator_id,machine_id,registration_id) VALUES(1,?,?,NULL)")
+            .run(coordinatorId, machineId);
+        }
+        this.db.prepare("UPDATE node_operations SET status='uncertain',updated_at=? WHERE status='admitted'").run(Date.now());
         this.db.exec("COMMIT");
-      } catch {
+      } catch (error) {
         try { this.db.exec("ROLLBACK"); } catch {}
+        this.db.close();
+        throw error;
       }
-      this.db.close();
+      try {
+        this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
+        chmodSync(home, 0o700);
+        chmodSync(databasePath, 0o600);
+      } catch (error) {
+        try {
+          this.db.exec("BEGIN IMMEDIATE");
+          this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?").run(this.ownerId, process.pid);
+          this.db.exec("COMMIT");
+        } catch {
+          try { this.db.exec("ROLLBACK"); } catch {}
+        }
+        this.db.close();
+        throw error;
+      }
+    } catch (error) {
+      this.ownership.close();
       throw error;
     }
   }
@@ -444,7 +443,8 @@ class NodeJournal {
       this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?").run(this.ownerId, process.pid);
       this.db.exec("COMMIT");
     } finally {
-      this.db.close();
+      try { this.db.close(); }
+      finally { this.ownership.close(); }
     }
   }
 }
