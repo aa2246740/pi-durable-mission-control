@@ -1111,7 +1111,8 @@ export class ControlPlane {
         const requestedStop = runtime?.desired === "stop" && runtime.state === "stopping";
         if (machine?.status === "online" && machine.sessionId === binding.sessionId &&
             machine.sessionEpoch === binding.sessionEpoch && (machine.leaseExpiresAt ?? 0) > Date.now() &&
-            agent?.machineId === binding.machineId && (agent.epoch === binding.epoch || requestedStop)) return;
+            agent?.machineId === binding.machineId &&
+            (agent.epoch === binding.epoch || (requestedStop && agent.epoch > binding.epoch))) return;
         if (!registered) {
           this.workerMailbox.fence(binding);
           return;
