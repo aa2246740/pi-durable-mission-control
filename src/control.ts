@@ -1010,6 +1010,8 @@ export class ControlPlane {
       return this.transaction(() => {
         this.fenceStaleWorkerBindings();
         const saved = this.remoteRuntimes.report(report);
+        const deadline = this.coordinatorStopDeadline(report.binding.runtimeId);
+        if (deadline !== undefined && Date.now() >= deadline) this.fenceUnconfirmedRemoteStop(report.binding.runtimeId);
         if (this.workerMailbox.inspectBinding(report.binding).status !== "closed") this.workerMailbox.fence(report.binding);
         if (!saved.duplicate) {
           const agent = this.getAgent(report.binding.agentId);
@@ -1210,9 +1212,28 @@ export class ControlPlane {
     return this.remoteRuntimes.markReady(binding);
   }
 
-  pauseForCoordinatorShutdown(missionId: string, runtimeIds: string[]): void {
-    this.missionAction(missionId, "pause");
-    this.event(missionId, "coordinator_stopping", "Mission paused for normal coordinator shutdown.", undefined, { runtimeIds });
+  pauseForCoordinatorShutdown(missionId: string, runtimeIds: string[], deadlineAt: number): void {
+    this.transaction(() => {
+      const pause = ["active", "validating"].includes(this.getMission(missionId)?.status ?? "");
+      if (pause) this.missionAction(missionId, "pause");
+      this.event(missionId, pause ? "coordinator_stopping" : "coordinator_stop_waiting",
+        "Coordinator shutdown is awaiting remote stop confirmation.", undefined, { runtimeIds, deadlineAt });
+      for (const runtimeId of runtimeIds) {
+        const runtime = this.remoteRuntimes.byRuntime(runtimeId);
+        const agent = runtime ? this.getAgent(runtime.agent_id) : undefined;
+        if (!agent) continue;
+        this.requestRemoteRuntimeStop(agent.id);
+        this.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
+      }
+    });
+  }
+
+  private coordinatorStopDeadline(runtimeId: string): number | undefined {
+    const row = this.db.prepare(`SELECT MIN(json_extract(events.data,'$.data.deadlineAt')) AS deadline
+      FROM events, json_each(events.data,'$.data.runtimeIds') AS stopped
+      WHERE events.type IN ('coordinator_stopping','coordinator_stop_waiting') AND stopped.value=?`)
+      .get(runtimeId) as { deadline: number | null };
+    return row.deadline ?? undefined;
   }
 
   confirmedRemoteRuntimeStop(runtimeId: string | undefined): boolean {
@@ -1221,7 +1242,14 @@ export class ControlPlane {
         runtime.stop_provenance !== "controlled" || runtime.stop_request_reason !== "controlled" ||
         runtime.stop_request_epoch !== runtime.epoch || !runtime.last_report_json) return false;
     const report = decode<{ outcome: string; stopReason?: string }>(runtime.last_report_json);
-    return report.outcome === "stopped" && report.stopReason === "requested";
+    if (report.outcome !== "stopped" || report.stopReason !== "requested") return false;
+    const deadline = this.coordinatorStopDeadline(runtime.runtime_id);
+    if (deadline === undefined) return true;
+    const first = this.db.prepare(`SELECT MIN(created_at) AS confirmedAt FROM remote_worker_runtime_reports
+      WHERE runtime_id=? AND json_extract(body_json,'$.outcome')='stopped'
+        AND json_extract(body_json,'$.stopReason')='requested'`)
+      .get(runtime.runtime_id) as { confirmedAt: number | null };
+    return first.confirmedAt !== null && first.confirmedAt < deadline;
   }
 
   fenceUnconfirmedRemoteStop(runtimeId: string): void {
@@ -1232,7 +1260,9 @@ export class ControlPlane {
       sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
     }, "ownership-lost");
     const agent = this.getAgent(runtime.agent_id);
-    if (agent) this.event(agent.missionId, "coordinator_stop_unconfirmed",
+    const recorded = this.db.prepare(`SELECT 1 FROM events WHERE type='coordinator_stop_unconfirmed'
+      AND json_extract(data,'$.data.runtimeId')=? LIMIT 1`).get(runtimeId);
+    if (agent && !recorded) this.event(agent.missionId, "coordinator_stop_unconfirmed",
       "Coordinator shutdown deadline expired without a controlled remote stop confirmation; recovery remains fail-closed.", agent.id, { runtimeId });
   }
 
@@ -1714,7 +1744,7 @@ export class ControlPlane {
     } else if (action === "cancel" && ["completed", "cancelled"].includes(mission.status)) {
       throw new HttpError(409, "Mission is already terminal");
     }
-    return this.transaction(() => {
+    return this.transactionIfNeeded(() => {
     const status: Mission["status"] = action === "resume" ? "active" : action === "pause" ? "paused" : "cancelled";
     const updated = { ...mission, status, updatedAt: now() };
     this.putMission(updated);
@@ -4229,7 +4259,7 @@ export class ControlPlane {
     });
   }
 
-  markAgentInterrupted(agentId: string, expectedEpoch?: number, options: { controlledRemoteStop?: true } = {}): void {
+  markAgentInterrupted(agentId: string, expectedEpoch?: number, options: { controlledRemoteStop?: true; preserveQueued?: true } = {}): void {
     this.transactionIfNeeded(() => {
       const agent = this.getAgent(agentId);
       if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
@@ -4238,6 +4268,7 @@ export class ControlPlane {
         const message = decode<Message>(row.data);
         if (message.recipientId !== agentId) continue;
         const outbox = this.db.prepare("SELECT id,status FROM outbox WHERE message_id=? ORDER BY attempt DESC LIMIT 1").get(message.id) as { id: string; status: string } | undefined;
+        if (options.preserveQueued && message.status === "queued" && outbox?.status === "queued") continue;
         const uncertain = outbox?.status !== "queued";
         const status = uncertain ? "uncertain" : "aborted";
         if (outbox && outbox.status !== status) this.db.prepare("UPDATE outbox SET status=?,deadline_at=NULL WHERE id=?").run(status, outbox.id);
