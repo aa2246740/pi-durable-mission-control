@@ -22,7 +22,7 @@ function fixture() {
     fetch: () => new Promise(() => {}), setInterval() {}, setTimeout() {}, clearTimeout() {}
   };
   runInNewContext(source + `\n globalThis.ui = {
-    state, renderDetail, renderRemoteRuntimes, timeline, load,
+    state, renderDetail, renderRemoteRuntimes, timeline, load, renderMessages, api, toast,
     setApi: (handler) => { api = handler; loading = false; },
     invalidateRoute: () => { routeVersion += 1; state.missionId = null; }
   };`, context);
@@ -36,7 +36,7 @@ function fixture() {
     agents: [{ id: 'worker', title: '执行者 <甲>', kind: 'worker', epoch: 3 }],
     tasks: [], events: [], approvals: [], blockers: []
   };
-  return { ui, elements };
+  return { ui, elements, context };
 }
 
 function runtime(overrides = {}) {
@@ -264,4 +264,144 @@ test('a late runtime response cannot replace detail after navigation', async () 
   release([runtime()]);
   await loading;
   assert.equal(ui.state.detail, null);
+});
+
+for (const [type, text] of [
+  ['coordinator_stopping', 'Mission 已暂停，等待远端运行时确认停止'],
+  ['coordinator_stop_waiting', 'Mission 保持原状态'],
+  ['coordinator_stop_unconfirmed', '恢复已被禁止，请核对旧进程'],
+  ['coordinator_resume_queued', '代理将读取持久历史继续待办，不会重放旧操作'],
+  ['local_worker_exit_confirmed', '仍需点击“继续执行”显式恢复']
+]) {
+  test(`${type} renders a Chinese explanation instead of server text`, () => {
+    const { ui } = fixture();
+    const html = ui.timeline([{ type, text: 'English server text', data: { runtimeId: '<old>"&' } }]);
+    assert.ok(html.includes(text));
+    assert.doesNotMatch(html, /English server text|<old>/);
+    if (type === 'coordinator_stop_unconfirmed') assert.ok(html.includes('&lt;old&gt;&quot;&amp;'));
+  });
+}
+
+test('coordinator recovery messages identify the system sender and escape durable content', () => {
+  const { ui } = fixture();
+  ui.state.detail.messages = [{ senderId: 'system:coordinator', recipientId: 'worker',
+    content: '<script>history</script>', status: 'queued', mode: 'followUp', attempt: 1 }];
+  const html = ui.renderMessages();
+  assert.match(html, /<b>协调端恢复通知<\/b>/);
+  assert.match(html, /&lt;script&gt;history&lt;\/script&gt;/);
+  assert.match(html, /排队中/);
+  assert.doesNotMatch(html, /<script>|system:coordinator/);
+});
+
+for (const status of ['paused', 'blocked', 'failed']) {
+  test(`${status} local worker stop hold disables resume even after blocker resolution`, () => {
+    const { ui } = fixture();
+    ui.state.detail.mission.status = status;
+    ui.state.detail.mission.localWorkerStops = [{ agentId: '<old>"&', epoch: '<epoch>', exit: 'unconfirmed' }];
+    ui.state.detail.blockers = [{ id: 'worker-stop:old:1', kind: 'unsafe_execution', status: 'resolved', text: 'old blocker' }];
+    const html = ui.renderDetail();
+    assert.match(html, /data-action="resume" disabled aria-disabled="true" aria-describedby="local-worker-stop-diagnostic"/);
+    assert.match(html, /需确认旧进程已退出后再显式恢复/);
+    assert.match(html, /退出尚未确认，继续执行已禁用/);
+    assert.ok(html.includes('&lt;old&gt;&quot;&amp;'));
+    assert.ok(html.includes('&lt;epoch&gt;'));
+    assert.doesNotMatch(html, /<old>|<epoch>|old blocker/);
+    ui.state.detail.mission.localWorkerStops[0].exit = 'confirmed';
+    const confirmed = ui.renderDetail();
+    assert.match(confirmed, /已确认退出，可处理阻塞后显式恢复/);
+    assert.doesNotMatch(confirmed.match(/<button[^>]*data-action="resume"[^>]*>/)[0], /disabled/);
+    ui.state.detail.mission.localWorkerStops = [];
+    assert.doesNotMatch(ui.renderDetail(), /本地进程停止门禁|需确认旧进程/);
+  });
+}
+
+test('open local stop blocker has a Chinese explanation and preserves its resolution action', () => {
+  const { ui } = fixture();
+  ui.state.detail.blockers = [{ id: 'worker-stop:<old>:1', kind: 'unsafe_execution', status: 'open', text: 'Local worker exit was not confirmed' }];
+  const html = ui.renderDetail();
+  assert.match(html, /本地进程退出未确认。请先核对旧进程，再记录处理结果；排队输入尚未发送/);
+  assert.match(html, /data-action="resolve-blocker" data-id="worker-stop:&lt;old&gt;:1"/);
+  assert.doesNotMatch(html, /Local worker exit was not confirmed|<old>/);
+});
+
+for (const status of ['completed', 'cancelled']) {
+  test(`${status} uncertain delivery is history without recovery controls or new blockers`, () => {
+    const { ui } = fixture();
+    ui.state.detail.mission.status = status;
+    ui.state.detail.mission.localWorkerStops = [{ agentId: 'worker', epoch: 1, exit: 'unconfirmed' }];
+    ui.state.detail.events = [{ type: 'delivery_uncertain', data: { messageId: '<message>"&' } }];
+    const html = ui.renderDetail();
+    assert.match(html, /Mission 已结束，此记录仅保留历史证据，不新增待处理问题，也不会重放消息/);
+    assert.ok(html.includes('&lt;message&gt;&quot;&amp;'));
+    assert.doesNotMatch(html, /data-action="resume"|data-action="resolve-blocker"|恢复诊断|本地进程停止门禁|<message>/);
+  });
+}
+
+test('active uncertain delivery asks for reconciliation and does not call it terminal history', () => {
+  const { ui } = fixture();
+  ui.state.detail.mission.status = 'active';
+  const html = ui.timeline([{ type: 'delivery_uncertain', data: { messageId: 'message-1' } }]);
+  assert.match(html, /消息 message-1 的投递结果不确定/);
+  assert.match(html, /处理对应阻塞后再继续/);
+  assert.doesNotMatch(html, /Mission 已结束|仅保留历史证据/);
+});
+
+test('unexpected runtime stop report explains session reconnection without claiming a specific cause', () => {
+  const { ui } = fixture();
+  ui.state.detail.runtimes = [runtime({ stopProvenance: 'unexpected', report: { outcome: 'stopped', stopReason: 'unexpected' } })];
+  const html = ui.renderRemoteRuntimes();
+  assert.match(html, /报告停止原因：意外停止（包括节点会话失效后重连）/);
+  assert.ok(html.includes(warning));
+  ui.state.detail.runtimes[0].report.stopReason = '<reason>"&';
+  const escaped = ui.renderRemoteRuntimes();
+  assert.ok(escaped.includes('&lt;reason&gt;&quot;&amp;'));
+  assert.doesNotMatch(escaped, /<reason>/);
+  ui.state.detail.runtimes[0].report.stopReason = 'requested';
+  assert.match(ui.renderRemoteRuntimes(), /报告停止原因：响应停止请求/);
+});
+
+for (const [error, expected] of [
+  ['Workspace operations must finish before mission completion', '仍有工作区操作、shell 命令或验证在执行'],
+  ['Local worker exit is not confirmed; explicit resume is refused and answers remain held. A coordinator restart cannot confirm an old process exit.', '无法继续执行：旧本地进程退出尚未确认'],
+  ['Resolve mission blockers before resuming', '无法继续执行：请先处理所有未解决的阻塞']
+]) {
+  test(`API rejection translates ${error} and retains escaped contextual details`, async () => {
+    const { ui, context, elements } = fixture();
+    context.fetch = async () => ({ ok: false, text: async () => JSON.stringify({ error: error + ' <detail>"&' }) });
+    await assert.rejects(ui.api('/api/missions/runtime-mission/resume', 'POST', {}), (failure) => {
+      assert.ok(failure.message.includes(expected));
+      assert.ok(failure.message.includes('<detail>"&'));
+      ui.toast(failure.message);
+      assert.equal(elements.get('#toast').textContent, failure.message);
+      return true;
+    });
+    const html = ui.timeline([{ type: 'worker_failed', text: error + ' <detail>"&' }]);
+    assert.ok(html.includes(expected));
+    assert.ok(html.includes('&lt;detail&gt;&quot;&amp;'));
+    assert.ok(!html.includes(error));
+    assert.doesNotMatch(html, /<detail>/);
+  });
+}
+
+for (const status of ['paused', 'blocked']) {
+  test(`${status} without a local stop hold keeps ordinary resume available`, () => {
+    const { ui } = fixture();
+    ui.state.detail.mission.status = status;
+    ui.state.detail.blockers = [{ id: 'question', kind: 'user_input', status: 'resolved', text: 'answered' }];
+    const html = ui.renderDetail();
+    assert.doesNotMatch(html.match(/<button[^>]*data-action="resume"[^>]*>/)[0], /disabled|aria-describedby/);
+    assert.doesNotMatch(html, /本地进程停止门禁/);
+  });
+}
+
+test('confirmed local exits do not hide a permanent remote failure or enable resume', () => {
+  const { ui } = fixture();
+  ui.state.detail.mission.localWorkerStops = [{ agentId: 'worker', epoch: 1, exit: 'confirmed' }];
+  ui.state.detail.events = [{ type: 'worker_start_failed', data: { recoverable: false, diagnostic: '<remote>' } }];
+  const html = ui.renderDetail();
+  assert.match(html, /本地进程停止门禁/);
+  assert.match(html, /id="recovery-diagnostic"/);
+  assert.ok(html.includes(unrecoverableExplanation));
+  assert.match(html, /data-action="resume" disabled aria-disabled="true" aria-describedby="recovery-diagnostic"/);
+  assert.match(html, /&lt;remote&gt;/);
 });
