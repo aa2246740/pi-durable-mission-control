@@ -127,7 +127,7 @@ export class WorkerManager {
   async refreshProfile(profileId: string): Promise<void> {
     for (const agent of this.control.listAgents().filter((item) => item.profileId === profileId)) {
       if (agent.machineId !== "local") {
-        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch);
+        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
         continue;
       }
       if (!["idle", "offline"].includes(agent.status)) continue;
@@ -141,7 +141,7 @@ export class WorkerManager {
   async refreshRole(roleId: string): Promise<void> {
     for (const agent of this.control.listAgents().filter((item) => item.roleId === roleId)) {
       if (agent.machineId !== "local") {
-        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch);
+        if (this.control.requestRemoteRuntimeStop(agent.id)) this.control.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
         continue;
       }
       if (!["idle", "offline"].includes(agent.status)) continue;
@@ -392,7 +392,7 @@ export class WorkerManager {
         this.control.requestRemoteRuntimeStop(agent.id);
         if (!flight.fencedAgents.has(agent.id)) {
           flight.fencedAgents.add(agent.id);
-          this.control.markAgentInterrupted(agent.id, agent.epoch);
+          this.control.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
         }
         continue;
       }
@@ -448,7 +448,7 @@ export class WorkerManager {
     if (!agent) throw new HttpError(404, "Agent not found");
     if (agent.machineId !== "local") {
       this.control.requestRemoteRuntimeStop(agentId);
-      this.control.markAgentInterrupted(agentId, agent.epoch);
+      this.control.markAgentInterrupted(agentId, agent.epoch, { controlledRemoteStop: true });
       return;
     }
     const handle = this.handles.get(agentId);

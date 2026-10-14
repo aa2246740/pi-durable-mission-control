@@ -2842,7 +2842,7 @@ export class ControlPlane {
       this.event(row.mission_id, "delivery_uncertain", `Remote delivery ${row.message_id} became uncertain after timeout.`, agentId, { messageId: row.message_id, attempt: row.attempt });
       this.requestRemoteRuntimeStop(agentId);
       const agent = this.getAgent(agentId);
-      this.markAgentInterrupted(agentId, agent?.epoch);
+      this.markAgentInterrupted(agentId, agent?.epoch, { controlledRemoteStop: true });
     });
   }
 
@@ -3990,7 +3990,7 @@ export class ControlPlane {
     });
   }
 
-  markAgentInterrupted(agentId: string, expectedEpoch?: number): void {
+  markAgentInterrupted(agentId: string, expectedEpoch?: number, options: { controlledRemoteStop?: true } = {}): void {
     const agent = this.getAgent(agentId);
     if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
     const rows = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(agent.missionId) as Row[];
@@ -4008,8 +4008,14 @@ export class ControlPlane {
         this.insertSystemBlocker(`delivery:${outbox.id}`, agent.missionId, "delivery", `Delivery ${next.id} may have reached the worker before interruption. Reconcile it before resuming.`);
       }
     }
-    this.putAgent({ ...agent, epoch: agent.epoch + 1, status: "offline", updatedAt: now() });
-    this.remoteRuntimes.markControlledStopFence(agentId, agent.epoch);
+    const runtime = options.controlledRemoteStop && agent.machineId !== "local" ? this.remoteRuntimes.byAgent(agentId) : undefined;
+    // Repeated controlled stops still settle new deliveries above, but the
+    // persisted fence already rejects traffic from this runtime's old epoch.
+    const alreadyFenced = runtime?.desired === "stop" && runtime.stop_request_reason === "controlled" &&
+      runtime.machine_id === agent.machineId && runtime.stop_request_epoch === runtime.epoch &&
+      runtime.stop_fenced_epoch === agent.epoch && agent.epoch === runtime.epoch + 1;
+    this.putAgent({ ...agent, epoch: alreadyFenced ? agent.epoch : agent.epoch + 1, status: "offline", updatedAt: now() });
+    if (!alreadyFenced) this.remoteRuntimes.markControlledStopFence(agentId, agent.epoch);
   }
 
   authorizeAgent(agentId: string, epoch: number, missionId: string): { agent: Agent; mission: Mission; role: RoleProfile } {

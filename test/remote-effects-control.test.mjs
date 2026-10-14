@@ -683,3 +683,102 @@ test("unexpected node reason remains unexpected when physical extinction is unco
   explicitResume(f);
   assertNoReassignment(f, /unexpected stop/);
 });
+
+
+test("repeated blocked lifecycle sync preserves controlled stop and permits recovery", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  const question = await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-question"));
+  assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+  await workers.syncMissionLifecycle(f.mission.id);
+  const firstEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  assert.equal(firstEpoch, f.assignment.binding.epoch + 1);
+  const lateMessage = f.control.sendMessage(f.mission.id, f.agent.id, "Input queued between syncs.", "followUp", "repeat-sync-input");
+  await workers.syncMissionLifecycle(f.mission.id);
+  const secondEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  stopReport(f);
+  const stopped = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.equal(stopped.stop_provenance, "controlled", `epochs ${f.assignment.binding.epoch} -> ${firstEpoch} -> ${secondEpoch}`);
+  assert.equal(secondEpoch, firstEpoch);
+  assert.equal(stopped.stop_request_reason, "controlled");
+  assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+  assert.equal(f.control.message(lateMessage.id).status, "aborted");
+  assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE message_id=?").get(lateMessage.id).status, "aborted");
+  f.control.resolveBlocker(question.id, "Continue with a new runtime.");
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+  const replacement = f.control.remoteRuntimeForAgent(f.agent.id);
+  assert.notEqual(replacement.runtime_id, stopped.runtime_id);
+  assert.equal(replacement.state, "queued");
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  assert.deepEqual(f.control.remoteRuntimes.byRuntime(stopped.runtime_id), stopped);
+});
+
+
+for (const action of ["refreshProfile", "refreshRole", "interruptAgent"]) {
+  test(`repeated controlled ${action} preserves the fenced epoch and permits recovery`, async t => {
+    const f = fixture(t, "metadata-only");
+    const workers = new WorkerManager(f.control);
+    const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+    const question = await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, `repeat-${action}-question`));
+    const invoke = () => action === "refreshProfile" ? workers.refreshProfile(f.profile.id)
+      : action === "refreshRole" ? workers.refreshRole(f.roleIds[1]) : workers.interruptAgent(f.agent.id);
+    await invoke();
+    const fencedEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+    assert.equal(fencedEpoch, f.assignment.binding.epoch + 1);
+    const lateMessage = f.control.sendMessage(f.mission.id, f.agent.id, "New input during shutdown.", "followUp", `repeat-${action}-input`);
+    await invoke();
+    assert.equal(f.control.message(lateMessage.id).status, "aborted");
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+    stopReport(f);
+    assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "controlled");
+    await invoke();
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+    assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+    f.control.resolveBlocker(question.id, "Continue.");
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+    await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+    assert.notEqual(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+  });
+}
+
+test("repeated controlled lifecycle sync still fences newly admitted delivery as uncertain", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-admitted-question"));
+  await workers.syncMissionLifecycle(f.mission.id);
+  const fencedEpoch = f.control.getAgentPublic(f.agent.id).epoch;
+  const input = f.control.sendMessage(f.mission.id, f.agent.id, "Delivery admission arrived late.", "followUp", "repeat-sync-admitted-input");
+  f.control.db.prepare("UPDATE messages SET status='admitted',data=? WHERE id=?")
+    .run(JSON.stringify({ ...input, status: "admitted" }), input.id);
+  f.control.db.prepare("UPDATE outbox SET status='admitted' WHERE message_id=?").run(input.id);
+  const outbox = f.control.db.prepare("SELECT id FROM outbox WHERE message_id=?").get(input.id);
+  await workers.syncMissionLifecycle(f.mission.id);
+  assert.equal(f.control.getAgentPublic(f.agent.id).epoch, fencedEpoch);
+  assert.equal(f.control.message(input.id).status, "uncertain");
+  assert.equal(f.control.db.prepare("SELECT status FROM outbox WHERE id=?").get(outbox.id).status, "uncertain");
+  assert.ok(f.control.blockers(f.mission.id).some(b => b.id === `delivery:${outbox.id}` && b.status === "open"));
+  stopReport(f);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "controlled");
+  assert.equal(f.control.blockers(f.mission.id).some(b => b.id === `remote-runtime:${f.assignment.binding.runtimeId}`), false);
+  explicitResume(f);
+  assertNoReassignment(f, /uncertain or partially executed durable delivery/);
+});
+
+test("unrelated interruption between controlled lifecycle syncs remains ownership loss", async t => {
+  const f = fixture(t, "metadata-only");
+  const workers = new WorkerManager(f.control);
+  const orchestrator = f.control.listAgents(f.mission.id).find(agent => agent.kind === "orchestrator");
+  await f.control.workerCommand(request(orchestrator, "RequestUserInput", { question: "Continue?" }, "repeat-sync-owner-question"));
+  await workers.syncMissionLifecycle(f.mission.id);
+  f.control.markAgentInterrupted(f.agent.id, f.control.getAgentPublic(f.agent.id).epoch);
+  await workers.syncMissionLifecycle(f.mission.id);
+  stopReport(f);
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_provenance, "uncertain");
+  assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).stop_request_reason, "ownership-lost");
+  explicitResume(f);
+  assertNoReassignment(f, /uncertain/);
+});
