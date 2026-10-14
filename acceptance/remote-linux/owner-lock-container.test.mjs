@@ -8,8 +8,8 @@ import { setTimeout as delay } from "node:timers/promises";
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const proof = join(root, ".acceptance-proof");
 mkdirSync(proof, { recursive: true });
-const prefix = process.env.MC_ACCEPTANCE_CONTAINER_PREFIX ?? "mc-acc-p5-gpt-";
-assert.match(prefix, /^mc-acc-p5-gpt-[a-z0-9-]*$/);
+const prefix = process.env.MC_ACCEPTANCE_CONTAINER_PREFIX ?? "mc-acc-owner-lock-";
+assert.match(prefix, /^mc-acc-[a-z0-9-]+-$/);
 const image = "node:22-bookworm-slim";
 function container(args) {
   const result = spawnSync("container", args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 180000 });
