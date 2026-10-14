@@ -10,7 +10,9 @@ import { delivery, deliveryName, shellQuote, startMock } from "./mock.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const containerCLI = "/opt/homebrew/bin/container";
-const prefix = "mc-acc-e-gpt-";
+// Concurrent runs (for example from separate checkouts) must use distinct prefixes.
+const prefix = process.env.MC_ACCEPTANCE_CONTAINER_PREFIX ?? "mc-acc-";
+if (!/^mc-acc-[a-z0-9-]*$/.test(prefix)) throw new Error("MC_ACCEPTANCE_CONTAINER_PREFIX must start with mc-acc- and use lowercase letters, digits and hyphens");
 
 export function parseOptions(args) {
   const options = { keep: false, timeoutMs: 180000 };

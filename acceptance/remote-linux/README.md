@@ -14,7 +14,7 @@ node acceptance/remote-linux/run.mjs --keep --out /指定的/新证据目录 --t
 
 `--out` 必须指定尚不存在的目录，父目录必须存在。默认位置是 `$TMPDIR/mc-acceptance-<时间戳>-<随机后缀>`。成功默认删除目录，`--keep` 保留；失败、超时、SIGINT 或 SIGTERM 保留目录并输出路径。退出码非零表示验收或清理失败。不能用 SIGKILL 中断并期待 finally 清理。
 
-容器名仅使用 `mc-acc-e-gpt-` 前缀，运行带 `--rm`。只停止、删除当前运行创建的精确容器名；若启动前发现已有此前缀容器，拒绝运行并由其所有者处理。退出前以 `container list --all --quiet` 核对此前缀无残留，并打印 `cleanup verified`。正常成功还会关闭协调端、mock、TCP 中继并删除证据目录。只读挂载本 checkout 的 dist、package.json、解析软链接后的 node_modules 及节点启动脚本；节点工作目录与状态位于容器中，随容器销毁。
+容器名仅使用 `mc-acc-` 前缀（可用环境变量 `MC_ACCEPTANCE_CONTAINER_PREFIX` 改成其他 `mc-acc-` 开头的前缀，以便多个检出并行运行），运行带 `--rm`。只停止、删除当前运行创建的精确容器名；若启动前发现已有此前缀容器，拒绝运行并由其所有者处理。退出前以 `container list --all --quiet` 核对此前缀无残留，并打印 `cleanup verified`。正常成功还会关闭协调端、mock、TCP 中继并删除证据目录。只读挂载本 checkout 的 dist、package.json、解析软链接后的 node_modules 及节点启动脚本；节点工作目录与状态位于容器中，随容器销毁。
 
 宿主中继只将 `192.168.64.1:<随机端口>` 接到协调端 `127.0.0.1:<nodePort>`。容器内中继将 `127.0.0.1:14311` 接到宿主中继，节点使用字面量回环 HTTP 地址。admin/UI 端口不转发。mock 有独立的宿主中继。node bearer token 和假模型凭据通过 `container run -i` 的 stdin 传入 shell，再导出给 `--token-env`、`--credential-ref`；值不进入 argv 或证据。admin token 由脚本读入内存，协调端退出后删除产品生成的 admin.token。保留证据前扫描全部文件，检查这三个凭据值没有泄漏。
 
@@ -39,12 +39,12 @@ summary 必须同时满足 Mission completed、任务 accepted、验收 exitCode
 node --test acceptance/remote-linux/container.test.mjs
 ```
 
-编排 worktree 开发环境必须用其指定测试入口：
+脚本自身的测试（依赖 Apple Container，不属于 `npm test`）在 `npm run build` 之后运行：
 
 ```sh
-/Users/wu/.mc-orch/bin/wt-test e-gpt acceptance/remote-linux/container.test.mjs
-MC_ACCEPTANCE_TEST_KEEP=1 /Users/wu/.mc-orch/bin/wt-test e-gpt acceptance/remote-linux/container.test.mjs
-/Users/wu/.mc-orch/bin/wt-test e-gpt acceptance/remote-linux/lifecycle.test.mjs
+node --test acceptance/remote-linux/container.test.mjs
+MC_ACCEPTANCE_TEST_KEEP=1 node --test acceptance/remote-linux/container.test.mjs
+node --test acceptance/remote-linux/lifecycle.test.mjs
 ```
 
 容器测试默认检查成功后目录已删除；环境变量 `MC_ACCEPTANCE_TEST_KEEP=1` 检查 `--keep --out` 保留的 summary，再删除该次测试证据。生命周期测试分别验证真实运行中的 SIGINT 和超时，先检查失败证据保留与清理结果，再删除该次测试证据。三个命令应依次执行，避免同一容器名前缀的验收互相影响。
