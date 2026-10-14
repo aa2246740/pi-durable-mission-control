@@ -4,9 +4,17 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assertCoordinatorExit, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
-import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance } from "../acceptance/remote-linux/real.mjs";
-import { modelResponseEvidence, modelUsageEvidence } from "../dist/worker.js";
+import { assertCoordinatorExit, commandOutput, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
+import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, touchedOracle, oracleTouches } from "../acceptance/remote-linux/real.mjs";
+import { readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
+import { ControlPlane } from "../dist/control.js";
+import { shellQuote } from "../acceptance/remote-linux/mock.mjs";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { Type } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, defineExtension, defineTool, Harness } from "@earendil-works/pi-durable";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
 const temporary = (t) => {
   const path = mkdtempSync(join(tmpdir(), "mc-real-unit-"));
@@ -163,43 +171,78 @@ test("real mission binds one remote workspace and explicit business contract wit
   assert.match(mission.goal,/nonnegative safe integers/);
   assert.match(mission.assertions[0].description,/nonnegative safe integers/);
   assert.match(mission.acceptance,/node --test \/host\/frozen/);
+  const text = JSON.stringify(mission);
+  for (const forbidden of ["move the task", "Assign distinct", "human intervention", "corrupt", "republish", "existing mission state", "CompleteMission", "RunValidation", "review"]) assert.equal(text.includes(forbidden),false);
 });
 
-const usage = {input:11,output:7,cacheRead:3,cacheWrite:2,totalTokens:23,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}};
-test("worker evidence includes tool names and token counters without reasoning, arguments or unknown cost", () => {
-  const response = modelResponseEvidence({role:"assistant",model:"unit-model",content:[{type:"thinking",thinking:fakeKey},{type:"toolCall",name:"PublishArtifact",arguments:{secret:fakeKey}},{type:"toolCall",name:"Report",arguments:{}}]});
-  assert.deepEqual(response,{modelId:"unit-model",tools:["PublishArtifact","Report"]});
-  assert.equal(JSON.stringify(response).includes(fakeKey),false);
-  assert.equal(modelResponseEvidence({role:"user",content:"text"}),undefined);
-  assert.deepEqual(modelUsageEvidence({models:{one:usage,two:usage},tools:{bash:usage}}),{input:22,output:14,cacheRead:6,cacheWrite:4,totalTokens:46});
+test("stopped pi-durable SQLite evidence retains assistant tool order and cumulative model usage", async (t) => {
+  const directory = temporary(t);
+  const path = join(directory, "session.sqlite");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([{type:"thinking",thinking:fakeKey}, fauxToolCall("Probe",{secret:fakeKey})], {stopReason:"toolUse"}),
+    fauxAssistantMessage([{type:"text",text:"completed"},fauxToolCall("Finish",{})], {stopReason:"toolUse"})
+  ]);
+  const models = createModels(); models.setProvider(faux.provider);
+  const registry = createRegistry();
+  const extension = defineExtension({name:"unit-evidence-tools",tools:[
+    defineTool({name:"Probe",description:"Unit probe",parameters:Type.Object({secret:Type.String()}),execute:async()=>({content:[{type:"text",text:"probe"}],usage:{input:9999,output:9999,cacheRead:0,cacheWrite:0,totalTokens:19998,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}})}),
+    defineTool({name:"Finish",description:"Unit finish",parameters:Type.Object({}),execute:async()=>({content:[{type:"text",text:"done"}],control:{terminate:true}})})
+  ]});
+  registry.install(extension);
+  const harness = await Harness.open(await openNodeSqliteStorage(path), {models,registry}, BACKGROUND_CONTEXT);
+  let expected;
+  try {
+    const root = await harness.root(BACKGROUND_CONTEXT, {agent:{model:{provider:"faux",modelId:"faux-1"},extensions:[extension],tools:extension.tools}});
+    const submitted = await root.submit({type:"input",content:"Exercise two tools"},BACKGROUND_CONTEXT);
+    assert.equal((await submitted.wait(BACKGROUND_CONTEXT)).status,"done");
+    await root.waitForIdle(BACKGROUND_CONTEXT);
+    expected = (await harness.usage(BACKGROUND_CONTEXT)).models["faux/faux-1"];
+    assert.equal(faux.state.callCount,2);
+  } finally { await harness.close(BACKGROUND_CONTEXT); }
+  const before = sha256(readFileSync(path));
+  chmodSync(path,0o400);
+  const session = readSessionEvidence(path);
+  assert.equal(session.complete,true);
+  assert.equal(session.modelCalls,2);
+  assert.deepEqual(session.tools.map((tool)=>tool.name),["Probe","Finish"]);
+  assert.ok(session.tools[0].commitSeq < session.tools[1].commitSeq);
+  assert.deepEqual(session.usage,Object.fromEntries(["input","output","cacheRead","cacheWrite","totalTokens"].map((key)=>[key,expected[key]])));
+  assert.ok(session.usage.totalTokens > 0 && session.usage.totalTokens < 19998);
+  assert.equal(JSON.stringify(session).includes(fakeKey),false);
+  const remote = JSON.parse(await commandOutput(process.execPath,["-e",remoteSessionScript,path],{PATH:process.env.PATH}));
+  assert.deepEqual(remote,session);
+  assert.equal(sha256(readFileSync(path)),before,"the read-only query must leave the actual database unchanged");
+  const exported = {mission:{status:"blocked",turns:3,maxTurns:60,costKnown:false,cost:0},agents:[{id:"o",kind:"orchestrator",machineId:"local"},{id:"w",kind:"worker",machineId:"linux"}],
+    generationAdmissions:[{agent_id:"o"},{agent_id:"o",generation_id:"auxiliary:unit"},{agent_id:"w"}],transcripts:[],artifacts:[],validationReceipts:[],blockers:[{kind:"user_input"}],events:[]};
+  const evidence = collectRealEvidence(exported,undefined,{path:"/host/totals.acceptance.test.mjs"},{},[{agentId:"o",...session},{agentId:"w",...readSessionEvidence(join(directory,"missing.sqlite"))}]);
+  assert.equal(evidence.roles.orchestrator.modelCalls,2);
+  assert.equal(evidence.roles.orchestrator.admittedModelCalls,2);
+  assert.deepEqual(evidence.roles.orchestrator.usage,session.usage);
+  assert.equal(evidence.roles.worker.modelCalls,null);
+  assert.equal(evidence.roles.worker.usage,null);
+  assert.equal(evidence.evidenceComplete,false);
+  assert.deepEqual(evidence.tools.map((tool)=>tool.name),["Probe","Finish"]);
+  assert.equal(evidence.cost,null);
+  assert.deepEqual(evidence.blockers,[{kind:"user_input"}]);
+  assert.equal(statSync(path).mode & 0o777,0o400);
+  assert.equal(readSessionEvidence(join(directory,"missing.sqlite")).complete,false);
+  writeFileSync(join(directory,"invalid.sqlite"),"invalid database");
+  assert.equal(JSON.parse(await commandOutput(process.execPath,["-e",remoteSessionScript,join(directory,"invalid.sqlite")])).complete,false);
 });
 
-test("export evidence counts admitted calls including auxiliary requests and orders model tools", () => {
-  const exported = {mission:{status:"blocked",turns:3,maxTurns:60,costKnown:false,cost:0}, agents:[{id:"o",kind:"orchestrator"},{id:"w",kind:"worker"}],
-    generationAdmissions:[{agent_id:"o"},{agent_id:"o",generation_id:"auxiliary:unit"},{agent_id:"w"}],
-    transcripts:[{agentId:"o",entries:[{id:"o:model",role:"model",text:JSON.stringify({tools:["SpawnAgent","CreateTask"]}),createdAt:"2026-10-14T00:00:00.001Z"},{role:"model_usage",text:JSON.stringify({input:11,output:7,cacheRead:3,cacheWrite:2,totalTokens:23})}]},
-      {agentId:"w",entries:[{id:"w:model",role:"model",text:JSON.stringify({tools:["GetMissionState"]}),createdAt:"2026-10-14T00:00:00.002Z"}]}], artifacts:[],validationReceipts:[],blockers:[{kind:"user_input"}]};
-  const result = collectRealEvidence(exported,undefined,{sha256:"unit"});
-  assert.equal(result.roles.orchestrator.modelCalls,2);
-  assert.equal(result.roles.orchestrator.modelResponses,1);
-  assert.equal(result.roles.worker.modelCalls,1);
-  assert.equal(result.roles.worker.usage,null);
-  assert.equal(result.roles.validator.modelCalls,0);
-  assert.deepEqual(result.roles.orchestrator.usage,{input:11,output:7,cacheRead:3,cacheWrite:2,totalTokens:23});
-  assert.deepEqual(result.tools.map((tool)=>tool.name),["SpawnAgent","CreateTask","GetMissionState"]);
-  assert.equal(result.cost,null);
-  assert.deepEqual(result.blockers,[{kind:"user_input"}]);
-});
-
-test("real success gate rejects absent injection, changed CAS, wrong receipts and premature validation", () => {
+test("real success gate rejects absent injection, changed CAS, wrong receipts and oracle touches without guest clock ordering", () => {
   const digest = "a".repeat(64);
   const detail = {mission:{status:"completed"},tasks:[{status:"accepted"}],blockers:[],artifacts:[{id:"a",sha256:digest,agentId:"w",remoteProvenance:{machineId:"linux"}}],
     agents:[{id:"w",kind:"worker",machineId:"linux"},{id:"v",kind:"validator",machineId:"local"}],
-    validationReceipts:[{validatorId:"v",command:"unit-command",artifactIds:["a"],artifactDigests:{a:digest},exitCode:0,snapshotIntegrity:true,workspaceKind:"remote-snapshot",stdout:"# tests 4\n# pass 4\n# fail 0",createdAt:"2026-10-14T00:00:02Z"}]};
-  const evidence = {tools:[],mutation:{artifactId:"a",beforeSha256:digest,afterSha256:"b".repeat(64),casBeforeSha256:digest,casAfterSha256:digest,casFinalSha256:digest,completedAt:"2026-10-14T00:00:01Z"}};
+    validationReceipts:[{id:"receipt-1",validatorId:"v",command:"unit-command",artifactIds:["a"],artifactDigests:{a:digest},exitCode:0,snapshotIntegrity:true,workspaceKind:"remote-snapshot",stdout:"# tests 4\n# pass 4\n# fail 0",createdAt:"2026-10-14T00:00:02Z"}]};
+  const evidence = {tools:[],oracleTouches:[],acceptance:{checks:[{phase:"publication",intact:true},{phase:"receipt",receiptId:"receipt-1",intact:true}]},mutation:{artifactId:"a",beforeSha256:digest,afterSha256:"b".repeat(64),casBeforeSha256:digest,casAfterSha256:digest,casFinalSha256:digest,completedAt:"2026-10-14T00:00:01Z"}};
   assert.doesNotThrow(()=>assertRealSuccess(detail,evidence,"unit-command","linux"));
-  for (const patch of [{mutation:undefined},{mutation:{...evidence.mutation,casAfterSha256:"bad"}},{mutation:{...evidence.mutation,completedAt:"2026-10-14T00:00:03Z"}},{tools:[{name:"RequestUserInput"}]}]) assert.throws(()=>assertRealSuccess(detail,{...evidence,...patch},"unit-command","linux"));
-  assert.throws(()=>assertRealSuccess({...detail,validationReceipts:[{...detail.validationReceipts[0],exitCode:1}]},evidence,"unit-command","linux"));
+  for (const patch of [{mutation:undefined},{mutation:{...evidence.mutation,casAfterSha256:"bad"}},{oracleTouches:[{command:"chmod"}]},{acceptance:{checks:[{phase:"end",intact:false}]}},{tools:[{name:"RequestUserInput"}]}]) assert.throws(()=>assertRealSuccess(detail,{...evidence,...patch},"unit-command","linux"));
+  assert.doesNotThrow(()=>assertRealSuccess(detail,{...evidence,mutation:{...evidence.mutation,completedAt:"2026-10-14T00:00:03Z"}},"unit-command","linux"));
+  for (const patch of [{exitCode:1},{command:"changed"},{workspaceKind:"local"},{snapshotIntegrity:false},{artifactDigests:{a:"bad"}}]) {
+    assert.throws(()=>assertRealSuccess({...detail,validationReceipts:[{...detail.validationReceipts[0],...patch}]},evidence,"unit-command","linux"));
+  }
 });
 
 test("deadline timeout normalization preserves interruption and earlier command errors", () => {
@@ -220,4 +263,91 @@ test("cold coordinator SIGTERM confirms process exit while ready coordinators re
   assert.equal(forced.signal,"SIGKILL");
   for (const ready of [true,false]) assert.throws(() => assertCoordinatorExit(forced.signal,ready),/forced shutdown/);
   assert.doesNotThrow(() => assertCoordinatorExit(null,true));
+});
+
+
+test("command JSON parsing uses stdout while successful stderr diagnostics stay separate", async () => {
+  const output = await commandOutput(process.execPath,["-e",`process.stderr.write('SQLite warning\\n');console.log(JSON.stringify({beforeSha256:'before',afterSha256:'after'}));`],{PATH:process.env.PATH});
+  assert.deepEqual(JSON.parse(output),{beforeSha256:"before",afterSha256:"after"});
+  await assert.rejects(()=>commandOutput(process.execPath,["-e","console.error('unit command failure');process.exit(3)"]),/unit command failure/);
+});
+
+test("frozen command checks its embedded digest before tests, including paths with shell quotes", (t) => {
+  const directory = temporary(t);
+  const proof = join(directory,"host 'quoted"); mkdirSync(proof);
+  const acceptance = writeFrozenAcceptance(proof);
+  const workspace = join(directory,"workspace"); mkdirSync(workspace);
+  writeFileSync(join(workspace,"totals.mjs"),goodTotals);
+  const command = frozenAcceptanceCommand(acceptance);
+  const invoke = () => spawnSync("/bin/sh",["-c",command],{cwd:workspace,encoding:"utf8",env:{PATH:process.env.PATH}});
+  const intact = checkFrozenAcceptance(acceptance,"publication");
+  assert.equal(intact.intact,true);
+  assert.equal(invoke().status,0);
+  chmodSync(acceptance.path,0o600);
+  writeFileSync(acceptance.path,"console.log('TAMPERED-TEST-RAN');\n");
+  const tampered = invoke();
+  assert.notEqual(tampered.status,0);
+  assert.match(tampered.stderr,/Frozen acceptance hash mismatch/);
+  assert.equal(tampered.stdout.includes("TAMPERED-TEST-RAN"),false);
+  assert.equal(checkFrozenAcceptance(acceptance,"receipt","r").intact,false);
+});
+
+test("oracle audit detects all local shell records and proof-directory mutations", () => {
+  const path = "/host/proof/totals.acceptance.test.mjs";
+  for (const command of [`cat '${path}'`,"cat totals.acceptance.test.mjs", "chmod -R u+w /host/proof", "chflags nouchg '/host/proof'", "cd /host/proof && printf bad > other", "chmod -R u+w $HOME", "chflags nouchg ${TMPDIR}", "echo x > ~/other"]) assert.equal(touchedOracle(command,path),true,command);
+  for (const command of ["node --test totals.unit.test.mjs", "chmod 600 /work/totals.mjs", "ls /host/proof"]) assert.equal(touchedOracle(command,path),false,command);
+  const exported = {agents:[{id:"o",machineId:"local"},{id:"v",machineId:"local"},{id:"w",machineId:"linux"}],
+    events:[{type:"shell_evidence",agentId:"o",seq:1,data:{command:`chflags nouchg '${path}'`}},{type:"shell_evidence",agentId:"w",seq:2,data:{command:`cat ${path}`}}],
+    transcripts:[{agentId:"v",entries:[{id:"t",role:"tool",text:JSON.stringify({command:"chmod -R u+w /host/proof",exitCode:0})},{role:"tool",text:"plain tool result"},{role:"assistant",text:JSON.stringify({command:`cat ${path}`})}]}]};
+  assert.deepEqual(oracleTouches(exported,path).map((record)=>record.agentId),["o","v"]);
+});
+
+test("final evidence scan runs after summary and every late file and fails the run on leakage", (t) => {
+  const directory = temporary(t);
+  const summary = {status:"passed",cleanupVerified:true};
+  const save = (name,value) => writeFileSync(join(directory,name),JSON.stringify(value));
+  finalizeEvidence(directory,[fakeKey],summary,save);
+  assert.equal(JSON.parse(readFileSync(join(directory,"summary.json"))).status,"passed");
+  const lateSave = (name,value) => { save(name,value); writeFileSync(join(directory,"late.bin"),fakeKey); };
+  assert.throws(()=>finalizeEvidence(directory,[fakeKey],summary,lateSave),/Credential found/);
+  assert.equal(summary.status,"failed");
+  assert.equal(JSON.parse(readFileSync(join(directory,"summary.json"))).cleanupVerified,false);
+  rmSync(join(directory,"late.bin"));
+  assert.throws(()=>finalizeEvidence(directory,[fakeKey],{status:"passed",secret:fakeKey},save),/Credential found/);
+});
+
+
+test("stopped export reads the product's actual late shell events and tool transcript", async (t) => {
+  const directory = temporary(t);
+  const acceptance = writeFrozenAcceptance(directory);
+  const state = join(directory,"state"), workspace = join(directory,"workspace"); mkdirSync(workspace);
+  const control = new ControlPlane(state);
+  let before;
+  try {
+    control.upsertProfile({...example().worker,id:"unit",credentialEnv:"",baseUrl:"http://127.0.0.1:9999"});
+    for (const kind of ["orchestrator","worker","validator"]) control.upsertRole({id:kind,name:kind,kind,instructions:"Unit",profileId:"unit"});
+    const mission = control.createMission({title:"Unit",goal:"Unit",acceptance:"Unit",workspaceId:control.addWorkspace("unit",workspace).id,roleIds:["orchestrator","worker","validator"],maxTurns:10,maxCost:0,autonomy:"trusted"});
+    control.missionAction(mission.id,"start");
+    const [agent] = control.listAgents(mission.id);
+    before = control.exportMission(mission.id);
+    const command = `chmod 600 ${shellQuote(acceptance.path)}; chmod 400 ${shellQuote(acceptance.path)}`;
+    const receipt = await control.workerCommand({id:"oracle-unit",token:"internal",agentId:agent.id,epoch:agent.epoch,method:"bash",args:{command},taskId:"oracle-unit"});
+    assert.equal(receipt.exitCode,0);
+    assert.equal(checkFrozenAcceptance(acceptance,"end").intact,true,"restore hides the touch from a final hash check");
+    assert.deepEqual(oracleTouches(before,acceptance.path),[]);
+  } finally { control.close(); }
+  const refreshed = refreshStoppedExport(join(state,"control.sqlite"),before);
+  assert.deepEqual(oracleTouches(refreshed,acceptance.path).map((record)=>record.source),["shell_evidence","tool transcript"]);
+});
+
+
+test("secrets rejections distinguish metadata, missing references and format without values", (t) => {
+  const directory = temporary(t), path = join(directory,"unit.env");
+  writeFileSync(path,`MINIMAX_CN=${fakeKey}\n`,{mode:0o600});
+  chmodSync(path,0o644);
+  assert.throws(()=>readSecrets(path,["MINIMAX_CN"]),/Secrets file rejected: owner, type or permissions/);
+  chmodSync(path,0o600);
+  assert.throws(()=>readSecrets(path,["MISSING"]),/Secrets file rejected: missing referenced credential/);
+  writeFileSync(path,`MINIMAX_CN=${fakeKey}\nMINIMAX_CN=${fakeKey}\n`);
+  assert.throws(()=>readSecrets(path,["MINIMAX_CN"]),(error)=>error.message==="Secrets file rejected: referenced KEY=VALUE format" && !error.message.includes(fakeKey));
 });

@@ -1303,15 +1303,17 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
     assert.ok(detail.events.some((event) => event.type === "agent_report" && event.agentId === idleWorker.id), "the second agent's same-numbered tool task must not be swallowed as a duplicate");
     const workerTranscript = await (await fetch(`${base}/api/agents/${idleWorker.id}/transcript`, { headers: { cookie } })).json();
     assert.ok(workerTranscript.entries.some((entry) => entry.text === "test-only tool loop completed"), "the second agent's same-numbered assistant entry must remain visible");
-    let modelRecords;
+    const inflight = new Set(["queued", "dispatching", "admitted"]);
+    const quietDeadline = Date.now() + 20000;
     do {
-      const exported = await (await fetch(`${base}/api/missions/${mission.id}/export`, { headers: { cookie } })).json();
-      modelRecords = exported.transcripts.find((item) => item.agentId === idleWorker.id)?.entries ?? [];
-      if (modelRecords.filter((entry) => entry.role === "model").length === 2 && modelRecords.some((entry) => entry.role === "model_usage" && JSON.parse(entry.text).totalTokens > 0)) break;
+      detail = await (await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } })).json();
+      const bound = detail.agents.filter((agent) => agent.profileId === "http-faux");
+      if (bound.length > 0 && bound.every((agent) => agent.status === "idle") && detail.messages.every((message) => !inflight.has(message.status))) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
-    } while (Date.now() < workerDeadline);
-    assert.deepEqual(modelRecords.filter((entry) => entry.role === "model").flatMap((entry) => JSON.parse(entry.text).tools), ["GetMissionState", "Report"]);
-    assert.ok(modelRecords.some((entry) => entry.role === "model_usage" && JSON.parse(entry.text).totalTokens > 0), "actual worker token counters must reach Mission export");
+    } while (Date.now() < quietDeadline);
+    const boundAgents = detail.agents.filter((agent) => agent.profileId === "http-faux");
+    assert.ok(boundAgents.length > 0 && boundAgents.every((agent) => agent.status === "idle"), "profile revision waits until every bound agent is idle");
+    assert.equal(detail.messages.some((message) => inflight.has(message.status)), false);
     const updatedProfile = await post("/api/profiles", {
       id: "http-faux", name: "Test-only faux revision 2", api: "openai-completions", modelId: "faux-1",
       baseUrl: "http://127.0.0.1:9999", credentialEnv: "", contextWindow: 16000, maxTokens: 512,

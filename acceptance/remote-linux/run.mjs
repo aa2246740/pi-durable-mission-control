@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell } from "./real.mjs";
+import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance } from "./real.mjs";
+import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
 import { delivery, deliveryName, shellQuote, startMock } from "./mock.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
@@ -67,30 +68,45 @@ async function relay(targetPort) {
   } };
 }
 
-function childProcess(command, args, env = process.env) {
+export function childProcess(command, args, env = process.env) {
   const child = spawn(command, args, { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
-  let output = "";
+  let stdout = "", stderr = "";
   let error;
-  child.stdout.on("data", (chunk) => { output = (output + chunk.toString()).slice(-2 * 1024 * 1024); });
-  child.stderr.on("data", (chunk) => { output = (output + chunk.toString()).slice(-2 * 1024 * 1024); });
+  child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString()).slice(-2 * 1024 * 1024); });
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-2 * 1024 * 1024); });
   child.stdin.on("error", (value) => { error ??= value; });
   const done = new Promise((resolve) => {
     child.on("error", (value) => { error = value; resolve(); });
     child.on("close", resolve);
   });
-  return { child, done, output: () => output, error: () => error };
+  return { child, done, stdout: () => stdout, stderr: () => stderr, output: () => stdout + stderr, error: () => error };
 }
 
-async function command(args) {
-  const handle = childProcess(containerCLI, args, { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR });
+export async function commandOutput(executable, args, env = process.env) {
+  const handle = childProcess(executable, args, env);
   const timer = setTimeout(() => handle.child.kill("SIGKILL"), 20000);
   await handle.done;
   clearTimeout(timer);
-  if (handle.error() || handle.child.exitCode !== 0) throw new Error(`container ${args[0]} failed: ${handle.error()?.message ?? handle.output()}`);
-  return handle.output();
+  if (handle.error() || handle.child.exitCode !== 0) throw new Error(`Command failed: ${handle.error()?.message ?? handle.output()}`);
+  return handle.stdout();
 }
 
+const command = (args) => commandOutput(containerCLI, args, { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR });
+
 const containerNames = async () => (await command(["list", "--all", "--quiet"])).trim().split(/\s+/).filter((name) => name.startsWith(prefix));
+
+export function finalizeEvidence(proof, secrets, summary, save) {
+  save("summary.json", summary);
+  try { scanEvidence(proof, secrets); }
+  catch (error) {
+    summary.status = "failed";
+    summary.cleanupVerified = false;
+    summary.cleanupErrors = [...(summary.cleanupErrors ?? []), "credential evidence: final scan failed"];
+    save("summary.json", summary);
+    scanEvidence(proof, secrets);
+    throw error;
+  }
+}
 
 export async function run(options) {
   const config = options.real ? readConfig(options.real) : undefined;
@@ -109,7 +125,9 @@ export async function run(options) {
   const credential = randomUUID();
   secrets.push(credential);
   let daemon, node, mock, nodeRelay, modelRelay, detail, summary;
-  let captureReal, mutation, acceptance;
+  let captureReal, exportedReal, mutation, acceptance, acceptanceCommand;
+  const sessions = [];
+  const seenReceipts = new Set();
   let failure;
   let mockFailure;
   let aborted;
@@ -141,11 +159,19 @@ export async function run(options) {
     const images = JSON.parse(await command(["image", "list", "--format", "json"]));
     const image = images.find((i) => /^(docker\.io\/library\/)?node:22-bookworm-slim$/.test(i.configuration.name));
     assert.ok(image?.variants.some((v) => v.platform.architecture === "arm64" && v.platform.os === "linux"), "Required cached node:22-bookworm-slim arm64 image missing; pulling is forbidden");
-    let acceptanceCommand;
+
     const env = { PATH: process.env.PATH, HOME: proof, TMPDIR: proof };
     if (config) {
       acceptance = writeFrozenAcceptance(proof);
-      acceptanceCommand = `${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(acceptance.path)}`;
+      acceptance.checks = [];
+      acceptance.immutable = { attempted: process.platform === "darwin", applied: false };
+      if (acceptance.immutable.attempted) {
+        const flags = childProcess("/bin/chflags", ["uchg", acceptance.path], env);
+        await flags.done;
+        acceptance.immutable.applied = !flags.error() && flags.child.exitCode === 0;
+        if (!acceptance.immutable.applied) acceptance.immutable.error = "chflags uchg failed";
+      }
+      acceptanceCommand = frozenAcceptanceCommand(acceptance);
       save("real-config.json", config);
       save("frozen-acceptance.json", acceptance);
       for (const kind of ["orchestrator", "validator"]) env[config[kind].credentialEnv] = credentials[config[kind].credentialEnv];
@@ -178,7 +204,7 @@ export async function run(options) {
     const credentialRefs = config ? [config.worker.credentialEnv] : ["MC_ACCEPTANCE_MODEL_CREDENTIAL"];
     // Values travel only over stdin; the shell reads one value for each explicitly allowed name.
     const nodeInput = [enrolled.token, ...credentialRefs.map((ref) => config ? credentials[ref] : credential)].join("\n") + "\n";
-    node = childProcess(containerCLI, ["run", "--rm", "-i", "--name", name, "--arch", "arm64", "--cpus", "2", "--memory", "512M",
+    node = childProcess(containerCLI, ["run", "--rm", "-i", ...(config ? ["--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1"] : []), "--name", name, "--arch", "arm64", "--cpus", "2", "--memory", "512M",
       "-v", `${join(root, "dist")}:/app/dist:ro`, "-v", `${join(root, "package.json")}:/app/package.json:ro`,
       "-v", `${realpathSync(join(root, "node_modules"))}:/app/node_modules:ro`,
       "-v", `${join(root, "acceptance/remote-linux/bootstrap.mjs")}:/app/bootstrap.mjs:ro`,
@@ -203,7 +229,7 @@ export async function run(options) {
       for (const kind of kinds) {
         await api("/api/profiles", { ...config[kind], id: `acceptance-${kind}` });
         await api("/api/roles", { id: `acceptance-${kind}`, name: kind, kind, profileId: `acceptance-${kind}`,
-          instructions: "Read GetMissionState and follow the order totals business rules and independent frozen validation contract. Use actual tool results. Do not request human intervention.", mcpPermissions: [] });
+          instructions: `You are the ${kind} for this mission.`, mcpPermissions: [] });
       }
       mission = await api("/api/missions", realMission({ acceptanceCommand, localWorkspaceId: localWorkspace.id, remoteWorkspaceId: remoteWorkspace.id, roleIds: kinds.map((kind) => `acceptance-${kind}`) }));
       // Evidence reads remain possible after timeout; they never mutate mission state.
@@ -212,6 +238,7 @@ export async function run(options) {
         assert.ok(response.ok, "Mission export failed");
         const exported = await response.json();
         detail = exported;
+        exportedReal = exported;
         save("mission-export.json", exported);
         const casHashes = Object.fromEntries(exported.artifacts.map((artifact) => {
           let digest = null;
@@ -222,7 +249,7 @@ export async function run(options) {
           mutation.casFinalSha256 = casHashes[mutation.artifactId];
           save("fault-injection.json", mutation);
         }
-        const evidence = collectRealEvidence(exported, mutation, acceptance, casHashes);
+        const evidence = collectRealEvidence(exported, mutation, acceptance, casHashes, sessions);
         save("real-evidence.json", evidence);
         save("mission.json", detail);
         return evidence;
@@ -245,9 +272,17 @@ export async function run(options) {
     detail = await wait(async () => {
       const current = await api(`/api/missions/${mission.id}`);
       detail = current;
+      if (config) for (const receipt of current.validationReceipts) {
+        if (seenReceipts.has(receipt.id)) continue;
+        seenReceipts.add(receipt.id);
+        acceptance.checks.push(checkFrozenAcceptance(acceptance, "receipt", receipt.id));
+        save("frozen-acceptance.json", acceptance);
+      }
       if (config && !mutation) {
         const published = current.events.find((event) => event.type === "artifact_published" && current.agents.some((agent) => agent.id === event.agentId && agent.kind === "worker"));
         if (published) {
+          acceptance.checks.push(checkFrozenAcceptance(acceptance, "publication"));
+          save("frozen-acceptance.json", acceptance);
           const artifact = current.artifacts.find((value) => value.id === published.data.artifactId);
           assert.ok(artifact?.remoteProvenance?.machineId === machineId, "Publication did not come from the assigned Linux node");
           assert.equal(artifact.path, "/work/totals.mjs", "Publish totals.mjs at the Linux workspace root");
@@ -282,8 +317,6 @@ export async function run(options) {
     save("mission.json", detail);
     save("runtimes.json", runtimes);
     if (config) {
-      assert.equal(sha256(readFileSync(acceptance.path)), acceptance.sha256, "Host acceptance file changed");
-      assert.equal(statSync(acceptance.path).mode & 0o7777, 0o400, "Host acceptance permissions changed");
       const evidence = await captureReal();
       assertRealSuccess(detail, evidence, acceptanceCommand, machineId);
       summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
@@ -348,6 +381,57 @@ export async function run(options) {
       clearTimeout(timer);
       assertCoordinatorExit(daemon.child.signalCode, ready);
     });
+    if (config && acceptance) {
+      acceptance.checks.push(checkFrozenAcceptance(acceptance, "end"));
+      save("frozen-acceptance.json", acceptance);
+    }
+    if (config && exportedReal) {
+      await cleanup("stopped export records", async () => {
+        exportedReal = refreshStoppedExport(join(home, "control.sqlite"), exportedReal);
+        save("mission-export.json", exportedReal);
+      });
+      let remoteStopped = false;
+      if (node) {
+        try {
+          const stopped = JSON.parse(await command(["exec", name, "node", "-e", stopNodeForEvidenceScript]));
+          remoteStopped = stopped.stopped === true;
+          save("node-evidence-stop.json", stopped);
+        } catch { save("node-evidence-stop.json", { stopped: false, error: "Node shutdown not confirmed; remote session evidence incomplete" }); }
+      }
+      for (const agent of exportedReal.agents) {
+        let session;
+        if (agent.machineId === "local" && daemon?.child.exitCode !== null && daemon?.child.signalCode === null) {
+          session = readSessionEvidence(join(home, "agents", `${agent.id}.sqlite`));
+        } else if (agent.machineId === machineId && remoteStopped) {
+          try {
+            session = JSON.parse(await command(["exec", name, "node", "-e", remoteSessionScript, `${remoteRuntimeHome}/agents/${sha256(agent.id)}.sqlite`]));
+          } catch { session = { complete: false, error: "Remote session query failed" }; }
+        } else session = { complete: false, error: "Related process stop not confirmed" };
+        sessions.push({ agentId: agent.id, ...session });
+      }
+      save("session-evidence.json", sessions);
+      const casHashes = Object.fromEntries(exportedReal.artifacts.map((artifact) => {
+        try { return [artifact.id, sha256(readFileSync(join(home, "artifacts", artifact.sha256)))]; }
+        catch { return [artifact.id, null]; }
+      }));
+      if (mutation) {
+        mutation.casFinalSha256 = casHashes[mutation.artifactId];
+        save("fault-injection.json", mutation);
+      }
+      const evidence = collectRealEvidence(exportedReal, mutation, acceptance, casHashes, sessions);
+      save("real-evidence.json", evidence);
+      await cleanup("acceptance oracle", async () => {
+        assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle was touched by a local shell command");
+        assert.ok(acceptance.checks.every((check) => check.intact), "Frozen acceptance hash or permissions changed");
+      });
+      if (summary.status === "passed") await cleanup("final acceptance", async () => assertRealSuccess(exportedReal, evidence, acceptanceCommand, machineId));
+      Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches });
+    }
+    if (acceptance?.immutable.applied) await cleanup("frozen acceptance flags", async () => {
+      const flags = childProcess("/bin/chflags", ["nouchg", acceptance.path]);
+      await flags.done;
+      assert.ok(!flags.error() && flags.child.exitCode === 0, "chflags nouchg failed");
+    });
     await cleanup("container", async () => {
       if (!node) return;
       if ((await containerNames()).includes(name)) {
@@ -367,9 +451,6 @@ export async function run(options) {
     if (daemon) writeFileSync(join(proof, "coordinator.log"), redact(daemon.output()), { mode: 0o600 });
     if (node) writeFileSync(join(proof, "container.log"), redact(node.output()), { mode: 0o600 });
     rmSync(join(home, "admin.token"), { force: true });
-    await cleanup("credential evidence", async () => {
-      scanEvidence(proof, secrets);
-    });
     await cleanup("container residue", async () => assert.deepEqual(await containerNames(), []));
     process.removeListener("SIGINT", onInt);
     process.removeListener("SIGTERM", onTerm);
@@ -381,7 +462,8 @@ export async function run(options) {
       failure ??= new Error(cleanupErrors.join("; "));
     }
     summary.durationMs = Date.now() - startedAt;
-    save("summary.json", summary);
+    try { finalizeEvidence(proof, secrets, summary, save); }
+    catch (error) { failure ??= error; }
     if (summary.cleanupVerified) process.stdout.write("cleanup verified\n");
     process.stdout.write(`summary ${redact(JSON.stringify(summary))}\n`);
     if (failure || options.keep || (config && !options.discard)) process.stdout.write(`proof ${redact(proof)}\n`);

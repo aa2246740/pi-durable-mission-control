@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { constants, closeSync, fstatSync, openSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { constants, closeSync, fstatSync, openSync, readFileSync, readdirSync, writeFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { shellQuote } from "./mock.mjs";
 
 export const kinds = ["orchestrator", "worker", "validator"];
 const profileKeys = ["name", "api", "modelId", "baseUrl", "credentialEnv", "contextWindow", "maxTokens", "reasoning", "toolCalling", "vision", "cost"];
@@ -58,8 +59,9 @@ export function readSecrets(path, names, uid = process.getuid()) {
     const stat = fstatSync(fd);
     valid(stat.isFile() && stat.uid === uid && (stat.mode & 0o7777) === 0o600, "Secrets file must be a regular file owned by the current user with mode 0600");
     return parseSecrets(readFileSync(fd, "utf8"), names);
-  } catch {
-    throw new Error("Secrets file rejected; require an owned regular file, mode 0600, and unique referenced KEY=VALUE lines");
+  } catch (error) {
+    const category = fd === undefined ? "file access or type" : error.message.startsWith("Secrets file must") ? "owner, type or permissions" : error.message.startsWith("Missing referenced") ? "missing referenced credential" : "referenced KEY=VALUE format";
+    throw new Error(`Secrets file rejected: ${category}`);
   } finally { if (fd !== undefined) closeSync(fd); }
 }
 
@@ -88,7 +90,7 @@ export function writeFrozenAcceptance(proof) {
   const source = `import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 const { totalCents } = await import(pathToFileURL(join(process.cwd(), 'totals.mjs')));
 test('empty order', () => assert.equal(totalCents([]), 0));
 test('multiple lines', () => assert.equal(totalCents([{quantity:2,unitPriceCents:125},{quantity:3,unitPriceCents:70}]), 460));
@@ -110,35 +112,81 @@ test('reject invalid fields and unsafe amounts', () => {
 }
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
-export function realMission({ acceptanceCommand, localWorkspaceId, remoteWorkspaceId, roleIds }) {
-  return { title: "Remote Linux order totals frozen acceptance", goal: `${businessRules} Deliver from the assigned Linux workspace and complete independent host-only frozen snapshot acceptance.`,
-    acceptance: `${businessRules} Publish only totals.mjs for one task. Self-check on Linux before publication. After publication the acceptance harness will corrupt the live source; never repair or republish it. The validator must run the exact host-only command ${acceptanceCommand} via RunValidation with the published artifactIds, accept using its successful receipt, and the orchestrator must CompleteMission. The host acceptance file is read-only and unavailable to the worker. Use the existing mission state, roles and assertion IDs. Assign distinct worker and validator agents; move the task to review after publication. Do not request human intervention.`,
-    workspaceId: localWorkspaceId, remoteWorkspaceIds: [remoteWorkspaceId], roleIds, maxTurns: 60, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared",
-    assertions: [{ id: "TOTALS-FROZEN", description: `${businessRules} The independently assigned local validator passes all four host-only tests against the frozen remote snapshot after the live source is corrupted.` }] };
+export function frozenAcceptanceCommand(acceptance) {
+  const check = `const fs=require('node:fs'),crypto=require('node:crypto');if(crypto.createHash('sha256').update(fs.readFileSync(${JSON.stringify(acceptance.path)})).digest('hex')!==${JSON.stringify(acceptance.sha256)}){console.error('Frozen acceptance hash mismatch');process.exit(1)}`;
+  return `${shellQuote(process.execPath)} -e ${shellQuote(check)} && ${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(acceptance.path)}`;
 }
 
-export function collectRealEvidence(exported, mutation, acceptance, casHashes = {}) {
-  const tools = [];
-  const roles = Object.fromEntries(kinds.map((kind) => [kind, { modelCalls: 0, modelResponses: 0, usage: null }]));
-  for (const agent of exported.agents) {
-    if (!roles[agent.kind]) continue;
-    const role = roles[agent.kind];
-    role.modelCalls += (exported.generationAdmissions ?? []).filter((row) => row.agent_id === agent.id).length;
-    const entries = exported.transcripts.find((value) => value.agentId === agent.id)?.entries ?? [];
-    const responses = entries.filter((entry) => entry.role === "model").map((entry) => ({ entry, data: JSON.parse(entry.text) }));
-    role.modelResponses += responses.length;
-    for (const { entry, data } of responses) for (const [index, name] of data.tools.entries()) tools.push({ agentId: agent.id, role: agent.kind, name, entryId: entry.id, index, createdAt: entry.createdAt });
-    const usage = entries.filter((entry) => entry.role === "model_usage").at(-1);
-    if (usage) {
-      const counters = JSON.parse(usage.text);
-      role.usage ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
-      for (const key of Object.keys(role.usage)) role.usage[key] += counters[key];
+export function checkFrozenAcceptance(acceptance, phase, receiptId) {
+  const check = { phase, checkedAt: new Date().toISOString(), ...(receiptId ? { receiptId } : {}) };
+  try {
+    check.sha256 = sha256(readFileSync(acceptance.path));
+    check.mode = statSync(acceptance.path).mode & 0o7777;
+    check.intact = check.sha256 === acceptance.sha256 && check.mode === 0o400;
+  } catch { check.intact = false; check.error = "Frozen acceptance file unreadable"; }
+  return check;
+}
+
+export function touchedOracle(command, acceptancePath) {
+  // Shell evidence is audited conservatively, including relative file references.
+  const directory = dirname(acceptancePath);
+  const unquoted = command.replace(/["']/g, "").replace(/\$\{(?:HOME|TMPDIR)\}|\$(?:HOME|TMPDIR)\b|~(?=\/|\s|$)/g, directory);
+  return unquoted.includes(acceptancePath) || unquoted.includes("totals.acceptance.test.mjs") ||
+    (unquoted.includes(directory) && /\b(?:chmod|chflags|chown|rm|mv|cp|tee|touch|mkdir|rmdir|install|truncate|ln|sed|perl|python\d*|node)\b|>|write(?:File)?/i.test(unquoted));
+}
+
+export function oracleTouches(exported, acceptancePath) {
+  const local = new Set(exported.agents.filter((agent) => agent.machineId === "local").map((agent) => agent.id));
+  const commands = [];
+  for (const event of exported.events ?? []) {
+    if (event.type === "shell_evidence" && local.has(event.agentId) && typeof event.data?.command === "string") {
+      commands.push({ agentId: event.agentId, source: "shell_evidence", seq: event.seq, command: event.data.command });
     }
   }
-  tools.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? "") || a.entryId.localeCompare(b.entryId) || a.index - b.index);
+  for (const transcript of exported.transcripts ?? []) {
+    if (!local.has(transcript.agentId)) continue;
+    for (const entry of transcript.entries) {
+      if (entry.role !== "tool") continue;
+      let data;
+      try { data = JSON.parse(entry.text); } catch { continue; }
+      if (typeof data.command === "string") commands.push({ agentId: transcript.agentId, source: "tool transcript", entryId: entry.id, command: data.command });
+    }
+  }
+  return commands.filter((record) => touchedOracle(record.command, acceptancePath));
+}
+
+export function realMission({ acceptanceCommand, localWorkspaceId, remoteWorkspaceId, roleIds }) {
+  return { title: "Remote Linux order totals", goal: `${businessRules} Deliver totals.mjs at /work/totals.mjs in the assigned Linux workspace.`,
+    acceptance: `${businessRules} Deliver one totals.mjs file. An independent validator on the coordinator verifies the published snapshot using this read-only host command: ${acceptanceCommand}. The host test file is available only on the coordinator.`,
+    workspaceId: localWorkspaceId, remoteWorkspaceIds: [remoteWorkspaceId], roleIds, maxTurns: 60, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared",
+    assertions: [{ id: "TOTALS-FROZEN", description: `${businessRules} Independent validation of the published Linux snapshot passes all four host tests.` }] };
+}
+
+export function collectRealEvidence(exported, mutation, acceptance, casHashes = {}, sessions = []) {
+  const roles = Object.fromEntries(kinds.map((kind) => [kind, { modelCalls: 0, admittedModelCalls: 0, usage: null, evidenceComplete: true }]));
+  const tools = [];
+  const agents = exported.agents.map((agent) => {
+    const session = sessions.find((value) => value.agentId === agent.id) ?? { agentId: agent.id, complete: false, error: "Session evidence not collected" };
+    const admittedModelCalls = (exported.generationAdmissions ?? []).filter((row) => row.agent_id === agent.id).length;
+    const role = roles[agent.kind];
+    if (role) {
+      role.admittedModelCalls += admittedModelCalls;
+      role.evidenceComplete &&= session.complete;
+      if (session.complete) {
+        role.modelCalls += session.modelCalls;
+        role.usage ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+        for (const key of Object.keys(role.usage)) role.usage[key] += session.usage[key];
+        for (const tool of session.tools) tools.push({ agentId: agent.id, role: agent.kind, ...tool });
+      }
+    }
+    return { ...session, kind: agent.kind, admittedModelCalls };
+  });
+  for (const role of Object.values(roles)) if (!role.evidenceComplete) { role.modelCalls = null; role.usage = null; }
   return { status: exported.mission.status, turns: exported.mission.turns, maxTurns: exported.mission.maxTurns,
     cost: exported.mission.costKnown ? exported.mission.cost : null, costKnown: exported.mission.costKnown,
-    roles, tools, toolSequenceOrdering: "transcript commit time; per-response order retained", acceptance, mutation,
+    roles, agents, evidenceComplete: agents.every((agent) => agent.complete), tools,
+    toolSequenceOrdering: "per-agent durable commit_seq, entry id and tool position; no cross-agent clock ordering", acceptance, mutation,
+    oracleTouches: oracleTouches(exported, acceptance.path),
     artifacts: exported.artifacts.map((artifact) => ({ id: artifact.id, sha256: artifact.sha256, casSha256: casHashes[artifact.id] ?? null, snapshotPath: artifact.snapshotPath, remoteProvenance: artifact.remoteProvenance })),
     validationReceipts: exported.validationReceipts, blockers: exported.blockers };
 }
@@ -167,7 +215,10 @@ export function assertRealSuccess(detail, evidence, acceptanceCommand, machineId
   assert.match(receipt.stdout, /# tests 4/);
   assert.match(receipt.stdout, /# pass 4/);
   assert.match(receipt.stdout, /# fail 0/);
-  assert.ok(Date.parse(mutation.completedAt) <= Date.parse(receipt.createdAt), "Validation finished before fault injection");
+  assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle was touched by a local shell command");
+  assert.ok(evidence.acceptance.checks.some((check) => check.phase === "publication"), "Publication hash check missing");
+  assert.ok(evidence.acceptance.checks.some((check) => check.phase === "receipt" && check.receiptId === receipt.id), "Receipt hash check missing");
+  assert.ok(evidence.acceptance.checks.every((check) => check.intact), "Frozen acceptance hash or permissions changed");
   const worker = detail.agents.find((agent) => agent.id === artifact.agentId);
   const validator = detail.agents.find((agent) => agent.id === receipt.validatorId);
   assert.equal(worker.kind, "worker");
