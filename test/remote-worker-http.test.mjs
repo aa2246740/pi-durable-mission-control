@@ -16,6 +16,32 @@ const waitFor = async (predicate, timeout = 30000) => {
   throw new Error("timed out waiting for remote runtime");
 };
 
+const waitForCleanTransport = async (control, nodeHome, binding) => {
+  const db = new DatabaseSync(join(nodeHome, "worker-runtime", "node-workers.sqlite"), { readOnly: true });
+  let stableSince = 0;
+  let sequences;
+  try {
+    await waitFor(() => {
+      const nodeBinding = db.prepare("SELECT send_sequence,receive_sequence FROM worker_mailbox_bindings WHERE runtime_id=?")
+        .get(binding.runtimeId);
+      const fingerprint = JSON.stringify([control.workerMailbox.inspectBinding(binding), nodeBinding]);
+      const unsettledNode = db.prepare(`SELECT 1 FROM worker_mailbox_outbox WHERE runtime_id=? AND status!='acknowledged'
+        UNION ALL SELECT 1 FROM worker_mailbox_inbox WHERE runtime_id=? AND status!='applied' LIMIT 1`)
+        .get(binding.runtimeId, binding.runtimeId);
+      const clean = control.workerMailbox.inspectOutbox(binding).every(item => item.status === "acknowledged") &&
+        control.workerMailbox.inspectInbox(binding).every(item => item.status === "applied") &&
+        control.getAgentPublic(binding.agentId).status === "idle" && !unsettledNode;
+      // Settlement precedes asynchronous transcript/usage callbacks. Both durable
+      // mailboxes must remain drained before this fixture claims a clean stop.
+      if (!clean || fingerprint !== sequences) stableSince = Date.now();
+      sequences = fingerprint;
+      return clean && Date.now() - stableSince >= 1000;
+    });
+  } finally {
+    db.close();
+  }
+};
+
 const post = async (base, token, path, body) => {
   const response = await fetch(`${base}${path}`, {
     method: "POST",
@@ -27,7 +53,7 @@ const post = async (base, token, path, body) => {
   return value;
 };
 
-test("real node process performs metadata-only assignment, durable delivery, RPC admission, and physical stop", { timeout: 90000 }, async (t) => {
+test("real node process performs metadata-only assignment, durable delivery, RPC admission, and physical stop and clean recovery", { timeout: 120000 }, async (t) => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-remote-http-"));
   const root = join(home, "remote-root");
   const localWorkspacePath = join(home, "local-workspace");
@@ -44,6 +70,10 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
   try {
     service = await startServer({ home: join(home, "control"), port: 0, nodePort: 0 });
     const control = service.control;
+    // Keep this real-node fixture isolated from local model execution even when
+    // the HTTP resume path starts the mission's complete agent list.
+    const startAgent = service.workers.startAgent.bind(service.workers);
+    service.workers.startAgent = agent => agent.machineId === "local" ? Promise.resolve() : startAgent(agent);
     const adminToken = readFileSync(join(home, "control", "admin.token"), "utf8").trim();
     const adminBase = `http://127.0.0.1:${service.port}`;
     const nodeBase = `http://127.0.0.1:${service.nodePort}`;
@@ -119,7 +149,7 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
       title: "Real remote metadata fixture", goal: "deliver one faux turn",
       acceptance: "admission and settlement are durable", workspaceId: localWorkspace.id,
       remoteWorkspaceIds: [remoteWorkspace.id], roleIds: roles.map((role) => role.id),
-      maxTurns: 10, maxCost: 0, autonomy: "trusted",
+      maxTurns: 50, maxCost: 0, autonomy: "trusted",
       assertions: [{ id: "REMOTE-METADATA", description: "The faux metadata turn is admitted and settled." }],
       workspaceStrategy: "shared"
     });
@@ -238,6 +268,7 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     assert.equal(typeof workerRow.pid, "number");
     nodeDb.close();
 
+    await waitForCleanTransport(control, nodeHome, binding);
     const pause = await post(adminBase, adminToken, `/api/missions/${mission.id}/pause`, {});
     assert.equal(pause.status, "paused");
     try {
@@ -274,6 +305,77 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     stoppedDb.close();
     assert.equal(nodeOutput.includes(credentialValue), false);
     assert.equal(nodeOutput.includes(enrolled.token), false);
+
+    // Exercise the same resume/start path used by the admin UI, including the
+    // real node supervisor and the agent's existing durable session database.
+    const oldEvidence = control.remoteRuntimes.byRuntime(running.runtime_id);
+    const epochBeforeResume = control.getAgentPublic(remoteAgent.id).epoch;
+    assert.deepEqual(control.blockers(mission.id).filter(item => item.status === "open"), [], JSON.stringify(control.blockers(mission.id)));
+    const resumed = await post(adminBase, adminToken, `/api/missions/${mission.id}/resume`, {});
+    assert.equal(resumed.status, "active");
+    try {
+      await waitFor(() => control.remoteRuntimeForAgent(remoteAgent.id)?.state === "running");
+    } catch {
+      const debugDb = new DatabaseSync(join(nodeHome, "worker-runtime", "node-workers.sqlite"), { readOnly: true });
+      const state = debugDb.prepare("SELECT runtime_id,state,confirmed_stopped FROM node_worker_runtimes WHERE agent_id=?").all(remoteAgent.id);
+      const localMailbox = debugDb.prepare("SELECT runtime_id,status FROM worker_mailbox_outbox").all();
+      debugDb.close();
+      throw new Error(JSON.stringify({ replacement: control.remoteRuntimeForAgent(remoteAgent.id)?.state, state, localMailbox,
+        mission: control.missionById(mission.id).status, blockers: control.blockers(mission.id) }));
+    }
+    const replacement = control.remoteRuntimeForAgent(remoteAgent.id);
+    assert.notEqual(replacement.runtime_id, running.runtime_id);
+    assert.equal(replacement.machine_id, running.machine_id);
+    assert.equal(replacement.agent_id, running.agent_id);
+    assert.equal(replacement.epoch, epochBeforeResume + 1);
+    assert.deepEqual(control.remoteRuntimes.byRuntime(running.runtime_id), oldEvidence);
+    assert.equal(control.workerMailbox.inspectBinding(binding).status, "closed");
+    const resumedInput = control.sendMessage(mission.id, remoteAgent.id, "Process a new input after pause.",
+      "followUp", "real-http-resumed-input");
+    await service.workers.dispatchPending();
+    await waitFor(() => control.message(resumedInput.id)?.status === "completed");
+    assert.equal(control.message(remoteMessage.id).status, "completed");
+    assert.equal(control.message(remoteMessage.id).attempt, remoteMessage.attempt);
+    assert.equal(control.missionById(mission.id).status, "active");
+    assert.ok(control.detail(mission.id).events.some(event => event.type === "remote_runtime_reassigned" &&
+      event.data.previousRuntimeId === running.runtime_id && event.data.runtimeId === replacement.runtime_id));
+    const resumedDb = new DatabaseSync(join(nodeHome, "worker-runtime", "node-workers.sqlite"), { readOnly: true });
+    assert.equal(resumedDb.prepare("SELECT COUNT(*) AS n FROM node_worker_runtimes WHERE agent_id=?").get(remoteAgent.id).n, 2);
+    assert.equal(resumedDb.prepare("SELECT state FROM node_worker_runtimes WHERE runtime_id=?").get(replacement.runtime_id).state, "running");
+    resumedDb.close();
+
+    const replacementBinding = JSON.parse(replacement.descriptor_json).binding;
+    await waitForCleanTransport(control, nodeHome, replacementBinding);
+    const currentOrchestratorForInput = control.getAgentPublic(orchestrator.id);
+    const userInput = await control.workerCommand({ agentId: orchestrator.id, epoch: currentOrchestratorForInput.epoch,
+      method: "RequestUserInput", args: { question: "Continue the remote work?" }, taskId: `${orchestrator.id}:recovery-question` });
+    assert.equal(control.missionById(mission.id).status, "blocked");
+    await service.workers.syncMissionLifecycle(mission.id);
+    await waitFor(() => control.remoteRuntimeForAgent(remoteAgent.id)?.state === "closed");
+    assert.equal(control.remoteRuntimeForAgent(remoteAgent.id).stop_provenance, "controlled");
+    const userInputStop = control.remoteRuntimeForAgent(remoteAgent.id);
+    await post(adminBase, adminToken, `/api/blockers/${userInput.id}/resolve`, { resolution: "Continue with a new input." });
+    assert.equal(control.missionById(mission.id).status, "active");
+    const answeredInput = control.sendMessage(mission.id, remoteAgent.id, "Process a new input after the answer.",
+      "followUp", "real-http-answered-input");
+    await service.workers.dispatchPending();
+    try {
+      await waitFor(() => control.message(answeredInput.id)?.status === "completed");
+    } catch {
+      const debugDb = new DatabaseSync(join(nodeHome, "worker-runtime", "node-workers.sqlite"), { readOnly: true });
+      const state = debugDb.prepare("SELECT runtime_id,state,confirmed_stopped FROM node_worker_runtimes WHERE agent_id=?").all(remoteAgent.id);
+      const localMailbox = debugDb.prepare("SELECT runtime_id,status,json_extract(envelope_json,'$.payload.kind') AS kind FROM worker_mailbox_inbox UNION ALL SELECT runtime_id,status,json_extract(envelope_json,'$.payload.kind') AS kind FROM worker_mailbox_outbox").all();
+      debugDb.close();
+      throw new Error(JSON.stringify({ message: control.message(answeredInput.id), runtime: control.remoteRuntimeForAgent(remoteAgent.id)?.state,
+        state, localMailbox, blockers: control.blockers(mission.id), rpcResults: rpcResults.slice(-20) }));
+    }
+    const answeredRuntime = control.remoteRuntimeForAgent(remoteAgent.id);
+    assert.notEqual(answeredRuntime.runtime_id, userInputStop.runtime_id);
+    assert.ok(answeredRuntime.epoch > userInputStop.epoch);
+    assert.equal(answeredRuntime.machine_id, userInputStop.machine_id);
+    assert.deepEqual(control.remoteRuntimes.byRuntime(userInputStop.runtime_id), userInputStop);
+    assert.equal(control.missionById(mission.id).status, "active");
+    assert.equal(control.detail(mission.id).events.some(event => event.type === "worker_start_failed"), false);
 
     const fencedMission = await post(adminBase, adminToken, "/api/missions", {
       title: "Mailbox fence fixture", goal: "stop when only the mailbox is fenced",

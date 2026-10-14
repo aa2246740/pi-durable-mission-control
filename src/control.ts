@@ -63,7 +63,7 @@ import {
   type RepositoryIdentity
 } from "./worktrees.js";
 
-export const CONTROL_SCHEMA_VERSION = 8;
+export const CONTROL_SCHEMA_VERSION = 9;
 const REMOTE_OPERATION_UNAVAILABLE = "Remote operation is unavailable for this agent";
 export class HttpError extends Error {
   readonly status: number;
@@ -932,7 +932,7 @@ export class ControlPlane {
     try {
       return this.transaction(() => {
         const saved = this.remoteRuntimes.report(report);
-        this.workerMailbox.fence(report.binding);
+        if (this.workerMailbox.inspectBinding(report.binding).status !== "closed") this.workerMailbox.fence(report.binding);
         if (!saved.duplicate) {
           const agent = this.getAgent(report.binding.agentId);
           const mission = agent ? this.getMission(agent.missionId) : undefined;
@@ -980,7 +980,9 @@ export class ControlPlane {
       const active = this.remoteRuntimes.activeForAgent(agentId);
       if (active) {
         if (active.state === "uncertain" || active.state === "stopping") {
-          throw new HttpError(409, "Remote runtime ownership is unresolved and requires trusted reconciliation");
+          throw new HttpError(409, active.state === "uncertain"
+            ? "Prior remote runtime has an uncertain report or ownership; trusted reconciliation is required"
+            : "Prior remote runtime stop has not been confirmed; trusted reconciliation is required");
         }
         if (active.desired !== "run" || active.machine_id !== machine.id ||
             active.session_id !== machine.sessionId || active.session_epoch !== machine.sessionEpoch ||
@@ -999,9 +1001,8 @@ export class ControlPlane {
         const descriptor = parseWorkerStartSpec(JSON.parse(active.descriptor_json));
         return { binding: descriptor.binding, descriptor, descriptorHash: active.descriptor_hash, existing: true };
       }
-      if (this.remoteRuntimes.byAgent(agentId)) {
-        throw new HttpError(409, "A prior remote runtime still requires trusted ownership reconciliation");
-      }
+      const prior = this.remoteRuntimes.byAgent(agentId);
+      if (prior) this.assertRemoteRuntimeReassignable(prior, agent);
       const openMailbox = this.db.prepare("SELECT 1 FROM worker_mailbox_bindings WHERE agent_id=? AND status IN ('open','uncertain') LIMIT 1").get(agentId);
       if (openMailbox) throw new HttpError(409, "Remote worker ownership is uncertain and requires reconciliation");
       if (!machine.sessionId || !machine.sessionEpoch) throw new HttpError(409, "Remote node session is unavailable");
@@ -1020,8 +1021,61 @@ export class ControlPlane {
       });
       const assigned = this.remoteRuntimes.assign(descriptor);
       this.workerMailbox.open(binding);
+      if (prior) this.event(mission.id, "remote_runtime_reassigned", "A clean controlled stop allowed a new remote runtime assignment.", agentId,
+        { previousRuntimeId: prior.runtime_id, runtimeId: binding.runtimeId });
       return { binding, descriptor, descriptorHash: workerStartSpecHash(descriptor), existing: assigned.existing };
     });
+  }
+
+  private assertRemoteRuntimeReassignable(runtime: RemoteRuntimeRow, agent: Agent): void {
+    const refuse = (reason: string): never => {
+      throw new HttpError(409, `Prior remote runtime ${runtime.runtime_id}: ${reason}; trusted reconciliation is required`);
+    };
+    if (runtime.stop_provenance === "unexpected") refuse("unexpected stop");
+    if (runtime.stop_provenance === "uncertain") refuse("uncertain runtime report");
+    if (runtime.state !== "closed" || runtime.desired !== "stop") refuse("stop has not been confirmed");
+    if (runtime.stop_provenance !== "controlled") refuse("controlled stop cannot be proven from persisted evidence");
+    const binding = parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)).binding;
+    if (!runtime.last_report_json || JSON.parse(runtime.last_report_json).outcome !== "stopped") refuse("missing stopped report");
+    let mailboxStatus: string;
+    try { mailboxStatus = this.workerMailbox.inspectBinding(binding).status; }
+    catch { return refuse("mailbox binding evidence is missing"); }
+    if (mailboxStatus !== "uncertain" && mailboxStatus !== "closed") refuse("mailbox binding is not fenced or closed");
+    // Cancelled entries were fenced before admission. They remain historical
+    // evidence and are never moved to the replacement binding.
+    const unsettledOutbox = this.db.prepare(`SELECT 1 FROM worker_mailbox_outbox
+      WHERE runtime_id=? AND status NOT IN ('acknowledged','cancelled') LIMIT 1`).get(runtime.runtime_id);
+    if (unsettledOutbox) refuse("unacknowledged or uncertain mailbox delivery/RPC reply");
+    const unsettledInbox = this.db.prepare(`SELECT 1 FROM worker_mailbox_inbox
+      WHERE runtime_id=? AND status NOT IN ('applied','cancelled') LIMIT 1`).get(runtime.runtime_id);
+    if (unsettledInbox) refuse("unapplied or uncertain mailbox input/RPC");
+    const durableDelivery = this.db.prepare(`SELECT 1 FROM messages m WHERE json_extract(m.data,'$.recipientId')=? AND (
+      m.status IN ('dispatching','admitted','delivering','delivered','uncertain') OR
+      EXISTS (SELECT 1 FROM outbox o WHERE o.message_id=m.id AND o.status IN ('dispatching','admitted','delivering','delivered','uncertain'))
+    ) LIMIT 1`).get(agent.id);
+    if (durableDelivery) refuse("uncertain or partially executed durable delivery");
+    const permits = this.db.prepare(`SELECT command_id FROM commands WHERE scope=?
+      AND json_extract(response,'$.effectPermit.binding.runtimeId')=?`).all(`mission:${agent.missionId}:remote-effects`, runtime.runtime_id) as Array<{ command_id: string }>;
+    for (const permit of permits) {
+      const evidence = this.db.prepare(`SELECT json_extract(data,'$.data.receipt') AS receipt FROM events
+        WHERE mission_id=? AND type='remote_effect_receipt' AND json_extract(data,'$.data.effectId')=?
+        ORDER BY seq DESC LIMIT 1`).get(agent.missionId, `${agent.id}\0${permit.command_id}`) as { receipt: string | null } | undefined;
+      const receipt = evidence?.receipt ? parseNodeEffectReceipt(JSON.parse(evidence.receipt), binding) : undefined;
+      if (!receipt) return refuse(`workspace effect ${permit.command_id} has no terminal receipt`);
+      if (receipt.status === "uncertain") refuse(`workspace effect ${permit.command_id} has an uncertain receipt`);
+    }
+    const pendingApproval = this.db.prepare(`SELECT id FROM approvals WHERE mission_id=?
+      AND json_extract(data,'$.remoteEffectBinding.spec.binding.runtimeId')=?
+      AND status IN ('pending','approved','running','uncertain') LIMIT 1`).get(agent.missionId, runtime.runtime_id) as { id: string } | undefined;
+    if (pendingApproval) refuse(`old-binding effect approval ${pendingApproval.id} is unresolved`);
+    const blocker = this.blockers(agent.missionId).find((item) => item.status === "open" && (
+      item.id === `remote-runtime:${runtime.runtime_id}` || item.kind === "unsafe_execution" ||
+      item.agentId === agent.id || item.kind === "delivery" || item.kind === "approval"
+    ));
+    if (blocker) refuse(`unresolved blocker ${blocker.id}`);
+    // Closure and the new owner claim are committed together by assignment.
+    // No historical runtime, delivery, RPC, or effect is replayed or rebound.
+    if (mailboxStatus !== "closed") this.workerMailbox.confirmClosed(binding);
   }
 
   remoteRuntimeReady(binding: WorkerBinding): boolean {
@@ -1051,9 +1105,13 @@ export class ControlPlane {
       const fence = (binding: WorkerBinding, registered: boolean): void => {
         const machine = this.machineRegistry.get(binding.machineId);
         const agent = this.getAgent(binding.agentId);
+        const runtime = registered ? this.remoteRuntimes.byRuntime(binding.runtimeId) : undefined;
+        // Quiescence deliberately advances the agent epoch after requesting stop.
+        // The live node still owns physical shutdown of that fenced old runtime.
+        const requestedStop = runtime?.desired === "stop" && runtime.state === "stopping";
         if (machine?.status === "online" && machine.sessionId === binding.sessionId &&
             machine.sessionEpoch === binding.sessionEpoch && (machine.leaseExpiresAt ?? 0) > Date.now() &&
-            agent?.machineId === binding.machineId && agent.epoch === binding.epoch) return;
+            agent?.machineId === binding.machineId && (agent.epoch === binding.epoch || requestedStop)) return;
         if (!registered) {
           this.workerMailbox.fence(binding);
           return;

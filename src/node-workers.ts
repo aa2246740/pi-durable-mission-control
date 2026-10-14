@@ -353,7 +353,7 @@ export class NodeWorkerSupervisor {
     return value;
   }
 
-  async start(raw: unknown): Promise<NodeWorkerSnapshot> {
+  async start(raw: unknown, options: { coordinatorAssigned?: boolean } = {}): Promise<NodeWorkerSnapshot> {
     if (this.closed) throw new NodeWorkerError("Supervisor is closed");
     if (this.options.executionEnabled !== true) {
       throw new NodeWorkerError("Node worker execution is not enabled on this supervisor");
@@ -385,12 +385,38 @@ export class NodeWorkerSupervisor {
     if (this.db.prepare("SELECT 1 FROM node_worker_runtimes WHERE agent_id=? AND state IN ('admitted','running','stopping','uncertain') LIMIT 1").get(spec.binding.agentId)) {
       throw new NodeWorkerError("This agent still has unreconciled node runtime evidence");
     }
-    const promise = this.startOnce(spec, hash).finally(() => this.flights.delete(binding.runtimeId));
+    const promise = this.startOnce(spec, hash, options.coordinatorAssigned === true).finally(() => this.flights.delete(binding.runtimeId));
     this.flights.set(binding.runtimeId, { hash, promise });
     return promise;
   }
 
-  private async startOnce(spec: WorkerStartSpec, hash: string): Promise<NodeWorkerSnapshot> {
+  private closeStoppedMailboxesForAssignment(binding: WorkerBinding): void {
+    const previous = this.db.prepare("SELECT * FROM node_worker_runtimes WHERE agent_id=?")
+      .all(binding.agentId) as unknown as RuntimeRow[];
+    for (const row of previous) {
+      const oldBinding = parseWorkerBinding(JSON.parse(row.binding_json));
+      if (!oldBinding || row.state !== "closed" || row.confirmed_stopped !== 1 || row.epoch >= binding.epoch ||
+          oldBinding.machineId !== binding.machineId) {
+        throw new NodeWorkerError("Prior node runtime has no confirmed stop for this agent epoch");
+      }
+      const status = this.mailbox.inspectBinding(oldBinding).status;
+      if (status === "closed") continue;
+      if (status !== "uncertain" ||
+          this.mailbox.inspectOutbox(oldBinding).some(item => !["acknowledged", "cancelled"].includes(item.status)) ||
+          this.mailbox.inspectInbox(oldBinding).some(item => !["applied", "cancelled"].includes(item.status))) {
+        throw new NodeWorkerError("Prior node mailbox has unacknowledged or uncertain work");
+      }
+      if (this.effects.inspect().some(item => item.spec.binding.runtimeId === row.runtime_id &&
+          (!item.receipt || item.state === "prepared" || item.state === "executing" || item.receipt.status === "uncertain"))) {
+        throw new NodeWorkerError("Prior node runtime has missing or uncertain workspace effect receipts");
+      }
+      // The authenticated coordinator's new assignment has already passed its
+      // persisted controlled-stop gate. Local evidence must also be settled.
+      this.mailbox.confirmClosed(oldBinding);
+    }
+  }
+
+  private async startOnce(spec: WorkerStartSpec, hash: string, coordinatorAssigned: boolean): Promise<NodeWorkerSnapshot> {
     const binding = spec.binding;
     if (spec.effects && this.options.executionMode !== "workspace-effects") {
       throw new NodeWorkerError("Workspace effects are not enabled for this node session");
@@ -431,6 +457,7 @@ export class NodeWorkerSupervisor {
     };
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (coordinatorAssigned) this.closeStoppedMailboxesForAssignment(binding);
       const mailboxStatus = this.mailbox.open(binding);
       if (mailboxStatus.status !== "open") throw new NodeWorkerError("Mailbox binding is not open for a new worker");
       this.db.prepare(
@@ -1265,8 +1292,8 @@ export class NodeWorkerSupervisor {
     } catch {
       // Terminal bindings keep their existing evidence.
     }
-    // Deliberate boundary: mailbox.confirmClosed stays for a trusted
-    // reconciliation phase, so an uncertain binding keeps blocking replacements.
+    // Physical stop alone keeps the mailbox fenced. Only a new authenticated
+    // coordinator assignment may close it after checking settled local evidence.
     this.db.prepare("UPDATE node_worker_runtimes SET state=?,confirmed_stopped=? WHERE runtime_id=?")
       .run(confirmed ? "closed" : "uncertain", confirmed ? 1 : 0, binding.runtimeId);
     return {

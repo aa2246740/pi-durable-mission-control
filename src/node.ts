@@ -743,7 +743,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
               continue;
             }
             const descriptorHash = rawDirective.descriptorHash;
-            const flight = supervisor.start(descriptor).then(() => undefined, () => {
+            const flight = supervisor.start(descriptor, { coordinatorAssigned: true }).then(() => undefined, () => {
               try {
                 const admitted = supervisor?.inspectBindings().some((item) => sameBinding(item.binding, binding));
                 journal.recordRuntimeReport(binding, descriptorHash, admitted ? "uncertain" : "rejected");

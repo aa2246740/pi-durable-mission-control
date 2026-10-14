@@ -11,6 +11,7 @@ export type RemoteRuntimeDirective =
 export type RemoteRuntimeRow = {
   runtime_id: string; machine_id: string; session_id: string; session_epoch: number; agent_id: string; epoch: number;
   descriptor_json: string; descriptor_hash: string; state: RemoteRuntimeState; desired: "run" | "stop";
+  stop_provenance: "unproven" | "controlled" | "unexpected" | "uncertain";
   created_at: number; updated_at: number; last_offered_at: number | null; last_report_json: string | null;
 };
 
@@ -34,7 +35,8 @@ export class RemoteRuntimeRegistry {
         agent_id TEXT NOT NULL, epoch INTEGER NOT NULL, descriptor_json TEXT NOT NULL, descriptor_hash TEXT NOT NULL,
         state TEXT NOT NULL CHECK(state IN ('queued','offered','running','stopping','closed','uncertain')),
         desired TEXT NOT NULL CHECK(desired IN ('run','stop')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-        last_offered_at INTEGER, last_report_json TEXT
+        last_offered_at INTEGER, last_report_json TEXT,
+        stop_provenance TEXT NOT NULL DEFAULT 'unproven' CHECK(stop_provenance IN ('unproven','controlled','unexpected','uncertain'))
       );
       CREATE INDEX IF NOT EXISTS remote_worker_runtimes_agent_idx ON remote_worker_runtimes(agent_id,state);
       CREATE INDEX IF NOT EXISTS remote_worker_runtimes_offer_idx ON remote_worker_runtimes(machine_id,state,last_offered_at,created_at);
@@ -43,15 +45,19 @@ export class RemoteRuntimeRegistry {
         created_at INTEGER NOT NULL
       );
     `);
+    const columns = db.prepare("PRAGMA table_info(remote_worker_runtimes)").all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "stop_provenance")) {
+      db.exec("ALTER TABLE remote_worker_runtimes ADD COLUMN stop_provenance TEXT NOT NULL DEFAULT 'unproven' CHECK(stop_provenance IN ('unproven','controlled','unexpected','uncertain'))");
+    }
   }
 
   activeForAgent(agentId: string): RemoteRuntimeRow | undefined {
-    return this.db.prepare("SELECT * FROM remote_worker_runtimes WHERE agent_id=? AND state IN ('queued','offered','running','stopping','uncertain') ORDER BY created_at DESC LIMIT 1")
+    return this.db.prepare("SELECT * FROM remote_worker_runtimes WHERE agent_id=? AND state IN ('queued','offered','running','stopping','uncertain') ORDER BY epoch DESC,created_at DESC LIMIT 1")
       .get(agentId) as RemoteRuntimeRow | undefined;
   }
 
   byAgent(agentId: string): RemoteRuntimeRow | undefined {
-    return this.db.prepare("SELECT * FROM remote_worker_runtimes WHERE agent_id=? ORDER BY created_at DESC LIMIT 1").get(agentId) as RemoteRuntimeRow | undefined;
+    return this.db.prepare("SELECT * FROM remote_worker_runtimes WHERE agent_id=? ORDER BY epoch DESC,created_at DESC LIMIT 1").get(agentId) as RemoteRuntimeRow | undefined;
   }
 
   byRuntime(runtimeId: string): RemoteRuntimeRow | undefined {
@@ -140,15 +146,21 @@ export class RemoteRuntimeRegistry {
       throw new Error("Runtime report does not match its assignment");
     }
     const unexpected = row.desired === "run";
+    // A later stop request/report cannot turn an unexpected or uncertain ending
+    // into evidence of a clean coordinator-requested stop.
+    const provenance = report.outcome !== "stopped" ? "uncertain"
+      : row.stop_provenance === "unexpected" || row.stop_provenance === "uncertain" ? row.stop_provenance
+      : unexpected ? "unexpected"
+      : row.last_report_json === null && row.state === "stopping" ? "controlled" : row.stop_provenance;
     const nextState: RemoteRuntimeState = report.outcome === "stopped" ? "closed" : "uncertain";
     const state: RemoteRuntimeState = row.state === "closed" ? "closed" : nextState;
     const at = Date.now();
     this.db.prepare("INSERT INTO remote_worker_runtime_reports(report_id,body_hash,body_json,runtime_id,created_at) VALUES(?,?,?,?,?)")
       .run(report.reportId, bodyHash, body, b.runtimeId, at);
-    this.db.prepare(`UPDATE remote_worker_runtimes SET state=?,desired='stop',updated_at=?,
+    this.db.prepare(`UPDATE remote_worker_runtimes SET state=?,desired='stop',updated_at=?,stop_provenance=?,
       last_report_json=CASE WHEN state='closed' AND ?!='stopped' THEN last_report_json ELSE ? END
       WHERE runtime_id=?`)
-      .run(state, at, report.outcome, body, b.runtimeId);
+      .run(state, at, provenance, report.outcome, body, b.runtimeId);
     return { recorded: true, duplicate: false, state, unexpected };
   }
 
@@ -156,7 +168,7 @@ export class RemoteRuntimeRegistry {
     return (this.db.prepare(`SELECT r.* FROM remote_worker_runtimes r JOIN agents a ON a.id=r.agent_id
       WHERE a.mission_id=? ORDER BY r.created_at,r.runtime_id`).all(missionId) as RemoteRuntimeRow[]).map((row) => ({
       binding: rowBinding(row), descriptorHash: row.descriptor_hash, state: row.state, desired: row.desired,
-      createdAt: row.created_at, updatedAt: row.updated_at, lastOfferedAt: row.last_offered_at,
+      stopProvenance: row.stop_provenance, createdAt: row.created_at, updatedAt: row.updated_at, lastOfferedAt: row.last_offered_at,
       report: row.last_report_json ? JSON.parse(row.last_report_json) as { outcome: string } : undefined
     }));
   }

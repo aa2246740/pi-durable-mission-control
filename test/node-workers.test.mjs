@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DurableWorkerMailbox } from "../dist/worker-mailbox.js";
 import { NodeWorkerSupervisor, parseWorkerStartSpec } from "../dist/node-workers.js";
+import { NodeEffectJournal } from "../dist/node-effects.js";
 import { nodeEffectExtinct } from "../dist/node-effect-executor.js";
 
 const waitFor = async (predicate, timeout = 15000) => {
@@ -1009,3 +1010,61 @@ test("watchdog fences a lease-lost worker and restart preserves uncertain eviden
   assert.equal(afterRecovery[0].live, false);
   await assert.rejects(() => recovered.start(spec), /already has uncertain evidence/);
 });
+
+for (const evidence of ["clean", "new-session", "uncertain-mailbox", "missing-effect", "uncertain-effect"]) {
+  test(`coordinator replacement assignment requires settled node evidence: ${evidence}`, async t => {
+    const home = mkdtempSync(join(tmpdir(), "node-reassignment-"));
+    const root = join(home, "root"), nodeHome = join(home, "node");
+    mkdirSync(root);
+    let supervisor = new NodeWorkerSupervisor(supervisorOptions(nodeHome, root));
+    t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+    const oldBinding = bindingFor(`old-${evidence}`);
+    const spec = specFor(oldBinding, root, "");
+    const started = await supervisor.start(spec);
+    const outbound = supervisor.mailbox.pending(oldBinding);
+    if (evidence !== "uncertain-mailbox") {
+      for (const envelope of outbound) {
+        const row = supervisor.mailbox.inspectOutbox(oldBinding).find(item => item.envelope.messageId === envelope.messageId);
+        supervisor.mailbox.acknowledge(oldBinding, { messageId: envelope.messageId, sequence: envelope.sequence, sha256: row.sha256 });
+      }
+    }
+    if (evidence === "missing-effect" || evidence === "uncertain-effect") {
+      const db = new DatabaseSync(join(nodeHome, "node-workers.sqlite"));
+      const journal = new NodeEffectJournal(db);
+      const effect = { binding: oldBinding, descriptorHash: started.descriptorHash, taskId: `${oldBinding.agentId}:effect`,
+        method: "write_file", args: { path: "unsettled.txt", content: "effect" } };
+      journal.admit(effect);
+      if (evidence === "uncertain-effect") {
+        journal.begin(effect);
+        journal.complete(effect, { status: "uncertain", error: "Partial operation" });
+      }
+      db.close();
+    }
+    const stopped = await supervisor.stop(oldBinding);
+    assert.equal(stopped.confirmedStopped, true);
+    const nextBinding = { ...oldBinding, runtimeId: `next-${evidence}`, epoch: oldBinding.epoch + 1 };
+    if (evidence === "new-session") {
+      await supervisor.close();
+      nextBinding.sessionId = "new-node-session-fixture";
+      nextBinding.sessionEpoch++;
+      supervisor = new NodeWorkerSupervisor({ ...supervisorOptions(nodeHome, root),
+        sessionId: nextBinding.sessionId, sessionEpoch: nextBinding.sessionEpoch });
+    }
+    const nextSpec = { ...spec, binding: nextBinding };
+    if (evidence === "clean" || evidence === "new-session") {
+      await assert.rejects(() => supervisor.start(nextSpec), /Another open or uncertain/);
+      const next = await supervisor.start(nextSpec, { coordinatorAssigned: true });
+      assert.equal(next.state, "running");
+      assert.equal(supervisor.mailbox.inspectBinding(oldBinding).status, "closed");
+      assert.equal(supervisor.mailbox.inspectBinding(nextBinding).status, "open");
+      assert.equal(supervisor.inspect().length, 2);
+      assertProcessGroupExtinct(stopped.pid);
+    } else {
+      await assert.rejects(() => supervisor.start(nextSpec, { coordinatorAssigned: true }),
+        evidence === "uncertain-mailbox" ? /unacknowledged or uncertain work/ : /missing or uncertain workspace effect/);
+      assert.equal(supervisor.mailbox.inspectBinding(oldBinding).status, "uncertain");
+      assert.equal(supervisor.inspect().length, 1);
+      assert.equal(existsSync(join(root, "unsettled.txt")), false);
+    }
+  });
+}
