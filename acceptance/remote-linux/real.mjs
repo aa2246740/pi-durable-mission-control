@@ -86,17 +86,27 @@ export function scanEvidence(path, secrets) {
 export const businessRules = "Implement totals.mjs exporting totalCents(lines). Each line is { quantity, unitPriceCents }. Both fields must be nonnegative safe integers; reject negative, fractional, nonnumeric or missing fields with an error. Return the sum of quantity * unitPriceCents as a safe integer number of cents. Empty lines return 0; reject products or totals outside the safe integer range. Zero quantity or price is valid.";
 
 // Capture transport functions before loading delivery code in the disposable child.
-const totalsRunner = `import { readFileSync, writeFileSync } from 'node:fs';
-import { serialize, deserialize } from 'node:v8';
+const totalsRunner = `import { readFileSync, writeSync } from 'node:fs';
+import { Serializer, deserialize } from 'node:v8';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
-const lines = deserialize(readFileSync(0));
+const send = writeSync;
+const encoder = new Serializer();
+const begin = encoder.writeHeader.bind(encoder), encode = encoder.writeValue.bind(encoder), finish = encoder.releaseBuffer.bind(encoder);
+const { nonce, lines } = deserialize(readFileSync(0));
+const header = new Uint8Array(4);
 const { totalCents } = await import(pathToFileURL(join(process.cwd(), 'totals.mjs')));
 if (typeof totalCents !== 'function') throw new Error('Missing totalCents export');
 let result;
 try { result = { kind: 'returned', value: totalCents(lines) }; }
 catch { result = { kind: 'threw' }; }
-writeFileSync(3, serialize(result));
+begin();
+encode({ nonce, ...result });
+const payload = finish();
+const size = payload.length;
+header[0] = size >>> 24; header[1] = size >>> 16; header[2] = size >>> 8; header[3] = size;
+for (let offset = 0; offset < header.length;) offset += send(3, header, offset, header.length - offset);
+for (let offset = 0; offset < payload.length;) offset += send(3, payload, offset, payload.length - offset);
 `;
 
 export function writeFrozenAcceptance(proof) {
@@ -104,17 +114,25 @@ export function writeFrozenAcceptance(proof) {
   const source = `import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { serialize, deserialize } from 'node:v8';
 const runner = ${JSON.stringify(totalsRunner)};
 function probe(lines) {
+  const nonce = randomBytes(32).toString('hex');
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', runner], {
-    cwd: process.cwd(), env: { PATH: process.env.PATH }, input: serialize(lines),
-    stdio: ['pipe', 'pipe', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 65536
+    cwd: process.cwd(), env: { PATH: process.env.PATH }, input: serialize({ nonce, lines }),
+    stdio: ['pipe', 'pipe', 'pipe', 'pipe'], timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 65536
   });
   assert.equal(child.error, undefined, 'Delivery child transport failed');
   assert.equal(child.signal, null, 'Delivery child was interrupted');
   assert.equal(child.status, 0, 'Delivery child failed to execute');
-  const result = deserialize(child.output[3]);
+  const frame = child.output[3];
+  assert.ok(frame && frame.length >= 4, 'Missing delivery result frame');
+  assert.equal(frame.readUInt32BE(0), frame.length - 4, 'Expected exactly one delivery result frame');
+  const payload = frame.subarray(4);
+  const result = deserialize(payload);
+  assert.deepEqual(serialize(result), payload, 'Trailing or noncanonical delivery result bytes');
+  assert.equal(result?.nonce, nonce, 'Delivery result nonce mismatch');
   assert.ok(result && ['returned', 'threw'].includes(result.kind), 'Invalid delivery result');
   return result;
 }
