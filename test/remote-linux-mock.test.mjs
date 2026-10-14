@@ -410,7 +410,7 @@ test("worker-crash operator kills once, resolves every blocker, then resumes", a
   reassigned.mission.status = "active";
   reassigned.events.push({ type: "remote_runtime_reassigned" });
   await assert.rejects(() => observeWorkerCrash({
-    crash: { humanActions: [], killed: true, resumeAttempted: true }, current: reassigned, missionId: "mission-1", containerName: "c", records, 
+    crash: { humanActions: [], killed: true, resumeAttempted: true }, current: reassigned, missionId: "mission-1", containerName: "c", records,
     api: async () => runtimes, post: async () => ({ status: 200, body: {} }), exec: async () => { throw new Error("unexpected kill"); },
     transport: () => ({ effects: [], deliveries: [] }), save: () => undefined
   }), /remote_runtime_reassigned/);

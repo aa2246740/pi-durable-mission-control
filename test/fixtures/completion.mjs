@@ -88,4 +88,3 @@ export async function fixture(t, { admitted = true, settleOnShutdown = true } = 
   });
   return { home, control, workers, mission, agent, owner, row, child, handle, sent, reply, notice, settle, complete };
 }
-
