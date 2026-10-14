@@ -10,12 +10,13 @@ import { kinds, readConfig, readSecrets, redact } from "./real.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const containerCLI = "/opt/homebrew/bin/container";
-const probeMaxTokens = 64;
-const defaultTimeoutMs = 20000;
+// Reasoning models may think before calling the tool even when reasoning is off.
+const probeMaxTokens = 1024;
+const defaultTimeoutMs = 60000;
 const containerStartupMs = 30000;
 
 export function containerPrefix() {
-  const prefix = process.env.MC_ACCEPTANCE_CONTAINER_PREFIX ?? "mc-acc-i2-grok-";
+  const prefix = process.env.MC_ACCEPTANCE_CONTAINER_PREFIX ?? "mc-acc-";
   if (!/^mc-acc-[a-z0-9-]*$/.test(prefix)) throw new Error("MC_ACCEPTANCE_CONTAINER_PREFIX must start with mc-acc- and use lowercase letters, digits and hyphens");
   return prefix;
 }
@@ -48,12 +49,6 @@ export function uniqueTargets(config) {
     else targets.push({ key, roles: [role], profile });
   }
   return targets;
-}
-
-export function toolChoiceFor(api) {
-  if (api === "anthropic-messages") return { type: "tool", name: "ping" };
-  if (api === "openai-responses") return { type: "function", name: "ping" };
-  return { type: "function", function: { name: "ping" } };
 }
 
 export function classifyProbe({ httpStatus, error, httpOk, toolCalled }) {
@@ -175,7 +170,6 @@ export async function probeOnce({ profile, credential, timeoutMs = defaultTimeou
       maxRetryDelayMs: 0,
       cacheRetention: "none",
       signal: controller.signal,
-      toolChoice: toolChoiceFor(profile.api),
       fetch: async (url, init) => {
         const response = await globalThis.fetch(url, init);
         httpStatus ??= response.status;

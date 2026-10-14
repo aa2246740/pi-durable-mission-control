@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { classifyProbe, containerArgs, containerEnv, containerPrefix, parseOptions, publishReport, runPreflight, toolChoiceFor, uniqueTargets } from "../acceptance/remote-linux/preflight.mjs";
+import { classifyProbe, containerArgs, containerEnv, containerPrefix, parseOptions, publishReport, runPreflight, uniqueTargets } from "../acceptance/remote-linux/preflight.mjs";
 import { readConfig } from "../acceptance/remote-linux/real.mjs";
 
 const preflightPath = fileURLToPath(new URL("../acceptance/remote-linux/preflight.mjs", import.meta.url));
@@ -167,9 +167,6 @@ test("preflight options require a real config and secrets file", () => {
   for (const args of [[], ["--real", "models.json"], ["--secrets-file", "unit.env"], ["--real", "models.json", "--secrets-file", "unit.env", "--keep"]]) {
     assert.throws(() => parseOptions(args));
   }
-  assert.equal(toolChoiceFor("anthropic-messages").type, "tool");
-  assert.equal(toolChoiceFor("openai-completions").function.name, "ping");
-  assert.equal(toolChoiceFor("openai-responses").name, "ping");
   assert.equal(classifyProbe({ httpOk: true, toolCalled: true, httpStatus: 200, error: null }), null);
   assert.equal(classifyProbe({ httpOk: false, toolCalled: false, httpStatus: 401, error: "401 no" }), "auth");
 });
@@ -208,11 +205,12 @@ test("local OpenAI and Anthropic endpoints must return one ping tool call", asyn
   const parsed = server.requests.map((request) => ({ url: request.url, body: JSON.parse(request.body) }));
   const anthropic = parsed.find((request) => request.url.includes("/messages")).body;
   const openai = parsed.find((request) => request.url.includes("/chat/completions")).body;
-  assert.equal(anthropic.max_tokens, 64);
-  assert.deepEqual(anthropic.tool_choice, { type: "tool", name: "ping" });
+  assert.equal(anthropic.max_tokens, 1024);
+  // Like product runs, the probe leaves tool choice to the model (some endpoints only accept auto).
+  assert.equal(anthropic.tool_choice, undefined);
   assert.equal(anthropic.tools[0].name, "ping");
-  assert.equal(openai.max_completion_tokens, 64);
-  assert.deepEqual(openai.tool_choice, { type: "function", function: { name: "ping" } });
+  assert.equal(openai.max_completion_tokens, 1024);
+  assert.equal(openai.tool_choice, undefined);
   assert.equal(openai.tools[0].function.name, "ping");
   assert.equal(server.requests.some((request) => request.apiKey === secret), true);
   assert.equal(server.requests.some((request) => request.authorization === `Bearer ${secret}`), true);
