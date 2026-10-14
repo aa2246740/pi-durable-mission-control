@@ -268,6 +268,16 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     assert.equal(typeof workerRow.pid, "number");
     nodeDb.close();
 
+    for (const stopReason of ["local", null, 1]) {
+      const rejected = await fetch(`${nodeBase}/api/nodes/runtimes/events`, {
+        method: "POST", headers: { authorization: `Bearer ${enrolled.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ machineId: enrolled.machine.id, sessionId: binding.sessionId,
+          sessionEpoch: binding.sessionEpoch, reportId: crypto.randomUUID(), binding,
+          descriptorHash: running.descriptor_hash, outcome: "stopped", stopReason })
+      });
+      assert.equal(rejected.status, 400);
+    }
+    assert.equal(control.remoteRuntimeForAgent(remoteAgent.id).state, "running");
     await waitForCleanTransport(control, nodeHome, binding);
     const pause = await post(adminBase, adminToken, `/api/missions/${mission.id}/pause`, {});
     assert.equal(pause.status, "paused");
@@ -290,6 +300,14 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     }
     const stopped = control.remoteRuntimeForAgent(remoteAgent.id);
     assert.equal(stopped.last_report_json && JSON.parse(stopped.last_report_json).outcome, "stopped");
+    assert.equal(JSON.parse(stopped.last_report_json).stopReason, "requested");
+    assert.equal(stopped.stop_provenance, "controlled");
+    assert.equal(stopped.stop_request_reason, "controlled");
+    assert.equal(stopped.stop_request_epoch, binding.epoch);
+    const stopJournal = new DatabaseSync(join(nodeHome, "node.sqlite"), { readOnly: true });
+    assert.equal(stopJournal.prepare("SELECT stop_reason FROM node_runtime_reports WHERE runtime_id=? AND outcome='stopped'")
+      .get(binding.runtimeId).stop_reason, "requested");
+    stopJournal.close();
     assert.ok(runtimeReports.some(({ outcome, result }) =>
       outcome === "stopped" && result?.recorded === true &&
       (result.duplicate === undefined || typeof result.duplicate === "boolean")));
@@ -353,6 +371,7 @@ test("real node process performs metadata-only assignment, durable delivery, RPC
     await service.workers.syncMissionLifecycle(mission.id);
     await waitFor(() => control.remoteRuntimeForAgent(remoteAgent.id)?.state === "closed");
     assert.equal(control.remoteRuntimeForAgent(remoteAgent.id).stop_provenance, "controlled");
+    assert.equal(JSON.parse(control.remoteRuntimeForAgent(remoteAgent.id).last_report_json).stopReason, "requested");
     const userInputStop = control.remoteRuntimeForAgent(remoteAgent.id);
     await post(adminBase, adminToken, `/api/blockers/${userInput.id}/resolve`, { resolution: "Continue with a new input." });
     assert.equal(control.missionById(mission.id).status, "active");
