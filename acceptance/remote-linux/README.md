@@ -14,7 +14,7 @@ node acceptance/remote-linux/run.mjs --keep --out /指定的/新证据目录 --t
 
 `--out` 必须指定尚不存在的目录，父目录必须存在。默认位置是 `$TMPDIR/mc-acceptance-<时间戳>-<随机后缀>`。成功默认删除目录，`--keep` 保留；失败、超时、SIGINT 或 SIGTERM 保留目录并输出路径。退出码非零表示验收或清理失败。不能用 SIGKILL 中断并期待 finally 清理。
 
-容器名仅使用 `mc-acc-` 前缀（可用环境变量 `MC_ACCEPTANCE_CONTAINER_PREFIX` 改成其他 `mc-acc-` 开头的前缀，以便多个检出并行运行），运行带 `--rm`。只停止、删除当前运行创建的精确容器名；若启动前发现已有此前缀容器，拒绝运行并由其所有者处理。退出前以 `container list --all --quiet` 核对此前缀无残留，并打印 `cleanup verified`。正常成功还会关闭协调端、mock、TCP 中继并删除证据目录。只读挂载本 checkout 的 dist、package.json、解析软链接后的 node_modules 及节点启动脚本；节点工作目录与状态位于容器中，随容器销毁。
+容器名仅使用 `mc-acc-` 前缀（可用环境变量 `MC_ACCEPTANCE_CONTAINER_PREFIX` 改成其他 `mc-acc-` 开头的前缀，以便多个检出并行运行），运行带 `--rm`。只停止、删除当前运行创建的精确容器名；若启动前发现已有此前缀容器，拒绝运行并由其所有者处理。退出前以 `container list --all --quiet` 核对此前缀无残留，并打印 `cleanup verified`。正常成功还会关闭协调端、mock、TCP 中继并删除证据目录。只读挂载本 checkout 的 dist、package.json、解析软链接后的 node_modules 及节点启动脚本；默认场景的节点工作目录与状态位于容器中，随容器销毁；`node-power-loss` 将节点状态持久化到证据目录。
 
 宿主中继只将 `192.168.64.1:<随机端口>` 接到协调端 `127.0.0.1:<nodePort>`。容器内中继将 `127.0.0.1:14311` 接到宿主中继，节点使用字面量回环 HTTP 地址。admin/UI 端口不转发。mock 有独立的宿主中继。node bearer token 和假模型凭据通过 `container run -i` 的 stdin 传入 shell，再导出给 `--token-env`、`--credential-ref`；值不进入 argv 或证据。admin token 由脚本读入内存，协调端退出后删除产品生成的 admin.token。保留证据前扫描全部文件，检查这三个凭据值没有泄漏。
 
@@ -126,6 +126,28 @@ node --test acceptance/remote-linux/worker-crash-container.test.mjs
 ```
 
 2026-10-14 在 `orch/l2-grok`、基线 `b9e4d4c` 上实测：worker-crash 连续 3/3 通过，耗时 18.606、15.789、14.898 秒（含清理）。3 次停止来源都是 unexpected，runtime 为 closed，Mission failed，artifacts 为 0，effect receipt 为 2，resume 返回 409，diagnostic 说明 unexpected stop，没有 `remote_runtime_reassigned`，清理均通过，无残留容器。同前缀接着跑的 default 1/1 通过，18.351 秒，Mission completed。此前一轮连续运行的第 3 次在杀掉 worker 后，节点 supervisor 打印 `Node connection failed` 并退出，runtime 留在 stopping/unproven，Mission 仅 blocked，没有进入 resume；脚本现已把这种情况立即判失败。上面的 3/3 不包含那一次。这只验证此 mock 时序。
+
+### 整个远端节点断电后用同一 home 重启
+
+mock 模式新增 `--scenario node-power-loss`，不接受真实模型配置。运行命令：
+
+```sh
+mkdir -p .acceptance-proof
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s2-astra- node acceptance/remote-linux/run.mjs --scenario node-power-loss --keep --out "$PWD/.acceptance-proof/node-power-loss-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s2-astra- node --test acceptance/remote-linux/node-power-loss-container.test.mjs
+```
+
+只有此场景把宿主 `<proof>/node-home` bind mount 到 `/node-home`，实际节点 home 为其中的 `state/` 子目录。子目录避开 Apple Container 对挂载根目录执行 `chmod` 的 `EPERM`，不改产品代码。worker 完成第一次 Linux 自查、所有成员空闲且尚未发布后，脚本执行 `container kill --signal KILL <本次容器名>`，确认整个容器退出并被 `--rm` 清理。产品租约固定为 20 秒，没有覆盖参数；脚本使用默认 180 秒总超时，记录发出 SIGKILL 到协调端可观察到 offline、blocked 及所有权不确定的实际耗时。
+
+断电后必须有 `remote-runtime:<runtimeId>` blocker，旧 binding 不变、停止来源为 uncertain 或 unproven、artifacts 为 0，无重新分配和重放。脚本随后用同一个 home、machine 身份和 node token 创建新容器；token 再次经 stdin 传入。重连必须取得新的 sessionId、更大的 sessionEpoch，并再收到一次心跳。只读检查节点 journal 要求旧 runtime 为 uncertain、没有伪造 confirmed stop；检查 `/proc` 要求 supervisor 存活且没有 worker。之后逐个 resolve 开放 blocker，并显式 resume；路径、请求正文、时间和 HTTP 响应分别记录。最终必须出现一次 `worker_start_failed`，含 `recoverable: false` 和机器可读 `reason`，Mission 为 failed。effect permit/receipt、节点 effect journal、worker 工具调用、durable delivery attempt 不得重放，resume 前后投递状态不得改变。
+
+`node-power-loss.json` 包含断电前、租约丢失、重连和最终快照、SIGKILL 记录、节点 journal、进程列表、耗时和运营者操作；失败时仍保存 Mission 导出、runtime、transport、节点退出日志和可读取的持久 journal。任一断言失败或重启退出均返回非零，不修改 journal 来绕过故障。持久 home 跟随整个证据目录：成功默认删除，`--keep` 或失败保留。独立容器自测连续运行新场景 3 次，再各运行一次 default 和 worker-crash；第三次新场景设为成功时删除证据，并检查 home 同步删除，失败则保留。此自测不进入 `npm test`。
+
+2026-10-15 在 `orch/s2-astra`、基线 `8a5f3c3` 上修复节点所有者锁后，node-power-loss 连续 **3/3 通过**，总耗时依次为 41.514、41.325、41.383 秒；从 SIGKILL 请求到观察到租约丢失依次为 21.331、22.188、22.065 秒。3 次均用同一 home、machine 和 token 重连，取得新 session 并收到后续心跳；旧 binding 未被认领，旧 worker 未重启，节点 journal 和协调端 runtime 均为 uncertain。运营者 resolve 后显式 resume，得到不可恢复的 Mission failed、`worker_start_failed.recoverable: false`、`reason: remote_runtime_uncertain`，artifacts 为 0，无 effect、投递或 worker 工具调用重放。保留的两次证据中，重启前后节点 PID 均为 9，resume 均返回 HTTP 409。
+
+随后 default 通过，17.656 秒、Mission completed；worker-crash 通过，14.901 秒、Mission failed。5 次均 cleanupVerified=true，`mc-acc-s2-astra-` 前缀无残留。第三次新场景没有 keep，已验证成功后证据目录及持久 node home 一并删除；其余四次保留证据。结果汇总为 `.acceptance-proof/node-power-loss-results-1792006901622.json`。额外的 `test/node-owner.test.mjs` 在 macOS 和 Linux 均为 6/6 通过；Linux 容器整体耗时 48.007 秒，覆盖陈旧 PID、活所有者互斥、SIGKILL、正常退出及启动失败后的接管，结束后同样无残留。
+
+修复使用 `node.ownership.sqlite` 的生命周期独占锁。进程退出、SIGKILL 或重启后由操作系统释放，不再以旧 PID 是否存活判断所有权。`node_owner` 表保留兼容记录；取得锁后仍按原有规则将旧 runtime 恢复为 uncertain，不生成 controlled/stopped 证明，不重放旧工作。新版本之间的同进程重复打开和不同进程并发打开都会拒绝；升级前须停止不参与新锁协议的旧节点程序。修复前的 0/3 失败记录仍保留在 `.acceptance-proof/node-power-loss-results-1792006210613.json`，供比较。
 
 ### 远端 worker 的轮次上限与恢复
 

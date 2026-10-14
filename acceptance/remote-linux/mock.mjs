@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { workerCrashTool } from "./scenarios/worker-crash.mjs";
 import { coordinatorRestartCall } from "./scenarios/coordinator-restart.mjs";
+import { nodePowerLossTool } from "./scenarios/node-power-loss.mjs";
 import { turnLimitCall } from "./scenarios/turn-limit.mjs";
 
 export const shellQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
@@ -93,6 +94,10 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
     assert.equal(state.executionEnvironment?.platform, "linux");
     const owned = state.tasks.find((t) => state.agents.find((a) => a.id === t.ownerId)?.kind === "worker");
     if (!owned || owned.status !== "running") return call("WaitForMessage");
+    if (scenario === "node-power-loss") {
+      const decision = nodePowerLossTool(history);
+      if (decision) return call(decision.name, decision.args);
+    }
     if (scenario === "worker-crash") {
       const decision = workerCrashTool(history);
       if (decision) return call(decision.name, decision.args);
