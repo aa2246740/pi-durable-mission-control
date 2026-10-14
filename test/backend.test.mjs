@@ -761,6 +761,8 @@ test("late reports are recorded while paused without waking or redelivering the 
     const messages = f.control.detail(f.mission.id).messages;
     assert.equal(messages.find((message) => message.id === notSent.id).status, "aborted");
     assert.equal(messages.find((message) => message.id === uncertain.id).status, "uncertain");
+    assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+    f.control.resolveBlocker(`delivery:${uncertainOutbox.id}`, "Reviewed the interrupted delivery; do not replay it.");
     f.control.missionAction(f.mission.id, "resume");
     const resumed = f.control.detail(f.mission.id).messages.find((message) => message.id === notSent.id);
     assert.equal(resumed.attempt, 2);
@@ -1532,4 +1534,75 @@ catch (error) { console.log("RPC_REJECTED:" + error.message); }`;
   });
   assert.deepEqual(result, { code: 0, signal: null });
   assert.match(output, /RPC_REJECTED:Control-plane IPC channel disconnected/);
+});
+
+
+for (const state of ["dispatching", "admitted", "delivered"]) {
+  test(`local pause requires human reconciliation of ${state} input without replay`, () => {
+    const f = fixture();
+    try {
+      const message = f.control.sendMessage(f.mission.id, f.worker.id, "Interrupted input", "followUp", "pause-reconcile");
+      const row = f.control.pendingOutbox().find(item => item.message_id === message.id);
+      assert.equal(f.control.markOutboxDispatching(row.id, f.worker.epoch), true);
+      if (state === "admitted") assert.equal(f.control.ackOutbox(message.id, row.request_id, row.attempt, f.worker.epoch, "admitted"), true);
+      if (state === "delivered") f.control.setOutboxStatus(row.id, "delivered");
+      f.control.missionAction(f.mission.id, "pause");
+      f.control.markAgentInterrupted(f.worker.id, f.worker.epoch);
+      assert.equal(f.control.missionById(f.mission.id).status, "paused");
+      const blockers = f.control.blockers(f.mission.id).filter(item => item.id === `delivery:${row.id}`);
+      assert.equal(blockers.length, 1);
+      assert.equal(blockers[0].status, "open");
+      assert.throws(() => f.control.resolveBlocker(blockers[0].id, "  "), /human resolution/);
+      assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+      f.control.resolveBlocker(blockers[0].id, "Reviewed the interrupted input; do not replay it.");
+      const evidence = f.control.message(message.id);
+      const outbox = f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id);
+      f.control.missionAction(f.mission.id, "resume");
+      assert.equal(f.control.missionById(f.mission.id).status, "active");
+      assert.equal(evidence.status, "uncertain");
+      assert.equal(outbox.status, "uncertain");
+      assert.deepEqual(f.control.message(message.id), evidence);
+      assert.deepEqual(f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id), outbox);
+      assert.equal(f.control.pendingOutbox().some(item => item.message_id === message.id), false);
+    } finally { clean(f); }
+  });
+}
+
+test("cancel retains a resolvable delivery blocker without allowing mission revival", () => {
+  const f = fixture();
+  try {
+    const row = f.control.pendingOutbox().find(item => item.message_id === `mission-opening:${f.mission.id}`);
+    f.control.markOutboxDispatching(row.id, f.orchestrator.epoch);
+    f.control.ackOutbox(row.message_id, row.request_id, row.attempt, f.orchestrator.epoch, "admitted");
+    f.control.missionAction(f.mission.id, "cancel");
+    assert.equal(f.control.blockers(f.mission.id).find(item => item.id === `delivery:${row.id}`).status, "open");
+    f.control.resolveBlocker(`delivery:${row.id}`, "Reviewed cancellation; no replay.");
+    assert.equal(f.control.missionById(f.mission.id).status, "cancelled");
+    assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Only a paused/);
+    assert.equal(f.control.message(row.message_id).status, "uncertain");
+    assert.equal(f.control.pendingOutbox().some(item => item.id === row.id), false);
+  } finally { clean(f); }
+});
+
+test("startup repairs legacy uncertain delivery blockers once and preserves human resolution", () => {
+  const f = fixture();
+  let reopened;
+  try {
+    const row = f.control.pendingOutbox()[0];
+    f.control.setOutboxStatus(row.id, "uncertain", "Historical interrupted input");
+    assert.equal(f.control.blockers(f.mission.id).find(item => item.id === `delivery:${row.id}`).status, "open");
+    f.control.db.prepare("DELETE FROM blockers WHERE id=?").run(`delivery:${row.id}`);
+    const outbox = f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id);
+    f.control.close();
+    reopened = new ControlPlane(f.stateHome);
+    assert.equal(reopened.blockers(f.mission.id).filter(item => item.id === `delivery:${row.id}`).length, 1);
+    assert.throws(() => reopened.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+    const resolved = reopened.resolveBlocker(`delivery:${row.id}`, "Reviewed historical uncertainty; do not replay.");
+    reopened.close();
+    reopened = new ControlPlane(f.stateHome);
+    assert.deepEqual(reopened.blockers(f.mission.id).find(item => item.id === resolved.id), resolved);
+    assert.deepEqual(reopened.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id), outbox);
+    reopened.missionAction(f.mission.id, "resume");
+    assert.equal(reopened.pendingOutbox().some(item => item.id === row.id), false);
+  } finally { reopened?.close(); clean(f); }
 });

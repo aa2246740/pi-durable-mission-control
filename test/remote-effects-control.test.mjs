@@ -990,3 +990,68 @@ test("unrelated interruption between controlled lifecycle syncs remains ownershi
   explicitResume(f);
   assertNoReassignment(f, /uncertain/);
 });
+
+
+test("manual pause exposes interrupted delivery reconciliation before remote reassignment", t => {
+  const f = fixture(t);
+  const message = f.control.detail(f.mission.id).messages.find(item => item.recipientId === f.agent.id);
+  const outbox = f.control.pendingOutbox().find(row => row.message_id === message.id);
+  assert.equal(f.control.markOutboxDispatching(outbox.id, f.agent.epoch), true);
+  assert.equal(f.control.ackOutbox(message.id, outbox.request_id, outbox.attempt, f.agent.epoch, "admitted"), true);
+  f.control.missionAction(f.mission.id, "pause");
+  f.control.requestRemoteRuntimeStop(f.agent.id);
+  f.control.markAgentInterrupted(f.agent.id, f.agent.epoch, { controlledRemoteStop: true });
+  stopReport(f);
+  const blocker = f.control.blockers(f.mission.id).find(item => item.id === `delivery:${outbox.id}`);
+  assert.ok(blocker, "Manual pause must expose a resolvable delivery blocker");
+  assert.equal(blocker.status, "open");
+  assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+  f.control.resolveBlocker(blocker.id, "Reviewed the interrupted input; do not replay it.");
+  f.control.missionAction(f.mission.id, "resume");
+  const before = f.control.message(message.id);
+  const oldOutbox = f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(outbox.id);
+  const replacement = f.control.assignRemoteRuntime(f.agent.id);
+  assert.notEqual(replacement.binding.runtimeId, f.assignment.binding.runtimeId);
+  assert.ok(replacement.binding.epoch > f.assignment.binding.epoch);
+  assert.equal(before.status, "uncertain");
+  assert.equal(oldOutbox.status, "uncertain");
+  assert.deepEqual(f.control.message(message.id), before);
+  assert.deepEqual(f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(outbox.id), oldOutbox);
+  assert.equal(f.control.pendingOutbox().some(row => row.message_id === message.id), false);
+  assert.equal(f.control.workerMailbox.inspectOutbox(replacement.binding).length, 0);
+});
+
+
+for (const cause of ["coordinator-restart", "lease-loss", "admission-timeout"]) {
+  test(`remote ${cause} exposes delivery reconciliation without replaying the input`, t => {
+    const f = fixture(t);
+    let reopened;
+    try {
+      const message = f.control.detail(f.mission.id).messages.find(item => item.recipientId === f.agent.id);
+      const row = f.control.pendingOutbox().find(item => item.message_id === message.id);
+      assert.equal(f.control.markOutboxDispatching(row.id, f.agent.epoch), true);
+      if (cause !== "admission-timeout") assert.equal(f.control.ackOutbox(message.id, row.request_id, row.attempt, f.agent.epoch, "admitted"), true);
+      let control = f.control;
+      if (cause === "coordinator-restart") {
+        control.close();
+        reopened = new ControlPlane(join(f.home, "control"));
+        control = reopened;
+      } else if (cause === "lease-loss") {
+        control.db.prepare("UPDATE remote_machines SET data=json_set(data,'$.leaseExpiresAt',?) WHERE id=?")
+          .run(Date.now() - 1, f.enrolled.machine.id);
+        control.fenceStaleWorkerBindings();
+      } else {
+        control.db.prepare("UPDATE outbox SET deadline_at=? WHERE id=?").run(Date.now() - 1, row.id);
+        control.pendingOutbox();
+      }
+      assert.equal(control.message(message.id).status, "uncertain");
+      assert.equal(control.db.prepare("SELECT status FROM outbox WHERE id=?").get(row.id).status, "uncertain");
+      const blocker = control.blockers(f.mission.id).find(item => item.id === `delivery:${row.id}`);
+      assert.equal(blocker?.status, "open");
+      control.resolveBlocker(blocker.id, "Reviewed interrupted delivery; ownership evidence is a separate gate.");
+      assert.equal(control.pendingOutbox().some(item => item.id === row.id), false);
+      assert.equal(control.message(message.id).attempt, message.attempt);
+      if (cause !== "admission-timeout") assert.ok(control.blockers(f.mission.id).some(item => item.id === `remote-runtime:${f.assignment.binding.runtimeId}` && item.status === "open"));
+    } finally { reopened?.close(); }
+  });
+}

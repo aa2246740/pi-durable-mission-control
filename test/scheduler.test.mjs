@@ -209,7 +209,8 @@ test("paused, busy, budget-exhausted, and uncertain missions record skipped occu
     uncertain.control.setOutboxStatusForMessage(pending.id, "uncertain", "test uncertainty");
     const schedule = uncertain.control.createSchedule(uncertain.mission.id, "uncertain-1", "Uncertain", "Do not wake", { kind: "once", at: onceSoon() }, true);
     uncertain.control.tickSchedules(Date.parse(schedule.nextRunAt) + 60_000);
-    assert.equal(uncertain.control.scheduleOccurrences(uncertain.mission.id)[0].reason, "outbox_pending");
+    assert.equal(uncertain.control.scheduleOccurrences(uncertain.mission.id)[0].reason, "mission_not_active");
+    assert.ok(uncertain.control.blockers(uncertain.mission.id).some(blocker => blocker.status === "open" && blocker.kind === "delivery"));
     assert.equal(uncertain.control.db.prepare("SELECT COUNT(*) AS count FROM outbox WHERE mission_id=? AND message_id LIKE 'schedule-message:%'").get(uncertain.mission.id).count, 0);
   } finally {
     closeFixture(uncertain);
