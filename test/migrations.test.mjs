@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { ControlPlane, CONTROL_SCHEMA_VERSION } from "../dist/control.js";
+import { ControlPlane, CONTROL_SCHEMA_VERSION, tryAcquireDaemonOwnership } from "../dist/control.js";
 
 function fixture(t) {
   const home = mkdtempSync(join(tmpdir(), "mission-control-migration-"));
@@ -164,7 +164,10 @@ test("a live owner blocks schema migration before any database writes", (t) => {
   db.prepare("INSERT INTO daemon_owner VALUES(1,?,?,?,?)").run("existing-owner", 7, process.pid, Date.now());
   db.close();
   const before = readFileSync(f.path);
-  assert.throws(() => new ControlPlane(f.home), /already has an owner.*schema migration is refused/);
+  const ownership = tryAcquireDaemonOwnership(f.home);
+  assert.ok(ownership);
+  t.after(() => ownership.close());
+  assert.throws(() => new ControlPlane(f.home), /already has an owner.*schema migration are refused/);
   assert.deepEqual(readFileSync(f.path), before);
   const check = new DatabaseSync(f.path, { readOnly: true });
   try {
@@ -174,6 +177,21 @@ test("a live owner blocks schema migration before any database writes", (t) => {
   } finally {
     check.close();
   }
+});
+
+test("a stale current PID does not block legacy migration or epoch advancement", (t) => {
+  const f = fixture(t);
+  const db = legacy(f.path);
+  db.exec("CREATE TABLE daemon_owner(singleton INTEGER PRIMARY KEY,daemon_id TEXT NOT NULL,epoch INTEGER NOT NULL,pid INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL)");
+  db.prepare("INSERT INTO daemon_owner VALUES(1,?,?,?,?)").run("stale-owner", 7, process.pid, Date.now());
+  db.close();
+  const control = new ControlPlane(f.home);
+  try {
+    assert.equal(version(control.db), CONTROL_SCHEMA_VERSION);
+    const owner = control.db.prepare("SELECT daemon_id, epoch FROM daemon_owner").get();
+    assert.equal(owner.daemon_id, control.daemonId);
+    assert.equal(owner.epoch, 8);
+  } finally { control.close(); }
 });
 
 test("schema 8 closed runtimes retain evidence but cannot prove a controlled stop after upgrade", t => {

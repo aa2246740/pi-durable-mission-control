@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { ControlPlane } from "../dist/control.js";
 import { probe, readDaemonRecord } from "../dist/daemon.js";
 import { generateLaunchAgentPlist, serviceLabel } from "../dist/service.js";
 
@@ -184,6 +185,7 @@ test("LaunchAgent install is idempotent, restarts crashes, respects stop, and un
 
 test("service refuses an unconfirmed live daemon without touching launchd", { skip: process.platform !== "darwin" }, async () => {
   const f = fixture();
+  const control = new ControlPlane(f.home);
   try {
     writeFileSync(join(f.home, "daemon.json"), JSON.stringify({
       pid: process.pid,
@@ -196,11 +198,56 @@ test("service refuses an unconfirmed live daemon without touching launchd", { sk
     assert.match(status.stdout, /unavailable\/unconfirmed/);
     const result = await runCli(["service", "install", "--home", f.home, "--port", "0"], f.env);
     assert.equal(result.code, 1);
-    assert.match(result.stderr, /alive but unconfirmed/);
+    assert.match(result.stderr, /ownership lock .* held but its identity is unconfirmed/);
     assert.equal(existsSync(f.plist), false);
     const launchctl = await run("/bin/launchctl", ["print", f.domainLabel], f.env);
     assert.notEqual(launchctl.code, 0);
   } finally {
+    control.close();
+    await cleanupFixture(f);
+  }
+});
+
+test("service ignores a stale record pointing at an unrelated live PID", { skip: process.platform !== "darwin" }, async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.home, "daemon.json"), JSON.stringify({
+      pid: process.pid,
+      port: 65534,
+      daemonId: "11111111-1111-4111-8111-111111111111",
+      startedAt: new Date().toISOString()
+    }), { mode: 0o600 });
+    const status = await runCli(["service", "status", "--home", f.home], f.env);
+    assert.equal(status.code, 1);
+    assert.match(status.stdout, /Daemon: stopped/);
+    const result = await runCli(["service", "install", "--home", f.home, "--port", "0"], f.env);
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    const record = readDaemonRecord(f.home);
+    assert.equal(record.state, "present");
+    assert.notEqual(record.info.pid, process.pid);
+    assert.equal(await probe(record.info), true);
+    const stopped = await runCli(["stop", "--home", f.home], f.env);
+    assert.equal(stopped.code, 0, stopped.stdout + stopped.stderr);
+    writeFileSync(join(f.home, "daemon.json"), JSON.stringify({ ...record.info, pid: process.pid }), { mode: 0o600 });
+    const removed = await runCli(["service", "uninstall", "--home", f.home], f.env);
+    assert.equal(removed.code, 0, removed.stdout + removed.stderr);
+    assert.equal(existsSync(f.plist), false);
+    process.kill(process.pid, 0);
+  } finally {
+    await cleanupFixture(f);
+  }
+});
+
+test("service refuses an occupied home even without a daemon record", { skip: process.platform !== "darwin" }, async () => {
+  const f = fixture();
+  const control = new ControlPlane(f.home);
+  try {
+    const result = await runCli(["service", "install", "--home", f.home, "--port", "0"], f.env);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /ownership lock .* held/);
+    assert.equal(existsSync(f.plist), false);
+  } finally {
+    control.close();
     await cleanupFixture(f);
   }
 });

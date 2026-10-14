@@ -25,7 +25,7 @@ import { DatabaseSync } from "node:sqlite";
 import { DurableWorkerMailbox } from "./worker-mailbox.js";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import type { WorktreeRecord } from "./contracts.js";
-import { CONTROL_SCHEMA_VERSION, processExists } from "./control.js";
+import { CONTROL_SCHEMA_VERSION, tryAcquireDaemonOwnership } from "./control.js";
 
 const BACKUP_FORMAT = "mission-control-backup";
 const BACKUP_FORMAT_VERSION = 1;
@@ -364,17 +364,6 @@ function inspectControlDatabase(path: string): {
     if (!Number.isSafeInteger(controlSchemaVersion) || controlSchemaVersion < 0 || controlSchemaVersion > CONTROL_SCHEMA_VERSION) {
       throw new Error(`Control database schema ${controlSchemaVersion} is not supported by this build (maximum ${CONTROL_SCHEMA_VERSION})`);
     }
-    if (tableExists(db, "daemon_owner")) {
-      const owner = db.prepare("SELECT pid FROM daemon_owner WHERE singleton=1").get() as { pid: unknown } | undefined;
-      if (owner) {
-        if (typeof owner.pid !== "number" || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
-          throw new Error("The control database has an invalid daemon owner PID; refusing to back it up");
-        }
-        if (processExists(owner.pid)) {
-          throw new Error(`Cannot back up while Mission Control owner process ${owner.pid} is alive; stop the daemon first`);
-        }
-      }
-    }
     return { controlSchemaVersion, ...readWorktreeMetadata(db) };
   } finally {
     db.close();
@@ -485,18 +474,19 @@ export async function backupHome(
   const sourceHome = realpathSync(sourceHomePath);
   const outputPath = resolve(output);
   ensureOutputLocation(outputPath);
-  await assertDaemonOffline(sourceHome);
-
-  const controlPath = join(sourceHome, "control.sqlite");
-  requireRegularFile(controlPath, "Control database");
-  const databaseMetadata = inspectControlDatabase(controlPath);
-  requireRegularFile(join(sourceHome, "admin.token"), "Administrative token");
-
-  const controlLease = acquireControlBackupLock(controlPath);
+  const ownership = tryAcquireDaemonOwnership(sourceHome);
+  if (!ownership) throw new Error("Cannot back up while the daemon ownership lock is held by a live coordinator or another backup; stop the daemon first");
+  let controlLease: DatabaseSync | undefined;
   let agentLeases: DatabaseSync[] = [];
   let temporary: string | undefined;
   const durabilityWarnings = new Set<string>();
   try {
+    await assertDaemonOffline(sourceHome);
+    const controlPath = join(sourceHome, "control.sqlite");
+    requireRegularFile(controlPath, "Control database");
+    const databaseMetadata = inspectControlDatabase(controlPath);
+    requireRegularFile(join(sourceHome, "admin.token"), "Administrative token");
+    controlLease = acquireControlBackupLock(controlPath);
     const lockedMetadata = inspectControlDatabase(controlPath);
     if (lockedMetadata.controlSchemaVersion !== databaseMetadata.controlSchemaVersion) {
       throw new Error("Control database schema changed while establishing the offline backup boundary");
@@ -568,7 +558,7 @@ export async function backupHome(
     throw error;
   } finally {
     releaseLeases(agentLeases);
-    releaseLeases([controlLease]);
+    releaseLeases(controlLease ? [ownership, controlLease] : [ownership]);
   }
 }
 

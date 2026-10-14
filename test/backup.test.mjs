@@ -319,7 +319,7 @@ test("backup refuses a live SQLite owner without creating output", async (t) => 
   try {
     const result = await runCli(["backup", "--home", f.home, "--out", output]);
     assert.equal(result.code, 1);
-    assert.match(result.stderr, /owner process .* is alive/);
+    assert.match(result.stderr, /daemon ownership lock is held/);
     assert.equal(existsSync(output), false);
   } finally {
     control.close();

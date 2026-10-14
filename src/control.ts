@@ -260,11 +260,33 @@ export function processExists(pid: number): boolean {
   }
 }
 
+// Keep this file in place: unlinking it could give concurrent owners different locks.
+export function tryAcquireDaemonOwnership(home: string): DatabaseSync | undefined {
+  const path = join(home, "daemon.ownership.sqlite");
+  if (existsSync(path)) {
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Daemon ownership path must be a regular file: ${path}`);
+  }
+  const ownership = new DatabaseSync(path, { timeout: 0 });
+  try {
+    // A separate rollback-mode database leaves control writes independent of the
+    // lifetime lock, which the OS releases even after SIGKILL or reboot.
+    ownership.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;");
+    chmodSync(path, 0o600);
+    return ownership;
+  } catch (error) {
+    ownership.close();
+    if (error instanceof Error && "errcode" in error && (error.errcode === 5 || error.errcode === 6)) return undefined;
+    throw error;
+  }
+}
+
 export class ControlPlane {
   readonly mcpRuntime = new McpRuntimeManager();
   readonly home: string;
   readonly db: DatabaseSync;
   readonly daemonId = randomUUID();
+  private readonly ownership: DatabaseSync;
   private ownerEpoch = 0;
   private closed = false;
   private watchdogFailureLogAt: number | undefined;
@@ -281,13 +303,17 @@ export class ControlPlane {
   constructor(home: string) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.home = realpathSync(home);
-    mkdirSync(join(home, "agents"), { recursive: true, mode: 0o700 });
-    mkdirSync(join(home, "artifacts"), { recursive: true, mode: 0o700 });
-    mkdirSync(join(home, "worktrees"), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(join(home, "control.sqlite"), { timeout: 5000 });
-    this.machineRegistry = new MachineRegistry(this.db);
-    this.remoteRuntimes = new RemoteRuntimeRegistry(this.db);
+    const ownership = tryAcquireDaemonOwnership(this.home);
+    if (!ownership) throw new HttpError(409, "Mission Control already has an owner or offline backup in progress; startup and schema migration are refused while the daemon ownership lock is held");
+    this.ownership = ownership;
+    let db: DatabaseSync | undefined;
     try {
+      mkdirSync(join(home, "agents"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(home, "artifacts"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(home, "worktrees"), { recursive: true, mode: 0o700 });
+      this.db = db = new DatabaseSync(join(home, "control.sqlite"), { timeout: 5000 });
+      this.machineRegistry = new MachineRegistry(this.db);
+      this.remoteRuntimes = new RemoteRuntimeRegistry(this.db);
       this.checkStartupCompatibility();
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
       this.workerMailbox = this.transaction(() => {
@@ -314,7 +340,8 @@ export class ControlPlane {
       });
       this.remoteArtifacts = new RemoteArtifactStore(this.db, this.home);
     } catch (error) {
-      this.db.close();
+      try { db?.close(); }
+      finally { this.ownership.close(); }
       throw error;
     }
   }
@@ -327,12 +354,6 @@ export class ControlPlane {
     const version = this.schemaVersion();
     if (version < 0 || version > CONTROL_SCHEMA_VERSION) {
       throw new HttpError(409, `Control database schema ${version} is not supported by this build (maximum ${CONTROL_SCHEMA_VERSION}); use a compatible version or restore a complete backup. Automatic downgrade is not supported.`);
-    }
-    if (this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='daemon_owner'").get()) {
-      const owner = this.db.prepare("SELECT pid FROM daemon_owner WHERE singleton=1").get() as { pid: number } | undefined;
-      if (owner && processExists(owner.pid)) {
-        throw new HttpError(409, `Mission Control already has an owner process (${owner.pid}); schema migration is refused while it is alive`);
-      }
     }
   }
 
@@ -5330,8 +5351,12 @@ export class ControlPlane {
     if (this.closed) return;
     if (this.mcpRuntime.activeCount) throw new Error("MCP runtime must be asynchronously closed before the control database.");
     this.closed = true;
-    this.db.prepare("DELETE FROM daemon_owner WHERE singleton=1 AND daemon_id=? AND epoch=?").run(this.daemonId, this.ownerEpoch);
-    this.db.close();
+    try {
+      this.db.prepare("DELETE FROM daemon_owner WHERE singleton=1 AND daemon_id=? AND epoch=?").run(this.daemonId, this.ownerEpoch);
+    } finally {
+      try { this.db.close(); }
+      finally { this.ownership.close(); }
+    }
   }
 
   async settlePendingShells(): Promise<void> {
