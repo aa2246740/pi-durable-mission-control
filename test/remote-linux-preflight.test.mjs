@@ -105,6 +105,21 @@ async function startServer(t, mode) {
     } catch { /* A malformed body still gets a named fake model. */ }
     const modelName = mode === "mismatch" ? "mapped-from-endpoint" : requested;
     response.writeHead(200, { "content-type": "text/event-stream" });
+    if (["missing-finish-reason", "timeout-after-tool", "provider-error-after-tool", "cancelled-after-tool", "length-after-tool"].includes(mode)) {
+      const stream = anthropic ? anthropicStream(true, modelName) : openaiStream(true, modelName);
+      const prefix = stream.split("\n\n").slice(0, anthropic ? 4 : 2).join("\n\n") + "\n\n";
+      response.write(prefix);
+      if (mode === "timeout-after-tool") return;
+      if (mode === "missing-finish-reason") { response.end(anthropic ? "" : "data: [DONE]\n\n"); return; }
+      if (anthropic) {
+        const reason = mode === "length-after-tool" ? "max_tokens" : "refusal";
+        response.end(`event: message_delta\ndata: ${JSON.stringify({type:"message_delta",delta:{stop_reason:reason},usage:{output_tokens:4}})}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`);
+      } else {
+        const reason = mode === "length-after-tool" ? "length" : mode === "cancelled-after-tool" ? "cancelled" : "network_error";
+        response.end(`data: ${JSON.stringify({id:"chatcmpl-preflight",object:"chat.completion.chunk",created:1,model:modelName,choices:[{index:0,delta:{},finish_reason:reason}]})}\n\ndata: [DONE]\n\n`);
+      }
+      return;
+    }
     response.end(anthropic ? anthropicStream(mode === "tool" || mode === "mismatch", modelName) : openaiStream(mode === "tool" || mode === "mismatch", modelName));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -390,4 +405,38 @@ test("a shared worker combination is probed once from the container entry", asyn
   assert.equal(report.checks[0].transport, "container");
   assert.deepEqual(report.checks[0].roles, ["orchestrator", "worker", "validator"]);
   assert.equal(server.requests.length, 1);
+});
+
+// Regressions from the independent review: a tool name alone is no success signal.
+test("preflight rejects incomplete, failed, cancelled and timed-out streams after a ping", async (t) => {
+  const directory = temporary(t);
+  for (const mode of ["missing-finish-reason", "timeout-after-tool", "provider-error-after-tool", "cancelled-after-tool", "length-after-tool"]) {
+    const server = await startServer(t, mode);
+    const shared = profile(server.openai, "openai-completions");
+    const report = await runPreflight({ configPath: writeConfig(directory, {orchestrator:shared,worker:shared,validator:shared}),
+      secretsFile: writeSecrets(directory), timeoutMs: mode === "timeout-after-tool" ? 500 : 5000 });
+    assert.equal(report.pass, false, mode);
+    assert.equal(server.requests.length, 1, "failed probes must not retry");
+    const [check] = report.checks;
+    assert.equal(check.httpOk, true, mode);
+    assert.equal(check.toolCalled, true, mode);
+    assert.notEqual(check.errorCategory, null, mode);
+    assert.ok(check.error, mode);
+    if (mode === "timeout-after-tool") assert.equal(check.errorCategory, "timeout");
+    assertNoSecret(report);
+  }
+});
+
+test("Anthropic partial tools, refusal and output limits also fail preflight", async (t) => {
+  const directory = temporary(t);
+  for (const mode of ["missing-finish-reason", "provider-error-after-tool", "length-after-tool"]) {
+    const server = await startServer(t, mode);
+    const shared = profile(server.anthropic, "anthropic-messages");
+    const report = await runPreflight({configPath:writeConfig(directory,{orchestrator:shared,worker:shared,validator:shared}),secretsFile:writeSecrets(directory),timeoutMs:5000});
+    assert.equal(report.pass, false, mode);
+    assert.equal(report.checks[0].httpOk, true);
+    assert.equal(report.checks[0].toolCalled, true);
+    assert.notEqual(report.checks[0].errorCategory, null);
+    assert.equal(server.requests.length, 1);
+  }
 });
