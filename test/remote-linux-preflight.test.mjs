@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -6,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { classifyProbe, containerArgs, containerEnv, containerPrefix, parseOptions, publishReport, runPreflight, uniqueTargets } from "../acceptance/remote-linux/preflight.mjs";
+import { defaultContainerRun, runProbeProcess, classifyProbe, containerArgs, containerEnv, containerPrefix, parseOptions, publishReport, runPreflight, uniqueTargets } from "../acceptance/remote-linux/preflight.mjs";
 import { readConfig } from "../acceptance/remote-linux/real.mjs";
 
 const preflightPath = fileURLToPath(new URL("../acceptance/remote-linux/preflight.mjs", import.meta.url));
@@ -439,4 +440,81 @@ test("Anthropic partial tools, refusal and output limits also fail preflight", a
     assert.notEqual(report.checks[0].errorCategory, null);
     assert.equal(server.requests.length, 1);
   }
+});
+
+
+test("container probe owns cleanup after timeout, exceptions and both interruption signals", async () => {
+  for (const mode of ["success","timeout","exception","SIGINT","SIGTERM","late-SIGTERM"]) {
+    const signals=new EventEmitter(), calls=[], containers=new Set();
+    let owned;
+    const command=async args => {
+      calls.push(args);
+      if(args[0]==="list") return [...containers].join("\n");
+      if(args[0]==="image") return JSON.stringify([{configuration:{name:"node:22-bookworm-slim"},variants:[{platform:{architecture:"arm64",os:"linux"}}]}]);
+      assert.equal(args[1],owned,"must only mutate the container created by this probe");
+      if(args[0]==="stop" && mode==="late-SIGTERM") signals.emit("SIGTERM");
+      if(args[0]==="delete") containers.delete(args[1]);
+      return "";
+    };
+    const result=await defaultContainerRun({profile:profile("http://127.0.0.1:9/v1","openai-completions"),credential:secret,timeoutMs:10,maxTokens:100},
+      {command,signals,runProcess:async (_command,args,_stdin,_credential,_timeout,signal)=>{
+        owned=args[args.indexOf("--name")+1];containers.add(owned);
+        if(mode==="exception") throw Error("spawn failed");
+        if(mode.startsWith("SIG")) {
+          const aborted=new Promise(resolve=>signal.addEventListener("abort",resolve,{once:true}));
+          signals.emit(mode);await aborted;
+        }
+        return {httpOk:true,toolCalled:true,errorCategory:mode==="timeout"?"timeout":null,error:mode==="timeout"?"timeout":null};
+      }});
+    assert.equal(result.cleanupVerified,true,mode);
+    assert.equal(result.containerName,owned);
+    assert.equal(containers.size,0);
+    assert.deepEqual(calls.filter(args=>["stop","delete"].includes(args[0])),[["stop",owned],["delete",owned]]);
+    assert.deepEqual(calls.at(-1),["list","--all","--quiet"]);
+    assert.equal(signals.listenerCount("SIGINT"),0);
+    assert.equal(signals.listenerCount("SIGTERM"),0);
+    if(mode.includes("SIG")) {assert.equal(result.interrupted,true);assert.match(result.error,/Interrupted by SIG/);assert.equal(result.errorCategory,"container");}
+    else assert.equal(result.errorCategory,mode==="success"?null:mode==="timeout"?"timeout":"container");
+  }
+});
+
+test("container cleanup failure cannot pass and preexisting containers are never removed", async () => {
+  for(const existing of [false,true]) {
+    const calls=[], signals=new EventEmitter();
+    let name=existing?`${containerPrefix()}someone-else`:undefined;
+    const command=async args=>{
+      calls.push(args);
+      if(args[0]==="list")return name??"";
+      if(args[0]==="image")return JSON.stringify([{configuration:{name:"node:22-bookworm-slim"},variants:[{platform:{architecture:"arm64",os:"linux"}}]}]);
+      throw Error("cannot clean up");
+    };
+    const result=await defaultContainerRun({profile:profile("http://127.0.0.1:9/v1","openai-completions"),credential:secret,timeoutMs:10,maxTokens:100},
+      {command,signals,runProcess:async(_command,args)=>{name=args[args.indexOf("--name")+1];return {httpOk:true,toolCalled:true,errorCategory:null};}});
+    assert.equal(result.cleanupVerified,false);
+    assert.equal(result.errorCategory,"container");
+    assert.match(result.error,/Residual/);
+    if(existing)assert.equal(calls.some(args=>["stop","delete"].includes(args[0])),false);
+  }
+});
+
+test("probe process terminates on its deadline and an abort signal", async () => {
+  const timeout=await runProbeProcess(process.execPath,["-e","setInterval(()=>{},1000)"],"",secret,100);
+  assert.equal(timeout.errorCategory,"timeout");
+  const controller=new AbortController();
+  const pending=runProbeProcess(process.execPath,["-e","setInterval(()=>{},1000)"],"",secret,10000,controller.signal);
+  controller.abort(Error("Interrupted by SIGINT"));
+  const result=await pending;
+  assert.equal(result.errorCategory,"container");
+  assert.match(result.error,/Interrupted by SIGINT/);
+});
+
+test("interrupted container probes stop the remaining provider combinations", async(t)=>{
+  const directory=temporary(t), worker=profile("http://127.0.0.1:9/v1","openai-completions");
+  const configPath=writeConfig(directory,{orchestrator:worker,worker,validator:{...worker,modelId:"never-called"}});
+  const report=await runPreflight({configPath,secretsFile:writeSecrets(directory),fromContainer:true,
+    containerRun:async()=>({httpOk:false,toolCalled:false,errorCategory:"container",error:"Interrupted by SIGTERM",interrupted:true,containerName:"unit",cleanupVerified:true})});
+  assert.equal(report.pass,false);
+  assert.equal(report.checks.length,1);
+  assert.equal(report.checks[0].interrupted,true);
+  assert.equal(report.checks[0].cleanupVerified,true);
 });

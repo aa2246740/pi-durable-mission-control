@@ -217,6 +217,7 @@ export function containerArgs({ name, image }) {
     ...mount(fileURLToPath(new URL("./preflight.mjs", import.meta.url)), "/app/acceptance/remote-linux/preflight.mjs"),
     ...mount(fileURLToPath(new URL("./real.mjs", import.meta.url)), "/app/acceptance/remote-linux/real.mjs"),
     ...mount(fileURLToPath(new URL("./mock.mjs", import.meta.url)), "/app/acceptance/remote-linux/mock.mjs"),
+    ...mount(fileURLToPath(new URL("./scenarios", import.meta.url)), "/app/acceptance/remote-linux/scenarios"),
     image, "node", "/app/acceptance/remote-linux/preflight.mjs", "--container-probe"];
 }
 
@@ -278,51 +279,97 @@ function reportFor(checks) {
 async function commandOutput(args) {
   const child = spawn(containerCLI, args, { env: containerEnv(), stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "", stderr = "";
-  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-  const code = await new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", resolve);
-  });
-  if (code !== 0) throw new Error(stderr.trim() || stdout.trim() || `container ${args[0]} failed`);
-  return stdout;
+  child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString()).slice(-2 * 1024 * 1024); });
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-2 * 1024 * 1024); });
+  const timer = setTimeout(() => child.kill("SIGKILL"), 20000);
+  try {
+    const code = await new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
+    if (code !== 0) throw new Error(stderr.trim() || stdout.trim() || `container ${args[0]} failed`);
+    return stdout;
+  } finally { clearTimeout(timer); }
 }
 
-async function defaultContainerRun({ profile, credential, timeoutMs, maxTokens }) {
+export async function defaultContainerRun({ profile, credential, timeoutMs, maxTokens }, {
+  command = commandOutput, runProcess = runProbeProcess, signals = process
+} = {}) {
   const prefix = containerPrefix();
-  const listed = (await commandOutput(["list", "--all", "--quiet"])).trim().split(/\s+/).filter((name) => name.startsWith(prefix));
-  if (listed.length > 0) throw new Error(`Existing ${prefix} containers require their owner's cleanup`);
-  const images = JSON.parse(await commandOutput(["image", "list", "--format", "json"]));
-  const image = images.find((item) => /^(docker\.io\/library\/)?node:22-bookworm-slim$/.test(item.configuration?.name));
-  if (!image?.variants?.some((variant) => variant.platform?.architecture === "arm64" && variant.platform?.os === "linux")) {
-    throw new Error("Required cached node:22-bookworm-slim arm64 image missing; pulling is forbidden");
-  }
   const name = `${prefix}${randomUUID().slice(0, 12)}`;
-  const args = containerArgs({ name, image: image.configuration.name });
-  const stdin = containerStdin({ profile, credential, timeoutMs, maxTokens });
-  if (args.join("\n").includes(credential) || Object.values(containerEnv()).some((value) => value.includes(credential))) {
-    throw new Error("Refusing to place a credential in container arguments or environment");
+  const controller = new AbortController();
+  const onInt = () => controller.abort(new Error("Interrupted by SIGINT"));
+  const onTerm = () => controller.abort(new Error("Interrupted by SIGTERM"));
+  const names = async () => (await command(["list", "--all", "--quiet"])).trim().split(/\s+/).filter((value) => value.startsWith(prefix));
+  let launched = false, result;
+  const cleanupErrors = [];
+  signals.on("SIGINT", onInt);
+  signals.on("SIGTERM", onTerm);
+  try {
+    if ((await names()).length > 0) throw new Error(`Existing ${prefix} containers require their owner's cleanup`);
+    controller.signal.throwIfAborted();
+    const images = JSON.parse(await command(["image", "list", "--format", "json"]));
+    const image = images.find((item) => /^(docker\.io\/library\/)?node:22-bookworm-slim$/.test(item.configuration?.name));
+    if (!image?.variants?.some((variant) => variant.platform?.architecture === "arm64" && variant.platform?.os === "linux")) {
+      throw new Error("Required cached node:22-bookworm-slim arm64 image missing; pulling is forbidden");
+    }
+    const args = containerArgs({ name, image: image.configuration.name });
+    const stdin = containerStdin({ profile, credential, timeoutMs, maxTokens });
+    if (args.join("\n").includes(credential) || Object.values(containerEnv()).some((value) => value.includes(credential))) {
+      throw new Error("Refusing to place a credential in container arguments or environment");
+    }
+    controller.signal.throwIfAborted();
+    launched = true;
+    result = await runProcess(containerCLI, args, stdin, credential, timeoutMs + containerStartupMs, controller.signal);
+  } catch (error) {
+    result = failedProbe("container", error instanceof Error ? error.message : String(error));
+  } finally {
+    try {
+      if (launched) {
+        // Killing the CLI does not prove that its guest stopped. Remove only this run's name.
+        for (const action of ["stop", "delete"]) {
+          try {
+            if (!(await names()).includes(name)) continue;
+            try { await command([action, name]); }
+            catch (error) { if ((await names()).includes(name)) throw error; }
+          } catch (error) { cleanupErrors.push(`${action}: ${error.message}`); }
+        }
+      }
+      if ((await names()).length > 0) cleanupErrors.push(`Residual ${prefix} containers`);
+    } catch (error) { cleanupErrors.push(`residue check: ${error.message}`); }
+    finally {
+      signals.removeListener("SIGINT", onInt);
+      signals.removeListener("SIGTERM", onTerm);
+    }
   }
-  return runProbeProcess(containerCLI, args, stdin, credential, timeoutMs + containerStartupMs);
+  if (controller.signal.aborted) result = { ...failedProbe("container", controller.signal.reason.message), interrupted: true };
+  if (cleanupErrors.length > 0) {
+    result = { ...result, errorCategory: "container", error: [result.error, ...cleanupErrors].filter(Boolean).join("; ") };
+  }
+  return { ...result, containerName: name, cleanupVerified: cleanupErrors.length === 0 };
 }
 
-function runProbeProcess(command, args, stdin, credential, deadlineMs) {
+export function runProbeProcess(command, args, stdin, credential, deadlineMs, signal) {
   const child = spawn(command, args, { env: containerEnv(), stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "", stderr = "";
   child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString()).slice(-1024 * 1024); });
   child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-1024 * 1024); });
   let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, deadlineMs);
+  const kill = () => child.kill("SIGKILL");
+  const timer = setTimeout(() => { timedOut = true; kill(); }, deadlineMs);
+  signal?.addEventListener("abort", kill, { once: true });
+  if (signal?.aborted) kill();
   child.stdin.on("error", () => undefined);
   child.stdin.end(stdin);
   return new Promise((resolve) => {
     const finish = (error) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", kill);
       const secrets = credential ? [credential] : [];
       const safeOut = redact(stdout, secrets);
       const safeErr = redact(stderr, secrets);
-      if (error || timedOut) {
-        resolve(failedProbe(timedOut ? "timeout" : "container", error?.message || safeErr || "Container probe failed"));
+      if (signal?.aborted || error || timedOut) {
+        resolve(failedProbe(timedOut ? "timeout" : "container", signal?.reason?.message || [error?.message, safeErr].filter(Boolean).join(": ") || "Container probe failed"));
         return;
       }
       try { resolve(JSON.parse(safeOut.trim())); }
@@ -367,6 +414,8 @@ export async function runPreflight(options) {
       baseUrl: target.profile.baseUrl,
       credentialEnv: target.profile.credentialEnv,
       transport,
+      ...(result.containerName ? { containerName: result.containerName, cleanupVerified: result.cleanupVerified } : {}),
+      ...(result.interrupted ? { interrupted: true } : {}),
       httpOk: result.httpOk === true,
       httpStatus: Number.isInteger(result.httpStatus) ? result.httpStatus : null,
       latencyMs: Number.isFinite(result.latencyMs) ? Math.max(0, Math.round(result.latencyMs)) : null,
@@ -378,6 +427,7 @@ export async function runPreflight(options) {
       errorCategory: result.errorCategory ?? null,
       error: clip(result.error ?? null)
     });
+    if (result.interrupted) break;
   }
   return JSON.parse(publishReport(reportFor(checks), secrets));
 }

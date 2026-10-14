@@ -130,6 +130,13 @@ const command = (args) => commandOutput(containerCLI, args, { PATH: process.env.
 
 const containerNames = async () => (await command(["list", "--all", "--quiet"])).trim().split(/\s+/).filter((name) => name.startsWith(prefix));
 
+export function finalInterruption(summary, failure, aborted) {
+  if (!aborted) return failure;
+  summary.status = "failed";
+  summary.error = aborted.message;
+  return aborted;
+}
+
 export function finalizeEvidence(proof, secrets, summary, save) {
   save("summary.json", summary);
   try { scanEvidence(proof, secrets); }
@@ -751,6 +758,7 @@ export async function run(options) {
       summary.cleanupErrors = cleanupErrors;
       failure ??= new Error(cleanupErrors.join("; "));
     }
+    failure = finalInterruption(summary, failure, aborted);
     summary.durationMs = Date.now() - startedAt;
     if (options.rehearsal) Object.assign(summary, { rehearsal: true, modelRequests: records.length, modelRequestTools: records });
     try { finalizeEvidence(proof, secrets, summary, save); }

@@ -164,7 +164,7 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-rehearsal- node --test acceptance/remote-l
 
 Mission 使用 shared workspace，`remoteWorkspaceIds` 只有本次 Linux workspace。产品默认 `approve` 会等待人工批准文件写入、shell 和验收命令；此无人值守复现明确选择 `trusted`，以便脚本全程不发送人工消息、不解除 blocker、不调用 resume、不通过 API 修改任务状态。模型仍需自己创建任务、交付、验收和完成 Mission。
 
-宿主生成 `totals.acceptance.test.mjs`，权限 0400，记录 SHA-256，且不挂载给 Linux worker。macOS 额外尝试 `chflags uchg`，记录成功或失败，结束时解除以便清理；两次 chflags 子进程只接收 PATH。验收命令先按命令内写死的 SHA-256 校验此文件，再运行 node:test；回执必须原样记录这条命令。发布时、新回执被轮询发现时、结束时分别核对 hash 与权限。导出中的所有本地 agent 的 `shell_evidence` 和 tool transcript 都会接受检查；引用测试文件或对证据目录执行权限修改、写入的 shell 命令会使验收失败。测试进程不导入被测 `totals.mjs`。每次调用在独立 Node 子进程中导入交付模块，只传入固定输入，再从独立管道读取结构化的返回值或抛错结果，由父测试进程断言。`node:v8` 二进制序列化保留 NaN、Infinity 和 undefined；交付模块的 stdout 与结果分开。子进程只继承 PATH，单次调用限时 5 秒、输出限 64 KiB；非零退出、超时或损坏的结果均使测试失败。宿主验收和新容器复核使用同一份原始测试源码，均采用此隔离方式。四个用例验证导出的 `totalCents(lines)`：空订单为 0、多行合计、整数分乘法与零值、拒绝负数/非整数/非数字/缺字段及超出安全整数的金额。每行字段是 `quantity` 与 `unitPriceCents`，完整规则同时写入 goal、acceptance 和 assertion，模型无须读取宿主测试源码。
+宿主生成 `totals.acceptance.test.mjs`，权限 0400，记录 SHA-256，且不挂载给 Linux worker。macOS 额外尝试 `chflags uchg`，记录成功或失败，结束时解除以便清理；两次 chflags 子进程只接收 PATH。验收命令先按命令内写死的 SHA-256 校验此文件，再运行 node:test；回执必须原样记录这条命令。发布时、新回执被轮询发现时、结束时分别核对 hash 与权限。导出中的所有本地 agent 的 `shell_evidence` 和 tool transcript 都会接受检查；引用测试文件或对证据目录执行权限修改、写入的 shell 命令会使验收失败。测试进程不导入被测 `totals.mjs`。每次调用在独立 Node 子进程中导入交付模块，只传入固定输入，再从独立管道读取结构化的返回值或抛错结果，由父测试进程断言。`node:v8` 二进制序列化保留 NaN、Infinity 和 undefined；交付模块的 stdout 与结果分开。父进程每次生成随机 nonce，与输入经 stdin 发送；runner 在加载交付模块之前读完输入，保存传输函数的普通常量引用。结果采用四字节长度头加带 nonce 的二进制载荷，父进程要求恰好一帧、无尾随字节且 nonce 匹配，防止交付模块插入伪造结果或通过同步内置模块导出替换传输函数。子进程只继承 PATH，单次调用限时 5 秒后发送 SIGKILL、输出限 64 KiB；非零退出、超时或损坏的结果均使测试失败。宿主验收和新容器复核使用同一份原始测试源码，均采用此隔离方式。此协议不构成操作系统沙箱；被测代码若另起子进程并继承管道，五秒终止只覆盖直接子进程，管道关闭仍可能受后代进程影响，需由外层验收进程组停止和容器清理兜底。四个用例验证导出的 `totalCents(lines)`：空订单为 0、多行合计、整数分乘法与零值、拒绝负数/非整数/非数字/缺字段及超出安全整数的金额。每行字段是 `quantity` 与 `unitPriceCents`，完整规则同时写入 goal、acceptance 和 assertion，模型无须读取宿主测试源码。
 
 Mission 题面只提供业务规则、`/work/totals.mjs` 交付位置和独立验收命令；角色说明仅声明角色名称，任务推进由产品提示和模型自行完成。worker 在 `/work/totals.mjs` 交付冻结 artifact。首次发布路径不符合 `/work/totals.mjs` 时，脚本记录 `rejected-publications.json` 并继续等待正确发布，不修改 Mission 题面。脚本观察到正确的 worker `artifact_published` 事件后，用 `container exec <本次容器名> node -e ...` 把源文件改成 `throw new Error("mutated after publish")`，记录改写前后 hash，并检查协调端 CAS hash 不变。脚本只等待结果；模型不能通过修复或再次发布绕开本次故障。独立本地 validator 必须用 Mission 中的精确命令和 artifactIds 调用 RunValidation，成功回执需为 remote-snapshot、snapshotIntegrity true，四个用例全过。验收通过依据 CAS hash、remote-snapshot、snapshotIntegrity 和回执 artifact digest；注入与回执的时间戳只作为记录。完成时再检查宿主测试 hash 和 CAS hash，Mission completed、恰好一条任务 accepted、无 blocker 才通过。该任务的最终成功 validator 决定必须引用覆盖 totals.mjs 冻结快照的精确回执；其他任务仅允许 cancelled 或 attempt 为 0 且从未进入 running/review。真实模式按 artifact 的 remoteProvenance 核对交付 worker 的 runtimeId、agentId 和 machineId，并等待本 Mission 的全部 runtime 进入 closed；其他 worker 的 runtime 不导致数量断言失败。mock 的固定 runtime 数量、唯一任务及唯一 artifact 断言保持不变。
 
@@ -176,7 +176,7 @@ Mission 题面只提供业务规则、`/work/totals.mjs` 交付位置和独立�
 - `real-evidence.json`：最终状态、轮数/60、每个 agent 及角色的模型计数、累计 token、工具调用名称序列、artifact/CAS hash、故障注入和回执。`modelCalls` 计数会话库中已提交的 assistant 响应，包含错误与重试响应；`admittedModelCalls` 另记产品准入数，包含辅助请求，不能把准入数称为已完成的提供商调用。usage 汇总各会话最新 `pi.usage` 文档的 models 桶，包含辅助调用，排除 tools 桶。工具名取 assistant 的 toolCall，按每个 agent 的 commit_seq、entry ID 和响应内位置排序，不记录参数或隐藏推理，也不依靠跨进程时钟排序。响应模型证据保留配置名、API `responseModel` 名、各名称的调用数及不一致标记；没有 `responseModel` 的调用记为未报告，不推断实际名。库读取失败显示 `complete: false`、错误类别和安全的 `error.code`，该 agent/角色的计数与 usage 为 null，整体标记 `evidenceComplete: false`，不单独使业务验收失败。未知金额为 null。`oracleTouches` 记录本地 shell 对验收文件或目录的触碰。
 - `fault-injection.json`：触发事件序号、artifact ID、源文件改写前后 SHA-256、CAS 改写前后 SHA-256 和注入结束时间。
 - `independent-review.json`、`independent-inputs/`、`host-runtime.json`、`rejected-publications.json`：独立容器复核结果及输入、Node hash 和不符合交付路径的发布记录。原始测试在脚本内存中保留，复核不从可能被修改的宿主测试文件读取。
-- `summary.json`：验收及清理结果；成功时有模型计数、usage、`modelMismatches` 和最终 CAS hash。失败时保留已取得的 Mission/export/evidence，即使超时也尝试只读导出。最终凭据扫描覆盖 summary 及所有晚写文件，扫描失败会非零退出。
+- `summary.json`：验收及清理结果；成功时有模型计数、usage、`modelMismatches` 和最终 CAS hash。失败时保留已取得的 Mission/export/evidence，即使超时也尝试只读导出。最终凭据扫描覆盖 summary 及所有晚写文件，扫描失败会非零退出。收尾期间收到 SIGINT/SIGTERM 时继续清理，最终 summary 标为失败、非零退出并保留证据，`--discard` 不删除中断证据。
 
 普通测试中的 `test/remote-linux-real.test.mjs` 只用假凭据和本地进程，覆盖配置、文件权限、脱敏、stdin 传递、故障注入、四个业务测试、固定 hash 命令、预言触碰检测、stdout/stderr 分离、最终扫描顺序、实际 pi-durable 库的只读查询、响应模型名、错误类别、额外任务、纠正发布、独立复核分歧、宿主 Node hash、最后一轮准入等待、多 worker 停止检查及被测模块修改内置模块后的进程隔离，不调用任何外部模型。真实 MiniMax/GLM 运行须由持有凭据的运行者执行，单元测试和 mock 容器通过都不能代替这一结果。
 
@@ -190,9 +190,9 @@ node acceptance/remote-linux/preflight.mjs --real acceptance/remote-linux/real-m
 node acceptance/remote-linux/preflight.mjs --real acceptance/remote-linux/real-glm.json --secrets-file /私有目录/models.env --from-container
 ```
 
-`--from-container` 把远端 worker 那一个组合改到临时 Apple Container 里请求，用来确认容器网络能够到达 endpoint。同一组合不会在宿主上再请求一次。容器镜像必须是本机已缓存的 `node:22-bookworm-slim` arm64；缺失时直接失败，不拉取。容器名默认使用 `mc-acc-` 前缀，可用 `MC_ACCEPTANCE_CONTAINER_PREFIX` 覆盖，覆盖值仍须以 `mc-acc-` 开头。运行带 `--rm`。只读挂载 `dist`、`node_modules` 和预检脚本。密钥只经 stdin 传入容器，不进入 argv、环境变量或挂载文件。若启动前已有同前缀容器，预检拒绝运行，由该容器的所有者处理。
+`--from-container` 把远端 worker 那一个组合改到临时 Apple Container 里请求，用来确认容器网络能够到达 endpoint。同一组合不会在宿主上再请求一次。容器镜像必须是本机已缓存的 `node:22-bookworm-slim` arm64；缺失时直接失败，不拉取。容器名默认使用 `mc-acc-` 前缀，可用 `MC_ACCEPTANCE_CONTAINER_PREFIX` 覆盖，覆盖值仍须以 `mc-acc-` 开头。运行带 `--rm`。预检保存本次容器名，正常结束、超时、异常和 SIGINT/SIGTERM 后均按精确名字停止并删除，再核对此前缀无残留；清理失败会使预检失败，结果记录 `containerName` 和 `cleanupVerified`。中断后不再探测其余模型组合。只读挂载 `dist`、`node_modules` 和预检脚本。密钥只经 stdin 传入容器，不进入 argv、环境变量或挂载文件。若启动前已有同前缀容器，预检拒绝运行，由该容器的所有者处理。
 
-标准输出是一行 JSON。`pass` 是总体结论。`checks` 的每一项对应一个组合，包含角色、`transport`（`host` 或 `container`）、HTTP 是否成功、状态码、延迟、是否返回名为 `ping` 的工具调用、token usage、`responseModel`，以及 `errorCategory`。`responseModel` 来自 pi-ai 读到的提供商流事件里的 `model` 字段；流里没有该字段，或请求在返回模型名之前失败时为 null，并由 `responseModelReason` 说明原因。部分兼容端点会把配置里的 `modelId` 映射成另一个模型。映射结果与 `modelId` 不同时，该项 `modelMismatch` 为 true，顶层 `modelMismatches` 列出这些组合，并带有 `notice`。这个标记不改变 `pass`，退出码仍只由工具调用是否成功决定。错误类别包括 `auth`、`timeout`、`http`、`network`、`no-tool-call`、`provider`、`container`。配置或 secrets 文件不合法时 `checks` 为空，并给出不含密钥的 `error`。任何输出都会脱敏。退出码非零表示先不要进入上面的正式验收。预检通过后再运行 `run.mjs --real`。
+标准输出是一行 JSON。`pass` 是总体结论。`checks` 的每一项对应一个组合，包含角色、`transport`（`host` 或 `container`）、HTTP 是否成功、状态码、延迟、是否返回名为 `ping` 的工具调用、token usage、`responseModel`，以及 `errorCategory`。`responseModel` 来自 pi-ai 读到的提供商流事件里的 `model` 字段；流里没有该字段，或请求在返回模型名之前失败时为 null，并由 `responseModelReason` 说明原因。部分兼容端点会把配置里的 `modelId` 映射成另一个模型。映射结果与 `modelId` 不同时，该项 `modelMismatch` 为 true，顶层 `modelMismatches` 列出这些组合，并带有 `notice`。这个标记不改变 `pass`；工具调用和容器清理均成功时退出码才为零。错误类别包括 `auth`、`timeout`、`http`、`network`、`no-tool-call`、`provider`、`container`。配置或 secrets 文件不合法时 `checks` 为空，并给出不含密钥的 `error`。任何输出都会脱敏。退出码非零表示先不要进入上面的正式验收。预检通过后再运行 `run.mjs --real`。
 
 ### 四场景与隔离回归
 
@@ -200,4 +200,12 @@ node acceptance/remote-linux/preflight.mjs --real acceptance/remote-linux/real-g
 
 ```sh
 MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-regression- node --test acceptance/remote-linux/regression-container.test.mjs
+```
+
+### 结果通道与预检清理回归
+
+构建后运行以下专用容器测试。它只用本机缓存镜像和监听 `192.168.64.1` 的本地假模型服务：正确 totals 实现须 4/4 通过，向结果管道注入伪造结果的错误实现须失败；无响应服务的预检超时和 SIGINT 中断均须非零退出、清理本次容器且前缀无残留。证据目录写入 TMPDIR 并打印路径，不调用真实模型。
+
+```sh
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-rv7-a-astra- node --test acceptance/remote-linux/integrity-container.test.mjs
 ```

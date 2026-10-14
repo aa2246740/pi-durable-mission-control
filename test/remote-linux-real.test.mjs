@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assertCoordinatorExit, missionOutcomeReady, stoppedRealRuntimes, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
+import { assertCoordinatorExit, finalInterruption, missionOutcomeReady, stoppedRealRuntimes, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
 import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
 import { sessionFailure, readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
 import { ControlPlane } from "../dist/control.js";
@@ -552,4 +552,60 @@ console.log('delivery diagnostic');
     assert.match(result.stdout,/^# tests 4$/m);
     assert.doesNotMatch(result.stdout,/^# pass 4$/m);
   }
+});
+
+
+test("frozen result frames reject forgery on host and independent review inputs", (t) => {
+  return verifyResultFrames(t);
+});
+
+async function verifyResultFrames(t) {
+  const { correctTotals, corruptTotals } = await import("./fixtures/remote-linux-totals.mjs");
+  const directory = temporary(t), acceptance = writeFrozenAcceptance(directory);
+  const synchronized = "import fs from 'node:fs'; import v8 from 'node:v8'; import {syncBuiltinESMExports} from 'node:module'; fs.writeFileSync=()=>{throw Error('replaced writer');};fs.writeSync=()=>{throw Error('replaced low-level writer');};v8.serialize=()=>{throw Error('replaced serializer');};v8.Serializer.prototype.writeValue=()=>{throw Error('replaced encoder');};syncBuiltinESMExports();";
+  for (const [index, [name, source, passed]] of [["correct", correctTotals, true], ["correct with replaced builtin exports", synchronized+correctTotals, true], ...corruptTotals.map(([name,source])=>[name,source,false])].entries()) {
+    const proof = join(directory, String(index)); mkdirSync(proof);
+    const casPath = join(proof, "totals.mjs"); writeFileSync(casPath, source);
+    const host = spawnSync(process.execPath, ["--test", "--test-reporter=tap", acceptance.path], {cwd:proof,env:{PATH:process.env.PATH},encoding:"utf8",timeout:20000,killSignal:"SIGKILL"});
+    assert.equal(host.status, passed ? 0 : 1, name + host.stdout + host.stderr);
+    const artifact = {id:"a",path:"/work/totals.mjs",sha256:sha256(source)};
+    const receipt = {id:"r",exitCode:0,stdout:"# tests 4\n# pass 4\n# fail 0\n"};
+    const review = await independentReview({proof,acceptance,artifact,casPath,receipt,name:"unit",image:"unused",
+      execute:async args => {
+        const mounts = args.filter((value,i)=>args[i-1] === "-v");
+        const child = spawnSync(process.execPath,["--test","--test-reporter=tap",mounts[0].split(":")[0]],
+          {cwd:mounts[1].split(":")[0],env:{PATH:process.env.PATH},encoding:"utf8",timeout:20000,killSignal:"SIGKILL"});
+        return {exitCode:child.status,stdout:child.stdout,stderr:child.stderr};
+      }});
+    assert.equal(review.passed, passed, name + review.stdout);
+    if (passed) assertIndependentReview(review,acceptance,artifact,receipt);
+    else assert.throws(()=>assertIndependentReview(review,acceptance,artifact,receipt),/disagrees/);
+  }
+}
+
+test("frozen probe forcibly kills a delivery that ignores SIGTERM", (t) => {
+  const directory=temporary(t), acceptance=writeFrozenAcceptance(directory);
+  writeFileSync(join(directory,"totals.mjs"), "process.on('SIGTERM',()=>{});setInterval(()=>{},1000);export const totalCents=()=>0;");
+  const child=spawnSync(process.execPath,["--test","--test-reporter=tap","--test-name-pattern","empty order",acceptance.path],
+    {cwd:directory,env:{PATH:process.env.PATH},encoding:"utf8",timeout:12000,killSignal:"SIGKILL"});
+  assert.equal(child.error,undefined);
+  assert.equal(child.signal,null);
+  assert.equal(child.status,1);
+  assert.match(child.stdout,/Delivery child transport failed/);
+});
+
+test("late interruptions fail the saved summary and return the CLI failure", (t) => {
+  for (const signal of ["SIGINT","SIGTERM"]) {
+    const directory=temporary(t), summary={status:"passed",cleanupVerified:true};
+    const aborted=new Error(`Interrupted by ${signal}`);
+    const failure=finalInterruption(summary,undefined,aborted);
+    assert.equal(failure,aborted);
+    finalizeEvidence(directory,[],summary,(name,value)=>writeFileSync(join(directory,name),JSON.stringify(value)));
+    assert.equal(JSON.parse(readFileSync(join(directory,"summary.json"))).status,"failed");
+    assert.equal(summary.error,`Interrupted by ${signal}`);
+    // run's discard branch requires no failure; throwing the returned error makes the CLI nonzero.
+    assert.throws(()=>{if(failure) throw failure;},new RegExp(signal));
+  }
+  const failure=new Error("existing");
+  assert.equal(finalInterruption({status:"failed"},failure,undefined),failure);
 });
