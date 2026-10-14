@@ -21,7 +21,7 @@ function fixture() {
     fetch: () => new Promise(() => {}), setInterval() {}, setTimeout() {}, clearTimeout() {}
   };
   runInNewContext(source + `\n globalThis.ui = {
-    state, missionDialog, worktreeCommit, remoteWorkspaceStatus,
+    state, missionDialog, worktreeCommit, remoteWorkspaceStatus, renderArtifacts,
     submit: (data) => submitHandler(data), setApi: (handler) => { api = handler; }
   };`, context);
   const { ui } = context;
@@ -88,4 +88,23 @@ test('remote snapshot receipt displays integrity without a Git commit', () => {
   assert.match(ui.remoteWorkspaceStatus(ui.state.app.workspaces[1]), /成果传回/);
   machine.leaseExpiresAt = 0;
   assert.match(ui.remoteWorkspaceStatus(ui.state.app.workspaces[1]), /未在线/);
+});
+
+test('artifact download links use the server filename and escape HTML attributes', () => {
+  const { ui } = fixture();
+  ui.state.missionId = 'downloads';
+  ui.state.detail = {
+    agents: [], tasks: [], validations: [], validationReceipts: [],
+    artifacts: [
+      { id: 'local', name: 'Display label', path: '/different/source', downloadName: 'totals.mjs' },
+      { id: 'remote', name: 'Remote report', path: '/remote/source', downloadName: '报告&汇总.mjs' },
+      { id: 'escape', name: 'Escape fixture', path: '/source', downloadName: '" onmouseover="<script>&' }
+    ]
+  };
+  const links = ui.renderArtifacts().match(/<a[^>]+href="\/api\/artifacts\/[^>]+>下载<\/a>/g);
+  assert.deepEqual(Array.from(links), [
+    '<a class="button secondary small" href="/api/artifacts/local/content" download="totals.mjs">下载</a>',
+    '<a class="button secondary small" href="/api/artifacts/remote/content" download="报告&amp;汇总.mjs">下载</a>',
+    '<a class="button secondary small" href="/api/artifacts/escape/content" download="&quot; onmouseover=&quot;&lt;script&gt;&amp;">下载</a>'
+  ]);
 });

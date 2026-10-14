@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 import type { ModelProfile, RoleProfile } from "./contracts.js";
+import { artifactContentDisposition, artifactDownloadName } from "./artifact-download.js";
 import { McpConfigurationError } from "./mcp-config.js";
 import { ControlPlane, HttpError, parseCreateMissionInput, parseValidationContractUpdateInput } from "./control.js";
 import { MachineError } from "./machines.js";
@@ -524,7 +525,13 @@ export async function startServer(options: ServerOptions) {
         ));
         throw new HttpError(400, "At least one supported mission field is required");
       }
-      if (missionMatch && method === "GET") return jsonResponse(response, 200, control.detail(decodeURIComponent(missionMatch[1]!)));
+      if (missionMatch && method === "GET") {
+        const detail = control.detail(decodeURIComponent(missionMatch[1]!));
+        return jsonResponse(response, 200, {
+          ...detail,
+          artifacts: detail.artifacts.map((artifact) => ({ ...artifact, downloadName: artifactDownloadName(artifact) }))
+        });
+      }
       const runtimeMatch = /^\/api\/missions\/([^/]+)\/runtimes$/.exec(url.pathname);
       if (runtimeMatch && method === "GET") return jsonResponse(response, 200, control.remoteRuntimeSnapshots(decodeURIComponent(runtimeMatch[1]!)));
       const contractMatch = /^\/api\/missions\/([^/]+)\/validation-contract$/.exec(url.pathname);
@@ -634,7 +641,10 @@ export async function startServer(options: ServerOptions) {
         if (!artifact.snapshotPath) throw new HttpError(409, "Artifact snapshot is unavailable");
         const bytes = readFileSync(artifact.snapshotPath);
         if (createHash("sha256").update(bytes).digest("hex") !== artifact.sha256) throw new HttpError(409, "Artifact digest changed");
-        response.writeHead(200, { "content-type": "application/octet-stream", "content-length": bytes.length });
+        response.writeHead(200, {
+          "content-type": "application/octet-stream", "content-length": bytes.length,
+          "content-disposition": artifactContentDisposition(artifact)
+        });
         response.end(bytes);
         return;
       }
