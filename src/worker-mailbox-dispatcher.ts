@@ -100,6 +100,8 @@ export class WorkerMailboxDispatcher {
             return;
           }
           if (!this.options.mailbox.finish(binding, envelope.messageId)) throw new Error("Worker notice completion was not accepted");
+          // Let a lifecycle microtask fence the binding before the next claim.
+          await Promise.resolve();
           continue;
         }
         if (payload.kind !== "rpc") throw new Error("Unexpected worker uplink payload");
