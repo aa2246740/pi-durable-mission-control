@@ -5279,7 +5279,9 @@ export class ControlPlane {
   private ensureUncertainDeliveryBlockers(missionId?: string): void {
     // Startup also repairs older and restored evidence without reopening a
     // blocker that a human already resolved or changing the delivery itself.
+    // A completed mission has already passed its blocker gate; its history is left as recorded.
     const rows = this.db.prepare(`SELECT o.id,o.mission_id,o.message_id FROM outbox o
+      JOIN missions m ON m.id=o.mission_id AND m.status!='completed'
       LEFT JOIN blockers b ON b.id='delivery:' || o.id
       WHERE o.status='uncertain' AND b.id IS NULL AND (? IS NULL OR o.mission_id=?)`)
       .all(missionId ?? null, missionId ?? null) as Array<{ id: string; mission_id: string; message_id: string }>;

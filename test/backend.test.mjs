@@ -1606,3 +1606,20 @@ test("startup repairs legacy uncertain delivery blockers once and preserves huma
     assert.equal(reopened.pendingOutbox().some(item => item.id === row.id), false);
   } finally { reopened?.close(); clean(f); }
 });
+
+test("startup repair leaves completed missions without new delivery blockers", () => {
+  const f = fixture();
+  let reopened;
+  try {
+    const row = f.control.pendingOutbox()[0];
+    f.control.setOutboxStatus(row.id, "uncertain", "Historical interrupted input");
+    f.control.db.prepare("DELETE FROM blockers WHERE id=?").run(`delivery:${row.id}`);
+    const completed = { ...f.control.missionById(f.mission.id), status: "completed" };
+    f.control.db.prepare("UPDATE missions SET status=?,data=? WHERE id=?").run("completed", JSON.stringify(completed), f.mission.id);
+    f.control.close();
+    reopened = new ControlPlane(f.stateHome);
+    assert.equal(reopened.missionById(f.mission.id).status, "completed");
+    assert.equal(reopened.blockers(f.mission.id).some(item => item.id === `delivery:${row.id}`), false);
+    assert.equal(reopened.db.prepare("SELECT status FROM outbox WHERE id=?").get(row.id).status, "uncertain");
+  } finally { reopened?.close(); clean(f); }
+});
