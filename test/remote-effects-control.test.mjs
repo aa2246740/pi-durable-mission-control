@@ -57,6 +57,30 @@ function request(agent, method, args, suffix = "effect") {
   return { agentId: agent.id, epoch: agent.epoch, method, args, taskId: `${agent.id}:${suffix}` };
 }
 
+for (const executionMode of ["metadata-only", "workspace-effects"]) {
+  for (const kind of ["worker", "validator"]) {
+    test(`remote ${executionMode} ${kind} cannot create a user-input blocker through RPC`, async t => {
+      const { control, agent, mission, roleIds } = fixture(t, executionMode);
+      if (kind === "validator") {
+        // Remote placement admits workers only; also reject a stored role changed to validator.
+        const row = control.db.prepare("SELECT data FROM agents WHERE id=?").get(agent.id);
+        control.db.prepare("UPDATE agents SET data=? WHERE id=?")
+          .run(JSON.stringify({ ...JSON.parse(row.data), roleId: roleIds[2] }), agent.id);
+      }
+      await assert.rejects(() => control.workerCommand(request(agent, "RequestUserInput", { question: "Move to review?" })), error => {
+        assert.equal(error.status, 403);
+        assert.match(error.message, /Only the orchestrator/);
+        assert.match(error.message, /Report or SendMessage/);
+        return true;
+      });
+      assert.equal(control.missionById(mission.id).status, "active");
+      assert.deepEqual(control.blockers(mission.id), []);
+      assert.equal(control.getAgentPublic(agent.id).status, agent.status);
+      assert.equal(control.detail(mission.id).events.some(event => event.type === "user_input_requested"), false);
+    });
+  }
+}
+
 test("protocol-3 worker receives identity-bound idempotent permits without coordinator filesystem effects", async t => {
   const f = fixture(t), { control, agent, assignment, remotePath, mission } = f;
   assert.equal(assignment.descriptor.effects, true);

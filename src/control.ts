@@ -42,7 +42,7 @@ import { MachineRegistry, type NodeCommand, type RemoteMachine } from "./machine
 import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
-import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
+import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, parseNodeEffectSpec, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
 import { RemoteArtifactStore, parseRemoteArtifactManifest, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
 import {
@@ -71,6 +71,14 @@ export class HttpError extends Error {
   constructor(status: number, message: string) {
     super(message);
     this.status = status;
+  }
+}
+
+type ArtifactHandoff = { task?: Pick<Task, "id" | "status">; nextStep?: string };
+
+function assertValidationStatus(task: Task): void {
+  if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) {
+    throw new HttpError(409, `Task must be in review or explicit rework before validation. Task ${task.id} is currently ${task.status}. The task owner or orchestrator must use UpdateTask with status=review when delivery is complete. Validators cannot change task status; use SendMessage or Report to notify the orchestrator. Do not ask the user.`);
   }
 }
 
@@ -849,10 +857,10 @@ export class ControlPlane {
   }
 
   nodeArtifactComplete(machineId: string, token: string, sessionId: string, sessionEpoch: number,
-    rawSpec: unknown, rawManifest: unknown): { artifact: Record<string, unknown> } {
+    rawSpec: unknown, rawManifest: unknown): { artifact: Record<string, unknown> & ArtifactHandoff } {
     const auth = this.authorizeRemoteArtifactTransfer(machineId, token, sessionId, sessionEpoch, rawSpec, rawManifest);
     const transferId = remoteArtifactTransferId(auth.spec, auth.manifest);
-    return this.command(`mission:${auth.mission.id}:remote-artifacts`, transferId, {
+    const result = this.command(`mission:${auth.mission.id}:remote-artifacts`, transferId, {
       spec: auth.spec, manifest: auth.manifest
     }, () => {
       const artifact = this.remoteArtifacts.complete(auth.spec, auth.manifest, (snapshotPath, identity) => ({
@@ -876,6 +884,7 @@ export class ControlPlane {
         sha256: artifact.sha256, size: artifact.size, taskId: artifact.taskId
       } };
     });
+    return { artifact: { ...result.artifact, ...this.artifactHandoff(auth.agent.id, auth.task.id) } };
   }
 
   private recordRemoteEffectReceipt(upload: NodeEffectUpload): NodeEffectAck {
@@ -3098,7 +3107,8 @@ export class ControlPlane {
 
   async workerCommand(request: RpcMessage): Promise<unknown> {
     const current = this.getAgent(request.agentId);
-    if (current && current.machineId !== "local" && !REMOTE_RPC_METHODS.has(request.method) && !REMOTE_EFFECT_METHODS.has(request.method)) {
+    if (current && current.machineId !== "local" && !REMOTE_RPC_METHODS.has(request.method) &&
+        !REMOTE_ORCHESTRATOR_RPC_METHODS.has(request.method) && !REMOTE_EFFECT_METHODS.has(request.method)) {
       throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
     }
     if (current && current.epoch !== request.epoch) {
@@ -3350,6 +3360,7 @@ export class ControlPlane {
       case "Report":
         return this.report(agent, request.epoch, request.taskId, getString("summary"), getString("evidence", false));
       case "RequestUserInput": {
+        if (role.kind !== "orchestrator") throw new HttpError(403, "Only the orchestrator may use RequestUserInput. Use Report or SendMessage to notify the orchestrator about progress, workflow problems, or blockers.");
         const question = getString("question");
         return this.createBlocker(agent.id, request.epoch, request.taskId, "user_input", question);
       }
@@ -3926,6 +3937,19 @@ export class ControlPlane {
     return { agent, mission, role };
   }
 
+  private assertTaskAssignments(missionId: string, ownerId?: string, validatorId?: string): void {
+    const agents = this.listAgents(missionId);
+    const invalidOwner = ownerId && !agents.some((agent) => agent.id === ownerId && agent.kind === "worker");
+    const invalidValidator = validatorId && !agents.some((agent) => agent.id === validatorId && agent.kind === "validator");
+    if (!invalidOwner && !invalidValidator) return;
+    const available = (kind: Agent["kind"]): string => {
+      const matches = agents.filter((agent) => agent.kind === kind);
+      const entries = matches.slice(0, 10).map((agent) => `${agent.id} (${JSON.stringify(agent.title.slice(0, 120))})`);
+      return `${entries.join(", ") || "none"}${matches.length > 10 ? `; ${matches.length - 10} more (use ListAgents)` : ""}`;
+    };
+    throw new HttpError(400, `${invalidOwner ? "Task owner must be a worker" : "Task validator must be a validator"} in this mission. Available worker agents: ${available("worker")}. Available validator agents: ${available("validator")}. roleId is not an agent id; use the agent id returned by SpawnAgent.`);
+  }
+
   createTask(agentId: string, epoch: number, commandId: string, input: Omit<Task, "id" | "status" | "attempt">): Task {
     const authorized = this.authorizeAgent(agentId, epoch, input.missionId);
     if (authorized.role.kind !== "orchestrator") throw new HttpError(403, "Only the orchestrator may create tasks");
@@ -3940,8 +3964,7 @@ export class ControlPlane {
       }
       if (new Set(dependencies).size !== dependencies.length) throw new HttpError(400, "Duplicate task dependency");
       this.validateFulfills(input.missionId, fulfills);
-      if (input.ownerId && !this.listAgents(input.missionId).some((agent) => agent.id === input.ownerId && agent.kind === "worker")) throw new HttpError(400, "Task owner must be a worker in this mission");
-      if (input.validatorId && !this.listAgents(input.missionId).some((agent) => agent.id === input.validatorId && agent.kind === "validator")) throw new HttpError(400, "Task validator must be a validator in this mission");
+      this.assertTaskAssignments(input.missionId, input.ownerId, input.validatorId);
       for (const dependency of dependencies) {
         const prior = this.db.prepare("SELECT data FROM tasks WHERE id=? AND mission_id=?").get(dependency, input.missionId) as Row | undefined;
         if (!prior) throw new HttpError(400, "Task dependency must belong to the same mission");
@@ -3989,8 +4012,7 @@ export class ControlPlane {
       if (change.dependencies) this.checkDependencies(taskId, task.missionId, change.dependencies);
       const ownerId = change.ownerId ?? task.ownerId;
       const validatorId = change.validatorId ?? task.validatorId;
-      if (ownerId && !this.listAgents(task.missionId).some((agent) => agent.id === ownerId && agent.kind === "worker")) throw new HttpError(400, "Task owner must be a worker in this mission");
-      if (validatorId && !this.listAgents(task.missionId).some((agent) => agent.id === validatorId && agent.kind === "validator")) throw new HttpError(400, "Task validator must be a validator in this mission");
+      this.assertTaskAssignments(task.missionId, ownerId, validatorId);
       if (ownerId && validatorId && ownerId === validatorId) throw new HttpError(400, "Task owner and validator must be distinct");
       if (change.status === "review" && (!ownerId || !validatorId || ownerId === validatorId)) throw new HttpError(409, "A task requires a distinct implementation owner and validator before review");
       const nextAttempt = change.status === "running" && task.attempt === 0 ? 1 : task.attempt;
@@ -4078,7 +4100,7 @@ export class ControlPlane {
       if (inFlight) return inFlight.promise;
       throw new HttpError(409, "Validation outcome is uncertain; resolve its blocker before retrying");
     }
-    if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) throw new HttpError(409, "Task must be in review or explicit rework before validation");
+    assertValidationStatus(task);
     if (task.dependencies.some((id) => this.task(id)?.status !== "accepted")) throw new HttpError(409, "Task dependencies must be accepted before validation");
     if (!input.artifactIds.length) throw new HttpError(400, "Validation requires at least one artifact");
     if (new Set(input.artifactIds).size !== input.artifactIds.length) throw new HttpError(400, "Duplicate artifact id");
@@ -4406,7 +4428,7 @@ export class ControlPlane {
     if (!task.ownerId || !task.validatorId || task.ownerId === task.validatorId) throw new HttpError(409, "Task must have a distinct implementation owner and validator");
     if (task.ownerId === agentId) throw new HttpError(403, "A task owner cannot validate its own task");
     if (task.validatorId !== agentId) throw new HttpError(403, "Task is assigned to a different validator");
-    if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) throw new HttpError(409, "Task must be in review or explicit rework before validation");
+    assertValidationStatus(task);
     if (!evidence.trim()) throw new HttpError(400, "Validation evidence is required");
     const receiptRow = this.db.prepare("SELECT data FROM validation_receipts WHERE id=? AND task_id=? AND mission_id=?").get(receiptId, taskId, task.missionId) as Row | undefined;
     if (!receiptRow) throw new HttpError(409, "A genuine validation receipt is required");
@@ -4524,7 +4546,7 @@ export class ControlPlane {
       if (!args || typeof args !== "object") throw new HttpError(400, "Invalid validation approval payload");
       const input = args as { taskId?: unknown; command?: unknown; artifactIds?: unknown };
       const task = validationTask!;
-      if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) throw new HttpError(409, "Task must be in review or explicit rework before validation");
+      assertValidationStatus(task);
       if (typeof input.command !== "string" || !input.command.trim() || !Array.isArray(input.artifactIds) || input.artifactIds.length === 0 || input.artifactIds.some((id) => typeof id !== "string")) {
         throw new HttpError(400, "Validation approval requires a command and artifact ids");
       }
@@ -4907,7 +4929,18 @@ export class ControlPlane {
     });
   }
 
-  publishArtifact(agentId: string, epoch: number, commandId: string, name: string, path: string, bytes: Buffer, taskId?: string): Artifact {
+  private artifactHandoff(agentId: string, taskId?: string): ArtifactHandoff {
+    const task = taskId ? this.task(taskId) : undefined;
+    if (!task || task.ownerId !== agentId) return {};
+    return {
+      task: { id: task.id, status: task.status },
+      ...(task.status === "running" ? {
+        nextStep: `When delivery is complete, use UpdateTask with taskId=${task.id} and status=review, then Report to the orchestrator.`
+      } : {})
+    };
+  }
+
+  publishArtifact(agentId: string, epoch: number, commandId: string, name: string, path: string, bytes: Buffer, taskId?: string): Artifact & ArtifactHandoff {
     const agent = this.getAgent(agentId);
     if (!agent) throw new HttpError(404, "Agent not found");
     if (agent.machineId !== "local") throw new HttpError(409, "Remote agents must publish through the negotiated artifact transfer protocol");
@@ -4915,7 +4948,7 @@ export class ControlPlane {
     if (auth.role.kind === "validator") throw new HttpError(403, "Validators cannot publish workspace artifacts");
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     const size = bytes.length;
-    return this.command(`mission:${agent.missionId}:artifacts`, commandId, { name, path, sha256, size, taskId }, () => {
+    const artifact = this.command(`mission:${agent.missionId}:artifacts`, commandId, { name, path, sha256, size, taskId }, () => {
       const mission = this.getMission(agent.missionId)!;
       let immutable: { workspaceCommit: string; relativePath: string } | undefined;
       if (taskId) {
@@ -4958,6 +4991,7 @@ export class ControlPlane {
       this.event(agent.missionId, "artifact_published", `Artifact ${name} published.`, agentId, { artifactId: artifact.id, sha256 });
       return artifact;
     });
+    return { ...artifact, ...this.artifactHandoff(agentId, taskId) };
   }
 
   recordTranscript(agentId: string, role: TranscriptEntry["role"], text: string, id: string = randomUUID()): void {

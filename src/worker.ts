@@ -14,7 +14,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { ModelProfile, RoleProfile } from "./contracts.js";
 import { AGENT_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS, WORKTREE_INSTRUCTIONS } from "./prompts.js";
 import type { WorkerNotice, WorkerNoticeBody } from "./worker-events.js";
-import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
+import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 
 export type WorkerConfig = {
   agentId: string;
@@ -227,12 +227,14 @@ function tools(config: WorkerConfig) {
       targetWorkspaceId: Type.Optional(Type.String({ description: "Remote targets require an execution-enabled node." }))
     })]
     : config.role.kind === "validator"
-      ? common.filter((item) => !["CompleteMission", "write_file", "bash"].includes(item.name))
-      : common;
+      ? common.filter((item) => !["CompleteMission", "RequestUserInput", "write_file", "bash"].includes(item.name))
+      : common.filter((item) => item.name !== "RequestUserInput");
+  const remoteRpcTool = (name: string): boolean => REMOTE_RPC_METHODS.has(name) ||
+    config.role.kind === "orchestrator" && REMOTE_ORCHESTRATOR_RPC_METHODS.has(name);
   const runtimeTools = config.runtimeMode === "remote-metadata-only"
-    ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name))
+    ? selected.filter((item) => item.name === "WaitForMessage" || remoteRpcTool(item.name))
     : config.runtimeMode === "remote-workspace-effects"
-      ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name) ||
+      ? selected.filter((item) => item.name === "WaitForMessage" || remoteRpcTool(item.name) ||
         REMOTE_EFFECT_METHODS.has(item.name) && (item.name !== "PublishArtifact" || config.artifactTransfers === true))
     : selected;
   return defineExtension({ name: "mission-control-tools", tools: runtimeTools });

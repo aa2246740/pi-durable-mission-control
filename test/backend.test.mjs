@@ -164,6 +164,203 @@ function clean(f) {
   rmSync(f.home, { recursive: true, force: true });
 }
 
+for (const runtimeMode of [undefined, "remote-metadata-only", "remote-workspace-effects"]) {
+  for (const kind of ["worker", "validator", "orchestrator"]) {
+    test(`${runtimeMode ?? "local"} ${kind} tools reserve human questions for the orchestrator`, async () => {
+      const f = fixture();
+      let runtime;
+      const agent = f[kind];
+      try {
+        runtime = await openWorkerRuntime({
+          agentId: agent.id, missionId: f.mission.id, epoch: agent.epoch,
+          token: "test-only-internal-token", durablePath: join(f.stateHome, "agents", `${agent.id}.sqlite`),
+          workspacePath: f.workspacePath, profile: f.control.profile(agent.profileId),
+          role: f.control.role(agent.roleId), runtimeMode, artifactTransfers: true, testOnlyScripted: true
+        });
+        const resolved = await runtime.root.agent(BACKGROUND_CONTEXT);
+        const names = resolved.tools.map(tool => tool.name);
+        assert.ok(names.includes("Report"));
+        assert.ok(names.includes("SendMessage"));
+        assert.equal(names.includes("RequestUserInput"), kind === "orchestrator");
+      } finally {
+        await runtime?.harness.close(BACKGROUND_CONTEXT);
+        clean(f);
+      }
+    });
+  }
+}
+
+test("only orchestrator questions create blockers and receive durable user answers", async () => {
+  const f = fixture();
+  const ask = agent => f.control.workerCommand({
+    agentId: agent.id, epoch: agent.epoch, method: "RequestUserInput",
+    taskId: `${agent.id}:question`, args: { question: "Choose a value" }
+  });
+  try {
+    for (const agent of [f.worker, f.validator]) {
+      await assert.rejects(() => ask(agent), error => {
+        assert.equal(error.status, 403);
+        assert.match(error.message, /Only the orchestrator/);
+        assert.match(error.message, /Report/);
+        assert.match(error.message, /SendMessage/);
+        return true;
+      });
+      assert.equal(f.control.missionById(f.mission.id).status, "active");
+      assert.deepEqual(f.control.blockers(f.mission.id), []);
+      assert.equal(f.control.getAgentPublic(agent.id).status, agent.status);
+    }
+    const blocker = await ask(f.orchestrator);
+    assert.equal(blocker.kind, "user_input");
+    assert.equal(blocker.agentId, f.orchestrator.id);
+    assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+    f.control.resolveBlocker(blocker.id, "Use the safe default");
+    const answer = f.control.detail(f.mission.id).messages.find(message => message.id === `blocker-resolution:${blocker.id}`);
+    assert.equal(answer.recipientId, f.orchestrator.id);
+    assert.equal(answer.content, "Use the safe default");
+    assert.equal(answer.status, "queued");
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+  } finally {
+    clean(f);
+  }
+});
+
+test("task assignment errors list mission agent identities for CreateTask and UpdateTask", async () => {
+  const f = fixture();
+  try {
+    const input = {
+      missionId: f.mission.id, title: "Handoff", description: "Review published delivery", acceptance: "Validate published work",
+      dependencies: [], ownerId: f.worker.id, validatorId: f.validator.id
+    };
+    const task = f.control.createTask(f.orchestrator.id, f.orchestrator.epoch, "valid-assignment", input);
+    for (const method of ["CreateTask", "UpdateTask"]) {
+      for (const [field, wrongId] of [["ownerId", "worker"], ["validatorId", "validator"], ["ownerId", f.validator.id], ["validatorId", "unknown-agent"]]) {
+        await assert.rejects(() => f.control.workerCommand({
+          agentId: f.orchestrator.id, epoch: f.orchestrator.epoch,
+          taskId: `${method}:${field}:${wrongId}`, method,
+          args: method === "CreateTask" ? { ...input, [field]: wrongId } : { taskId: task.id, [field]: wrongId }
+        }), error => {
+          assert.equal(error.status, 400);
+          assert.ok(error.message.includes(`${f.worker.id} ("Worker")`));
+          assert.ok(error.message.includes(`${f.validator.id} ("Validator")`));
+          assert.match(error.message, /roleId is not an agent id/);
+          assert.match(error.message, /agent id returned by SpawnAgent/);
+          return true;
+        });
+      }
+    }
+    assert.equal(f.control.detail(f.mission.id).tasks.length, 1);
+    assert.equal(f.control.task(task.id).ownerId, f.worker.id);
+    assert.equal(f.control.task(task.id).validatorId, f.validator.id);
+  } finally {
+    clean(f);
+  }
+});
+
+test("all validation status gates give the same actionable handoff error", async () => {
+  const f = fixture();
+  try {
+    const { task, artifact } = validationTarget(f, "status-error");
+    f.control.updateTask(f.worker.id, f.worker.epoch, "back-to-running", task.id, { status: "running" });
+    const input = { taskId: task.id, command: "printf validated", artifactIds: [artifact.id] };
+    const errors = [];
+    for (const operation of [
+      () => f.control.runValidation(f.validator.id, f.validator.epoch, "status-run", input),
+      () => f.control.createApproval(f.validator.id, f.validator.epoch, "status-approval", "run_validation", input),
+      () => f.control.validateTask(f.validator.id, f.validator.epoch, "status-decision", task.id, "no-receipt", true, "not executed")
+    ]) {
+      await assert.rejects(async () => operation(), error => {
+        assert.equal(error.status, 409);
+        assert.ok(error.message.includes(`Task ${task.id} is currently running`));
+        assert.match(error.message, /owner or orchestrator.*UpdateTask.*status=review/);
+        assert.match(error.message, /Validators cannot change task status/);
+        assert.match(error.message, /SendMessage or Report.*orchestrator/);
+        assert.match(error.message, /Do not ask the user/);
+        errors.push(error.message);
+        return true;
+      });
+    }
+    assert.equal(new Set(errors).size, 1);
+    assert.equal(f.control.task(task.id).status, "running");
+    assert.equal(f.control.detail(f.mission.id).validationReceipts.length, 0);
+    assert.equal(f.control.detail(f.mission.id).approvals.length, 0);
+    assert.deepEqual(f.control.blockers(f.mission.id), []);
+  } finally {
+    clean(f);
+  }
+});
+
+test("owner publication returns current handoff state without changing the task or artifact fields", async () => {
+  const f = fixture();
+  try {
+    const { task } = validationTarget(f, "publish-handoff");
+    f.control.updateTask(f.worker.id, f.worker.epoch, "publish-running", task.id, { status: "running" });
+    const path = join(f.workspacePath, "publish-handoff.txt");
+    const request = {
+      agentId: f.worker.id, epoch: f.worker.epoch, method: "PublishArtifact", taskId: "publish-with-handoff",
+      args: { name: "Handoff input", path, taskId: task.id }
+    };
+    const result = await f.control.workerCommand(request);
+    const { task: state, nextStep, ...artifact } = result;
+    assert.deepEqual(state, { id: task.id, status: "running" });
+    assert.match(nextStep, /When delivery is complete.*UpdateTask.*status=review, then Report/);
+    assert.ok(nextStep.includes(task.id));
+    assert.deepEqual(artifact, f.control.artifact(result.id));
+    assert.deepEqual(readFileSync(result.snapshotPath), readFileSync(path));
+    assert.equal(f.control.task(task.id).status, "running");
+    const orchestratorPublication = f.control.publishArtifact(f.orchestrator.id, f.orchestrator.epoch,
+      "orchestrator-publication", "Reference", path, readFileSync(path), task.id);
+    assert.equal(Object.hasOwn(orchestratorPublication, "nextStep"), false);
+    f.control.updateTask(f.worker.id, f.worker.epoch, "publish-review", task.id, { status: "review" });
+    const replay = await f.control.workerCommand(request);
+    assert.equal(replay.id, result.id);
+    assert.deepEqual(replay.task, { id: task.id, status: "review" });
+    assert.equal(Object.hasOwn(replay, "nextStep"), false);
+    const reviewed = await f.control.workerCommand({ ...request, taskId: "publish-already-review" });
+    assert.deepEqual(reviewed.task, { id: task.id, status: "review" });
+    assert.equal(Object.hasOwn(reviewed, "nextStep"), false);
+  } finally {
+    clean(f);
+  }
+});
+
+test("orchestrator recovers a published running task and completes independent validation without user input", async () => {
+  const f = fixture();
+  const command = (agent, method, args, taskId) => f.control.workerCommand({
+    agentId: agent.id, epoch: agent.epoch, method, args, taskId
+  });
+  try {
+    const task = await command(f.orchestrator, "CreateTask", {
+      title: "Delivery", description: "Publish the acceptance file", acceptance: "Published file is correct", dependencies: [],
+      ownerId: f.worker.id, validatorId: f.validator.id, fulfills: ["REQ-001"]
+    }, "handoff-task");
+    await command(f.worker, "UpdateTask", { taskId: task.id, status: "running" }, "handoff-running");
+    const path = join(f.workspacePath, "delivery.txt");
+    writeFileSync(path, "ready for acceptance");
+    const artifact = await command(f.worker, "PublishArtifact", { name: "Delivery", path, taskId: task.id }, "handoff-publish");
+    await command(f.worker, "Report", { summary: "Delivery published", evidence: artifact.id }, "handoff-report");
+    const validation = { taskId: task.id, command: "test \"$(cat delivery.txt)\" = 'ready for acceptance'", artifactIds: [artifact.id] };
+    await assert.rejects(() => command(f.validator, "RunValidation", validation, "handoff-premature-validation"), /currently running/);
+    await assert.rejects(() => command(f.validator, "RequestUserInput", { question: "Move to review?" }, "handoff-premature-question"), error => error.status === 403);
+    await command(f.validator, "SendMessage", {
+      recipientId: f.orchestrator.id, content: `Task ${task.id} has a complete artifact; use UpdateTask status=review.`, mode: "followUp"
+    }, "handoff-notify");
+    await command(f.orchestrator, "UpdateTask", { taskId: task.id, status: "review" }, "handoff-recover-review");
+    const receipt = await command(f.validator, "RunValidation", validation, "handoff-real-validation");
+    assert.equal(receipt.exitCode, 0);
+    await command(f.validator, "ValidateTask", {
+      taskId: task.id, receiptId: receipt.id, passed: true, evidence: "Published delivery passed the acceptance command",
+      assertionResults: [{ assertionId: "REQ-001", status: "passed", evidence: "The delivery file contains the expected acceptance text" }]
+    }, "handoff-accept");
+    await command(f.orchestrator, "CompleteMission", {}, "handoff-complete");
+    assert.equal(f.control.missionById(f.mission.id).status, "completed");
+    assert.equal(f.control.task(task.id).status, "accepted");
+    assert.equal(f.control.detail(f.mission.id).validationReceipts.length, 1);
+    assert.deepEqual(f.control.blockers(f.mission.id), []);
+  } finally {
+    clean(f);
+  }
+});
+
 test("profile and bound-role revisions are retained in mission audit history", () => {
   const f = fixture();
   try {
@@ -406,7 +603,7 @@ test("approve-mode validation stores and notifies the real validator receipt", a
 test("paused human answers survive restart and release only after explicit resume", () => {
   const f = fixture();
   try {
-    const blocker = f.control.createBlocker(f.worker.id, f.worker.epoch, "need-human-answer", "user_input", "Choose a value");
+    const blocker = f.control.createBlocker(f.orchestrator.id, f.orchestrator.epoch, "need-human-answer", "user_input", "Choose a value");
     f.control.missionAction(f.mission.id, "pause");
     f.control.resolveBlocker(blocker.id, "Use the safe default");
     const held = f.control.detail(f.mission.id).messages.find((message) => message.id === `blocker-resolution:${blocker.id}`);
