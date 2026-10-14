@@ -252,17 +252,148 @@ test("pause still aborts immediately and records interrupted delivery blockers",
   assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [`delivery:${f.row.id}`]);
 });
 
-test("RequestUserInput still replies before immediate blocked-mission interruption", async (t) => {
-  const f = await fixture(t);
-  const pausing = f.workers.onRpc(f.agent, f.handle, {
+function requestUserInput(f) {
+  return f.workers.onRpc(f.agent, f.handle, {
     type: "rpc", id: "question-rpc", token: f.handle.token, agentId: f.agent.id, epoch: f.agent.epoch,
     method: "RequestUserInput", args: { question: "Confirm the next step" }, taskId: "question"
   });
+}
+
+test("RequestUserInput replies before settlement and pauses without an extra delivery blocker", async (t) => {
+  const f = await fixture(t);
+  const pausing = requestUserInput(f);
   const reply = await f.reply;
   assert.equal(reply.error, undefined);
-  await pausing;
+  await nextImmediate();
+  assert.deepEqual(f.control.blockers(f.mission.id).map(({ id, kind }) => ({ id, kind })),
+    [{ id: reply.result.id, kind: "user_input" }]);
+  assert.deepEqual(f.sent.map((message) => message.id ?? message.type), ["question-rpc"]);
+  f.notice({ type: "turn_end", turnId: "question-turn" });
+  const concurrent = f.workers.syncMissionLifecycle(f.mission.id);
+  await nextImmediate();
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  assert.equal(f.sent.some((message) => message.type === "abort"), false, "turn_end alone is not settlement");
+  f.settle();
+  await Promise.all([pausing, concurrent]);
   assert.deepEqual(f.sent.map((message) => message.id ?? message.type), ["question-rpc", "abort", "shutdown"]);
   assert.equal(f.control.missionById(f.mission.id).status, "blocked");
-  assert.equal(f.control.message(f.row.message_id).status, "uncertain");
-  assert.equal(f.control.blockers(f.mission.id).filter((blocker) => blocker.status === "open").length, 2);
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.deepEqual({ ...f.control.db.prepare("SELECT status,attempt FROM outbox WHERE id=?").get(f.row.id) },
+    { status: "completed", attempt: 1 });
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [reply.result.id]);
+  assert.equal(f.child.listenerCount("message"), 1);
+  assert.equal(f.child.listenerCount("exit"), 0);
+});
+
+for (const outcome of ["timeout", "exited", "unanswered"]) {
+  test(`RequestUserInput ${outcome} preserves the uncertain delivery and blocker`, async (t) => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const pausing = requestUserInput(f);
+    const reply = await f.reply;
+    await nextImmediate();
+    assert.equal(f.control.message(f.row.message_id).status, "admitted");
+    if (outcome === "timeout") {
+      t.mock.timers.tick(4999);
+      await nextImmediate();
+      assert.equal(f.sent.some((message) => message.type === "abort"), false);
+      t.mock.timers.tick(1);
+    } else if (outcome === "exited") {
+      f.child.exitCode = 1;
+      f.child.connected = false;
+      f.child.emit("exit", 1);
+    } else {
+      f.settle("unanswered", "Submission failed after asking the question");
+    }
+    await pausing;
+    assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+    assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+    assert.deepEqual({ ...f.control.db.prepare("SELECT status,attempt FROM outbox WHERE id=?").get(f.row.id) },
+      { status: "uncertain", attempt: 1 });
+    assert.deepEqual(f.control.blockers(f.mission.id).filter((blocker) => blocker.status === "open").map((blocker) => blocker.id).sort(),
+      [reply.result.id, `delivery:${f.row.id}`].sort());
+    assert.equal(f.child.listenerCount("message"), 1);
+    assert.equal(f.child.listenerCount("exit"), 0);
+    if (outcome === "timeout") assert.match(f.control.getAgentPublic(f.agent.id).error, /5000 ms before user-input pause/);
+    if (outcome === "exited") assert.match(f.control.getAgentPublic(f.agent.id).error, /exited before user-input delivery settlement/);
+    if (outcome === "unanswered") assert.match(f.control.db.prepare("SELECT result FROM outbox WHERE id=?").get(f.row.id).result, /failed after asking/);
+  });
+}
+
+test("RequestUserInput with no pending delivery pauses immediately", async (t) => {
+  const f = await fixture(t);
+  f.settle();
+  await requestUserInput(f);
+  const reply = await f.reply;
+  assert.deepEqual(f.sent.map((message) => message.id ?? message.type), ["question-rpc", "abort", "shutdown"]);
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [reply.result.id]);
+});
+
+test("RequestUserInput drains only its caller while local and remote peers pause immediately", async (t) => {
+  const f = await fixture(t);
+  const local = f.owner;
+  const remote = f.control.listAgents(f.mission.id).find((agent) => agent.kind === "validator");
+  const rows = [local, remote].map((agent) => {
+    const message = f.control.sendMessage(f.mission.id, agent.id, "Peer input", "followUp", `peer-${agent.id}`);
+    const row = f.control.pendingOutbox().find((item) => item.message_id === message.id);
+    assert.equal(f.control.markOutboxDispatching(row.id, agent.epoch), true);
+    assert.equal(f.control.ackOutbox(message.id, row.request_id, row.attempt, agent.epoch, "admitted"), true);
+    return row;
+  });
+  f.control.db.prepare("UPDATE agents SET data=? WHERE id=?").run(JSON.stringify({ ...remote, machineId: "remote-test" }), remote.id);
+  const child = new EventEmitter();
+  Object.assign(child, { connected: true, exitCode: null, signalCode: null });
+  const sent = [];
+  child.send = (message, callback) => {
+    sent.push(message.type);
+    callback(null);
+    if (message.type === "abort") child.emit("message", { type: "aborted", agentId: local.id, epoch: local.epoch });
+    if (message.type === "shutdown") {
+      child.emit("message", { type: "closed", agentId: local.id, epoch: local.epoch });
+      child.exitCode = 0;
+      child.connected = false;
+      child.emit("exit", 0);
+    }
+  };
+  f.workers.handles.set(local.id, { child, token: "peer-token", epoch: local.epoch, ready: Promise.resolve(), stopping: false });
+  const queued = f.control.sendMessage(f.mission.id, f.agent.id, "Do not start", "followUp", "queued-question-input");
+  const pausing = requestUserInput(f);
+  const reply = await f.reply;
+  await nextImmediate();
+  assert.deepEqual(sent, ["abort", "shutdown"]);
+  assert.equal(f.control.getAgentPublic(remote.id).epoch, remote.epoch + 1);
+  for (const row of rows) assert.equal(f.control.message(row.message_id).status, "uncertain");
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  assert.equal(f.sent.some((message) => message.type === "abort"), false);
+  f.settle();
+  await pausing;
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.equal(f.control.message(queued.id).status, "aborted");
+  assert.equal(f.sent.some((message) => message.type === "deliver"), false);
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id).sort(),
+    [reply.result.id, ...rows.map((row) => `delivery:${row.id}`)].sort());
+  for (const row of rows) assert.equal(f.control.db.prepare("SELECT attempt FROM outbox WHERE id=?").get(row.id).attempt, 1);
+});
+
+test("RequestUserInput reserves settlement before a concurrent lifecycle sync during its reply", async (t) => {
+  const f = await fixture(t);
+  const send = f.child.send;
+  let concurrent;
+  f.child.send = (message, callback) => {
+    if (message.id === "question-rpc") {
+      f.notice({ type: "turn_end", turnId: "reply-race-turn" });
+      concurrent = f.workers.syncMissionLifecycle(f.mission.id);
+    }
+    send(message, callback);
+  };
+  const pausing = requestUserInput(f);
+  const reply = await f.reply;
+  await nextImmediate();
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  assert.equal(f.sent.some((message) => message.type === "abort"), false);
+  f.settle();
+  await Promise.all([pausing, concurrent]);
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [reply.result.id]);
 });

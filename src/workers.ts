@@ -379,11 +379,17 @@ export class WorkerManager {
     }
     try {
       const result = await this.control.workerCommand(request);
+      // Reserve the pause before sending the reply so concurrent turn-end
+      // lifecycle syncs join the same bounded settlement wait.
+      const userInputPause = request.method === "RequestUserInput" && agent.machineId === "local" &&
+        this.control.missionById(agent.missionId)?.status === "blocked"
+        ? this.quiesceMission(agent.missionId, "pause", agent.id) : undefined;
       await this.sendReply(agent, handle, { id: request.id, result });
       if (request.method === "InterruptAgent" && result && typeof result === "object" && "agentId" in result && typeof result.agentId === "string") {
         await this.interruptAgent(result.agentId);
       }
-      await this.syncMissionLifecycle(agent.missionId).catch((error: unknown) => this.recordDetachedFailure(agent, error));
+      await (userInputPause ?? this.syncMissionLifecycle(agent.missionId))
+        .catch((error: unknown) => this.recordDetachedFailure(agent, error));
       await this.dispatchPending();
     } catch (error) {
       const profile = this.control.profile(agent.profileId);
@@ -441,7 +447,7 @@ export class WorkerManager {
     return this.quiesceMission(missionId, "pause");
   }
 
-  private quiesceMission(missionId: string, mode: "pause" | "stop"): Promise<void> {
+  private quiesceMission(missionId: string, mode: "pause" | "stop", settlingAgentId?: string): Promise<void> {
     const existing = this.quiescenceFlights.get(missionId);
     if (existing && !existing.finished) {
       if (mode === "stop") existing.mode = "stop";
@@ -449,14 +455,14 @@ export class WorkerManager {
     }
     const flight: QuiescenceFlight = { mode, promise: Promise.resolve(), finished: false, fencedAgents: new Set() };
     this.quiescenceFlights.set(missionId, flight);
-    flight.promise = this.performMissionQuiescence(missionId, flight).finally(() => {
+    flight.promise = this.performMissionQuiescence(missionId, flight, settlingAgentId).finally(() => {
       flight.finished = true;
       if (this.quiescenceFlights.get(missionId) === flight) this.quiescenceFlights.delete(missionId);
     });
     return flight.promise;
   }
 
-  private async performMissionQuiescence(missionId: string, flight: QuiescenceFlight): Promise<void> {
+  private async performMissionQuiescence(missionId: string, flight: QuiescenceFlight, settlingAgentId?: string): Promise<void> {
     const agents = this.control.listAgents(missionId);
     for (const agent of agents) this.clearRemoteStopWait(agent.id);
     const captured = new Map<string, Handle>();
@@ -475,6 +481,9 @@ export class WorkerManager {
         captured.set(agent.id, handle);
       }
     }
+    const settlingHandle = settlingAgentId ? captured.get(settlingAgentId) : undefined;
+    const pauseSettlement = settlingHandle && settlingAgentId
+      ? this.waitForLocalSettlement(missionId, settlingAgentId, settlingHandle) : undefined;
     const status = this.control.missionById(missionId)?.status;
     if (flight.mode === "stop" && (status === "completed" || status === "cancelled")) {
       // The completion RPC reply precedes submission.wait(). Do not close the
@@ -498,7 +507,11 @@ export class WorkerManager {
         captured.set(agentId, handle);
       }
     }
-    for (const agent of agents) {
+    // Pause peers immediately while the asking agent finishes its submission.
+    const stoppingAgents = settlingAgentId
+      ? [...agents.filter((agent) => agent.id !== settlingAgentId), ...agents.filter((agent) => agent.id === settlingAgentId)]
+      : agents;
+    for (const agent of stoppingAgents) {
       const handle = captured.get(agent.id);
       if (!handle) {
         if (agent.machineId === "local" && (status === "completed" || status === "cancelled") && !flight.fencedAgents.has(agent.id) &&
@@ -508,6 +521,12 @@ export class WorkerManager {
           this.control.markAgentInterrupted(agent.id, agent.epoch);
         }
         continue;
+      }
+      if (agent.id === settlingAgentId && pauseSettlement) {
+        const outcome = await pauseSettlement;
+        if (outcome !== "settled") this.control.recordWorkerDiagnostic(agent.id, handle.epoch,
+          outcome === "timeout" ? "Local delivery did not settle within 5000 ms before user-input pause"
+            : "Local worker exited before user-input delivery settlement");
       }
       if (flight.mode === "pause" && isChildLive(handle.child)) {
         const acknowledged = await this.waitForAck(agent.id, handle, "aborted", () => sendToWorker(handle.child, { type: "abort" }));
