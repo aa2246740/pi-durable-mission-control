@@ -1051,9 +1051,13 @@ export class ControlPlane {
       const fence = (binding: WorkerBinding, registered: boolean): void => {
         const machine = this.machineRegistry.get(binding.machineId);
         const agent = this.getAgent(binding.agentId);
+        const runtime = registered ? this.remoteRuntimes.byRuntime(binding.runtimeId) : undefined;
+        // Explicit stop fences the agent epoch before the node confirms physical shutdown.
+        const requestedStop = runtime?.desired === "stop" && runtime.state === "stopping";
         if (machine?.status === "online" && machine.sessionId === binding.sessionId &&
             machine.sessionEpoch === binding.sessionEpoch && (machine.leaseExpiresAt ?? 0) > Date.now() &&
-            agent?.machineId === binding.machineId && agent.epoch === binding.epoch) return;
+            agent?.machineId === binding.machineId &&
+            (agent.epoch === binding.epoch || (requestedStop && agent.epoch > binding.epoch))) return;
         if (!registered) {
           this.workerMailbox.fence(binding);
           return;
