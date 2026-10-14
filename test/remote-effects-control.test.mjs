@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { ControlPlane, RemoteRuntimeStopPendingError } from "../dist/control.js";
+import { ControlPlane, RemoteRuntimeRecoveryError, RemoteRuntimeStopPendingError } from "../dist/control.js";
 import { WorkerManager } from "../dist/workers.js";
 import { startServer } from "../dist/server.js";
 import { nodeEffectUpload } from "../dist/node-effects.js";
@@ -488,32 +488,91 @@ test("missing controlled stop report fails at its original deadline with an accu
     await waitForStopResult(() => f.control.missionById(f.mission.id).status === "failed");
     const failures = f.control.detail(f.mission.id).events.filter(event => event.type === "worker_start_failed");
     assert.equal(failures.length, 1);
-    assert.equal(failures[0].data.diagnostic,
-      `Prior remote runtime ${f.assignment.binding.runtimeId} did not confirm its stop within 0.1 seconds`);
+    assert.deepEqual(failures[0].data, {
+      diagnostic: `Prior remote runtime ${f.assignment.binding.runtimeId} did not confirm its stop within 0.1 seconds`,
+      recoverable: true, reason: "remote_runtime_stop_timeout"
+    });
     assert.equal(failures[0].data.diagnostic.includes("trusted reconciliation"), false);
     stopReport(f);
     await workers.remoteRuntimeReported(f.agent.id, f.assignment.binding.runtimeId);
     assert.equal(f.control.missionById(f.mission.id).status, "failed");
     assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+    explicitResume(f);
+    await workers.startAgent(f.control.getAgentPublic(f.agent.id));
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+    assert.notEqual(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
   } finally { await workers.close(); }
 });
 
-for (const ending of ["unexpected", "uncertain", "unproven"]) {
+for (const ending of ["unexpected", "uncertain", "unproven", "rejected"]) {
   test(`pending controlled stop rejects a later ${ending} report permanently`, async t => {
     const f = fixture(t), workers = new WorkerManager(f.control, false, false, 5000);
     try {
       await resumeBeforeStopReport(f, workers);
-      stopReport(f, ending === "uncertain" ? "uncertain" : "stopped", ending === "unexpected" ? "unexpected" : ending === "unproven" ? "missing" : "requested");
+      stopReport(f, ["uncertain", "rejected"].includes(ending) ? ending : "stopped", ending === "unexpected" ? "unexpected" : ending === "unproven" ? "missing" : "requested");
       await workers.remoteRuntimeReported(f.agent.id, f.assignment.binding.runtimeId);
       assert.equal(f.control.missionById(f.mission.id).status, "failed");
-      const diagnostic = f.control.detail(f.mission.id).events.find(event => event.type === "worker_start_failed").data.diagnostic;
-      assert.match(diagnostic, ending === "unproven" ? /controlled stop cannot be proven/ : new RegExp(ending));
+      const data = f.control.detail(f.mission.id).events.find(event => event.type === "worker_start_failed").data;
+      const diagnostic = data.diagnostic;
+      assert.deepEqual(data, {
+        diagnostic, recoverable: false,
+        reason: ending === "unexpected" ? "remote_runtime_unexpected_stop" : `remote_runtime_${ending}`
+      });
+      assert.match(diagnostic, ending === "unproven" ? /controlled stop cannot be proven/ : new RegExp(ending === "rejected" ? "uncertain" : ending));
       assert.match(diagnostic, /trusted reconciliation is required/);
       assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
       assert.equal(f.control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(f.agent.id).n, 1);
     } finally { await workers.close(); }
   });
 }
+
+for (const ending of ["unexpected", "uncertain", "unproven", "rejected"]) {
+  test(`startup after ${ending} stop records an irrecoverable reason without replacement or replay`, async t => {
+    const f = fixture(t), workers = new WorkerManager(f.control);
+    try {
+      f.control.missionAction(f.mission.id, "pause");
+      await workers.pauseMission(f.mission.id);
+      stopReport(f, ["uncertain", "rejected"].includes(ending) ? ending : "stopped",
+        ending === "unexpected" ? "unexpected" : ending === "unproven" ? "missing" : "requested");
+      explicitResume(f);
+      const before = {
+        messages: f.control.detail(f.mission.id).messages,
+        outbox: f.control.db.prepare("SELECT * FROM outbox WHERE mission_id=? ORDER BY id").all(f.mission.id)
+      };
+      const reason = ending === "unexpected" ? "remote_runtime_unexpected_stop" : `remote_runtime_${ending}`;
+      await assert.rejects(() => workers.startAgent(f.control.getAgentPublic(f.agent.id)), error => {
+        assert.ok(error instanceof RemoteRuntimeRecoveryError);
+        assert.equal(error.status, 409);
+        assert.equal(error.reason, reason);
+        return true;
+      });
+      const failures = f.control.detail(f.mission.id).events.filter(event => event.type === "worker_start_failed");
+      assert.equal(failures.length, 1);
+      assert.deepEqual(failures[0].data, { diagnostic: failures[0].data.diagnostic, recoverable: false, reason });
+      assert.match(failures[0].data.diagnostic, /trusted reconciliation is required/);
+      assert.equal(f.control.missionById(f.mission.id).status, "failed");
+      assert.equal(f.control.remoteRuntimeForAgent(f.agent.id).runtime_id, f.assignment.binding.runtimeId);
+      assert.equal(f.control.db.prepare("SELECT COUNT(*) AS n FROM remote_worker_runtimes WHERE agent_id=?").get(f.agent.id).n, 1);
+      const remoteMessages = new Set(before.messages.filter(item => item.recipientId === f.agent.id).map(item => item.id));
+      assert.deepEqual(f.control.detail(f.mission.id).messages, before.messages.map(item => remoteMessages.has(item.id)
+        ? { ...item, status: "aborted", error: "Delivery aborted before worker admission" } : item));
+      assert.deepEqual(f.control.db.prepare("SELECT * FROM outbox WHERE mission_id=? ORDER BY id").all(f.mission.id).map(item => ({ ...item })),
+        before.outbox.map(item => ({ ...item, status: remoteMessages.has(item.message_id) && item.status === "queued" ? "aborted" : item.status })));
+    } finally { await workers.close(); }
+  });
+}
+
+test("ordinary startup failure retains diagnostic-only event data", async t => {
+  const f = fixture(t), workers = new WorkerManager(f.control);
+  try {
+    f.control.db.prepare("DELETE FROM profiles WHERE id=?").run(f.profile.id);
+    await assert.rejects(() => workers.startAgent(f.control.getAgentPublic(f.agent.id)));
+    const failures = f.control.detail(f.mission.id).events.filter(event => event.type === "worker_start_failed");
+    assert.equal(failures.length, 1);
+    assert.deepEqual(Object.keys(failures[0].data), ["diagnostic"]);
+    assert.equal(typeof failures[0].data.diagnostic, "string");
+  } finally { await workers.close(); }
+});
 
 for (const unsafe of ["mailbox", "delivery", "effect", "approval", "blocker", "ownership"]) {
   test(`pending stop with unresolved ${unsafe} fails immediately instead of waiting`, async t => {
@@ -759,6 +818,7 @@ test("unresolved safety blocker prevents replacement and worker startup still fa
   await assert.rejects(() => workers.startAgent(f.control.getAgentPublic(f.agent.id)), /unresolved blocker/);
   assert.equal(f.control.missionById(f.mission.id).status, "failed");
   assert.equal(f.control.detail(f.mission.id).events.filter(event => event.type === "worker_start_failed").length, 1);
+  assert.deepEqual(Object.keys(f.control.detail(f.mission.id).events.find(event => event.type === "worker_start_failed").data), ["diagnostic"]);
   await workers.startAgent(f.control.getAgentPublic(f.agent.id));
   assert.equal(f.control.detail(f.mission.id).events.filter(event => event.type === "worker_start_failed").length, 1);
 });

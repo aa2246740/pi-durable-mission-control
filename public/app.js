@@ -308,11 +308,19 @@ function renderRemoteRuntimes() {
   }).join('')}</div></section>`;
 }
 
+const unrecoverableRuntimeExplanation = '这是远端运行时的意外或无法证明的停止。当前版本不支持可信对账，此 Mission 无法继续。请先核对远端工作区和未结清的工作，再新建 Mission。系统不会重放任何工作。';
+
+function latestStartupFailure() {
+  return state.detail.events.slice().reverse().find((item) => item.type === 'worker_start_failed')?.data;
+}
+
 function renderRecoveryDiagnostic() {
   if (state.detail.mission.status !== 'failed') return '';
-  const event = state.detail.events.slice().reverse().find((item) => item.type === 'worker_start_failed');
-  const diagnostic = event?.data?.diagnostic;
-  return diagnostic ? `<div class="notice error-panel"><strong>恢复诊断</strong><p class="text danger-text">${e(diagnostic)}</p>修复原因后可再次恢复</div>` : '';
+  const failure = latestStartupFailure();
+  const diagnostic = failure?.diagnostic;
+  const unrecoverable = failure?.recoverable === false;
+  if (!diagnostic && !unrecoverable) return '';
+  return `<div class="notice error-panel" id="recovery-diagnostic"><strong>恢复诊断</strong>${diagnostic ? `<p class="text danger-text">${e(diagnostic)}</p>` : ''}${e(unrecoverable ? unrecoverableRuntimeExplanation : '修复原因后可再次恢复')}</div>`;
 }
 
 function timeline(events, limit = 40) {
@@ -562,7 +570,11 @@ function renderDetail() {
   const controls = [badge(mission.status)];
   if (mission.status === 'draft') controls.push(button('启动 Mission', 'start'));
   if (['active', 'validating'].includes(mission.status)) controls.push(button('暂停', 'pause', '', 'secondary'));
-  if (['paused', 'blocked', 'failed'].includes(mission.status)) controls.push(button('继续执行', 'resume'));
+  if (['paused', 'blocked', 'failed'].includes(mission.status)) {
+    controls.push(mission.status === 'failed' && latestStartupFailure()?.recoverable === false
+      ? `<button class="button" data-action="resume" disabled aria-disabled="true" aria-describedby="recovery-diagnostic" title="${e(unrecoverableRuntimeExplanation)}">${e('继续执行')}</button>`
+      : button('继续执行', 'resume'));
+  }
   if (!['completed', 'cancelled'].includes(mission.status)) controls.push(button('取消', 'cancel', '', 'secondary danger'));
   if (['draft', 'paused', 'blocked', 'failed'].includes(mission.status)) controls.push(button('调整预算', 'edit-limits', '', 'secondary'));
   controls.push(button('重命名', 'rename', '', 'secondary'));

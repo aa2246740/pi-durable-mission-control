@@ -80,6 +80,22 @@ export class RemoteRuntimeStopPendingError extends HttpError {
   }
 }
 
+type RemoteRuntimeRecoveryReason = "remote_runtime_unexpected_stop" | "remote_runtime_uncertain" | "remote_runtime_unproven" | "remote_runtime_rejected";
+export type MissionStartupRecovery =
+  | { recoverable: false; reason: RemoteRuntimeRecoveryReason }
+  | { recoverable: true; reason: "remote_runtime_stop_timeout" };
+
+export class RemoteRuntimeRecoveryError extends HttpError {
+  constructor(readonly reason: RemoteRuntimeRecoveryReason, message: string) {
+    super(409, message);
+  }
+}
+
+function uncertainRuntimeReason(runtime: RemoteRuntimeRow): RemoteRuntimeRecoveryReason {
+  return runtime.last_report_json && JSON.parse(runtime.last_report_json).outcome === "rejected"
+    ? "remote_runtime_rejected" : "remote_runtime_uncertain";
+}
+
 type ArtifactHandoff = { task?: Pick<Task, "id" | "status">; nextStep?: string };
 
 function assertValidationStatus(task: Task): void {
@@ -990,9 +1006,10 @@ export class ControlPlane {
       if (active) {
         if (active.state === "stopping") this.assertRemoteRuntimeReassignable(active, agent);
         if (active.state === "uncertain" || active.state === "stopping") {
-          throw new HttpError(409, active.state === "uncertain"
-            ? "Prior remote runtime has an uncertain report or ownership; trusted reconciliation is required"
-            : "Prior remote runtime stop has not been confirmed; trusted reconciliation is required");
+          throw new RemoteRuntimeRecoveryError(active.state === "uncertain" ? uncertainRuntimeReason(active) : "remote_runtime_unproven",
+            active.state === "uncertain"
+              ? "Prior remote runtime has an uncertain report or ownership; trusted reconciliation is required"
+              : "Prior remote runtime stop has not been confirmed; trusted reconciliation is required");
         }
         if (active.desired !== "run" || active.machine_id !== machine.id ||
             active.session_id !== machine.sessionId || active.session_epoch !== machine.sessionEpoch ||
@@ -1048,19 +1065,20 @@ export class ControlPlane {
   }
 
   assertRemoteRuntimeReassignable(runtime: RemoteRuntimeRow, agent: Agent): void {
-    const refuse = (reason: string): never => {
-      throw new HttpError(409, `Prior remote runtime ${runtime.runtime_id}: ${reason}; trusted reconciliation is required`);
+    const refuse = (reason: string, recoveryReason?: RemoteRuntimeRecoveryReason): never => {
+      const message = `Prior remote runtime ${runtime.runtime_id}: ${reason}; trusted reconciliation is required`;
+      throw recoveryReason ? new RemoteRuntimeRecoveryError(recoveryReason, message) : new HttpError(409, message);
     };
-    if (runtime.stop_provenance === "unexpected") refuse("unexpected stop");
-    if (runtime.stop_provenance === "uncertain") refuse("uncertain runtime report");
+    if (runtime.stop_provenance === "unexpected") refuse("unexpected stop", "remote_runtime_unexpected_stop");
+    if (runtime.stop_provenance === "uncertain") refuse("uncertain runtime report", uncertainRuntimeReason(runtime));
     const stopPending = runtime.desired === "stop" && runtime.state === "stopping" &&
       runtime.stop_request_reason === "controlled" && runtime.stop_request_epoch === runtime.epoch &&
       (agent.epoch === runtime.epoch || (agent.epoch === runtime.epoch + 1 && runtime.stop_fenced_epoch === agent.epoch)) &&
       runtime.stop_provenance === "unproven" && runtime.last_report_json === null;
-    if (!stopPending && (runtime.state !== "closed" || runtime.desired !== "stop")) refuse("stop has not been confirmed");
-    if (!stopPending && runtime.stop_provenance !== "controlled") refuse("controlled stop cannot be proven from persisted evidence");
+    if (!stopPending && (runtime.state !== "closed" || runtime.desired !== "stop")) refuse("stop has not been confirmed", "remote_runtime_unproven");
+    if (!stopPending && runtime.stop_provenance !== "controlled") refuse("controlled stop cannot be proven from persisted evidence", "remote_runtime_unproven");
     const binding = parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)).binding;
-    if (!stopPending && (!runtime.last_report_json || JSON.parse(runtime.last_report_json).outcome !== "stopped")) refuse("missing stopped report");
+    if (!stopPending && (!runtime.last_report_json || JSON.parse(runtime.last_report_json).outcome !== "stopped")) refuse("missing stopped report", "remote_runtime_unproven");
     let mailboxStatus: string;
     try { mailboxStatus = this.workerMailbox.inspectBinding(binding).status; }
     catch { return refuse("mailbox binding evidence is missing"); }
@@ -4085,13 +4103,16 @@ export class ControlPlane {
     this.putAgent({ ...agent, error: text, updatedAt: now() });
   }
 
-  failMissionStartup(missionId: string, diagnostic: string): void {
+  failMissionStartup(missionId: string, diagnostic: string, recovery?: MissionStartupRecovery): void {
     const mission = this.getMission(missionId);
     if (!mission || !["active", "blocked"].includes(mission.status)) return;
     this.transaction(() => {
       this.putMission({ ...mission, status: "failed", updatedAt: now() });
-      this.event(missionId, "worker_start_failed", "A worker could not start; correct its configuration or ownership before resuming.", undefined, {
-        diagnostic: diagnostic.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(-1000)
+      this.event(missionId, "worker_start_failed", recovery?.recoverable === false
+        ? "A worker could not start; this remote runtime requires trusted reconciliation, which is not supported in this version."
+        : "A worker could not start; correct its configuration or ownership before resuming.", undefined, {
+        diagnostic: diagnostic.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(-1000),
+        ...recovery
       });
     });
   }
