@@ -352,3 +352,26 @@ test("finishWithReply rolls back a conflicting reply ID and leaves the RPC proce
   assert.equal(coordinator.inspectInbox(binding)[0].status, "applied");
   assert.ok(received.sha256);
 });
+
+test("single outbox lookup matches inspection for existing, absent, and corrupt records", (t) => {
+  const { node, nodeDb, coordinator } = pair(t);
+  const envelope = node.enqueue(binding, rpc("lookup-rpc"), "lookup-message");
+  const previousLookup = (messageId) => node.inspectOutbox(binding).find(row => row.envelope.messageId === messageId);
+  const check = () => {
+    assert.deepEqual(node.inspectOutboxMessage(binding, envelope.messageId), previousLookup(envelope.messageId));
+    assert.equal(node.inspectOutboxMessage(binding, "missing-message"), previousLookup("missing-message"));
+    assert.equal(Object.isFrozen(node.inspectOutboxMessage(binding, envelope.messageId)), true);
+  };
+  check();
+  node.pending(binding);
+  check();
+  node.acknowledge(binding, coordinator.receive(binding, envelope));
+  check();
+  const other = { ...binding, runtimeId: "lookup-other-runtime", agentId: "lookup-other-agent" };
+  node.open(other);
+  assert.equal(node.inspectOutboxMessage(other, envelope.messageId), undefined);
+  assert.throws(() => node.inspectOutboxMessage({ ...binding, epoch: binding.epoch + 1 }, envelope.messageId), /identity mismatch/);
+  nodeDb.prepare("UPDATE worker_mailbox_outbox SET sha256=? WHERE message_id=?").run("0".repeat(64), envelope.messageId);
+  assert.throws(() => previousLookup(envelope.messageId), /invalid envelope hash/);
+  assert.throws(() => node.inspectOutboxMessage(binding, envelope.messageId), /invalid envelope hash/);
+});
