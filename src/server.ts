@@ -82,7 +82,7 @@ function exactKeys(body: Record<string, unknown>, allowed: string[]): void {
   if (unknown.length) throw new HttpError(400, `Unexpected fields: ${unknown.join(", ")}`);
 }
 
-export type ServerOptions = { home: string; port: number; nodePort?: number; testOnlyScripted?: boolean; testOnlyToolLoop?: boolean; remoteRuntimeStopTimeoutMs?: number; remoteShutdownTimeoutMs?: number };
+export type ServerOptions = { home: string; port: number; nodePort?: number; testOnlyScripted?: boolean; testOnlyToolLoop?: boolean; remoteRuntimeStopTimeoutMs?: number; remoteShutdownTimeoutMs?: number; onDaemonStop?: () => void };
 
 export async function startServer(options: ServerOptions) {
   const remoteRuntimeStopTimeoutMs = options.remoteRuntimeStopTimeoutMs ?? Number(process.env.MC_REMOTE_RUNTIME_STOP_TIMEOUT_MS ?? 60000);
@@ -189,13 +189,14 @@ export async function startServer(options: ServerOptions) {
       response.setHeader("x-content-type-options", "nosniff");
       response.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'");
       if (!isLocalHost(request.headers.host)) throw new HttpError(403, "Host is not a loopback host");
+      const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
       const origin = request.headers.origin;
+      if (url.pathname === "/api/daemon/stop" && origin !== undefined) throw new HttpError(403, "Daemon shutdown rejects browser origins");
       if (origin) {
         const originUrl = new URL(origin);
         if (originUrl.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(originUrl.hostname)) throw new HttpError(403, "Origin is not local");
         if (request.headers.host && originUrl.host !== request.headers.host) throw new HttpError(403, "Cross-origin request rejected");
       }
-      const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
       const method = request.method ?? "GET";
       const mutation = ["POST", "PATCH", "PUT", "DELETE"].includes(method);
       if (request.headers["sec-fetch-site"] === "cross-site") throw new HttpError(403, "Cross-site request rejected");
@@ -347,6 +348,22 @@ export async function startServer(options: ServerOptions) {
           return jsonResponse(response, 200, result);
         }
         throw new MachineError(404, "Node route not found");
+      }
+      if (url.pathname === "/api/daemon/stop") {
+        const adminPort = (server.address() as AddressInfo).port;
+        const localHost = request.headers.host === `127.0.0.1:${adminPort}` || request.headers.host === `localhost:${adminPort}`;
+        if (method !== "POST" || !localHost || request.headers.origin !== undefined ||
+            request.headers.cookie !== undefined || request.headers["sec-fetch-site"] !== undefined ||
+            !safeEqual(request.headers.authorization ?? "", `Bearer ${token}`)) {
+          throw new HttpError(403, "Daemon shutdown requires a local administrator bearer request");
+        }
+        if (request.headers["x-mission-control-daemon-id"] !== control.daemonId) {
+          throw new HttpError(409, "Daemon incarnation does not match");
+        }
+        response.writeHead(202, { "connection": "close", "cache-control": "no-store" }).end();
+        void close();
+        options.onDaemonStop?.();
+        return;
       }
       if (url.pathname === "/api/bootstrap" && method === "GET") {
         response.writeHead(204, { "set-cookie": `mission-control-auth=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/`, "cache-control": "no-store" });
@@ -771,13 +788,8 @@ export async function startServer(options: ServerOptions) {
     if (!existsSync(target)) throw new HttpError(404, "UI asset not found");
     return readFileSync(target);
   }
-  return {
-    server,
-    control,
-    workers,
-    port: (server.address() as AddressInfo).port,
-    nodePort: (nodeServer?.address() as AddressInfo | null)?.port,
-    close: () => closeFlight ??= (async () => {
+  function close(): Promise<void> {
+    return closeFlight ??= (async () => {
       closing = true;
       clearInterval(heartbeat);
       // prepareCoordinatorShutdown persists every stop request before its first
@@ -806,6 +818,14 @@ export async function startServer(options: ServerOptions) {
       }
       if (failures.length) throw new AggregateError(failures, "Mission Control shutdown did not settle all owned resources");
       control.close();
-    })()
+    })();
+  }
+  return {
+    server,
+    control,
+    workers,
+    port: (server.address() as AddressInfo).port,
+    nodePort: (nodeServer?.address() as AddressInfo | null)?.port,
+    close
   };
 }

@@ -109,9 +109,12 @@ test("daemon shutdown requires administrator authentication and matching incarna
       ["POST", {}, 403],
       ["POST", { authorization: "Bearer wrong" }, 403],
       ["POST", { authorization: `Bearer ${"x".repeat(token.length)}` }, 403],
+      ["POST", { authorization: token }, 403],
+      ["POST", { authorization: `Bearer ${token}` }, 409],
       ["GET", { authorization: `Bearer ${token}` }, 403],
       ["POST", { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": daemonId }, 409],
       ["POST", { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId, origin: `http://127.0.0.1:${info.port}` }, 403],
+      ["POST", { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId, origin: "invalid-origin" }, 403],
       ["POST", { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId, cookie: "session=browser" }, 403],
       ["POST", { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId, "sec-fetch-site": "same-origin" }, 403]
     ]) {
@@ -121,14 +124,16 @@ test("daemon shutdown requires administrator authentication and matching incarna
       const health = await fetch(`http://127.0.0.1:${info.port}/api/health`);
       assert.equal((await health.json()).daemonId, info.daemonId);
     }
-    const badHostStatus = await new Promise((resolve, reject) => {
-      const call = request(`http://127.0.0.1:${info.port}/api/daemon/stop`, {
-        method: "POST", headers: { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId, host: "attacker.invalid" }
-      }, (response) => { response.resume(); resolve(response.statusCode); });
-      call.on("error", reject);
-      call.end();
-    });
-    assert.equal(badHostStatus, 403);
+    for (const host of ["attacker.invalid", "127.0.0.1", `localhost:${info.nodePort}`]) {
+      const badHostStatus = await new Promise((resolve, reject) => {
+        const call = request(`http://127.0.0.1:${info.port}/api/daemon/stop`, {
+          method: "POST", headers: { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId, host }
+        }, (response) => { response.resume(); resolve(response.statusCode); });
+        call.on("error", reject);
+        call.end();
+      });
+      assert.equal(badHostStatus, 403, host);
+    }
     const nodeResponse = await fetch(`http://127.0.0.1:${info.nodePort}/api/daemon/stop`, {
       method: "POST", headers: { authorization: `Bearer ${token}`, "x-mission-control-daemon-id": info.daemonId }
     });
