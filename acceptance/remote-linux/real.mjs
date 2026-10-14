@@ -251,6 +251,12 @@ export function realAcceptanceSelection(detail, acceptanceCommand, machineId, ar
   return { task, artifact, receipt };
 }
 
+export function assertRealOutcome(detail, acceptanceCommand) {
+  const failed = detail.validationReceipts.filter((receipt) => receipt.command === acceptanceCommand && receipt.exitCode !== 0);
+  const reason = failed.length ? "Frozen acceptance failed for the published snapshot" : "Real Mission did not complete";
+  assert.equal(detail.mission.status, "completed", `${reason}; status=${detail.mission.status}; failedReceipts=${failed.length}`);
+}
+
 export function assertRealSuccess(detail, evidence, acceptanceCommand, machineId) {
   assert.equal(detail.mission.status, "completed");
   assert.deepEqual(detail.blockers, []);

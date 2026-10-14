@@ -7,9 +7,10 @@ import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
+import { assertRealOutcome, assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
 import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
 import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
+import { rehearsalConfig, rehearsalSecrets, startFakeProvider } from "./fake-provider.mjs";
 import { assertWorkerCrash, observeWorkerCrash } from "./scenarios/worker-crash.mjs";
 import { createTurnLimitScenario, turnLimitMaxTurns } from "./scenarios/turn-limit.mjs";
 
@@ -26,6 +27,7 @@ export function parseOptions(args) {
     if (args[i] === "--keep") options.keep = true;
     else if (args[i] === "--real" && args[i + 1]) options.real = resolve(args[++i]);
     else if (args[i] === "--secrets-file" && args[i + 1]) options.secretsFile = resolve(args[++i]);
+    else if (args[i] === "--rehearsal") options.rehearsal = true;
     else if (args[i] === "--discard") options.discard = true;
     else if (args[i] === "--scenario" && args[i + 1]) {
       options.scenario = args[++i];
@@ -40,9 +42,10 @@ export function parseOptions(args) {
   }
   if (options.real) {
     assert.ok(!options.scenario || options.scenario === "default", "Non-default scenarios require mock mode");
-    assert.ok(options.secretsFile, "--real requires --secrets-file");
+    assert.ok(!(options.rehearsal && options.secretsFile), "--rehearsal conflicts with --secrets-file");
+    assert.ok(options.secretsFile || options.rehearsal, "--real requires --secrets-file or --rehearsal");
     if (!explicitTimeout) options.timeoutMs = 1800000;
-  } else assert.ok(!options.secretsFile && !options.discard, "--secrets-file and --discard require --real");
+  } else assert.ok(!options.secretsFile && !options.discard && !options.rehearsal, "--secrets-file, --discard and --rehearsal require --real");
   assert.ok(!(options.keep && options.discard), "--keep conflicts with --discard");
   return options;
 }
@@ -203,12 +206,20 @@ export function assertRemoteResume(detail, runtimes, evidence, records, transpor
 }
 
 export async function run(options) {
-  const config = options.real ? readConfig(options.real) : undefined;
-  const credentials = config ? readSecrets(options.secretsFile, kinds.map((kind) => config[kind].credentialEnv)) : undefined;
+  let config = options.real ? readConfig(options.real) : undefined;
+  assert.ok(!(options.rehearsal && options.secretsFile), "--rehearsal conflicts with --secrets-file");
+  let credentials = config && !options.rehearsal ? readSecrets(options.secretsFile, kinds.map((kind) => config[kind].credentialEnv)) : undefined;
   assert.ok(existsSync(join(root, "dist/cli.js")), "Build first with npm run build");
   const proof = options.out ?? join(tmpdir(), `mc-acceptance-${Date.now()}-${randomUUID().slice(0, 8)}`);
   // Never reuse an existing directory: success cleanup must not delete caller data.
   mkdirSync(proof, { mode: 0o700 });
+  let rehearsalSecretPath;
+  if (options.rehearsal) {
+    assert.ok(config, "--rehearsal requires --real");
+    const generated = rehearsalSecrets(proof, config);
+    rehearsalSecretPath = generated.path;
+    credentials = generated.credentials;
+  }
   const startedAt = Date.now();
   const secrets = credentials ? Object.values(credentials) : [];
   const redact = (text) => redactSecrets(text, secrets);
@@ -282,6 +293,12 @@ export async function run(options) {
         if (!acceptance.immutable.applied) acceptance.immutable.error = "chflags uchg failed";
       }
       acceptanceCommand = frozenAcceptanceCommand(acceptance);
+      if (options.rehearsal) {
+        mock = await startFakeProvider({ config, credentials, acceptanceCommand, wrongImplementation: options.rehearsalWrongImplementation,
+          record: (record) => { records.push(record); save("rehearsal-tools.json", records); }, fail: (error) => { mockFailure = error; } });
+        modelRelay = await relay(mock.address().port);
+        config = rehearsalConfig(config, mock.address().port, modelRelay.port);
+      }
       save("real-config.json", config);
       save("frozen-acceptance.json", acceptance);
       for (const kind of ["orchestrator", "validator"]) env[config[kind].credentialEnv] = credentials[config[kind].credentialEnv];
@@ -506,7 +523,7 @@ export async function run(options) {
     });
     if (config) {
       await captureReal();
-      assert.equal(detail.mission.status, "completed");
+      assertRealOutcome(detail, acceptanceCommand);
     } else if (crash) {
       assert.equal(detail.mission.status, "failed", JSON.stringify({ failures: crash.failures, blockers: detail.blockers, humanActions: crash.humanActions }));
     } else {
@@ -726,6 +743,7 @@ export async function run(options) {
     await cleanup("container residue", async () => assert.deepEqual(await containerNames(), []));
     process.removeListener("SIGINT", onInt);
     process.removeListener("SIGTERM", onTerm);
+    if (rehearsalSecretPath) await cleanup("rehearsal secrets", async () => rmSync(rehearsalSecretPath, { force: true }));
     summary ??= { status: "failed" };
     summary.cleanupVerified = cleanupErrors.length === 0;
     if (cleanupErrors.length) {
@@ -734,6 +752,7 @@ export async function run(options) {
       failure ??= new Error(cleanupErrors.join("; "));
     }
     summary.durationMs = Date.now() - startedAt;
+    if (options.rehearsal) Object.assign(summary, { rehearsal: true, modelRequests: records.length, modelRequestTools: records });
     try { finalizeEvidence(proof, secrets, summary, save); }
     catch (error) { failure ??= error; }
     if (summary.cleanupVerified) process.stdout.write("cleanup verified\n");

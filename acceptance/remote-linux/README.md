@@ -144,6 +144,20 @@ node acceptance/remote-linux/run.mjs --real acceptance/remote-linux/real-minimax
 node acceptance/remote-linux/run.mjs --real acceptance/remote-linux/real-glm.json --secrets-file /私有目录/models.env --out /指定的/新证据目录 --timeout-ms 1800000
 ```
 
+### 本地彩排
+
+`--real <config> --rehearsal` 使用指定配置的 API、modelId 和 credentialEnv，只将 baseUrl 改为本地假模型服务。支持 Anthropic Messages 与 OpenAI Completions SSE。假服务逐请求核对配置模型名和 API 对应的凭据请求头，不记录凭据值，返回工具调用及 token usage。远端 worker 沿用宿主中继。此开关与 `--secrets-file` 互斥，不读取用户 secrets 或 shell 中的模型凭据。
+
+脚本在证据目录生成随机值的 0600 `rehearsal.env`，通过真实模式的 `readSecrets` 读取，结束时删除原文件，再对全部证据扫描这些假凭据。题面、冻结验收、发布后故障注入、成功门槛、只读会话取证、oracle 审计、独立容器复核和清理均复用真实模式代码。summary 保留 `mode: "real"` 并添加 `rehearsal: true`、`modelRequests`、`modelRequestTools`。彩排证明脚本流程；实际服务能力与真实模型表现仍需真实运行验证。
+
+```sh
+node acceptance/remote-linux/run.mjs --real acceptance/remote-linux/real-minimax.json --rehearsal --out .acceptance-proof/minimax-rehearsal
+node acceptance/remote-linux/run.mjs --real acceptance/remote-linux/real-glm.json --rehearsal --out .acceptance-proof/glm-rehearsal
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-rehearsal- node --test acceptance/remote-linux/rehearsal-container.test.mjs
+```
+
+容器自测依次跑两个配置的正向彩排和错误实现负向彩排。负向 worker 省略字段和安全整数检查，自查普通订单通过，冻结业务测试必须拒绝并由 validator 记录失败决定；orchestrator 请求修正并产生 blocker，运行进程必须以冻结验收失败原因非零退出。负向选项仅供程序化自测，不暴露 CLI。每次保留结果、耗时、模型请求数、工具序列及清理证据，最后核对独占前缀无残留。测试在 `acceptance/`，不进 `npm test`。逐次运行记录及已复现的产品结束竞态见 [REHEARSAL_FINDINGS.md](REHEARSAL_FINDINGS.md)。
+
 协调端只通过 env 接收本地角色所需的凭据。Linux 节点只通过 `container run -i` 的 stdin 接收 worker 所需的凭据和 node token，再用 `--credential-ref` 显式放行名称。值不进入 argv、挂载文件或证据；输出按全部已读凭据脱敏，在 summary、日志和其他证据全部写完后，递归扫描证据文件，包括 SQLite 与二进制文件，发现任一凭据原值即失败。
 
 真实模式默认超时 30 分钟，`--timeout-ms` 可修改。三个角色共用最多 60 轮，包含辅助模型请求，可能发生真实计费。示例未声明价格，`maxCost: 0` 表示没有金额上限；不能用未知价格计算金额或声称免费。轮数在模型请求准入时递增；达到 60 轮后，脚本继续等待已准入的请求结束。Mission completed 可以通过，failed/blocked 或团队空闲时的预算拒绝证据会判失败并保留证据。总超时不变。成功默认也保留；只有成功时 `--discard` 才删除，不能与 `--keep` 同用。
