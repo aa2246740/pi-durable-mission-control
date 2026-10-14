@@ -135,6 +135,11 @@ function assertValidationStatus(task: Task): void {
   }
 }
 
+type StoredMission = Mission & {
+  // An empty list records an explicit resume; absent means legacy/no failed stop.
+  localWorkerStops?: Array<{ agentId: string; epoch: number; exit: "unconfirmed" | "confirmed" }>;
+};
+
 type Row = { data: string };
 type OutboxRow = { id: string; mission_id: string; message_id: string; attempt: number; request_id: string; retry_count: number };
 type ScheduleRow = {
@@ -354,6 +359,7 @@ export class ControlPlane {
         const workerMailbox = new DurableWorkerMailbox(this.db, "coordinator");
         this.seedProfiles();
         this.acquireOwner();
+        this.recoverLocalWorkerStops();
         this.fenceRecoveredAgents();
         this.ensureUncertainDeliveryBlockers();
         MachineRegistry.fenceOnCoordinatorStart(this.db);
@@ -529,6 +535,25 @@ export class ControlPlane {
       .run(this.daemonId, this.ownerEpoch, process.pid, Date.now());
   }
 
+  private recoverLocalWorkerStops(): void {
+    const rows = this.db.prepare("SELECT data FROM missions WHERE status NOT IN ('completed','cancelled')").all() as Row[];
+    for (const row of rows) {
+      const mission = decode<StoredMission>(row.data);
+      // Older snapshots have blocker evidence but no durable exit confirmation.
+      const stops = mission.localWorkerStops ?? this.blockers(mission.id).flatMap(blocker => {
+        const match = /^worker-stop:(.+):(\d+)$/.exec(blocker.id);
+        if (!match || this.getAgent(match[1]!)?.machineId !== "local") return [];
+        return [{ agentId: match[1]!, epoch: Number(match[2]), exit: "unconfirmed" as const }];
+      });
+      if (!stops.length) continue;
+      const status = ["active", "validating"].includes(mission.status) ? "paused" : mission.status;
+      if (mission.localWorkerStops === undefined || status !== mission.status) {
+        this.putMission({ ...mission, localWorkerStops: stops, status, updatedAt: now() });
+        this.event(mission.id, "mission_resume_required", "Local worker stop evidence requires confirmed exit and explicit resume; coordinator restart cannot confirm an old process exit.");
+      }
+    }
+  }
+
   private fenceRecoveredAgents(): void {
     const rows = this.db.prepare("SELECT id,mission_id,status,epoch,data FROM agents").all() as Array<{ id: string; mission_id: string; status: string; epoch: number; data: string }>;
     for (const row of rows) {
@@ -599,9 +624,9 @@ export class ControlPlane {
     return { seq: Number(result.lastInsertRowid), ...value };
   }
 
-  private getMission(id: string): Mission | undefined {
+  private getMission(id: string): StoredMission | undefined {
     const row = this.db.prepare("SELECT data FROM missions WHERE id=?").get(id) as Row | undefined;
-    return row ? decode<Mission>(row.data) : undefined;
+    return row ? decode<StoredMission>(row.data) : undefined;
   }
 
   validationContract(missionId: string): ValidationContract | undefined {
@@ -724,7 +749,7 @@ export class ControlPlane {
     });
   }
 
-  private putMission(mission: Mission): void {
+  private putMission(mission: StoredMission): void {
     this.db.prepare("INSERT INTO missions(id,status,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data")
       .run(mission.id, mission.status, json(mission));
   }
@@ -1737,6 +1762,8 @@ export class ControlPlane {
       throw new HttpError(409, "Only a paused, blocked, or failed mission can resume");
     } else if (action === "resume" && this.blockers(id).some((blocker) => blocker.status === "open")) {
       throw new HttpError(409, "Resolve mission blockers before resuming");
+    } else if (action === "resume" && mission.localWorkerStops?.some(stop => stop.exit === "unconfirmed")) {
+      throw new HttpError(409, "Local worker exit is not confirmed; explicit resume is refused and answers remain held. A coordinator restart cannot confirm an old process exit.");
     } else if (action === "resume" && mission.turns >= mission.maxTurns) {
       throw new HttpError(409, "Mission turn limit has been reached");
     } else if (action === "resume" && mission.costKnown && mission.maxCost > 0 && mission.cost >= mission.maxCost) {
@@ -1746,7 +1773,8 @@ export class ControlPlane {
     }
     return this.transactionIfNeeded(() => {
     const status: Mission["status"] = action === "resume" ? "active" : action === "pause" ? "paused" : "cancelled";
-    const updated = { ...mission, status, updatedAt: now() };
+    const updated = { ...mission, status, updatedAt: now(),
+      ...(action === "resume" && mission.localWorkerStops?.length ? { localWorkerStops: [] } : {}) };
     this.putMission(updated);
     if (action === "pause" || action === "cancel") {
       if (action === "cancel") this.clearLocalDeliveryDeadlines(id);
@@ -3398,29 +3426,34 @@ export class ControlPlane {
         this.putMission({ ...mission, status: "paused", updatedAt: now() });
       } else if (mission && !remaining && blocker.kind === "user_input" && blocker.agentId &&
         ["blocked", "paused"].includes(mission.status)) {
-        const resume = mission.status === "blocked" &&
+        const explicitResume = this.hasLocalWorkerStopHold(mission.id);
+        const resume = !explicitResume && mission.status === "blocked" &&
           mission.turns < mission.maxTurns &&
           (mission.maxCost <= 0 || !mission.costKnown || mission.cost < mission.maxCost);
         const recipient = this.getAgent(blocker.agentId);
+        const queued = resume || (explicitResume && recipient?.machineId === "local");
         const message: Message | undefined = recipient ? {
           id: `blocker-resolution:${id}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
-          content: resolution, mode: "followUp", status: resume ? "queued" : "aborted", attempt: 1, createdAt: now(),
-          ...(!resume ? { error: "Held until the mission can resume; delivery is not released while paused or over budget." } : {})
+          content: resolution, mode: "followUp", status: queued ? "queued" : "aborted", attempt: 1, createdAt: now(),
+          ...(!queued ? { error: "Held until the mission can resume; delivery is not released while paused or over budget." } : {})
         } : undefined;
         if (message) {
           this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
-          if (resume) this.enqueue(message);
+          if (queued) this.enqueue(message);
           this.event(mission.id, "message_created", resume ? "Human blocker resolution queued for its requesting agent." : "Human blocker resolution held for explicit resume.", recipient!.id, { messageId: message.id, blockerId: id });
         }
         if (resume) {
           this.putMission({ ...mission, status: "active", updatedAt: now() });
           this.releaseHeldMessages(mission.id);
           if (recipient) this.setAgentStatus(recipient.id, recipient.epoch, "idle");
+        } else if (explicitResume) {
+          this.putMission({ ...mission, status: "paused", updatedAt: now() });
+          this.event(mission.id, "mission_resume_required", "Human answer retained; a prior local worker stop requires confirmed exit and explicit resume.");
         }
       } else if (mission && blocker.kind === "user_input" && blocker.agentId) {
         const recipient = this.getAgent(blocker.agentId);
         if (recipient) {
-          const holdQueued = recipient.machineId === "local" && this.hasUnconfirmedLocalWorkerStop(mission.id);
+          const holdQueued = recipient.machineId === "local" && this.hasLocalWorkerStopHold(mission.id);
           const message: Message = {
             id: `blocker-resolution:${id}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
             content: resolution, mode: "followUp", status: holdQueued ? "queued" : "aborted", attempt: 1, createdAt: now(),
@@ -4289,17 +4322,35 @@ export class ControlPlane {
       const current = this.getAgent(agentId)!;
       if (agent.epoch === epoch) this.recordWorkerDiagnostic(agentId, current.epoch, diagnostic);
       // A retry still belongs to the old process after its database epoch advances.
-      if (!terminal) this.insertSystemBlocker(`worker-stop:${agentId}:${epoch}`, agent.missionId, "unsafe_execution", diagnostic);
+      if (!terminal) {
+        const mission = this.getMission(agent.missionId)!;
+        const stops = mission.localWorkerStops ?? [];
+        if (!stops.some(stop => stop.agentId === agentId && stop.epoch === epoch)) {
+          this.putMission({ ...mission, localWorkerStops: [...stops, { agentId, epoch, exit: "unconfirmed" }], updatedAt: now() });
+        }
+        this.insertSystemBlocker(`worker-stop:${agentId}:${epoch}`, agent.missionId, "unsafe_execution", diagnostic);
+      }
     });
   }
 
-  private hasUnconfirmedLocalWorkerStop(missionId: string): boolean {
-    return !["completed", "cancelled"].includes(this.getMission(missionId)?.status ?? "") &&
-      Boolean(this.db.prepare("SELECT 1 FROM blockers WHERE mission_id=? AND status='open' AND id LIKE 'worker-stop:%'").get(missionId));
+  confirmLocalWorkerExit(agentId: string, epoch: number): void {
+    this.transactionIfNeeded(() => {
+      const agent = this.getAgent(agentId);
+      const mission = agent ? this.getMission(agent.missionId) : undefined;
+      if (!mission?.localWorkerStops?.some(stop => stop.agentId === agentId && stop.epoch === epoch && stop.exit === "unconfirmed")) return;
+      this.putMission({ ...mission, updatedAt: now(), localWorkerStops: mission.localWorkerStops.map(stop =>
+        stop.agentId === agentId && stop.epoch === epoch ? { ...stop, exit: "confirmed" } : stop) });
+      this.event(mission.id, "local_worker_exit_confirmed", "Old local worker exit confirmed; explicit resume is still required.", agentId, { epoch });
+    });
+  }
+
+  private hasLocalWorkerStopHold(missionId: string): boolean {
+    const mission = this.getMission(missionId);
+    return Boolean(mission?.localWorkerStops?.length) && !["completed", "cancelled"].includes(mission?.status ?? "");
   }
 
   private queuedAnswersHeldByLocalWorkerStop(missionId: string): Set<string> {
-    if (!this.hasUnconfirmedLocalWorkerStop(missionId)) return new Set();
+    if (!this.hasLocalWorkerStopHold(missionId)) return new Set();
     const rows = this.db.prepare(`SELECT m.id FROM messages m
       JOIN blockers question ON m.id='blocker-resolution:' || question.id
       JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')

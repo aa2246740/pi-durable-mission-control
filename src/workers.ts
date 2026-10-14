@@ -341,6 +341,7 @@ export class WorkerManager {
           const final = redactDiagnosticChunk(stderrPending, "", secret, true).complete;
           if (final) this.control.recordWorkerDiagnostic(owner.id, owner.epoch, sanitizeDiagnostic(final, secret));
           if (!ready) reject(new Error(`Worker exited before readiness (${code ?? "signal"})`));
+          this.control.confirmLocalWorkerExit(owner.id, owner.epoch);
           if (code && code !== 0) this.control.setAgentStatus(owner.id, owner.epoch, "error", `Worker exited with ${code}`);
           else this.control.setAgentStatus(owner.id, owner.epoch, "offline");
           if (this.handles.get(owner.id) === handle) this.handles.delete(owner.id);
@@ -666,6 +667,7 @@ export class WorkerManager {
     if (handle.close) return handle.close;
     handle.stopping = true;
     if (!isChildLive(handle.child)) {
+      this.control.confirmLocalWorkerExit(agentId, handle.epoch);
       if (this.handles.get(agentId) === handle) this.handles.delete(agentId);
       return;
     }
@@ -692,6 +694,7 @@ export class WorkerManager {
           reject(new Error("Local worker exit was not confirmed; queued inputs remain held"));
           return;
         }
+        this.control.confirmLocalWorkerExit(agentId, handle.epoch);
         if (!acknowledged) this.control.setAgentStatus(agentId, handle.epoch, "error", "Worker exited without a shutdown acknowledgement");
         if (this.handles.get(agentId) === handle) this.handles.delete(agentId);
         resolve();
