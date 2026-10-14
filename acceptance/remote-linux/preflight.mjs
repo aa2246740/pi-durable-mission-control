@@ -101,6 +101,27 @@ function usageOf(message) {
   };
 }
 
+function modelName(value) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+// pi-ai drops a matching model name and only stores responseModel when it differs.
+function modelFromProviderEvent(event) {
+  if (!event || typeof event !== "object") return undefined;
+  return modelName(event.model)
+    ?? modelName(event.message?.model)
+    ?? modelName(event.response?.model);
+}
+
+function responseModelFields(profile, message, observed, httpOk) {
+  const responseModel = observed ?? modelName(message?.responseModel) ?? null;
+  if (responseModel) return { responseModel, responseModelReason: null, modelMismatch: responseModel !== profile.modelId };
+  const responseModelReason = httpOk
+    ? "Provider stream did not include a model name"
+    : "Request failed before a response model name was available";
+  return { responseModel: null, responseModelReason, modelMismatch: false };
+}
+
 function statusOf(error) {
   return typeof error?.status === "number" ? error.status : undefined;
 }
@@ -112,6 +133,7 @@ export async function probeOnce({ profile, credential, timeoutMs = defaultTimeou
   timer.unref?.();
   let httpStatus;
   let errorBody = "";
+  let observedModel;
   let message;
   let thrown;
   try {
@@ -162,7 +184,8 @@ export async function probeOnce({ profile, credential, timeoutMs = defaultTimeou
         }
         return response;
       },
-      onResponse: (response) => { httpStatus ??= response.status; }
+      onResponse: (response) => { httpStatus ??= response.status; },
+      onProviderStreamEvent: (event) => { observedModel ??= modelFromProviderEvent(event); }
     });
   } catch (error) {
     thrown = error;
@@ -186,6 +209,7 @@ export async function probeOnce({ profile, credential, timeoutMs = defaultTimeou
     latencyMs,
     toolCalled,
     usage: usageOf(message),
+    ...responseModelFields(profile, message, observedModel, httpOk),
     errorCategory: classifyProbe({ httpStatus, error, httpOk, toolCalled }),
     error: clip(error)
   };
@@ -227,7 +251,34 @@ export function containerStdin({ profile, credential, timeoutMs, maxTokens }) {
 }
 
 function failedProbe(errorCategory, error) {
-  return { httpOk: false, httpStatus: null, latencyMs: null, toolCalled: false, usage: null, errorCategory, error: clip(error) };
+  return {
+    httpOk: false,
+    httpStatus: null,
+    latencyMs: null,
+    toolCalled: false,
+    usage: null,
+    responseModel: null,
+    responseModelReason: "Request failed before a response model name was available",
+    modelMismatch: false,
+    errorCategory,
+    error: clip(error)
+  };
+}
+
+function reportFor(checks) {
+  const modelMismatches = checks.filter((check) => check.modelMismatch).map((check) => ({
+    roles: check.roles,
+    api: check.api,
+    baseUrl: check.baseUrl,
+    modelId: check.modelId,
+    responseModel: check.responseModel
+  }));
+  return {
+    pass: checks.length > 0 && checks.every((check) => check.httpOk && check.toolCalled && check.errorCategory == null),
+    modelMismatches,
+    ...(modelMismatches.length > 0 ? { notice: "API response model differs from configured modelId" } : {}),
+    checks
+  };
 }
 
 async function commandOutput(args) {
@@ -290,7 +341,7 @@ function runProbeProcess(command, args, stdin, credential, deadlineMs) {
 
 export async function runPreflight(options) {
   const secrets = [];
-  const fail = (error) => ({ pass: false, error: clip(redact(error, secrets)), checks: [] });
+  const fail = (error) => ({ pass: false, error: clip(redact(error, secrets)), modelMismatches: [], checks: [] });
   let config;
   try { config = readConfig(options.configPath); }
   catch (error) { return fail(error instanceof Error ? error.message : String(error)); }
@@ -327,12 +378,14 @@ export async function runPreflight(options) {
       latencyMs: Number.isFinite(result.latencyMs) ? Math.max(0, Math.round(result.latencyMs)) : null,
       toolCalled: result.toolCalled === true,
       usage: result.usage ?? null,
+      responseModel: typeof result.responseModel === "string" && result.responseModel.length > 0 ? result.responseModel : null,
+      responseModelReason: typeof result.responseModel === "string" && result.responseModel.length > 0 ? null : (result.responseModelReason || "Response model name was not available"),
+      modelMismatch: typeof result.responseModel === "string" && result.responseModel.length > 0 && result.responseModel !== target.profile.modelId,
       errorCategory: result.errorCategory ?? null,
       error: clip(result.error ?? null)
     });
   }
-  const report = { pass: checks.length > 0 && checks.every((check) => check.httpOk && check.toolCalled && check.errorCategory == null), checks };
-  return JSON.parse(publishReport(report, secrets));
+  return JSON.parse(publishReport(reportFor(checks), secrets));
 }
 
 async function readStdin() {

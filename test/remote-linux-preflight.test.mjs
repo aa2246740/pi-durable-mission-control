@@ -45,7 +45,7 @@ function writeConfig(directory, config) {
   return path;
 }
 
-function openaiStream(tool) {
+function openaiStream(tool, modelName) {
   const first = tool
     ? { role: "assistant", tool_calls: [{ index: 0, id: "call_ping", type: "function", function: { name: "ping", arguments: "" } }] }
     : { role: "assistant", content: "hello" };
@@ -54,14 +54,14 @@ function openaiStream(tool) {
     : { content: "" };
   const finish = tool ? "tool_calls" : "stop";
   const chunks = [
-    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: "preflight-model", choices: [{ index: 0, delta: first, finish_reason: null }] },
-    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: "preflight-model", choices: [{ index: 0, delta: second, finish_reason: null }] },
-    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: "preflight-model", choices: [{ index: 0, delta: {}, finish_reason: finish }], usage: { prompt_tokens: 11, completion_tokens: 4, total_tokens: 15 } }
+    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: modelName, choices: [{ index: 0, delta: first, finish_reason: null }] },
+    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: modelName, choices: [{ index: 0, delta: second, finish_reason: null }] },
+    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: modelName, choices: [{ index: 0, delta: {}, finish_reason: finish }], usage: { prompt_tokens: 11, completion_tokens: 4, total_tokens: 15 } }
   ];
   return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
 }
 
-function anthropicStream(tool) {
+function anthropicStream(tool, modelName) {
   const blocks = tool
     ? [
       ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_ping", name: "ping", input: {} } }],
@@ -73,7 +73,7 @@ function anthropicStream(tool) {
       ["content_block_stop", { type: "content_block_stop", index: 0 }]
     ];
   const events = [
-    ["message_start", { type: "message_start", message: { id: "msg_preflight", type: "message", role: "assistant", model: "preflight-model", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 9, output_tokens: 1 } } }],
+    ["message_start", { type: "message_start", message: { id: "msg_preflight", type: "message", role: "assistant", model: modelName, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 9, output_tokens: 1 } } }],
     ...blocks,
     ["message_delta", { type: "message_delta", delta: { stop_reason: tool ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } }],
     ["message_stop", { type: "message_stop" }]
@@ -98,8 +98,14 @@ async function startServer(t, mode) {
       response.end(payload);
       return;
     }
+    let requested = "preflight-model";
+    try {
+      const parsed = JSON.parse(body);
+      if (typeof parsed.model === "string" && parsed.model.length > 0) requested = parsed.model;
+    } catch { /* A malformed body still gets a named fake model. */ }
+    const modelName = mode === "mismatch" ? "mapped-from-endpoint" : requested;
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end(anthropic ? anthropicStream(mode === "tool") : openaiStream(mode === "tool"));
+    response.end(anthropic ? anthropicStream(mode === "tool" || mode === "mismatch", modelName) : openaiStream(mode === "tool" || mode === "mismatch", modelName));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }));
@@ -190,9 +196,14 @@ test("local OpenAI and Anthropic endpoints must return one ping tool call", asyn
     assert.equal(check.toolCalled, true);
     assert.equal(check.errorCategory, null);
     assert.equal(check.error, null);
+    assert.equal(check.responseModel, check.modelId);
+    assert.equal(check.responseModelReason, null);
+    assert.equal(check.modelMismatch, false);
     assert.ok(check.latencyMs >= 0);
     assert.ok(check.usage.totalTokens > 0);
   }
+  assert.deepEqual(report.modelMismatches, []);
+  assert.equal(report.notice, undefined);
   assert.equal(server.requests.length, 2);
   const parsed = server.requests.map((request) => ({ url: request.url, body: JSON.parse(request.body) }));
   const anthropic = parsed.find((request) => request.url.includes("/messages")).body;
@@ -224,24 +235,56 @@ test("authentication, missing tool calls, and timeouts fail closed without retri
     assert.equal(server.requests.length, 2);
     for (const check of report.checks) {
       assert.equal(check.toolCalled, false);
+      assert.equal(check.modelMismatch, false);
       if (mode === "unauthorized") {
         assert.equal(check.httpOk, false);
         assert.equal(check.httpStatus, 401);
         assert.equal(check.errorCategory, "auth");
+        assert.equal(check.responseModel, null);
+        assert.match(check.responseModelReason, /before a response model/);
       } else if (mode === "text") {
         assert.equal(check.httpOk, true);
         assert.equal(check.httpStatus, 200);
         assert.equal(check.errorCategory, "no-tool-call");
+        assert.equal(check.responseModel, check.modelId);
         assert.ok(check.usage.totalTokens > 0);
       } else {
         assert.equal(check.httpOk, false);
         assert.equal(check.errorCategory, "timeout");
+        assert.equal(check.responseModel, null);
+        assert.match(check.responseModelReason, /before a response model/);
         assert.ok(check.latencyMs >= 300);
         assert.ok(check.latencyMs < 5000);
       }
     }
     assertNoSecret(report);
   }
+});
+
+test("a different response model is reported without failing the tool-call check", async (t) => {
+  const directory = temporary(t);
+  const server = await startServer(t, "mismatch");
+  const configPath = writeConfig(directory, configFor(server));
+  const report = await runPreflight({ configPath, secretsFile: writeSecrets(directory), timeoutMs: 5000 });
+  assert.equal(report.pass, true);
+  assert.equal(report.notice, "API response model differs from configured modelId");
+  assert.equal(report.modelMismatches.length, 2);
+  assert.deepEqual(report.modelMismatches.map((item) => item.responseModel), ["mapped-from-endpoint", "mapped-from-endpoint"]);
+  for (const check of report.checks) {
+    assert.equal(check.httpOk, true);
+    assert.equal(check.toolCalled, true);
+    assert.equal(check.errorCategory, null);
+    assert.equal(check.responseModel, "mapped-from-endpoint");
+    assert.equal(check.responseModelReason, null);
+    assert.equal(check.modelMismatch, true);
+    assert.notEqual(check.responseModel, check.modelId);
+  }
+  const cli = await runCli(["--real", configPath, "--secrets-file", writeSecrets(directory), "--timeout-ms", "5000"]);
+  assert.equal(cli.status, 0, cli.stdout + cli.stderr);
+  const parsed = JSON.parse(cli.stdout);
+  assert.equal(parsed.pass, true);
+  assert.equal(parsed.modelMismatches.length, 2);
+  assert.match(cli.stdout, /mapped-from-endpoint/);
 });
 
 test("provider error bodies that echo a credential are redacted", async (t) => {
