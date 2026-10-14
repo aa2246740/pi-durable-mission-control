@@ -12,6 +12,7 @@ import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSes
 import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
 import { assertWorkerCrash, observeWorkerCrash } from "./scenarios/worker-crash.mjs";
 import { createTurnLimitScenario, turnLimitMaxTurns } from "./scenarios/turn-limit.mjs";
+import { createNodePowerLossScenario } from "./scenarios/node-power-loss.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const containerCLI = "/opt/homebrew/bin/container";
@@ -29,7 +30,7 @@ export function parseOptions(args) {
     else if (args[i] === "--discard") options.discard = true;
     else if (args[i] === "--scenario" && args[i + 1]) {
       options.scenario = args[++i];
-      assert.ok(["default", "pause-resume", "worker-crash", "turn-limit"].includes(options.scenario), "--scenario must be default, pause-resume, worker-crash, or turn-limit");
+      assert.ok(["default", "pause-resume", "worker-crash", "turn-limit", "node-power-loss"].includes(options.scenario), "--scenario must be default, pause-resume, worker-crash, turn-limit, or node-power-loss");
     }
     else if (args[i] === "--out" && args[i + 1]) options.out = resolve(args[++i]);
     else if (args[i] === "--timeout-ms" && args[i + 1]) {
@@ -222,6 +223,7 @@ export async function run(options) {
   const pause = options.scenario === "pause-resume" ? { humanActions: [] } : undefined;
   const crash = options.scenario === "worker-crash" ? { humanActions: [] } : undefined;
   const turnLimit = options.scenario === "turn-limit" ? createTurnLimitScenario() : undefined;
+  const powerLoss = options.scenario === "node-power-loss" ? createNodePowerLossScenario(join(proof, "node-home")) : undefined;
   const recovery = pause ?? turnLimit?.evidence;
   const recoveryFile = pause ? "pause-resume.json" : "turn-limit.json";
   let captureMock, captureCrash;
@@ -246,6 +248,7 @@ export async function run(options) {
     if (mockFailure) throw mockFailure;
     if (Date.now() >= deadline) throw new Error(`Acceptance timed out after ${options.timeoutMs} ms`);
     for (const handle of [daemon, node]) if (handle && (handle.error() || handle.child.exitCode !== null || handle.child.signalCode !== null)) {
+      if (powerLoss?.expectsExit(handle)) continue;
       if (crash?.killed && handle === node) {
         crash.nodeExitedAfterKill ??= { exitCode: node.child.exitCode, signalCode: node.child.signalCode, output: redact(node.output()).slice(-4000) };
         continue;
@@ -324,13 +327,18 @@ export async function run(options) {
     const credentialRefs = config ? [config.worker.credentialEnv] : ["MC_ACCEPTANCE_MODEL_CREDENTIAL"];
     // Values travel only over stdin; the shell reads one value for each explicitly allowed name.
     const nodeInput = [enrolled.token, ...credentialRefs.map((ref) => config ? credentials[ref] : credential)].join("\n") + "\n";
-    node = childProcess(containerCLI, ["run", "--rm", "-i", ...(config ? ["--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1"] : []), "--name", name, "--arch", "arm64", "--cpus", "2", "--memory", "512M",
-      "-v", `${join(root, "dist")}:/app/dist:ro`, "-v", `${join(root, "package.json")}:/app/package.json:ro`,
-      "-v", `${realpathSync(join(root, "node_modules"))}:/app/node_modules:ro`,
-      "-v", `${join(root, "acceptance/remote-linux/bootstrap.mjs")}:/app/bootstrap.mjs:ro`,
-      image.configuration.name, "sh", "-c", nodeCredentialShell,
-      "acceptance", String(nodeRelay.port), machineId, ...credentialRefs], { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });
-    node.child.stdin.end(nodeInput);
+    const startNode = () => {
+      node = childProcess(containerCLI, ["run", "--rm", "-i", ...(config ? ["--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1"] : []), "--name", name, "--arch", "arm64", "--cpus", "2", "--memory", "512M",
+        ...(powerLoss ? powerLoss.mountArgs() : []),
+        "-v", `${join(root, "dist")}:/app/dist:ro`, "-v", `${join(root, "package.json")}:/app/package.json:ro`,
+        "-v", `${realpathSync(join(root, "node_modules"))}:/app/node_modules:ro`,
+        "-v", `${join(root, "acceptance/remote-linux/bootstrap.mjs")}:/app/bootstrap.mjs:ro`,
+        image.configuration.name, "sh", "-c", nodeCredentialShell,
+        "acceptance", String(nodeRelay.port), machineId, ...credentialRefs], { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });
+      node.child.stdin.end(nodeInput);
+      return node;
+    };
+    startNode();
     const machine = await wait(async () => (await api("/api/state")).machines.find((m) => m.id === machineId && m.status === "online"));
     assert.equal(machine.capabilities.platform, "linux");
     assert.equal(machine.capabilities.executionMode, "workspace-effects");
@@ -424,8 +432,16 @@ export async function run(options) {
       crash.transport = readPauseTransport(join(home, "control.sqlite"), mission.id);
       save("worker-crash.json", crash);
     };
+    if (powerLoss) powerLoss.configure({ api, post, wait, save, machineId, missionId: mission.id, containerName: name,
+      exec: command, startNode, getNode: () => node, records,
+      readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id),
+      readEvidence: async (path) => {
+        const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
+        assert.ok(response.ok, `Evidence read failed: ${path}`);
+        return response.json();
+      } });
     await api(`/api/missions/${mission.id}/start`, {});
-    detail = await wait(async () => {
+    detail = powerLoss ? await powerLoss.execute() : await wait(async () => {
       const current = await api(`/api/missions/${mission.id}`);
       detail = current;
       if (config) for (const receipt of current.validationReceipts) {
@@ -507,8 +523,8 @@ export async function run(options) {
     if (config) {
       await captureReal();
       assert.equal(detail.mission.status, "completed");
-    } else if (crash) {
-      assert.equal(detail.mission.status, "failed", JSON.stringify({ failures: crash.failures, blockers: detail.blockers, humanActions: crash.humanActions }));
+    } else if (crash || powerLoss) {
+      assert.equal(detail.mission.status, "failed", JSON.stringify({ failures: crash?.failures, blockers: detail.blockers, humanActions: crash?.humanActions ?? powerLoss.evidence.humanActions }));
     } else {
       if (recovery) {
         await captureMock();
@@ -517,6 +533,7 @@ export async function run(options) {
     }
     const runtimes = await wait(async () => {
       const current = await api(`/api/missions/${mission.id}/runtimes`);
+      if (powerLoss) return current;
       if (crash) {
         if (current.length === 1 && current[0].stopProvenance === "controlled") throw new Error("Remote runtime stop provenance is controlled");
         return current.length === 1 && ["closed", "uncertain"].includes(current[0].state) && current[0].stopProvenance !== "controlled" && current;
@@ -529,7 +546,11 @@ export async function run(options) {
     save("mission.json", detail);
     save("runtimes.json", runtimes);
     const deliveryRuntime = config ? stoppedRealRuntimes(runtimes, detail, mutation?.artifactId, machineId) : undefined;
-    if (crash) {
+    if (powerLoss) {
+      await powerLoss.capture();
+      summary = { status: "passed", scenario: "node-power-loss", missionStatus: detail.mission.status,
+        ...powerLoss.assertCompleted(), mockCost: 0, image: { name: image.configuration.name, digest: image.id } };
+    } else if (crash) {
       await captureCrash();
       crash.assertions = assertWorkerCrash(detail, crash.runtimes, crash, records, crash.transport);
       save("worker-crash.json", crash);
@@ -605,6 +626,13 @@ export async function run(options) {
       catch (captureError) { summary.evidenceError = redact(captureError.message); }
       Object.assign(summary, { scenario: "worker-crash", missionStatus: detail?.mission.status, stopProvenance: crash.stoppedRuntime?.stopProvenance,
         diagnostic: crash.failures?.map((event) => event.data?.diagnostic), blockers: crash.blockers, humanActions: crash.humanActions, kill: crash.kill, failure: crash.failure });
+    }
+    if (powerLoss) {
+      powerLoss.evidence.failure = redact(error.message);
+      try { await powerLoss.capture(); }
+      catch (captureError) { summary.evidenceError = redact(captureError.message); }
+      Object.assign(summary, { scenario: "node-power-loss", missionStatus: powerLoss.evidence.final?.detail?.mission.status,
+        lossObservedMs: powerLoss.evidence.lossObservedMs, failure: powerLoss.evidence.failure });
     }
     if (captureReal) {
       try { await captureReal(); }

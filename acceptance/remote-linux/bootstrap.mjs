@@ -16,7 +16,7 @@ const relay = createServer((socket) => {
 });
 await new Promise((resolve, reject) => { relay.once("error", reject); relay.listen(14311, "127.0.0.1", resolve); });
 const child = spawn(process.execPath, ["/app/dist/cli.js", "node", "--coordinator", "http://127.0.0.1:14311",
-  "--machine-id", machineId, "--token-env", "MC_ACCEPTANCE_NODE_TOKEN", "--home", "/node-home", "--root", "/work",
+  "--machine-id", machineId, "--token-env", "MC_ACCEPTANCE_NODE_TOKEN", "--home", process.env.MC_ACCEPTANCE_NODE_HOME ?? "/node-home", "--root", "/work",
   ...((credentialRefs.length ? credentialRefs : ["MC_ACCEPTANCE_MODEL_CREDENTIAL"]).flatMap((name) => ["--credential-ref", name])), "--execution-mode", "workspace-effects"], { stdio: "inherit" });
 const retainForEvidence = process.env.MC_ACCEPTANCE_RETAIN_CONTAINER === "1";
 if (retainForEvidence) {
