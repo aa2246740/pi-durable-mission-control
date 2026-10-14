@@ -4,7 +4,8 @@ import { chmodSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
-  DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope, type JsonValue, type WorkerBinding, type WorkerEnvelope
+  DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope,
+  type JsonValue, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding, type WorkerEnvelope
 } from "./worker-mailbox.js";
 import { parseWorkerNotice, type WorkerNotice } from "./worker-events.js";
 import {
@@ -67,6 +68,15 @@ export interface NodeWorkerSupervisorOptions {
     readChunk: (offset: number, length: number) => Buffer;
     verifySnapshot: () => void;
   }) => Promise<JsonValue>;
+  /**
+   * Read-only coordinator evidence for uncertain uploads on a stopped binding.
+   * Only ids whose message, sequence, and digest were reported applied may be
+   * treated as settled. A missing or failed answer leaves those rows blocking.
+   */
+  lookupAppliedUploads?: (
+    binding: WorkerBinding,
+    entries: readonly MailboxSettlementQuery[]
+  ) => Promise<readonly MailboxSettlementAnswer[]>;
 }
 
 export class NodeWorkerError extends Error {}
@@ -390,7 +400,53 @@ export class NodeWorkerSupervisor {
     return promise;
   }
 
-  private closeStoppedMailboxesForAssignment(binding: WorkerBinding): void {
+  /**
+   * Asks the coordinator, before taking the admission lock, which uncertain
+   * uploads are already applied. Network failure or a missing lookup leaves
+   * those ids unproven so the admission gate still refuses them.
+   */
+  private async provenUploadsForAssignment(binding: WorkerBinding): Promise<Map<string, ReadonlySet<string>>> {
+    const proven = new Map<string, ReadonlySet<string>>();
+    const previous = this.db.prepare("SELECT * FROM node_worker_runtimes WHERE agent_id=?")
+      .all(binding.agentId) as unknown as RuntimeRow[];
+    for (const row of previous) {
+      const oldBinding = parseWorkerBinding(JSON.parse(row.binding_json));
+      if (!oldBinding || row.state !== "closed" || row.confirmed_stopped !== 1 || row.epoch >= binding.epoch ||
+          oldBinding.machineId !== binding.machineId) {
+        continue;
+      }
+      let status = "";
+      try { status = this.mailbox.inspectBinding(oldBinding).status; } catch { continue; }
+      if (status !== "uncertain") continue;
+      const uploads = this.mailbox.inspectOutbox(oldBinding).filter((item) =>
+        item.status === "uncertain" && (item.envelope.payload.kind === "rpc" || item.envelope.payload.kind === "notice"));
+      const ids = new Set<string>();
+      if (uploads.length > 0 && this.options.lookupAppliedUploads) {
+        const entries = uploads.map((item) => ({
+          messageId: item.envelope.messageId, sequence: item.envelope.sequence, sha256: item.sha256
+        }));
+        let answers: readonly MailboxSettlementAnswer[];
+        try {
+          answers = await this.options.lookupAppliedUploads(oldBinding, entries);
+        } catch {
+          throw new NodeWorkerError("Prior node mailbox settlement could not be read");
+        }
+        if (!Array.isArray(answers)) throw new NodeWorkerError("Prior node mailbox settlement could not be read");
+        for (const item of uploads) {
+          const match = answers.find((candidate) => candidate
+            && candidate.messageId === item.envelope.messageId
+            && candidate.sequence === item.envelope.sequence
+            && candidate.sha256 === item.sha256
+            && candidate.applied === true);
+          if (match) ids.add(item.envelope.messageId);
+        }
+      }
+      proven.set(row.runtime_id, ids);
+    }
+    return proven;
+  }
+
+  private closeStoppedMailboxesForAssignment(binding: WorkerBinding, provenUploads: ReadonlyMap<string, ReadonlySet<string>>): void {
     const previous = this.db.prepare("SELECT * FROM node_worker_runtimes WHERE agent_id=?")
       .all(binding.agentId) as unknown as RuntimeRow[];
     for (const row of previous) {
@@ -401,9 +457,12 @@ export class NodeWorkerSupervisor {
       }
       const status = this.mailbox.inspectBinding(oldBinding).status;
       if (status === "closed") continue;
+      const proven = provenUploads.get(row.runtime_id) ?? new Set<string>();
+      // Same predicate as the coordinator: whitelist replies and uploads the
+      // coordinator has already applied. Nothing here is replayed or rebound.
       if (status !== "uncertain" ||
-          this.mailbox.inspectOutbox(oldBinding).some(item => !["acknowledged", "cancelled"].includes(item.status)) ||
-          this.mailbox.inspectInbox(oldBinding).some(item => !["applied", "cancelled"].includes(item.status))) {
+          this.mailbox.inspectOutbox(oldBinding).some((item) => !this.mailbox.outboxSettledForStop(oldBinding, item.envelope.messageId, proven)) ||
+          this.mailbox.inspectInbox(oldBinding).some((item) => !this.mailbox.inboxSettledForStop(oldBinding, item.envelope.messageId))) {
         throw new NodeWorkerError("Prior node mailbox has unacknowledged or uncertain work");
       }
       if (this.effects.inspect().some(item => item.spec.binding.runtimeId === row.runtime_id &&
@@ -455,9 +514,10 @@ export class NodeWorkerSupervisor {
         ...(this.options.testOnlyArtifactTaskId ? { testOnlyArtifactTaskId: this.options.testOnlyArtifactTaskId } : {})
       } : {})
     };
+    const provenUploads = coordinatorAssigned ? await this.provenUploadsForAssignment(binding) : undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (coordinatorAssigned) this.closeStoppedMailboxesForAssignment(binding);
+      if (coordinatorAssigned) this.closeStoppedMailboxesForAssignment(binding, provenUploads ?? new Map());
       const mailboxStatus = this.mailbox.open(binding);
       if (mailboxStatus.status !== "open") throw new NodeWorkerError("Mailbox binding is not open for a new worker");
       this.db.prepare(
