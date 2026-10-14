@@ -1656,7 +1656,13 @@ export class ControlPlane {
       const messages = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(id) as Row[];
       for (const row of messages) {
         const message = decode<Message>(row.data);
-        if (action === "cancel" && message.status !== "queued" && this.getAgent(message.recipientId)?.machineId === "local") continue;
+        if (action === "cancel" && this.getAgent(message.recipientId)?.machineId === "local" &&
+            this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status IN ('dispatching','admitted','delivering','delivered') LIMIT 1").get(message.id)) {
+          // A sent input can still have a queued message until admission arrives.
+          // Its timeout must not requeue it during terminal settlement.
+          this.db.prepare("UPDATE outbox SET deadline_at=NULL WHERE message_id=? AND status IN ('dispatching','admitted','delivering','delivered')").run(message.id);
+          continue;
+        }
         const uncertain = message.status === "delivered" || this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status='uncertain' LIMIT 1").get(message.id);
         const next = { ...message, status: uncertain ? "uncertain" : "aborted", error: uncertain ? "Delivery state is uncertain after " + action : "Delivery aborted by mission " + action };
         this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(next.status, json(next), next.id);
@@ -3247,8 +3253,11 @@ export class ControlPlane {
     return this.command(`mission:${mission.id}:blockers`, commandId, { kind, text, taskId }, () => {
       const blocker: Blocker = { id: randomUUID(), missionId: mission.id, agentId, ...(taskId ? { taskId } : {}), kind, status: "open", text, createdAt: now() };
       this.db.prepare("INSERT INTO blockers(id,mission_id,status,data) VALUES(?,?,?,?)").run(blocker.id, mission.id, blocker.status, json(blocker));
-      this.putMission({ ...mission, status: "blocked", updatedAt: now() });
-      this.setAgentStatus(agentId, epoch, "waiting_user");
+      // A shell stopped during terminal shutdown still needs uncertainty evidence.
+      if (mission.status !== "completed" && mission.status !== "cancelled") {
+        this.putMission({ ...mission, status: "blocked", updatedAt: now() });
+        this.setAgentStatus(agentId, epoch, "waiting_user");
+      }
       this.event(mission.id, `${kind}_requested`, text, agentId, { blockerId: blocker.id, commandId });
       return blocker;
     });
@@ -3706,6 +3715,11 @@ export class ControlPlane {
     return this.command(`mission:${agent.missionId}:completion`, commandId, {}, () => {
       this.authorizeAgent(agent.id, epoch, agent.missionId);
       const detail = this.detail(agent.missionId);
+      if (detail.agents.some((member) => this.activeWorkspaceOperations.has(member.id)) ||
+          [...this.externalProcesses.values()].some((owner) => owner.missionId === agent.missionId) ||
+          this.missionHasValidationFlight(agent.missionId)) {
+        throw new HttpError(409, "Workspace operations must finish before mission completion");
+      }
       if (!detail.tasks.length || detail.tasks.some((task) => task.status !== "accepted")) throw new HttpError(409, "All required tasks need independent accepted validation");
       if (detail.validationContract && (detail.requirementCoverage ?? []).some((coverage) => coverage.status !== "passed")) {
         throw new HttpError(409, "Every current validation assertion must have exactly one accepted task and a passing result");
@@ -4144,29 +4158,31 @@ export class ControlPlane {
   }
 
   markAgentInterrupted(agentId: string, expectedEpoch?: number, options: { controlledRemoteStop?: true } = {}): void {
-    const agent = this.getAgent(agentId);
-    if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
-    const rows = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(agent.missionId) as Row[];
-    for (const row of rows) {
-      const message = decode<Message>(row.data);
-      if (message.recipientId !== agentId) continue;
-      const outbox = this.db.prepare("SELECT id,status FROM outbox WHERE message_id=? ORDER BY attempt DESC LIMIT 1").get(message.id) as { id: string; status: string } | undefined;
-      const uncertain = outbox?.status !== "queued";
-      const status = uncertain ? "uncertain" : "aborted";
-      if (outbox && outbox.status !== status) this.db.prepare("UPDATE outbox SET status=? WHERE id=?").run(status, outbox.id);
-      const next = { ...message, status, error: uncertain ? "Delivery state is uncertain after interrupt" : "Delivery aborted before worker admission" };
-      this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(status, json(next), next.id);
-      this.event(agent.missionId, uncertain ? "delivery_uncertain" : "delivery_aborted", `Delivery ${next.id} ${uncertain ? "may have reached" : "was not admitted to"} the worker before interrupt.`, agentId, { messageId: next.id, attempt: next.attempt });
-    }
-    this.ensureUncertainDeliveryBlockers(agent.missionId);
-    const runtime = options.controlledRemoteStop && agent.machineId !== "local" ? this.remoteRuntimes.byAgent(agentId) : undefined;
-    // Repeated controlled stops still settle new deliveries above, but the
-    // persisted fence already rejects traffic from this runtime's old epoch.
-    const alreadyFenced = runtime?.desired === "stop" && runtime.stop_request_reason === "controlled" &&
-      runtime.machine_id === agent.machineId && runtime.stop_request_epoch === runtime.epoch &&
-      runtime.stop_fenced_epoch === agent.epoch && agent.epoch === runtime.epoch + 1;
-    this.putAgent({ ...agent, epoch: alreadyFenced ? agent.epoch : agent.epoch + 1, status: "offline", updatedAt: now() });
-    if (!alreadyFenced) this.remoteRuntimes.markControlledStopFence(agentId, agent.epoch);
+    this.transactionIfNeeded(() => {
+      const agent = this.getAgent(agentId);
+      if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
+      const rows = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(agent.missionId) as Row[];
+      for (const row of rows) {
+        const message = decode<Message>(row.data);
+        if (message.recipientId !== agentId) continue;
+        const outbox = this.db.prepare("SELECT id,status FROM outbox WHERE message_id=? ORDER BY attempt DESC LIMIT 1").get(message.id) as { id: string; status: string } | undefined;
+        const uncertain = outbox?.status !== "queued";
+        const status = uncertain ? "uncertain" : "aborted";
+        if (outbox && outbox.status !== status) this.db.prepare("UPDATE outbox SET status=?,deadline_at=NULL WHERE id=?").run(status, outbox.id);
+        const next = { ...message, status, error: uncertain ? "Delivery state is uncertain after interrupt" : "Delivery aborted before worker admission" };
+        this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(status, json(next), next.id);
+        this.event(agent.missionId, uncertain ? "delivery_uncertain" : "delivery_aborted", `Delivery ${next.id} ${uncertain ? "may have reached" : "was not admitted to"} the worker before interrupt.`, agentId, { messageId: next.id, attempt: next.attempt });
+      }
+      this.ensureUncertainDeliveryBlockers(agent.missionId);
+      const runtime = options.controlledRemoteStop && agent.machineId !== "local" ? this.remoteRuntimes.byAgent(agentId) : undefined;
+      // Repeated controlled stops still settle new deliveries above, but the
+      // persisted fence already rejects traffic from this runtime's old epoch.
+      const alreadyFenced = runtime?.desired === "stop" && runtime.stop_request_reason === "controlled" &&
+        runtime.machine_id === agent.machineId && runtime.stop_request_epoch === runtime.epoch &&
+        runtime.stop_fenced_epoch === agent.epoch && agent.epoch === runtime.epoch + 1;
+      this.putAgent({ ...agent, epoch: alreadyFenced ? agent.epoch : agent.epoch + 1, status: "offline", updatedAt: now() });
+      if (!alreadyFenced) this.remoteRuntimes.markControlledStopFence(agentId, agent.epoch);
+    });
   }
 
   authorizeAgent(agentId: string, epoch: number, missionId: string): { agent: Agent; mission: Mission; role: RoleProfile } {
