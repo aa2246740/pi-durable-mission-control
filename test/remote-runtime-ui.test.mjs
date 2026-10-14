@@ -109,6 +109,56 @@ test('failed mission shows latest worker-start diagnostic escaped at the top', (
   assert.doesNotMatch(html, /<script>|old diagnostic|unrelated/);
 });
 
+const unrecoverableExplanation = '这是远端运行时的意外或无法证明的停止。当前版本不支持可信对账，此 Mission 无法继续。请先核对远端工作区和未结清的工作，再新建 Mission。系统不会重放任何工作。';
+
+for (const reason of ['remote_runtime_unexpected_stop', 'remote_runtime_uncertain', 'remote_runtime_unproven', 'remote_runtime_rejected']) {
+  test(`${reason} explains permanent failure and disables resume accessibly`, () => {
+    const { ui } = fixture();
+    ui.state.detail.events = [
+      { type: 'worker_start_failed', data: { diagnostic: 'old', recoverable: true } },
+      { type: 'worker_start_failed', data: { diagnostic: '<script>"&\'', recoverable: false, reason } },
+      { type: 'other', data: { recoverable: true } }
+    ];
+    const html = ui.renderDetail();
+    const resume = html.match(/<button[^>]*data-action="resume"[^>]*>/)?.[0];
+    assert.ok(resume);
+    assert.match(resume, / disabled /);
+    assert.match(resume, /aria-disabled="true"/);
+    assert.match(resume, /aria-describedby="recovery-diagnostic"/);
+    assert.ok(resume.includes(`title="${unrecoverableExplanation}"`));
+    assert.ok(html.includes(`&lt;script&gt;&quot;&amp;&#39;</p>${unrecoverableExplanation}`));
+    assert.match(html, /id="recovery-diagnostic"/);
+    assert.doesNotMatch(html, /<script>|修复原因后可再次恢复/);
+  });
+}
+
+for (const recoverable of [true, undefined, 'false']) {
+  test(`latest failure with recoverable=${recoverable} keeps resume enabled and overrides older permanent failure`, () => {
+    const { ui } = fixture();
+    ui.state.detail.events = [
+      { type: 'worker_start_failed', data: { diagnostic: 'old', recoverable: false } },
+      { type: 'worker_start_failed', data: { diagnostic: 'timeout <img>"&\'', recoverable } }
+    ];
+    const html = ui.renderDetail();
+    assert.ok(html.includes('修复原因后可再次恢复'));
+    assert.ok(html.includes('timeout &lt;img&gt;&quot;&amp;&#39;'));
+    assert.doesNotMatch(html, /<img>|此 Mission 无法继续/);
+    const resume = html.match(/<button[^>]*data-action="resume"[^>]*>/)?.[0];
+    assert.ok(resume);
+    assert.doesNotMatch(resume, /disabled|aria-describedby|title=/);
+  });
+}
+
+test('permanent failure without diagnostic still explains the disabled resume button', () => {
+  const { ui } = fixture();
+  ui.state.detail.events = [{ type: 'worker_start_failed', data: { recoverable: false, reason: '<img>"&\'' } }];
+  const html = ui.renderDetail();
+  assert.ok(html.includes(unrecoverableExplanation));
+  assert.match(html, /id="recovery-diagnostic"/);
+  assert.match(html, /data-action="resume" disabled aria-disabled="true"/);
+  assert.doesNotMatch(html, /<img>|修复原因后可再次恢复/);
+});
+
 test('latest failure without diagnostic does not reuse an older diagnostic', () => {
   const { ui } = fixture();
   ui.state.detail.events = [
@@ -120,10 +170,10 @@ test('latest failure without diagnostic does not reuse an older diagnostic', () 
 
 test('non-failed missions do not show a recovery diagnostic', () => {
   const { ui } = fixture();
-  ui.state.detail.events = [{ type: 'worker_start_failed', data: { diagnostic: 'unexpected stop' } }];
+  ui.state.detail.events = [{ type: 'worker_start_failed', data: { diagnostic: 'unexpected stop', recoverable: false } }];
   for (const status of ['active', 'paused', 'completed']) {
     ui.state.detail.mission.status = status;
-    assert.doesNotMatch(ui.renderDetail(), /恢复诊断|修复原因后可再次恢复/);
+    assert.doesNotMatch(ui.renderDetail(), /恢复诊断|修复原因后可再次恢复|aria-disabled="true"|此 Mission 无法继续/);
   }
 });
 

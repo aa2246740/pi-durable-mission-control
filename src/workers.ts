@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Agent } from "./contracts.js";
-import { ControlPlane, HttpError, RemoteRuntimeStopPendingError } from "./control.js";
+import { ControlPlane, HttpError, RemoteRuntimeRecoveryError, RemoteRuntimeStopPendingError } from "./control.js";
 import { remoteWorkspacePromptFlags } from "./prompts.js";
 import type { RpcMessage } from "./worker.js";
 import { applyWorkerNotice, parseWorkerNotice } from "./worker-events.js";
@@ -129,7 +129,8 @@ export class WorkerManager {
       this.clearRemoteStopWait(agent.id);
       const profile = this.control.profile(agent.profileId);
       const secret = profile?.credentialEnv ? process.env[profile.credentialEnv] : undefined;
-      this.control.failMissionStartup(agent.missionId, sanitizeDiagnostic(error, secret));
+      this.control.failMissionStartup(agent.missionId, sanitizeDiagnostic(error, secret),
+        error instanceof RemoteRuntimeRecoveryError ? { recoverable: false, reason: error.reason } : undefined);
       await this.stopMission(agent.missionId);
       throw error;
     }).finally(() => this.starting.delete(agent.id));
@@ -179,7 +180,9 @@ export class WorkerManager {
       const diagnostic = error instanceof RemoteRuntimeStopPendingError
         ? `Prior remote runtime ${runtimeId} did not confirm its stop within ${this.remoteRuntimeStopTimeoutMs / 1000} seconds`
         : sanitizeDiagnostic(error);
-      this.control.failMissionStartup(agent.missionId, diagnostic);
+      this.control.failMissionStartup(agent.missionId, diagnostic,
+        error instanceof RemoteRuntimeRecoveryError ? { recoverable: false, reason: error.reason }
+          : error instanceof RemoteRuntimeStopPendingError ? { recoverable: true, reason: "remote_runtime_stop_timeout" } : undefined);
       await this.stopMission(agent.missionId);
       return;
     }
