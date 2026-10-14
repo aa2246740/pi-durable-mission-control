@@ -486,21 +486,21 @@ export class WorkerManager {
     const pauseSettlement = settlingHandle && settlingAgentId
       ? this.waitForLocalSettlement(missionId, settlingAgentId, settlingHandle) : undefined;
     const status = this.control.missionById(missionId)?.status;
-    if (flight.mode === "stop" && (status === "completed" || status === "cancelled")) {
-      // The completion RPC reply precedes submission.wait(). Do not close the
-      // Harness until its settlement evidence has reached the control database.
-      await Promise.all([...captured].map(async ([agentId, handle]) => {
+    // Observe settlement before stopping external operations, which can itself
+    // settle a delivery. Only the Harness gets a grace period, not workspace writes.
+    const terminalSettlement = flight.mode === "stop" && (status === "completed" || status === "cancelled")
+      ? Promise.all([...captured].map(async ([agentId, handle]) => {
         const outcome = await this.waitForLocalSettlement(missionId, agentId, handle);
         if (outcome !== "settled") this.control.recordWorkerDiagnostic(agentId, handle.epoch,
           outcome === "timeout" ? "Local delivery did not settle within 5000 ms before terminal mission shutdown"
             : "Local worker exited before terminal mission delivery settlement");
-      }));
-    }
+      })) : undefined;
     try {
       await this.control.stopMissionProcesses(missionId);
     } catch (error) {
       for (const agent of agents) this.recordDetachedFailure(agent, error);
     }
+    if (terminalSettlement) await terminalSettlement;
     for (const [agentId, handle] of this.handles) {
       const agent = this.control.getAgentPublic(agentId);
       if (!captured.has(agentId) && agent?.missionId === missionId) {
