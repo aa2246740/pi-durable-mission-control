@@ -282,6 +282,7 @@ export class ControlPlane {
         this.seedProfiles();
         this.acquireOwner();
         this.fenceRecoveredAgents();
+        this.ensureUncertainDeliveryBlockers();
         MachineRegistry.fenceOnCoordinatorStart(this.db);
         const interruptedRuntimes = this.db.prepare("SELECT runtime_id,agent_id FROM remote_worker_runtimes WHERE state IN ('queued','offered','running','stopping')")
           .all() as Array<{ runtime_id: string; agent_id: string }>;
@@ -472,7 +473,7 @@ export class ControlPlane {
       if (mission && nextStatus === "recovering") this.event(mission.id, "agent_recovering", `Agent ownership advanced to epoch ${next.epoch}.`, agent.id);
       if (remote) {
         this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL,error='Remote delivery outcome is uncertain after coordinator restart'
-          WHERE message_id IN (SELECT id FROM messages WHERE json_extract(data,'$.recipientId')=?) AND status IN ('dispatching','admitted')`).run(agent.id);
+          WHERE message_id IN (SELECT id FROM messages WHERE json_extract(data,'$.recipientId')=?) AND status IN ('dispatching','admitted','delivering','delivered')`).run(agent.id);
         this.db.prepare(`UPDATE messages SET status='uncertain',
           data=json_set(data,'$.status','uncertain','$.error','Remote delivery outcome is uncertain after coordinator restart')
           WHERE json_extract(data,'$.recipientId')=? AND (
@@ -1608,7 +1609,7 @@ export class ControlPlane {
     this.putMission(updated);
     if (action === "pause" || action === "cancel") {
       this.db.prepare("UPDATE outbox SET status='aborted' WHERE mission_id=? AND status='queued'").run(id);
-      this.db.prepare("UPDATE outbox SET status='uncertain',deadline_at=NULL WHERE mission_id=? AND status IN ('dispatching','admitted')").run(id);
+      this.db.prepare("UPDATE outbox SET status='uncertain',deadline_at=NULL WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')").run(id);
       const messages = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(id) as Row[];
       for (const row of messages) {
         const message = decode<Message>(row.data);
@@ -1617,6 +1618,7 @@ export class ControlPlane {
         this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(next.status, json(next), next.id);
         this.event(id, uncertain ? "delivery_uncertain" : "delivery_aborted", `Delivery ${next.id} ${uncertain ? "may have reached" : "was not admitted to"} the worker before ${action}.`, undefined, { messageId: next.id, attempt: next.attempt });
       }
+      this.ensureUncertainDeliveryBlockers(id);
     }
     if (action === "resume") {
       this.releaseHeldMessages(id);
@@ -3022,15 +3024,18 @@ export class ControlPlane {
   }
 
   setOutboxStatus(id: string, status: string, error?: string): void {
-    const row = this.db.prepare("SELECT mission_id,message_id,attempt FROM outbox WHERE id=?").get(id) as { mission_id: string; message_id: string; attempt: number } | undefined;
-    if (!row) return;
-    this.db.prepare("UPDATE outbox SET status=?,error=? WHERE id=?").run(status, error ?? null, id);
-    const message = this.message(row.message_id);
-    if (message) {
-      const updated = { ...message, status: status === "delivered" ? "delivered" : status, ...(error ? { error } : {}) };
-      this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(updated.status, json(updated), updated.id);
-    }
-    this.event(row.mission_id, `outbox_${status}`, `Outbox attempt ${row.attempt} ${status}.`, undefined, { messageId: row.message_id, attempt: row.attempt, error });
+    this.transactionIfNeeded(() => {
+      const row = this.db.prepare("SELECT mission_id,message_id,attempt FROM outbox WHERE id=?").get(id) as { mission_id: string; message_id: string; attempt: number } | undefined;
+      if (!row) return;
+      this.db.prepare("UPDATE outbox SET status=?,error=? WHERE id=?").run(status, error ?? null, id);
+      const message = this.message(row.message_id);
+      if (message) {
+        const updated = { ...message, status: status === "delivered" ? "delivered" : status, ...(error ? { error } : {}) };
+        this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(updated.status, json(updated), updated.id);
+      }
+      if (status === "uncertain") this.ensureUncertainDeliveryBlockers(row.mission_id);
+      this.event(row.mission_id, `outbox_${status}`, `Outbox attempt ${row.attempt} ${status}.`, undefined, { messageId: row.message_id, attempt: row.attempt, error });
+    });
   }
 
   setOutboxStatusForMessage(messageId: string, status: string, error?: string): void {
@@ -4105,10 +4110,8 @@ export class ControlPlane {
       const next = { ...message, status, error: uncertain ? "Delivery state is uncertain after interrupt" : "Delivery aborted before worker admission" };
       this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(status, json(next), next.id);
       this.event(agent.missionId, uncertain ? "delivery_uncertain" : "delivery_aborted", `Delivery ${next.id} ${uncertain ? "may have reached" : "was not admitted to"} the worker before interrupt.`, agentId, { messageId: next.id, attempt: next.attempt });
-      if (uncertain && outbox) {
-        this.insertSystemBlocker(`delivery:${outbox.id}`, agent.missionId, "delivery", `Delivery ${next.id} may have reached the worker before interruption. Reconcile it before resuming.`);
-      }
     }
+    this.ensureUncertainDeliveryBlockers(agent.missionId);
     const runtime = options.controlledRemoteStop && agent.machineId !== "local" ? this.remoteRuntimes.byAgent(agentId) : undefined;
     // Repeated controlled stops still settle new deliveries above, but the
     // persisted fence already rejects traffic from this runtime's old epoch.
@@ -5271,6 +5274,19 @@ export class ControlPlane {
       this.insertSystemBlocker(blockerId, validation.mission_id, approvalId ? "approval" : "unsafe_execution", `Validation ${validation.command_id} has no recorded terminal outcome. It will not be replayed automatically.`);
       }
     });
+  }
+
+  private ensureUncertainDeliveryBlockers(missionId?: string): void {
+    // Startup also repairs older and restored evidence without reopening a
+    // blocker that a human already resolved or changing the delivery itself.
+    const rows = this.db.prepare(`SELECT o.id,o.mission_id,o.message_id FROM outbox o
+      LEFT JOIN blockers b ON b.id='delivery:' || o.id
+      WHERE o.status='uncertain' AND b.id IS NULL AND (? IS NULL OR o.mission_id=?)`)
+      .all(missionId ?? null, missionId ?? null) as Array<{ id: string; mission_id: string; message_id: string }>;
+    for (const row of rows) {
+      this.insertSystemBlocker(`delivery:${row.id}`, row.mission_id, "delivery",
+        `Delivery ${row.message_id} may have reached the worker before interruption. Reconcile it before resuming.`);
+    }
   }
 
   private insertSystemBlocker(id: string, missionId: string, kind: Blocker["kind"], text: string): void {
