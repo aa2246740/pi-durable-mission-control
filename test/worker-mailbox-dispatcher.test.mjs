@@ -183,6 +183,72 @@ test("a closed notice does not confirm or release runtime ownership", async (t) 
   assert.throws(() => coordinator.open({ ...binding, runtimeId: "replacement-runtime" }), /owner|owns this agent/i);
 });
 
+test("a notice lifecycle microtask fences before the next RPC is claimed", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "notice",
+    notice: { type: "turn_end", agentId: binding.agentId, epoch: binding.epoch, turnId: "last-turn" }
+  }, "turn-end-notice");
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-after-turn", taskId: "task-after-turn", method: "Transcript",
+    args: { role: "assistant", text: "must not execute", entryId: "after-turn" }
+  }, "rpc-after-turn");
+  let rpcCalls = 0;
+  let statusBeforeFence;
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    isCurrent: () => coordinator.inspectBinding(binding).status === "open",
+    notice: () => {
+      void Promise.resolve().then(() => {
+        statusBeforeFence = coordinator.inspectInbox(binding).map((row) => row.status);
+        coordinator.fence(binding);
+      });
+    },
+    rpc: async (_binding, request) => {
+      rpcCalls += 1;
+      return { kind: "reply", rpcId: request.rpcId, ok: true, result: { done: true } };
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.deepEqual({
+    rpcCalls,
+    inbox: coordinator.inspectInbox(binding).map((row) => row.status),
+    outbox: coordinator.inspectOutbox(binding).length,
+    settled: coordinator.inboxSettledForStop(binding, "rpc-after-turn")
+  }, { rpcCalls: 0, inbox: ["applied", "cancelled"], outbox: 0, settled: true });
+  assert.deepEqual(statusBeforeFence, ["applied", "received"]);
+  assert.equal(coordinator.inspectBinding(binding).status, "uncertain");
+  await dispatcher.drain(binding);
+  assert.equal(rpcCalls, 0);
+});
+
+test("a notice without a lifecycle stop still drains the following RPC", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "notice", notice: { type: "ready", agentId: binding.agentId, epoch: binding.epoch }
+  }, "ready-before-rpc");
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-after-ready", taskId: "task-after-ready", method: "GetMissionState", args: {}
+  }, "rpc-after-ready");
+  const handled = [];
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    notice: (_binding, notice) => { handled.push(notice.type); },
+    rpc: async (_binding, request) => {
+      handled.push(request.method);
+      return { kind: "reply", rpcId: request.rpcId, ok: true, result: { active: true } };
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.deepEqual(handled, ["ready", "GetMissionState"]);
+  assert.deepEqual(coordinator.inspectInbox(binding).map((row) => row.status), ["applied", "applied"]);
+  assert.equal(coordinator.inspectBinding(binding).status, "open");
+  const replies = coordinator.pending(binding);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].payload.kind, "reply");
+  assert.equal(replies[0].payload.rpcId, "rpc-after-ready");
+  assert.equal(replies[0].payload.ok, true);
+  assert.equal(replies[0].payload.result.active, true);
+});
+
 test("drainAll processes a bounded backlog across successive passes", async (t) => {
   const { node, coordinator } = fixture(t);
   for (let index = 0; index < 17; index += 1) {

@@ -9,6 +9,9 @@ import { queryAppliedMailboxUploads } from "../dist/node.js";
 import { NodeWorkerSupervisor } from "../dist/node-workers.js";
 import { startServer } from "../dist/server.js";
 import { DurableWorkerMailbox } from "../dist/worker-mailbox.js";
+import { WorkerMailboxDispatcher } from "../dist/worker-mailbox-dispatcher.js";
+import { applyWorkerNotice } from "../dist/worker-events.js";
+import { WorkerManager } from "../dist/workers.js";
 
 const CREDENTIAL = "MC_NODE_SETTLEMENT_CREDENTIAL";
 process.env[CREDENTIAL] ||= "settlement-sentinel";
@@ -177,6 +180,71 @@ test("settlement query is read-only and matches applied envelope identity", asyn
     f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch, binding, envelope
   ), (error) => error.status === 409);
   assert.throws(() => ask({ ...identity, extra: true }), (error) => error.status === 400);
+});
+
+test("a turn-end lifecycle stop leaves the following RPC unexecuted and permits reassignment", async (t) => {
+  const f = fixture(t, "metadata-only", { maxTurns: 1 });
+  const binding = f.assignment.binding;
+  const nodeDb = new DatabaseSync(":memory:");
+  t.after(() => nodeDb.close());
+  const node = new DurableWorkerMailbox(nodeDb, "node");
+  node.open(binding);
+  const notice = node.enqueue(binding, {
+    kind: "notice",
+    notice: { type: "turn_end", agentId: binding.agentId, epoch: binding.epoch, turnId: "last-turn" }
+  }, "turn-end-notice");
+  const rpc = node.enqueue(binding, {
+    kind: "rpc", rpcId: "rpc-after-turn", taskId: `${f.agent.id}:after-turn`, method: "Transcript",
+    args: { role: "assistant", text: "must not execute", entryId: "after-turn" }
+  }, "rpc-after-turn");
+  for (const envelope of [notice, rpc]) f.control.workerMailbox.receive(binding, envelope);
+  const workers = new WorkerManager(f.control);
+  let lifecycle;
+  let rpcCalls = 0;
+  const dispatcher = new WorkerMailboxDispatcher({
+    mailbox: f.control.workerMailbox,
+    isCurrent: () => f.control.workerMailbox.inspectBinding(binding).status === "open" &&
+      f.control.getAgentPublic(f.agent.id).epoch === binding.epoch,
+    canDispatch: () => true,
+    notice: (_binding, incoming) => {
+      const result = applyWorkerNotice(f.control, f.control.getAgentPublic(f.agent.id), incoming, (value) => value);
+      assert.equal(result.lifecycleSync, true);
+      lifecycle = Promise.resolve().then(() => workers.syncMissionLifecycle(f.mission.id));
+    },
+    rpc: async (_binding, request) => {
+      rpcCalls += 1;
+      const result = await f.control.workerCommand({
+        type: "rpc", id: request.rpcId, token: "", agentId: f.agent.id, epoch: binding.epoch,
+        method: request.method, taskId: request.taskId, args: request.args
+      });
+      return { kind: "reply", rpcId: request.rpcId, ok: true, result };
+    }
+  });
+  await dispatcher.drain(binding);
+  assert.ok(lifecycle);
+  await lifecycle;
+  assert.deepEqual({
+    rpcCalls,
+    inbox: f.control.workerMailbox.inspectInbox(binding).map((item) => item.status),
+    outbox: f.control.workerMailbox.inspectOutbox(binding).length,
+    settled: f.control.workerMailbox.inboxSettledForStop(binding, rpc.messageId)
+  }, { rpcCalls: 0, inbox: ["applied", "cancelled"], outbox: 0, settled: true });
+  assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+  assert.deepEqual(f.control.transcript(f.agent.id), []);
+  assert.equal(f.control.workerMailbox.inspectInbox(binding).every((item) =>
+    f.control.workerMailbox.inboxSettledForStop(binding, item.envelope.messageId)), true);
+  reportControlledStop(f);
+  f.control.updateMissionLimits(f.mission.id, 4);
+  f.control.missionAction(f.mission.id, "resume");
+  f.control.nodePoll(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId, f.session.sessionEpoch);
+  const before = snapshot(f);
+  const next = f.control.assignRemoteRuntime(f.agent.id);
+  assert.notEqual(next.binding.runtimeId, binding.runtimeId);
+  assert.equal(f.control.workerMailbox.inspectBinding(binding).status, "closed");
+  assertNoReplay(f, before, next);
+  await dispatcher.drain(binding);
+  assert.equal(rpcCalls, 0);
+  await dispatcher.close();
 });
 
 test("uncertain reply to an applied transcript does not block reassignment or replay", async (t) => {
