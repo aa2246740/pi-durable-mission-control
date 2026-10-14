@@ -134,7 +134,7 @@ test("completion scenario executes confirmed graceful restart then crash restart
   assert.deepEqual(scenario.evidence.snapshots.map(({ label }) => label), ["before-restart", "after-SIGTERM", "after-SIGKILL"]);
 });
 
-test("running restart records read-only inspection, individual resolutions and rejected resume before fail-closed assertion", async () => {
+test("restart records operator reconciliation and accepts irrecoverable only for SIGKILL", async () => {
   for (const name of ["coordinator-restart", "coordinator-restart-kill"]) {
     const value = fixture();
     value.detail.blockers.push({ id: "delivery-blocker", kind: "delivery", text: "uncertain delivery", status: "open" });
@@ -154,13 +154,18 @@ test("running restart records read-only inspection, individual resolutions and r
         value.detail.events.push({ type: "worker_start_failed", data: { recoverable: false, reason: "remote_runtime_unproven", diagnostic: "controlled stop cannot be proven" } });
         return { status: 409, body: { error: "controlled stop cannot be proven" } };
       } });
-    let result;
-    for (let count = 0; count < 5; count++) result = await scenario.observe(value.detail);
-    assert.equal(result.mission.status, "failed");
+    for (let count = 0; count < 4; count++) assert.equal(await scenario.observe(value.detail), false);
+    if (name === "coordinator-restart") {
+      await assert.rejects(scenario.observe(value.detail), /Confirmed graceful stop must allow explicit resume/);
+      assert.equal(scenario.evidence.assertions, undefined);
+    } else {
+      const result = await scenario.observe(value.detail);
+      assert.equal(result.mission.status, "failed");
+      assert.equal(scenario.evidence.assertions.outcome, "irrecoverable");
+    }
     assert.deepEqual(signals, [name.endsWith("kill") ? "SIGKILL" : "SIGTERM"]);
     assert.deepEqual(calls.map(({ path }) => path), ["/api/missions/mission/export", "/api/blockers/runtime-blocker/resolve", "/api/blockers/delivery-blocker/resolve", "/api/missions/mission/resume"]);
     assert.equal(scenario.evidence.humanActions.at(-1).status, 409);
-    assert.equal(scenario.evidence.assertions.outcome, "irrecoverable");
   }
 });
 

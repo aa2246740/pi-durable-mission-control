@@ -40,7 +40,7 @@ summary 必须同时满足 Mission completed、任务 accepted、验收 exitCode
 
 ```sh
 mkdir -p .acceptance-proof
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario restart-after-complete --keep --out "$PWD/.acceptance-proof/restart-complete-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-g1-astra- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario restart-after-complete --keep --out "$PWD/.acceptance-proof/restart-complete-1"
 ```
 
 每次重启后核对 Mission 与 orchestrator ID、completed 状态、accepted 任务、验收回执的完整 JSON、artifact 下载 SHA-256 与 Content-Disposition、零开放 blocker、closed runtime 及停止来源。runtime 数量和 binding 保持原样，没有分配或重分配事件，mock 模型请求计数不增加。旧 mailbox 可以保留重启前已经存在的 uncertain 状态；全部字段及 transport 必须保持原样，binding 不能重新变成 open。
@@ -52,22 +52,24 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" no
 `--scenario coordinator-restart` 在远端 worker 第一次 Linux 自查成功后、发布之前暂停 mock 的后续发布决策，等待实际 WaitForMessage 上传结清，再对协调端发送 SIGTERM。`--scenario coordinator-restart-kill` 在同一个位置使用 SIGKILL。两个场景各运行一次独立 Mission，均使用原协调端 home 重启，并按上面的方式显式重连原容器中的节点。
 
 ```sh
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart --keep --out "$PWD/.acceptance-proof/restart-running-term-1"
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart-kill --keep --out "$PWD/.acceptance-proof/restart-running-kill-1"
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/coordinator-restart-container.test.mjs
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-g1-astra- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart --keep --out "$PWD/.acceptance-proof/restart-running-term-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-g1-astra- TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart-kill --keep --out "$PWD/.acceptance-proof/restart-running-kill-1"
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-g1-astra- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/coordinator-restart-container.test.mjs
 ```
 
-容器自测顺序运行这三个新场景各两次，最后再运行 default；即使前一次失败也保存结果并继续。任一次场景或清理失败，整个自测非零退出。该自测不进入 `npm test`。
+容器自测顺序运行这三个场景各两次，最后再运行 default、pause-resume 各一次；即使前一次失败也保存结果并继续。任一次场景或清理失败，整个自测非零退出。该自测不进入 `npm test`。
 
 运行中场景按产品实际状态检查安全边界，再模拟运营者执行 README 的正规流程。脚本先 GET 导出，检查 Linux 文件仍为原始 version 1，核对成功的写入与自查回执、runtime、mailbox 和投递，再逐个 POST resolve 开放 blocker，最后 POST resume。每一步保存请求方法、路径、正文、HTTP 状态和响应。脚本只读取状态库，不修改任务、旧 runtime、mailbox、投递或 effect，也不直接发送新的工作指令。
 
-可接受结局写入 summary 的 `outcome`。`recovered` 要求恰好一次重分配、同 worker 与同节点、epoch 严格递增、发布在新 runtime 上，并通过 pause-resume 共用的不重放断言。`irrecoverable` 要求 Mission failed、恰好一个 worker_start_failed，且带 `recoverable: false`、机器可读 reason 和非空 diagnostic。此时旧 binding、mailbox、effect、投递和消息必须保持运营者操作前的状态，worker 工具调用不能增加。effect 或投递重放、无证据的新 runtime、active 且没有 blocker 或诊断、重复生成 blocker、resume 后没有终局诊断的停滞都会使场景非零退出并保留证据。
+正常停止会暂停有运行中远端 runtime 的 Mission，持久化受控停止请求并标记中断投递；节点接口在确认期间继续开放。所有 runtime 共用默认 5 秒的等待上限，可用 `MC_REMOTE_SHUTDOWN_TIMEOUT_MS` 设置为 1 至 10000 毫秒。关闭期间管理员写请求返回 503。换新 runtime 时会原子地创建一条新的系统恢复通知，让 worker 读取持久化历史并继续待办工作；旧投递不重放。只有退出前取得完整的 closed/controlled 证据，重启后才保留恢复资格；超时后到达的报告不能恢复资格。没有运行中远端 runtime 的 Mission 保持原有关闭行为。
+
+结局写入 summary 的 `outcome`。`coordinator-restart` 必须为 `recovered`，`coordinator-restart-kill` 必须为 `irrecoverable`。`recovered` 要求恰好一次重分配、同 worker 与同节点、epoch 严格递增、发布在新 runtime 上，并通过 pause-resume 共用的不重放断言。`irrecoverable` 要求 Mission failed、恰好一个 worker_start_failed，且带 `recoverable: false`、机器可读 reason 和非空 diagnostic。此时旧 binding、mailbox、effect、投递和消息必须保持运营者操作前的状态，worker 工具调用不能增加。effect 或投递重放、无证据的新 runtime、active 且没有 blocker 或诊断、重复生成 blocker、resume 后没有终局诊断的停滞都会使场景非零退出并保留证据。
 
 `coordinator-restart.json` 保存重启前后与每步运营者操作的只读快照，包括 mission detail、runtimes、blockers、mock 请求计数、工具记录、完整 mailbox binding 和 transport。还保留 `mission-export.json`、每次协调端日志及节点重连日志。`summary.json` 只摘录结局与 HTTP 结果，完整 GET 响应留在场景证据中。
 
 2026-10-15 在 `orch/s1-gpt`、基线 `2dbe991` 上，运行中 SIGTERM 与 SIGKILL 重启均实测为 `irrecoverable`：重启后 Mission blocked，旧 runtime closed，stopProvenance uncertain，mailbox uncertain。唯一开放 blocker 的文本为 `Remote runtime ownership became uncertain after coordinator restart. Reconcile ownership and in-flight work before resuming.`。GET 导出与 resolve 返回 200，resolve 后 Mission paused；resume 返回 409 `Prior remote runtime <id>: uncertain runtime report; trusted reconciliation is required`，随后 Mission failed，worker_start_failed 带 `recoverable: false`、`reason: remote_runtime_uncertain` 和同一 diagnostic。没有新 runtime、发布或重放，mock 请求计数保持 19。
 
-这是当前产品明确拒绝恢复的结局。`src/control.ts:303` 在启动时封锁尚未终结的 runtime，`src/control.ts:1073` 拒绝 uncertain 停止来源，`src/workers.ts:132` 将该拒绝保存为不可恢复的启动失败，`src/control.ts:4111` 输出不支持 trusted reconciliation 的诊断。场景按这个边界判断通过，不能把它报告成运行中任务恢复完成。
+以上和下表是 G1 修改前的历史结果。该基线明确拒绝恢复。`src/control.ts:303` 在启动时封锁尚未终结的 runtime，`src/control.ts:1073` 拒绝 uncertain 停止来源，`src/workers.ts:132` 将该拒绝保存为不可恢复的启动失败，`src/control.ts:4111` 输出不支持 trusted reconciliation 的诊断。场景按这个边界判断通过，不能把它报告成运行中任务恢复完成。
 
 逐次运行结果如下，耗时包括清理。首轮六个新场景均因验收钩子缺少可选调用而在重启前失败；第二轮完成后场景的两次失败来自脚本误要求旧 mailbox 必须 closed，实际重启前后都保持 uncertain。已修正为完整 binding 不变且没有重开。第二轮运行中四次均通过。最终轮七次全部通过，所有轮次的清理验证均通过。
 
@@ -78,12 +80,26 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-s1-gpt- TMPDIR="$PWD/.acceptance-proof" no
 | coordinator-restart-kill | 失败 14.404s、失败 14.418s | 通过 28.183s、通过 33.978s | 通过 16.944s、通过 24.717s |
 | default | 通过 17.936s | 通过 18.286s | 通过 17.849s |
 
-已完成 Mission 重启后仍新增通用的 `remote_runtime_uncertain` 事件，这是 `src/control.ts:499` 对远端 agent 的启动记录。实测 runtime 与停止来源仍为 closed/controlled，未生成开放 blocker，不能用这个通用事件推断 runtime 已重新运行。
+上述旧基线在已完成 Mission 重启后仍新增通用的 `remote_runtime_uncertain` 事件，这是 `src/control.ts:499` 对远端 agent 的启动记录。实测 runtime 与停止来源仍为 closed/controlled，未生成开放 blocker，不能用这个通用事件推断 runtime 已重新运行。
 
 最终完成后场景的 mock 请求数始终为 31，runtime closed/controlled，开放 blocker 为 0，回执与下载不变；运行中四次均为 closed/uncertain 和不可恢复结局，mock 请求数始终为 19，写入、自查各一次，发布为 0，旧 mailbox、effect、投递与消息在恢复操作后完整不变。default 为 completed/accepted。这里只验证此 mock 时序与同 home 重启，没有真实模型、浏览器或 launchd 验收。
 
 结果索引：`.acceptance-proof/coordinator-restart-results-1792006113253.json`、`.acceptance-proof/coordinator-restart-results-1792006293188.json`、`.acceptance-proof/coordinator-restart-results-1792006541916.json`.
 
+
+G1 在基线 `18a3cbb` 上完成以下 mock 容器验证。首轮正常重启已成功分配新 runtime，但缺少恢复输入，resume 后停在 active。补上与重分配原子提交的单次系统恢复通知后，最终轮 8 次全部通过。所有轮次均验证本次容器已清理。耗时包含清理。
+
+| 场景 | G1 开发轮 | G1 最终轮 |
+| --- | --- | --- |
+| restart-after-complete | 通过 28.677s、通过 29.002s | 通过 25.486s、通过 26.466s |
+| coordinator-restart | 失败 32.492s、失败 25.360s | 通过 27.194s、通过 26.276s |
+| coordinator-restart-kill | 通过 19.317s、通过 17.770s | 通过 16.678s、通过 17.276s |
+| default | 通过 17.407s | 通过 17.526s |
+| pause-resume | 通过 24.055s | 通过 23.293s |
+
+最终轮正常重启两次均为 `recovered`，单次换新 runtime、epoch 递增、新 runtime 发布且无重放；SIGKILL 两次均为 `irrecoverable`。完成后重启的回执、下载与 runtime 保持不变，default 和 pause-resume 均完成。节点仍按本节描述显式重连，本次没有修改节点连接代码，也没有真实模型或浏览器验收。
+
+G1 结果索引：`.acceptance-proof/coordinator-restart-results-1792009157566.json`、`.acceptance-proof/coordinator-restart-results-1792009453934.json`。
 
 ### 中途暂停、回答与恢复
 

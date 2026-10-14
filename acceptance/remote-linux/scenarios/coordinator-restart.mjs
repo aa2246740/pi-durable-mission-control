@@ -196,8 +196,12 @@ export function createCoordinatorRestartScenario(name) {
         return false;
       });
       evidence.snapshots.push({ label: "after-operator-recovery", ...final });
-      if (final.detail.mission.status === "failed") evidence.assertions = assertIrrecoverableRestart(after, final, evidence);
-      else evidence.assertions = { outcome: "recovered", ...context.assertRecovered(final, evidence) };
+      if (name === "coordinator-restart-kill") evidence.assertions = assertIrrecoverableRestart(after, final, evidence);
+      else {
+        assert.equal(result.status, 200, "Confirmed graceful stop must allow explicit resume");
+        assert.equal(final.detail.mission.status, "completed", "Graceful restart must recover");
+        evidence.assertions = { outcome: "recovered", ...context.assertRecovered(final, evidence) };
+      }
       context.save();
       return final.detail;
     }

@@ -6,13 +6,13 @@ import { test } from "node:test";
 import { run } from "./run.mjs";
 import { restartScenarios } from "./scenarios/coordinator-restart.mjs";
 
-test("coordinator restart scenarios run twice each, then default, preserving every result", { timeout: 1500000 }, async () => {
-  assert.equal(process.env.MC_ACCEPTANCE_CONTAINER_PREFIX, "mc-acc-s1-gpt-", "Use the task-owned container prefix");
+test("coordinator restart scenarios run twice each, then default and pause-resume, preserving every result", { timeout: 1500000 }, async () => {
+  assert.equal(process.env.MC_ACCEPTANCE_CONTAINER_PREFIX, "mc-acc-g1-astra-", "Use the task-owned container prefix");
   const parent = join(process.cwd(), ".acceptance-proof");
   mkdirSync(parent, { recursive: true });
   const stamp = Date.now();
   const results = [];
-  for (const scenario of [...restartScenarios.flatMap((name) => [name, name]), "default"]) {
+  for (const scenario of [...restartScenarios.flatMap((name) => [name, name]), "default", "pause-resume"]) {
     const attempt = results.filter((result) => result.scenario === scenario).length + 1;
     const proof = join(parent, `${scenario}-${stamp}-${attempt}`);
     const started = Date.now();
@@ -32,6 +32,7 @@ test("coordinator restart scenarios run twice each, then default, preserving eve
   assert.ok(results.every((result) => result.cleanupVerified === true));
   for (const result of results) {
     if (result.scenario === "restart-after-complete") assert.equal(result.coordinatorRestart.missionStatus, "completed");
-    if (result.scenario.startsWith("coordinator-restart")) assert.ok(["irrecoverable", "recovered"].includes(result.outcome));
+    if (result.scenario === "coordinator-restart") assert.equal(result.outcome, "recovered");
+    if (result.scenario === "coordinator-restart-kill") assert.equal(result.outcome, "irrecoverable");
   }
 });

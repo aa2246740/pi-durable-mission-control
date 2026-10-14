@@ -394,6 +394,7 @@ export class WorkerManager {
   }
 
   async dispatchPending(): Promise<void> {
+    if (this.closing) return;
     for (const row of this.control.pendingOutbox()) {
       const message = this.control.message(row.message_id);
       if (this.control.missionById(row.mission_id)?.status !== "active") continue;
@@ -728,6 +729,37 @@ export class WorkerManager {
     } catch (error) {
       this.recordDetachedFailure(agent, error);
     }
+  }
+
+  async prepareCoordinatorShutdown(timeoutMs: number): Promise<void> {
+    this.closing = true;
+    for (const agentId of this.remoteStopWaits.keys()) this.clearRemoteStopWait(agentId);
+    const pending = new Set<string>();
+    for (const mission of this.control.state().missions) {
+      const assignments = this.control.listAgents(mission.id).flatMap((agent) => {
+        const runtime = agent.machineId !== "local" ? this.control.remoteRuntimes.activeForAgent(agent.id) : undefined;
+        return runtime ? [{ agent, runtime }] : [];
+      });
+      if (!assignments.length) continue;
+      if (["active", "validating"].includes(mission.status)) {
+        this.control.pauseForCoordinatorShutdown(mission.id, assignments.map(({ runtime }) => runtime.runtime_id));
+      }
+      for (const { agent, runtime } of assignments) {
+        this.control.requestRemoteRuntimeStop(agent.id);
+        this.control.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
+        pending.add(runtime.runtime_id);
+      }
+    }
+    // Keep the node listener alive until confirmation or the shared deadline.
+    const deadline = Date.now() + timeoutMs;
+    while (pending.size) {
+      for (const runtimeId of pending) {
+        if (this.control.confirmedRemoteRuntimeStop(runtimeId)) pending.delete(runtimeId);
+      }
+      if (!pending.size || Date.now() >= deadline) break;
+      await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(25, deadline - Date.now())));
+    }
+    for (const runtimeId of pending) this.control.fenceUnconfirmedRemoteStop(runtimeId);
   }
 
   async close(): Promise<void> {

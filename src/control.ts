@@ -508,7 +508,7 @@ export class ControlPlane {
       const next = { ...agent, status: nextStatus as Agent["status"], epoch: row.epoch + 1, updatedAt: now() };
       this.db.prepare("UPDATE agents SET status=?,epoch=?,data=? WHERE id=?").run(next.status, next.epoch, json(next), row.id);
       if (mission && nextStatus === "recovering") this.event(mission.id, "agent_recovering", `Agent ownership advanced to epoch ${next.epoch}.`, agent.id);
-      if (remote) {
+      if (remote && !this.confirmedRemoteRuntimeStop(this.remoteRuntimes.byAgent(agent.id)?.runtime_id)) {
         this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL,error='Remote delivery outcome is uncertain after coordinator restart'
           WHERE message_id IN (SELECT id FROM messages WHERE json_extract(data,'$.recipientId')=?) AND status IN ('dispatching','admitted','delivering','delivered')`).run(agent.id);
         this.db.prepare(`UPDATE messages SET status='uncertain',
@@ -1074,8 +1074,23 @@ export class ControlPlane {
       });
       const assigned = this.remoteRuntimes.assign(descriptor);
       this.workerMailbox.open(binding);
-      if (prior) this.event(mission.id, "remote_runtime_reassigned", "A clean controlled stop allowed a new remote runtime assignment.", agentId,
-        { previousRuntimeId: prior.runtime_id, runtimeId: binding.runtimeId });
+      if (prior) {
+        this.event(mission.id, "remote_runtime_reassigned", "A clean controlled stop allowed a new remote runtime assignment.", agentId,
+          { previousRuntimeId: prior.runtime_id, runtimeId: binding.runtimeId });
+        const coordinatorStop = this.db.prepare(`SELECT 1 FROM events, json_each(events.data,'$.data.runtimeIds') AS stopped
+          WHERE events.mission_id=? AND events.type='coordinator_stopping' AND stopped.value=? LIMIT 1`).get(mission.id, prior.runtime_id);
+        if (coordinatorStop) {
+          const message: Message = {
+            id: `coordinator-resume:${prior.runtime_id}`, missionId: mission.id, senderId: "system:coordinator", recipientId: agentId,
+            content: "Coordinator restart recovery: Read GetMissionState and your durable history. Continue pending work after the operator's reconciliation and explicit resume. Do not repeat completed operations or replay interrupted inputs.",
+            mode: "followUp", status: "queued", attempt: 1, createdAt: now()
+          };
+          this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
+          this.enqueue(message);
+          this.event(mission.id, "coordinator_resume_queued", "Queued one recovery notification for the replacement remote runtime.", agentId,
+            { messageId: message.id, previousRuntimeId: prior.runtime_id, runtimeId: binding.runtimeId });
+        }
+      }
       return { binding, descriptor, descriptorHash: workerStartSpecHash(descriptor), existing: assigned.existing };
     });
   }
@@ -1097,9 +1112,8 @@ export class ControlPlane {
       (agent.epoch === runtime.epoch || (agent.epoch === runtime.epoch + 1 && runtime.stop_fenced_epoch === agent.epoch)) &&
       runtime.stop_provenance === "unproven" && runtime.last_report_json === null;
     if (!stopPending && (runtime.state !== "closed" || runtime.desired !== "stop")) refuse("stop has not been confirmed", "remote_runtime_unproven");
-    if (!stopPending && runtime.stop_provenance !== "controlled") refuse("controlled stop cannot be proven from persisted evidence", "remote_runtime_unproven");
+    if (!stopPending && !this.confirmedRemoteRuntimeStop(runtime.runtime_id)) refuse("controlled stop cannot be proven from persisted evidence", "remote_runtime_unproven");
     const binding = parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)).binding;
-    if (!stopPending && (!runtime.last_report_json || JSON.parse(runtime.last_report_json).outcome !== "stopped")) refuse("missing stopped report", "remote_runtime_unproven");
     let mailboxStatus: string;
     try { mailboxStatus = this.workerMailbox.inspectBinding(binding).status; }
     catch { return refuse("mailbox binding evidence is missing"); }
@@ -1162,6 +1176,32 @@ export class ControlPlane {
 
   remoteRuntimeReady(binding: WorkerBinding): boolean {
     return this.remoteRuntimes.markReady(binding);
+  }
+
+  pauseForCoordinatorShutdown(missionId: string, runtimeIds: string[]): void {
+    this.missionAction(missionId, "pause");
+    this.event(missionId, "coordinator_stopping", "Mission paused for normal coordinator shutdown.", undefined, { runtimeIds });
+  }
+
+  confirmedRemoteRuntimeStop(runtimeId: string | undefined): boolean {
+    const runtime = runtimeId ? this.remoteRuntimes.byRuntime(runtimeId) : undefined;
+    if (!runtime || runtime.state !== "closed" || runtime.desired !== "stop" ||
+        runtime.stop_provenance !== "controlled" || runtime.stop_request_reason !== "controlled" ||
+        runtime.stop_request_epoch !== runtime.epoch || !runtime.last_report_json) return false;
+    const report = decode<{ outcome: string; stopReason?: string }>(runtime.last_report_json);
+    return report.outcome === "stopped" && report.stopReason === "requested";
+  }
+
+  fenceUnconfirmedRemoteStop(runtimeId: string): void {
+    const runtime = this.remoteRuntimes.byRuntime(runtimeId);
+    if (!runtime || this.confirmedRemoteRuntimeStop(runtimeId)) return;
+    this.remoteRuntimes.requestStop({
+      runtimeId, machineId: runtime.machine_id, sessionId: runtime.session_id,
+      sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
+    }, "ownership-lost");
+    const agent = this.getAgent(runtime.agent_id);
+    if (agent) this.event(agent.missionId, "coordinator_stop_unconfirmed",
+      "Coordinator shutdown deadline expired without a controlled remote stop confirmation; recovery remains fail-closed.", agent.id, { runtimeId });
   }
 
   requestRemoteRuntimeStop(agentId: string): boolean {
