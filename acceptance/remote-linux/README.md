@@ -59,7 +59,7 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-i1-gpt- node --test acceptance/remote-linu
 mock 模式可用 `--scenario worker-crash`。默认场景和 `pause-resume` 不变，真实模型模式不接受此场景。
 
 ```sh
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l2-grok- node acceptance/remote-linux/run.mjs --scenario worker-crash --keep --out "$PWD/.acceptance-proof/worker-crash-1"
+node acceptance/remote-linux/run.mjs --scenario worker-crash --keep --out "$PWD/.acceptance-proof/worker-crash-1"
 ```
 
 证据父目录须事先创建。worker 第一次 Linux bash 自查成功后只调用 WaitForMessage，不发布。脚本看到 `LINUX-SELF-CHECK-OK` 回执、worker 已回到 WaitForMessage、且尚无 artifact 后，再等几个轮询让节点 supervisor 离开当次 mailbox，然后用 `container exec` 在容器内读取 `/proc`：只选择命令行以 `/worker.js` 结尾、且父进程是唯一的 `cli.js node` supervisor 的那个进程，对它 `kill -9`。不杀 supervisor、bootstrap 或当前 exec。定位依据、PID、命令行、supervisor PID 和信号结果写入 `worker-crash.json`。
@@ -71,10 +71,36 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l2-grok- node acceptance/remote-linux/run.
 连续 3 次可运行独立容器自测，证据留在当前 worktree 的 `.acceptance-proof/`。它不进入 `npm test`：
 
 ```sh
-MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-l2-grok- node --test acceptance/remote-linux/worker-crash-container.test.mjs
+node --test acceptance/remote-linux/worker-crash-container.test.mjs
 ```
 
 2026-10-14 在 `orch/l2-grok`、基线 `b9e4d4c` 上实测：worker-crash 连续 3/3 通过，耗时 18.606、15.789、14.898 秒（含清理）。3 次停止来源都是 unexpected，runtime 为 closed，Mission failed，artifacts 为 0，effect receipt 为 2，resume 返回 409，diagnostic 说明 unexpected stop，没有 `remote_runtime_reassigned`，清理均通过，无残留容器。同前缀接着跑的 default 1/1 通过，18.351 秒，Mission completed。此前一轮连续运行的第 3 次在杀掉 worker 后，节点 supervisor 打印 `Node connection failed` 并退出，runtime 留在 stopping/unproven，Mission 仅 blocked，没有进入 resume；脚本现已把这种情况立即判失败。上面的 3/3 不包含那一次。这只验证此 mock 时序。
+
+### 远端 worker 的轮次上限与恢复
+
+mock 模式新增 `--scenario turn-limit`，真实模型模式拒绝该场景。`maxTurns` 固定计算为 16：orchestrator 设置任务和成员、发送消息与等待共 11 轮，validator 初次读取状态与等待共 2 轮，worker 读取状态、写文件与选择 Linux 自查共 3 轮。场景将 worker 的首次状态读取等到任务分配完成；orchestrator 的发送消息响应则等到 Linux bash 已完成内容自查。bash 在退出前通过随机 mock 路径同步，等最后一次本地模型准入占满预算。该本地响应暂不返回，避免本地 turn_end 提前触发停止；bash 退出并落库自查回执后，下一次远端 worker AdmitTurn RPC 必须触顶。同步只用于脚本化 mock，不修改产品状态库或产品代码。
+
+```sh
+mkdir -p .acceptance-proof
+TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario turn-limit --keep --out "$PWD/.acceptance-proof/turn-limit-1"
+TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/turn-limit-container.test.mjs
+```
+
+容器自测顺序运行 turn-limit 三次、default 一次、pause-resume 一次；逐次保存结果、完整耗时、清理结果和证据路径，即使前一次失败也继续其余场景，最后有任一次失败便非零退出。它不属于 `npm test`。
+
+`turn-limit.json` 保存同步点、blocked 快照、物理停止回报、只读读取 control.sqlite 的 transport、触顶 RPC 与拒绝回复、Linux 自查回执及每次运营者动作。触顶事件必须匹配旧 runtime binding 的 agentId、epoch、generationId，协调端 inbox 必须为 applied，并有唯一落库拒绝回复；旧 runtime 必须 closed 且 stopProvenance 为 controlled。脚本通过 PATCH 将 maxTurns 从 16 提到 96，再逐个解决开放的 blocker，然后按需 resume。对 delivery blocker，先核对其精确 outbox attempt、对应 uncertain 消息、受控停止回报、写入与 Linux 自查成功回执及尚未发布的状态，将真实核对结论写入 resolution 和证据；limit blocker 则记录调高后的预算。无法核对的 blocker 使场景非零退出。每次动作记录方法、路径、正文、时间、响应或完整错误，人工动作不改变任务状态，也不直接给 worker 发指令。
+
+恢复后团队没有待处理输入、没有忙碌 agent，且事件序列连续 2 秒不变时，脚本最多给 orchestrator 发一条普通 followUp 消息，请其读取状态并继续；方法、路径、消息和响应写入 humanActions。消息发出后再次持续空闲 10 秒便记录完整停滞快照和只读 transport，并非零退出。
+
+成功要求出现恰好一个 remote_runtime_reassigned，同节点、同 worker、epoch 递增，最终 completed，并通过 pause-resume 共用的 effect、投递、工具调用和历史 mailbox 不重放检查。额外逐条比对已对账投递的完整 outbox 与消息，要求保持原来的 uncertain 状态和 attempt，不发生重放。恢复拒绝、worker_start_failed、Mission failed、剩余 blocker 或停滞均使脚本非零退出，保留 mission-export.json、runtimes.json 和全部拒绝证据。产品是否生成 limit blocker 如实记录。
+
+2026-10-14 在 `orch/l1-gpt`、基线 `b9e4d4c` 上连续运行：turn-limit 三次均非零退出，完整耗时为 16.469、16.449、16.279 秒；default 通过，23.054 秒；pause-resume 通过，23.647 秒。五次清理均通过。三次 turn-limit 都有 Linux 自查回执 seq 72，随后远端 worker 拒绝事件 seq 74，触顶 RPC 的协调端 inbox 为 applied，旧 runtime 为 closed/controlled。PATCH 将 maxTurns 提到 96 成功，resume 返回 HTTP 409 `Resolve mission blockers before resuming`，Mission 保持 blocked，没有新 runtime。
+
+此基线的 `admitTurn` 在触顶时只保存 generation denial、设置 blocked 并记录事件，没有插入 limit blocker；停止过程则将仍在执行的投递记为 uncertain 并生成三个 delivery blocker，其中一个属于场景故意保留的本地模型请求。脚本保存全部原因，并按授权范围保留这些 blocker。第一轮因此只完成 RPC 回复落库验收；恢复、epoch 递增、最终 completed 和恢复后不重放当时尚未通过。第二轮合并 `orch/int@90ea9a6` 的 M1 修复后，按上述运营者对账流程重新验收；场景实现未编辑 src/。
+
+2026-10-15 第二轮在合并 `orch/int@90ea9a6` 后实测：turn-limit 连续 3/3 通过，完整耗时为 24.101、22.837、22.927 秒；default 通过，17.546 秒；pause-resume 通过，23.291 秒。五次清理均通过。三次 turn-limit 都由远端 worker 的 AdmitTurn 在自查后触顶，inbox 为 applied，旧 runtime 为 closed/controlled；运营者执行 PATCH、逐个对账解决三个 delivery blocker、resume，共五次动作，无须额外消息。恢复后同节点、同 worker 的新 runtime epoch 均从 2 提到 4，Mission completed，四个 effect permit/receipt 各出现一次，write_file 一次、bash 两次、PublishArtifact 一次，七个 durable delivery attempt 都为 1。三个已对账投递的完整 outbox 和消息在结束时与恢复前完全相同，仍为 uncertain；历史 mailbox/effect 未改变，独立冻结快照复核通过。证据索引为当前 worktree 的 `.acceptance-proof/turn-limit-results-1791997222290.json`。
+
+开发阶段首轮恢复已成功，但旧 mock 在任务进入 review 后再次读取状态时错误要求 running，导致脚本失败；现已修正为等待，并补充单测。该开发运行耗时 21.370 秒，修正后开发复核通过，29.045 秒。上述容器运行均在旧 runtime 停止确认后 resume；未用此场景覆盖停止报告尚未返回时的等待分支，也未实际触发可选的 orchestrator 普通消息分支，该分支由单测覆盖。
 
 普通 `npm test` 包含 mock 协议与决策单元测试，不启动 Apple Container。容器验收测试单独运行：
 
