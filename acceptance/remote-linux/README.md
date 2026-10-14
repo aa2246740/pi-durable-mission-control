@@ -33,6 +33,26 @@ orchestrator 从 GetMissionState 读取真实角色、任务、workspace、agent
 
 summary 必须同时满足 Mission completed、任务 accepted、验收 exitCode 0、snapshotIntegrity true、remote-snapshot、Linux machine provenance、正确下载文件名、成功 Linux PATH 自查、发布后原文件变化、没有 blocker、validator 未调用 RequestUserInput，才算通过。修改原文件后仍通过冻结内容测试证明读取的是发布快照。
 
+### 中途暂停、回答与恢复
+
+mock 模式可用 `--scenario pause-resume`；省略时仍走原来的正常完成场景，真实模型模式不接受此场景。
+
+```sh
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-i1-gpt- node acceptance/remote-linux/run.mjs --scenario pause-resume --keep --out "$PWD/.acceptance-proof/pause-1"
+```
+
+证据父目录须事先创建。worker 第一次 Linux bash 自查成功后调用 Report，然后 WaitForMessage。orchestrator 收到报告后调用 RequestUserInput，Mission 进入 blocked，产品请求停止远端 runtime。脚本只等待物理停止回报，不等待 mailbox 全部结清，也不修改 transport 状态。随后脚本作为人通过 `/api/blockers/<id>/resolve` 回答该 user_input blocker；只有产品仍为 paused 且无开放 blocker 时才显式 resume。这是此场景唯一的人工干预，路径、回答、时间和可选 resume 均写入 `pause-resume.json`。
+
+成功要求恰好一个 remote_runtime_reassigned 事件、新 runtimeId、epoch 严格递增、原节点与原 worker、发布在新 runtime 上完成，以及原有冻结快照验收通过。四个 effect permit/receipt 必须各出现一次，worker 写入、自查、发布、修改各执行一次，投递同一 attempt 的状态回执不能重复，历史 mailbox/effect 记录不得改变。`pause-resume.json` 保存回答前后只读查询的 mailbox、投递和 effect 证据；`mission-export.json` 保存完整导出。回答后严格门槛拒绝恢复、worker_start_failed、其他 blocker 或超时都以非零退出，保留事件诊断、blocker、runtime 与 transport 原因，不解除其他 blocker。
+
+此场景故意在 worker 刚完成 RPC 后停止，失败也是需要保留的产品回归证据。连续 5 次统计可运行独立容器自测，证据保留在当前 worktree 的 `.acceptance-proof/`：
+
+```sh
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-i1-gpt- node --test acceptance/remote-linux/pause-resume-container.test.mjs
+```
+
+2026-10-14 在 `orch/i1-gpt`、基线 `4dc93bd` 上实测：默认场景 1/1 通过，17.420 秒；修正后的 pause-resume 连续 5/5 通过，耗时分别为 22.670, 22.572, 21.990, 22.123, 22.083 秒（包含每次运行及清理）。5 次均由产品自动恢复，无须显式 resume；epoch 均从 2 增到 4，同节点分配新 runtime，4 个 effect permit/receipt 各执行一次，10 个 durable delivery attempt 均为 1，清理均通过，严格恢复门槛拒绝 0/5。此前一轮 5 次 Mission 均 completed，但脚本错误要求 epoch 恰好加 1，导致验收断言失败；现已按任务要求改为严格递增，并由单元测试固定覆盖 2 到 4。以上只验证此 mock 时序，不能排除其他时序的恢复拒绝。
+
 普通 `npm test` 包含 mock 协议与决策单元测试，不启动 Apple Container。容器验收测试单独运行：
 
 ```sh
