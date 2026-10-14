@@ -534,7 +534,7 @@ export class WorkerManager {
       }
     }
     const failures: unknown[] = [];
-    const stopAndFence = async (agent: Agent): Promise<void> => {
+    const stopAndFence = async (agent: Agent, handle: Handle): Promise<void> => {
       try {
         await this.stopAgent(agent.id);
       } catch (error) {
@@ -544,9 +544,10 @@ export class WorkerManager {
       if (!flight.fencedAgents.has(agent.id)) {
         flight.fencedAgents.add(agent.id);
         const currentStatus = this.control.missionById(missionId)?.status;
-        this.control.markAgentInterrupted(agent.id, agent.epoch, {
+        // The handle owns this stop, even if an earlier attempt already fenced its epoch.
+        this.control.markAgentInterrupted(agent.id, handle.epoch, {
           ...(flight.settlement.kind === "question" && flight.mode === "pause" &&
-            (currentStatus === "active" || (currentStatus === "blocked" && failures.length > 0)) ? { preserveQueued: true } : {})
+            currentStatus === "active" ? { preserveQueued: true } : {})
         });
       }
     };
@@ -578,13 +579,13 @@ export class WorkerManager {
           this.control.setAgentStatus(agent.id, handle.epoch, "error", "Worker did not acknowledge queue cancellation");
         }
       }
-      await stopAndFence(agent);
+      await stopAndFence(agent, handle);
     }
     for (const [agentId, handle] of [...this.handles]) {
       const agent = this.control.getAgentPublic(agentId);
       if (agent?.missionId !== missionId || captured.has(agentId)) continue;
       handle.stopping = true;
-      await stopAndFence(agent);
+      await stopAndFence(agent, handle);
     }
     if (failures.length) throw new AggregateError(failures, "Mission quiescence did not stop all workers");
   }
@@ -640,13 +641,13 @@ export class WorkerManager {
       if (!acknowledged) {
         this.control.setAgentStatus(agent.id, handle.epoch, "error", "Worker did not acknowledge interruption");
         await this.stopAgent(agent.id);
-        this.control.markAgentInterrupted(agentId, agent.epoch);
+        this.control.markAgentInterrupted(agentId, handle.epoch);
         return;
       }
       this.control.setAgentStatus(agent.id, handle.epoch, "idle");
       await this.stopAgent(agent.id);
     }
-    this.control.markAgentInterrupted(agentId, agent.epoch);
+    this.control.markAgentInterrupted(agentId, handle?.epoch ?? agent.epoch);
   }
 
   async stopMission(missionId: string): Promise<void> {

@@ -1750,7 +1750,9 @@ export class ControlPlane {
     this.putMission(updated);
     if (action === "pause" || action === "cancel") {
       if (action === "cancel") this.clearLocalDeliveryDeadlines(id);
-      this.db.prepare("UPDATE outbox SET status='aborted' WHERE mission_id=? AND status='queued'").run(id);
+      const heldAnswers = action === "pause" ? this.queuedAnswersHeldByLocalWorkerStop(id) : new Set<string>();
+      this.db.prepare(`UPDATE outbox SET status='aborted' WHERE mission_id=? AND status='queued'
+        AND message_id NOT IN (SELECT value FROM json_each(?))`).run(id, json([...heldAnswers]));
       this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL
         WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')
           AND (?='pause' OR message_id IN (SELECT m.id FROM messages m JOIN agents a
@@ -1759,6 +1761,7 @@ export class ControlPlane {
       const messages = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(id) as Row[];
       for (const row of messages) {
         const message = decode<Message>(row.data);
+        if (heldAnswers.has(message.id)) continue;
         if (action === "cancel" && this.getAgent(message.recipientId)?.machineId === "local" &&
             this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status IN ('dispatching','admitted','delivering','delivered') LIMIT 1").get(message.id)) {
           // A sent input can still have a queued message until admission arrives.
@@ -3417,12 +3420,14 @@ export class ControlPlane {
       } else if (mission && blocker.kind === "user_input" && blocker.agentId) {
         const recipient = this.getAgent(blocker.agentId);
         if (recipient) {
+          const holdQueued = recipient.machineId === "local" && this.hasUnconfirmedLocalWorkerStop(mission.id);
           const message: Message = {
             id: `blocker-resolution:${id}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
-            content: resolution, mode: "followUp", status: "aborted", attempt: 1, createdAt: now(),
-            error: "Held until all mission blockers are resolved and resume is allowed."
+            content: resolution, mode: "followUp", status: holdQueued ? "queued" : "aborted", attempt: 1, createdAt: now(),
+            ...(!holdQueued ? { error: "Held until all mission blockers are resolved and resume is allowed." } : {})
           };
           this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
+          if (holdQueued) this.enqueue(message);
           this.event(mission.id, "message_created", "Human blocker resolution held for explicit resume.", recipient.id, { messageId: message.id, blockerId: id });
         }
       }
@@ -4282,21 +4287,39 @@ export class ControlPlane {
       this.markAgentInterrupted(agentId, epoch, terminal ? {} : { preserveQueued: true });
       const diagnostic = "Local worker exit was not confirmed after shutdown and termination signals. Inspect the old process before resolving this blocker and resuming; queued inputs have not been sent.";
       const current = this.getAgent(agentId)!;
-      this.recordWorkerDiagnostic(agentId, current.epoch, diagnostic);
-      if (!terminal) this.insertSystemBlocker(`worker-stop:${agentId}:${current.epoch}`, agent.missionId, "unsafe_execution", diagnostic);
+      if (agent.epoch === epoch) this.recordWorkerDiagnostic(agentId, current.epoch, diagnostic);
+      // A retry still belongs to the old process after its database epoch advances.
+      if (!terminal) this.insertSystemBlocker(`worker-stop:${agentId}:${epoch}`, agent.missionId, "unsafe_execution", diagnostic);
     });
+  }
+
+  private hasUnconfirmedLocalWorkerStop(missionId: string): boolean {
+    return !["completed", "cancelled"].includes(this.getMission(missionId)?.status ?? "") &&
+      Boolean(this.db.prepare("SELECT 1 FROM blockers WHERE mission_id=? AND status='open' AND id LIKE 'worker-stop:%'").get(missionId));
+  }
+
+  private queuedAnswersHeldByLocalWorkerStop(missionId: string): Set<string> {
+    if (!this.hasUnconfirmedLocalWorkerStop(missionId)) return new Set();
+    const rows = this.db.prepare(`SELECT m.id FROM messages m
+      JOIN blockers question ON m.id='blocker-resolution:' || question.id
+      JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')
+      JOIN outbox o ON o.message_id=m.id
+      WHERE m.mission_id=? AND m.status='queued' AND o.status='queued'
+        AND json_extract(question.data,'$.kind')='user_input' AND json_extract(a.data,'$.machineId')='local'`).all(missionId) as { id: string }[];
+    return new Set(rows.map(row => row.id));
   }
 
   markAgentInterrupted(agentId: string, expectedEpoch?: number, options: { controlledRemoteStop?: true; preserveQueued?: true } = {}): void {
     this.transactionIfNeeded(() => {
       const agent = this.getAgent(agentId);
       if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
+      const heldAnswers = this.queuedAnswersHeldByLocalWorkerStop(agent.missionId);
       const rows = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(agent.missionId) as Row[];
       for (const row of rows) {
         const message = decode<Message>(row.data);
         if (message.recipientId !== agentId) continue;
         const outbox = this.db.prepare("SELECT id,status FROM outbox WHERE message_id=? ORDER BY attempt DESC LIMIT 1").get(message.id) as { id: string; status: string } | undefined;
-        if (options.preserveQueued && message.status === "queued" && outbox?.status === "queued") continue;
+        if ((options.preserveQueued || heldAnswers.has(message.id)) && message.status === "queued" && outbox?.status === "queued") continue;
         const uncertain = outbox?.status !== "queued";
         const status = uncertain ? "uncertain" : "aborted";
         if (outbox && outbox.status !== status) this.db.prepare("UPDATE outbox SET status=?,deadline_at=NULL WHERE id=?").run(status, outbox.id);
