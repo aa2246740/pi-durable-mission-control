@@ -216,8 +216,20 @@ function capture(value: string, chunk: Buffer): { value: string; exceeded: boole
   return { value: bounded, exceeded: bounded.length < combined.length };
 }
 
-async function bash(workspace: string, command: string, runtimeId: string, timeoutMs: number): Promise<NodeEffectReceipt> {
-  const env: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", HOME: workspace, LANG: "C" };
+function nodeEffectPath(nodeDirectory: string): string {
+  const ordered = [nodeDirectory, "/usr/local/bin", "/usr/bin", "/bin"];
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const entry of ordered) {
+    if (!entry || seen.has(entry)) continue;
+    seen.add(entry);
+    unique.push(entry);
+  }
+  return unique.join(":");
+}
+
+async function bash(workspace: string, command: string, runtimeId: string, timeoutMs: number, nodeDirectory: string): Promise<NodeEffectReceipt> {
+  const env: NodeJS.ProcessEnv = { PATH: nodeEffectPath(nodeDirectory), HOME: workspace, LANG: "C" };
   const child = spawn("/bin/sh", ["-c", command], { cwd: workspace, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
   const pid = child.pid;
   let stdout = "", stderr = "", timedOut = false, exceeded = false;
@@ -281,7 +293,7 @@ export function nodeEffectExtinct(runtimeId: string): boolean {
   return runtimeJobs.size === 0;
 }
 
-export async function executeNodeEffect(spec: NodeEffectSpec, workspace: string, options: { timeoutMs?: number } = {}): Promise<NodeEffectReceipt> {
+export async function executeNodeEffect(spec: NodeEffectSpec, workspace: string, options: { timeoutMs?: number; nodeDirectory?: string } = {}): Promise<NodeEffectReceipt> {
   if (spec.method === "PublishArtifact") throw new Error("PublishArtifact requires the durable node upload path");
   if (spec.method === "read_file") {
     const file = target(workspace, String(spec.args.path), false);
@@ -318,5 +330,5 @@ export async function executeNodeEffect(spec: NodeEffectSpec, workspace: string,
     } finally { closeSync(fd); }
     return { status: "succeeded", result: { path: file, bytes: Buffer.byteLength(String(spec.args.content)) } };
   }
-  return bash(workspace, String(spec.args.command), spec.binding.runtimeId, options.timeoutMs ?? TIMEOUT);
+  return bash(workspace, String(spec.args.command), spec.binding.runtimeId, options.timeoutMs ?? TIMEOUT, options.nodeDirectory || dirname(process.execPath));
 }

@@ -12,7 +12,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { AssistantEntry, createRegistry, defineExtension, defineTool, GenerationTask, Harness, hook, watchEvents } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ModelProfile, RoleProfile } from "./contracts.js";
-import { AGENT_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS, WORKTREE_INSTRUCTIONS } from "./prompts.js";
+import { workerSystemInstructions } from "./prompts.js";
 import type { WorkerNotice, WorkerNoticeBody } from "./worker-events.js";
 import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 
@@ -322,7 +322,7 @@ export async function openWorkerRuntime(
     const agent = {
       extensions: [extension],
       model: { provider: config.testOnlyScripted ? "faux" : `mission-${config.profile.id}`, modelId: config.testOnlyScripted ? "faux-1" : config.profile.modelId },
-      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : config.runtimeMode === "remote-workspace-effects" ? `\n\nThis runtime permits only node-local read_file, write_file, and bash effects in the assigned workspace.${config.artifactTransfers ? " PublishArtifact captures and uploads a bounded frozen snapshot; always provide the current task ID you own. It does not publish latest-source validation." : ""}${config.effectApprovals ? " Under approval autonomy, write_file and bash may return a durable pending approval and end this worker turn. Wait for the execution outcome; do not retry or poll." : " Approval-mode write_file and bash are unavailable on this node."} bash is not an OS sandbox: it runs as the node's OS user. Only read_file/write_file paths are scoped to the assigned workspace; the shell receives no credential environment variables intentionally.` : ""}`,
+      instructions: workerSystemInstructions(config),
       ...(extension.tools ? { tools: extension.tools } : {}),
       cwd: config.workspacePath
     };

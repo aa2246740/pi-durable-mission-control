@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { ControlPlane } from "../dist/control.js";
 import { nodeEffectUpload } from "../dist/node-effects.js";
 
-function fixture(t, executionMode = "workspace-effects", autonomy = "trusted") {
+function fixture(t, executionMode = "workspace-effects", autonomy = "trusted", capabilityOverrides = {}) {
   const home = mkdtempSync(join(tmpdir(), "remote-effects-control-"));
   let control;
   t.after(() => { control?.close(); rmSync(home, { recursive: true, force: true }); });
@@ -19,7 +19,8 @@ function fixture(t, executionMode = "workspace-effects", autonomy = "trusted") {
   const capabilities = {
     protocol: executionMode === "workspace-effects" ? 3 : 2,
     version: "test", platform: process.platform, arch: process.arch, node: process.version, piDurable: "test",
-    roots: [remotePath], credentialRefs: [], executionEnabled: true, executionMode
+    roots: [remotePath], credentialRefs: [], executionEnabled: true, executionMode,
+    ...capabilityOverrides
   };
   const session = control.nodeSession(enrolled.machine.id, enrolled.token, capabilities, crypto.randomUUID());
   const probe = control.probeMachine(enrolled.machine.id, crypto.randomUUID(), remotePath);
@@ -299,4 +300,63 @@ test("recovered uncertain receipt creates one durable unsafe-execution blocker w
   assert.equal(control.missionById(mission.id).status, "paused");
   assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
   assert.throws(() => control.missionAction(mission.id, "resume"), error => error.status === 409);
+});
+
+test("remote GetMissionState reports the live session execution environment and local state stays unchanged", async t => {
+  for (const executionMode of ["workspace-effects", "metadata-only"]) {
+    const f = fixture(t, executionMode, "trusted", {
+      platform: "linux", arch: "x64", node: "v22.19.0-isolated",
+      credentialRefs: ["SHOULD_NOT_LEAK_CREDENTIAL_REF"]
+    });
+    const stored = f.control.machineRegistry.get(f.agent.machineId);
+    stored.capabilities.roots = [...stored.capabilities.roots, "/should-not-leak-other-root"];
+    f.control.db.prepare("UPDATE remote_machines SET data=? WHERE id=?").run(JSON.stringify(stored), stored.id);
+    const other = f.control.enrollMachine(`other-${crypto.randomUUID()}`, "Other node");
+    f.control.nodeSession(other.machine.id, other.token, {
+      protocol: 3, version: "test", platform: "freebsd", arch: "arm", node: "v0.0.1-other-machine",
+      piDurable: "test", roots: ["/other-machine-root"], credentialRefs: ["OTHER_MACHINE_SECRET_REF"],
+      executionEnabled: true, executionMode: "workspace-effects"
+    }, crypto.randomUUID());
+
+    const state = await f.control.workerCommand(request(f.agent, "GetMissionState", {}, "execution-environment"));
+    assert.deepEqual(state.executionEnvironment, {
+      machineId: f.agent.machineId,
+      platform: "linux",
+      arch: "x64",
+      node: "v22.19.0-isolated",
+      workspacePath: f.remotePath
+    });
+    assert.equal(state.executionEnvironment.workspacePath, f.agent.workspacePath);
+    assert.deepEqual(Object.keys(state.executionEnvironment).sort(), ["arch", "machineId", "node", "platform", "workspacePath"]);
+    assert.equal(Object.hasOwn(state.remoteWorkspaces[0], "node"), false);
+    assert.equal(Object.hasOwn(state.remoteWorkspaces[0], "platform"), false);
+    const remoteText = JSON.stringify(state);
+    assert.equal(remoteText.includes("SHOULD_NOT_LEAK_CREDENTIAL_REF"), false);
+    assert.equal(remoteText.includes("/should-not-leak-other-root"), false);
+    assert.equal(remoteText.includes("v0.0.1-other-machine"), false);
+    assert.equal(remoteText.includes("OTHER_MACHINE_SECRET_REF"), false);
+    assert.equal(remoteText.includes("freebsd"), false);
+
+    const orchestrator = f.control.listAgents(f.mission.id).find(item => item.kind === "orchestrator");
+    assert.equal(orchestrator.machineId, "local");
+    const local = await f.control.workerCommand({
+      agentId: orchestrator.id, epoch: orchestrator.epoch, method: "GetMissionState", args: {},
+      taskId: `${orchestrator.id}:local-state`
+    });
+    assert.equal(Object.hasOwn(local, "executionEnvironment"), false);
+    const localText = JSON.stringify(local);
+    assert.equal(localText.includes("v22.19.0-isolated"), false);
+    assert.equal(localText.includes("SHOULD_NOT_LEAK_CREDENTIAL_REF"), false);
+    assert.equal(localText.includes("v0.0.1-other-machine"), false);
+    assert.equal(Array.isArray(local.tasks), true);
+    assert.equal(local.mission.id, f.mission.id);
+
+    stored.leaseExpiresAt = Date.now() - 1;
+    f.control.db.prepare("UPDATE remote_machines SET data=? WHERE id=?").run(JSON.stringify(stored), stored.id);
+    const stale = await f.control.workerCommand(request(f.agent, "GetMissionState", {}, "stale-execution-environment"));
+    assert.equal(Object.hasOwn(stale, "executionEnvironment"), false);
+    assert.equal(JSON.stringify(stale).includes("v22.19.0-isolated"), false);
+    assert.equal(f.control.machineRegistry.get(f.agent.machineId).capabilities.node, "v22.19.0-isolated");
+    assert.equal(Array.isArray(stale.tasks), true);
+  }
 });
