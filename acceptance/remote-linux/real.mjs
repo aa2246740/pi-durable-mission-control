@@ -85,13 +85,47 @@ export function scanEvidence(path, secrets) {
 
 export const businessRules = "Implement totals.mjs exporting totalCents(lines). Each line is { quantity, unitPriceCents }. Both fields must be nonnegative safe integers; reject negative, fractional, nonnumeric or missing fields with an error. Return the sum of quantity * unitPriceCents as a safe integer number of cents. Empty lines return 0; reject products or totals outside the safe integer range. Zero quantity or price is valid.";
 
+// Capture transport functions before loading delivery code in the disposable child.
+const totalsRunner = `import { readFileSync, writeFileSync } from 'node:fs';
+import { serialize, deserialize } from 'node:v8';
+import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
+const lines = deserialize(readFileSync(0));
+const { totalCents } = await import(pathToFileURL(join(process.cwd(), 'totals.mjs')));
+if (typeof totalCents !== 'function') throw new Error('Missing totalCents export');
+let result;
+try { result = { kind: 'returned', value: totalCents(lines) }; }
+catch { result = { kind: 'threw' }; }
+writeFileSync(3, serialize(result));
+`;
+
 export function writeFrozenAcceptance(proof) {
   const path = join(proof, "totals.acceptance.test.mjs");
   const source = `import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { pathToFileURL } from 'node:url';
-import { dirname, join } from 'node:path';
-const { totalCents } = await import(pathToFileURL(join(process.cwd(), 'totals.mjs')));
+import { spawnSync } from 'node:child_process';
+import { serialize, deserialize } from 'node:v8';
+const runner = ${JSON.stringify(totalsRunner)};
+function probe(lines) {
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', runner], {
+    cwd: process.cwd(), env: { PATH: process.env.PATH }, input: serialize(lines),
+    stdio: ['pipe', 'pipe', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 65536
+  });
+  assert.equal(child.error, undefined, 'Delivery child transport failed');
+  assert.equal(child.signal, null, 'Delivery child was interrupted');
+  assert.equal(child.status, 0, 'Delivery child failed to execute');
+  const result = deserialize(child.output[3]);
+  assert.ok(result && ['returned', 'threw'].includes(result.kind), 'Invalid delivery result');
+  return result;
+}
+function totalCents(lines) {
+  const result = probe(lines);
+  assert.equal(result.kind, 'returned', 'totalCents unexpectedly threw');
+  return result.value;
+}
+function rejects(lines) {
+  assert.equal(probe(lines).kind, 'threw', 'totalCents did not reject invalid input');
+}
 test('empty order', () => assert.equal(totalCents([]), 0));
 test('multiple lines', () => assert.equal(totalCents([{quantity:2,unitPriceCents:125},{quantity:3,unitPriceCents:70}]), 460));
 test('integer cents multiplication and zero', () => {
@@ -100,11 +134,11 @@ test('integer cents multiplication and zero', () => {
 });
 test('reject invalid fields and unsafe amounts', () => {
   for (const value of [-1, 1.5, NaN, Infinity, '2', undefined, Number.MAX_SAFE_INTEGER + 1]) {
-    assert.throws(() => totalCents([{quantity:value,unitPriceCents:100}]));
-    assert.throws(() => totalCents([{quantity:2,unitPriceCents:value}]));
+    rejects([{quantity:value,unitPriceCents:100}]);
+    rejects([{quantity:2,unitPriceCents:value}]);
   }
-  assert.throws(() => totalCents([{quantity:2,unitPriceCents:Number.MAX_SAFE_INTEGER}]));
-  assert.throws(() => totalCents([{quantity:1,unitPriceCents:Number.MAX_SAFE_INTEGER},{quantity:1,unitPriceCents:1}]));
+  rejects([{quantity:2,unitPriceCents:Number.MAX_SAFE_INTEGER}]);
+  rejects([{quantity:1,unitPriceCents:Number.MAX_SAFE_INTEGER},{quantity:1,unitPriceCents:1}]);
 });
 `;
   writeFileSync(path, source, { mode: 0o400, flag: "wx" });

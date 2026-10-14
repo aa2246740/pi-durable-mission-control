@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assertCoordinatorExit, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
+import { assertCoordinatorExit, missionOutcomeReady, stoppedRealRuntimes, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
 import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
 import { sessionFailure, readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
 import { ControlPlane } from "../dist/control.js";
@@ -408,7 +408,7 @@ test("independent review runs original in-memory tests against verified CAS byte
   assert.equal(good.review.passed,true);
   assert.equal(good.review.agreesWithReceipt,true);
   assert.doesNotThrow(()=>assertIndependentReview(good.review,acceptance,good.artifact,receipt));
-  const bad = await run("export const totalCents = () => 0;",2);
+  const bad = await run("import assert from 'node:assert/strict'; assert.equal = () => {}; assert.throws = () => {}; export const totalCents = () => 0;",2);
   assert.equal(bad.review.passed,false);
   assert.equal(bad.review.exitCode,1);
   assert.equal(bad.review.receiptPassed,true);
@@ -481,4 +481,75 @@ test("frozen flag subprocess environment excludes inherited fake role credential
   // macOS spawn adds this system variable even when the caller supplies only PATH.
   assert.ok(Object.keys(inherited).every((key)=>key === "PATH" || (process.platform === "darwin" && key === "__CF_USER_TEXT_ENCODING")));
   assert.equal(output.includes(fakeKey),false);
+});
+
+// The control plane increments turns on admission, before any provider response.
+test("acceptance waits for the last admitted turn and observes its eventual product outcome", (t) => {
+  const directory = temporary(t), workspace = join(directory, "workspace");
+  mkdirSync(workspace);
+  const control = new ControlPlane(join(directory, "home"));
+  try {
+    control.upsertProfile({...example().orchestrator,id:"unit",credentialEnv:"",baseUrl:"http://127.0.0.1:9999"});
+    for (const kind of ["orchestrator","worker","validator"]) control.upsertRole({id:kind,name:kind,kind,instructions:"Unit",profileId:"unit"});
+    const mission = control.createMission({title:"Unit",goal:"Unit",acceptance:"Unit",workspaceId:control.addWorkspace("unit",workspace).id,
+      roleIds:["orchestrator","worker","validator"],maxTurns:60,maxCost:0,autonomy:"trusted"});
+    control.missionAction(mission.id,"start");
+    const [agent] = control.listAgents(mission.id);
+    for (let turn = 1; turn <= 60; turn++) control.admitTurn(agent.id,agent.epoch,`unit-${turn}`);
+    const admitted = control.detail(mission.id);
+    assert.equal(admitted.mission.turns,60);
+    assert.equal(admitted.mission.status,"active");
+    assert.equal(missionOutcomeReady(admitted),false,"admission is not an exhausted response");
+    assert.equal(missionOutcomeReady({...admitted,mission:{...admitted.mission,status:"completed"}}),true);
+    assert.throws(() => control.admitTurn(agent.id,agent.epoch,"unit-61"),/limit exhausted/);
+    const denied = control.detail(mission.id);
+    assert.equal(denied.mission.status,"blocked");
+    assert.equal(missionOutcomeReady(denied),true);
+    assert.equal(missionOutcomeReady({...denied,mission:{...denied.mission,status:"active"},agents:[{status:"busy"}]}),false);
+    assert.equal(missionOutcomeReady({...denied,mission:{...denied.mission,status:"active"},agents:[{status:"idle"}]}),true);
+    assert.equal(missionOutcomeReady({...denied,mission:{...denied.mission,status:"active",maxTurns:96},agents:[{status:"idle"}]}),false,"raising the budget makes old denial evidence stale");
+    assert.equal(missionOutcomeReady({...admitted,mission:{...admitted.mission,status:"failed"}}),true);
+  } finally { control.close(); }
+});
+
+test("real runtime stop gate accepts multiple workers and binds delivery to its exact runtime", () => {
+  const binding = {runtimeId:"delivery-runtime",agentId:"delivery-worker",machineId:"linux"};
+  const delivery = {binding,state:"closed"};
+  const extra = {binding:{...binding,runtimeId:"extra-runtime",agentId:"extra-worker"},state:"closed"};
+  const detail = {agents:[{id:"delivery-worker",machineId:"linux"},{id:"extra-worker",machineId:"linux"}],
+    artifacts:[{id:"artifact",agentId:"delivery-worker",remoteProvenance:{...binding}}]};
+  assert.deepEqual(stoppedRealRuntimes([extra,delivery],detail,"artifact","linux"),delivery);
+  assert.equal(stoppedRealRuntimes([{...extra,state:"stopping"},delivery],detail,"artifact","linux"),false);
+  assert.equal(stoppedRealRuntimes([extra,{...delivery,state:"stopping"}],detail,"artifact","linux"),false);
+  assert.throws(()=>stoppedRealRuntimes([extra],detail,"artifact","linux"),/Delivery worker runtime missing/);
+  assert.throws(()=>stoppedRealRuntimes([extra,{...delivery,binding:{...binding,agentId:"extra-worker"}}],detail,"artifact","linux"));
+  assert.throws(()=>stoppedRealRuntimes([extra,delivery],detail,"artifact","foreign"));
+  assert.throws(()=>stoppedRealRuntimes([{...extra,state:"uncertain"},delivery],detail,"artifact","linux"),/uncertain/);
+  assert.throws(()=>stoppedRealRuntimes([{...extra,binding:{...extra.binding,agentId:"unrelated"}},delivery],detail,"artifact","linux"),/does not belong/);
+});
+
+test("frozen tests isolate delivery builtin mutations and reject child crashes or malformed results", (t) => {
+  const directory = temporary(t), snapshot = join(directory,"snapshot"); mkdirSync(snapshot);
+  const acceptance = writeFrozenAcceptance(directory), source = join(snapshot,"totals.mjs");
+  const run = () => spawnSync(process.execPath,["--test","--test-reporter=tap",acceptance.path],{cwd:snapshot,env:{PATH:process.env.PATH},encoding:"utf8"});
+  const mutations = `import assert from 'node:assert/strict';
+import nodeTest from 'node:test';
+assert.equal = () => {};
+assert.throws = () => {};
+nodeTest.test = () => {};
+console.log('delivery diagnostic');
+`;
+  writeFileSync(source,mutations + goodTotals);
+  const good = run();
+  assert.equal(good.status,0,good.stdout+good.stderr);
+  assert.match(good.stdout,/^# tests 4$/m);
+  assert.match(good.stdout,/^# pass 4$/m);
+  for (const bad of [mutations+"export const totalCents = () => 0;", "process.exit(0); export const totalCents = () => 0;",
+    "import fs from 'node:fs'; fs.writeFileSync(3,'malformed'); export const totalCents = () => 0;"]) {
+    writeFileSync(source,bad);
+    const result = run();
+    assert.notEqual(result.status,0,result.stdout+result.stderr);
+    assert.match(result.stdout,/^# tests 4$/m);
+    assert.doesNotMatch(result.stdout,/^# pass 4$/m);
+  }
 });

@@ -53,6 +53,28 @@ export function normalizeFailure(error, { aborted, deadline, timeoutMs, now = Da
   return error;
 }
 
+// Turn counts record admissions, so the last admitted response may still complete.
+export function missionOutcomeReady(detail) {
+  if (["completed", "failed", "blocked"].includes(detail.mission.status)) return true;
+  const exhausted = detail.mission.turns >= detail.mission.maxTurns && detail.events.some((event) => event.type === "turn_admission_denied" && event.text === "Mission turn limit exhausted" && event.data?.maxTurns === detail.mission.maxTurns);
+  return exhausted && detail.agents.every((agent) => ["idle", "offline", "failed"].includes(agent.status));
+}
+
+export function stoppedRealRuntimes(runtimes, detail, artifactId, machineId) {
+  const artifact = detail.artifacts.find((value) => value.id === artifactId);
+  assert.ok(artifact, "Delivery artifact missing from runtime stop check");
+  const provenance = artifact.remoteProvenance;
+  assert.equal(provenance?.machineId, machineId);
+  assert.equal(provenance?.agentId, artifact.agentId);
+  const delivery = runtimes.find((runtime) => runtime.binding.runtimeId === provenance.runtimeId);
+  assert.ok(delivery, "Delivery worker runtime missing");
+  assert.equal(delivery.binding.agentId, artifact.agentId);
+  assert.equal(delivery.binding.machineId, machineId);
+  assert.ok(runtimes.every((runtime) => detail.agents.some((agent) => agent.id === runtime.binding.agentId && agent.machineId === runtime.binding.machineId)), "Runtime does not belong to this Mission");
+  if (runtimes.some((runtime) => runtime.state === "uncertain")) throw new Error("Remote runtime stop is uncertain");
+  return runtimes.every((runtime) => runtime.state === "closed") && delivery;
+}
+
 export function assertCoordinatorExit(signalCode, ready) {
   // A fresh coordinator has no worker children before its ready record exists.
   assert.ok(signalCode === null || (!ready && signalCode === "SIGTERM"), "Coordinator required forced shutdown");
@@ -479,8 +501,7 @@ export async function run(options) {
         return false;
       }
       if (turnLimit) await turnLimit.observe(current);
-      if (config && current.mission.turns >= current.mission.maxTurns) return current;
-      if (["completed", "failed", "blocked"].includes(current.mission.status)) return current;
+      if (missionOutcomeReady(current)) return current;
       return false;
     });
     if (config) {
@@ -500,12 +521,14 @@ export async function run(options) {
         if (current.length === 1 && current[0].stopProvenance === "controlled") throw new Error("Remote runtime stop provenance is controlled");
         return current.length === 1 && ["closed", "uncertain"].includes(current[0].state) && current[0].stopProvenance !== "controlled" && current;
       }
+      if (config) return stoppedRealRuntimes(current, detail, mutation?.artifactId, machineId) && current;
       if (current.some((runtime) => runtime.state === "uncertain")) throw new Error("Remote runtime stop is uncertain");
       return current.length === (recovery ? 2 : 1) && current.every((runtime) => runtime.state === "closed") && current;
     });
     detail = await api(`/api/missions/${mission.id}`);
     save("mission.json", detail);
     save("runtimes.json", runtimes);
+    const deliveryRuntime = config ? stoppedRealRuntimes(runtimes, detail, mutation?.artifactId, machineId) : undefined;
     if (crash) {
       await captureCrash();
       crash.assertions = assertWorkerCrash(detail, crash.runtimes, crash, records, crash.transport);
@@ -519,7 +542,7 @@ export async function run(options) {
       const evidence = await captureReal();
       summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
         turns: evidence.turns, maxTurns: evidence.maxTurns, roles: evidence.roles, costKnown: evidence.costKnown,
-        acceptance, mutation, tools: evidence.tools, blockers: detail.blockers, remoteRuntimeState: runtimes[0].state,
+        acceptance, mutation, tools: evidence.tools, blockers: detail.blockers, remoteRuntimeState: deliveryRuntime.state, remoteRuntimeId: deliveryRuntime.binding.runtimeId, remoteRuntimeCount: runtimes.length,
         image: { name: image.configuration.name, digest: image.id } };
     } else {
       assert.equal(detail.mission.status, "completed");

@@ -51,14 +51,14 @@ export function uniqueTargets(config) {
   return targets;
 }
 
-export function classifyProbe({ httpStatus, error, httpOk, toolCalled }) {
-  if (httpOk && toolCalled) return null;
+export function classifyProbe({ httpStatus, error, httpOk, toolCalled, responseComplete = true }) {
+  if (httpOk && toolCalled && responseComplete && !error) return null;
   const text = error ?? "";
   if (httpStatus === 401 || httpStatus === 403 || /\b401\b|\b403\b|unauthorized|authentication|invalid[_ ]api[_ ]key|permission denied/i.test(text)) return "auth";
   if (/timeout|timed out|aborted|ETIMEDOUT|AbortError/i.test(text)) return "timeout";
   if (Number.isInteger(httpStatus) && httpStatus >= 400) return "http";
   if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|fetch failed|ECONNRESET|getaddrinfo|network/i.test(text)) return "network";
-  if (httpOk && !toolCalled) return "no-tool-call";
+  if (httpOk && responseComplete && !toolCalled) return "no-tool-call";
   if (!Number.isInteger(httpStatus)) return "network";
   return "provider";
 }
@@ -188,13 +188,13 @@ export async function probeOnce({ profile, credential, timeoutMs = defaultTimeou
     clearTimeout(timer);
   }
   const latencyMs = Math.max(0, Math.round(performance.now() - started));
-  const providerError = message?.stopReason === "error" || message?.stopReason === "aborted"
-    ? (message.errorMessage || message.stopReason)
-    : thrown ? (thrown instanceof Error ? `${thrown.name}: ${thrown.message}` : String(thrown)) : null;
+  const responseComplete = !controller.signal.aborted && !thrown && ["stop", "toolUse"].includes(message?.stopReason);
+  const providerError = thrown ? (thrown instanceof Error ? `${thrown.name}: ${thrown.message}` : String(thrown))
+    : !responseComplete ? (message?.errorMessage || controller.signal.reason?.message || `Response did not finish normally: ${message?.stopReason ?? "missing response"}`) : null;
   const combined = [providerError, errorBody].filter((item) => item).join("\n");
   const httpOk = Number.isInteger(httpStatus) && httpStatus >= 200 && httpStatus < 300;
   const toolCalled = message?.content?.some((block) => block.type === "toolCall" && block.name === "ping") === true;
-  const error = !httpOk || !toolCalled
+  const error = !httpOk || !responseComplete || !toolCalled
     ? combined || (httpOk ? "Model response did not call the ping tool" : "Preflight request failed")
     : null;
   return {
@@ -204,7 +204,7 @@ export async function probeOnce({ profile, credential, timeoutMs = defaultTimeou
     toolCalled,
     usage: usageOf(message),
     ...responseModelFields(profile, message, observedModel, httpOk),
-    errorCategory: classifyProbe({ httpStatus, error, httpOk, toolCalled }),
+    errorCategory: classifyProbe({ httpStatus, error, httpOk, toolCalled, responseComplete }),
     error: clip(error)
   };
 }
