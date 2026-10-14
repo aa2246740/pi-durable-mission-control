@@ -27,6 +27,7 @@ export type WorkerConfig = {
   profile: ModelProfile;
   role: RoleProfile;
   runtimeMode?: "remote-metadata-only" | "remote-workspace-effects";
+  remoteWorkspacesAuthorized?: boolean;
   effectApprovals?: true;
   artifactTransfers?: true;
   testOnlyScripted?: boolean;

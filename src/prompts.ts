@@ -19,9 +19,25 @@ For verification: independently inspect and execute the acceptance criteria thro
 For a mission with a validationContract, inspect the assigned task's fulfills IDs and the current assertion descriptions. ValidateTask must include assertionResults for exactly those IDs, each with status passed, failed, or untested and concrete evidence. Never mark an unexecuted or partially checked assertion passed. The overall task may pass only when the actual command exits zero and every claimed assertion passed. If requirements changed, use a fresh receipt for the current task attempt and requirement revisions. Legacy missions without a validationContract keep their original acceptance rules; do not silently rewrite their frozen contract.
 If work is interrupted, inspect persisted state and uncertain side effects before retrying. Tool interruption is not proof that an external operation did not run. Use Report or SendMessage to tell the orchestrator about workflow problems or blockers; the orchestrator decides whether to ask the user. After completing the necessary tool work, call Report alone to deliver one concise structured handoff with outcome, task identifiers, evidence, and next action. Report ends this run; a new durable input will wake you. Do not combine Report or WaitForMessage with other tool calls in the same response. If waiting on another agent with no new result or blocker, call WaitForMessage alone instead of polling or repeatedly reporting that you are waiting. Do not report fabricated results.`;
 
-export const REMOTE_NODE_EXECUTION_INSTRUCTIONS = `You run on a remote node, not the coordinator host. Coordinator paths such as /opt/homebrew and /Users/..., and acceptance files that exist only on the coordinator, are not present here. Use GetMissionState executionEnvironment (machineId, platform, arch, node, and workspacePath) to judge this node's platform.
-Self-checks must use commands and files that actually exist on this node. A failure masked by \`|| true\`, \`; true\`, \`2>/dev/null\`, or a similar mask is not a pass. A missing tool or missing file is a blocker: Report it to the orchestrator instead of publishing as if the check passed.
+const REMOTE_NODE_LOCATION_INSTRUCTIONS = `You run on a remote node, not the coordinator host. Coordinator paths such as /opt/homebrew and /Users/..., and acceptance files that exist only on the coordinator, are not present here. Use GetMissionState executionEnvironment (machineId, platform, arch, node, and workspacePath) to judge this node's platform.`;
+
+const REMOTE_NODE_EFFECT_INSTRUCTIONS = `Self-checks must use commands and files that actually exist on this node. A failure masked by \`|| true\`, \`; true\`, \`2>/dev/null\`, or a similar mask is not a pass. A missing tool or missing file is a blocker: Report it to the orchestrator instead of publishing as if the check passed.
 What you publish is a frozen snapshot. Independent acceptance is performed by the validator on the coordinator against that snapshot.`;
+
+export const REMOTE_NODE_EXECUTION_INSTRUCTIONS = `${REMOTE_NODE_LOCATION_INSTRUCTIONS}
+${REMOTE_NODE_EFFECT_INSTRUCTIONS}`;
+
+const REMOTE_SNAPSHOT_VALIDATION_INSTRUCTIONS = `This Mission authorizes remote workspaces. A remote owner's published delivery is frozen on the coordinator into a snapshot, and RunValidation's working directory is that frozen snapshot. This takes priority over inspecting your assigned workspace: do not look for that delivery in your own workspace, and do not use the remote workspacePath. Refer to published files with paths relative to the snapshot root, for example totals.mjs. The task must be in review before RunValidation. If the status is not review or the explicit rework case already described above, Report the actual status to the orchestrator. Do not ask the user.`;
+
+const METADATA_ONLY_LIMIT_INSTRUCTIONS = `You cannot run shell commands, publish artifacts, or execute validation. That restriction takes priority over any earlier instruction to run self-checks or call PublishArtifact. Report blockers to the orchestrator. Do not claim a command self-check or a published snapshot.`;
+
+export function remoteWorkspacePromptFlags(
+  roleKind: "orchestrator" | "worker" | "validator",
+  remoteWorkspaceIds: readonly string[] | undefined
+): { remoteWorkspacesAuthorized: true } | Record<string, never> {
+  if (roleKind !== "validator" || !remoteWorkspaceIds?.length) return {};
+  return { remoteWorkspacesAuthorized: true };
+}
 
 export function workerSystemInstructions(config: {
   role: { kind: "orchestrator" | "worker" | "validator"; instructions: string };
@@ -29,10 +45,23 @@ export function workerSystemInstructions(config: {
   runtimeMode?: "remote-metadata-only" | "remote-workspace-effects";
   artifactTransfers?: boolean;
   effectApprovals?: boolean;
+  remoteWorkspacesAuthorized?: boolean;
 }): string {
   const base = config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS;
   const worktree = config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : "";
-  return `${base}\n\n${config.role.instructions}${worktree}${remoteRuntimeInstructions(config)}`;
+  return `${base}\n\n${config.role.instructions}${worktree}${remoteRuntimeInstructions(config)}${remoteSnapshotValidationInstructions(config)}`;
+}
+
+function remoteSnapshotValidationInstructions(config: {
+  role: { kind: "orchestrator" | "worker" | "validator" };
+  workspaceStrategy?: "shared" | "worktree";
+  runtimeMode?: "remote-metadata-only" | "remote-workspace-effects";
+  remoteWorkspacesAuthorized?: boolean;
+}): string {
+  // Remote worktrees are rejected at assignment, so a worktree validator never receives a remote snapshot cwd.
+  const localValidator = config.role.kind === "validator" && config.runtimeMode === undefined;
+  if (!localValidator || config.remoteWorkspacesAuthorized !== true || config.workspaceStrategy === "worktree") return "";
+  return `\n\n${REMOTE_SNAPSHOT_VALIDATION_INSTRUCTIONS}`;
 }
 
 function remoteRuntimeInstructions(config: {
@@ -41,7 +70,7 @@ function remoteRuntimeInstructions(config: {
   effectApprovals?: boolean;
 }): string {
   if (config.runtimeMode === "remote-metadata-only") {
-    return `\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable.\n\n${REMOTE_NODE_EXECUTION_INSTRUCTIONS}`;
+    return `\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable.\n\n${REMOTE_NODE_LOCATION_INSTRUCTIONS}\n\n${METADATA_ONLY_LIMIT_INSTRUCTIONS}`;
   }
   if (config.runtimeMode !== "remote-workspace-effects") return "";
   const artifact = config.artifactTransfers
