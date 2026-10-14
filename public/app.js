@@ -288,8 +288,35 @@ async function machineAction(name, id) {
   }, '提交只读检查');
 }
 
+const shortRuntimeId = (id) => String(id ?? '未记录').slice(0, 8);
+
+function eventDescription(event) {
+  if (event.type === 'remote_runtime_reassigned') return `受控停止后已重新分配远端运行时：旧 ${shortRuntimeId(event.data?.previousRuntimeId)} → 新 ${shortRuntimeId(event.data?.runtimeId)}`;
+  return event.text;
+}
+
+function renderRemoteRuntimes() {
+  const runtimes = state.detail.runtimes || [];
+  if (!runtimes.length) return '';
+  const runtimeNames = { queued: '排队中', offered: '已下发', running: '运行中', stopping: '停止中', closed: '已关闭', uncertain: '状态不确定', run: '运行', stop: '停止', unproven: '尚未证实', controlled: '受控停止', unexpected: '意外停止', stopped: '已停止', rejected: '已拒绝' };
+  const runtimeBadge = (value) => `<span class="badge ${e(value)}">${e(runtimeNames[value] || value || '未记录')}</span>`;
+  return `<section class="panel"><h3>远端运行时</h3><div class="cards">${runtimes.map((runtime) => {
+    const { binding } = runtime;
+    const warning = ['unexpected', 'uncertain'].includes(runtime.stopProvenance);
+    const machine = state.app.machines.find((item) => item.id === binding.machineId);
+    return `<article class="agent-card ${warning ? 'error-panel' : ''}"><h3>${e(agentName(binding.agentId))}</h3><p class="agent-meta">机器：${e(machine?.name || binding.machineId)}<br>运行时：<span class="mono" title="${e(binding.runtimeId)}">${e(shortRuntimeId(binding.runtimeId))}</span><br>执行代次（epoch）：${e(binding.epoch)}</p><p class="text">状态：${runtimeBadge(runtime.state)}<br>期望状态：${runtimeBadge(runtime.desired)}<br>停止来源：${runtimeBadge(runtime.stopProvenance)}<br>最后报告结果：${runtime.report ? runtimeBadge(runtime.report.outcome) : '尚无报告'}</p>${warning ? '<div class="notice">需要人工核对远端进程与未结清的工作，系统不会自动重放</div>' : ''}<p class="agent-meta">创建时间：${e(date(runtime.createdAt))}<br>更新时间：${e(date(runtime.updatedAt))}</p></article>`;
+  }).join('')}</div></section>`;
+}
+
+function renderRecoveryDiagnostic() {
+  if (state.detail.mission.status !== 'failed') return '';
+  const event = state.detail.events.slice().reverse().find((item) => item.type === 'worker_start_failed');
+  const diagnostic = event?.data?.diagnostic;
+  return diagnostic ? `<div class="notice error-panel"><strong>恢复诊断</strong><p class="text danger-text">${e(diagnostic)}</p>修复原因后可再次恢复</div>` : '';
+}
+
 function timeline(events, limit = 40) {
-  return events.length ? `<div class="timeline">${events.slice(-limit).reverse().map((event) => `<div class="event"><span class="event-dot"></span><div><p>${e(event.text)}</p><small>#${event.seq} · ${e(event.type)} · ${date(event.createdAt)}</small></div></div>`).join('')}</div>` : '<p class="small-muted">尚无活动。启动后会在这里记录真实事件。</p>';
+  return events.length ? `<div class="timeline">${events.slice(-limit).reverse().map((event) => `<div class="event"><span class="event-dot"></span><div><p>${e(eventDescription(event))}</p><small>#${event.seq} · ${e(event.type)} · ${date(event.createdAt)}</small></div></div>`).join('')}</div>` : '<p class="small-muted">尚无活动。启动后会在这里记录真实事件。</p>';
 }
 
 function renderAgents(agents) {
@@ -552,9 +579,9 @@ function renderDetail() {
   if (state.tab === 'schedules') content = renderSchedules();
   if (state.tab === 'artifacts') content = renderArtifacts();
   if (state.tab === 'events') content = `<section class="panel">${timeline(events, 300)}</section>`;
-  return `<a class="back-link" href="#missions">← 所有 Missions</a>` + heading(`MISSION / ${mission.id.slice(0, 8).toUpperCase()}`, mission.title, `${workspaceName(mission.workspaceId)} · ${mission.autonomy === 'trusted' ? '可信自主执行' : '工具操作需审批'} · 创建于 ${date(mission.createdAt)}`, controls.join('')) +
+  return `<a class="back-link" href="#missions">← 所有 Missions</a>` + heading(`MISSION / ${mission.id.slice(0, 8).toUpperCase()}`, mission.title, `${workspaceName(mission.workspaceId)} · ${mission.autonomy === 'trusted' ? '可信自主执行' : '工具操作需审批'} · 创建于 ${date(mission.createdAt)}`, controls.join('')) + renderRecoveryDiagnostic() +
     `<div class="stats">${stat('任务验收', `${accepted} / ${tasks.length}`, '独立验证后才能完成')}${stat('活跃代理', `${agents.filter((a) => a.status === 'running').length} / ${agents.length}`, '各自保持上下文')}${stat('执行轮次', `${mission.turns} / ${mission.maxTurns}`, '达到上限后停止派工')}${stat('已记录模型费用', mission.costKnown ? `$${Number(mission.cost).toFixed(4)}` : '未定价', mission.costKnown ? `${mission.maxCost > 0 ? `上限 $${mission.maxCost}` : '未设置费用上限'} · 不含未结算请求` : '未配置单价，不假装免费')}</div>` +
-    (['paused', 'blocked'].includes(mission.status) ? `<div class="notice">${mission.status === 'paused' ? '已冻结新派工。迟到报告仍会保存，但不会偷偷唤醒负责人。' : 'Mission 需要处理阻塞。查看活动与消息，解决原因后再继续。'}</div>` : '') + renderBlockers() + renderApprovals() +
+    (['paused', 'blocked'].includes(mission.status) ? `<div class="notice">${mission.status === 'paused' ? '已冻结新派工。迟到报告仍会保存，但不会偷偷唤醒负责人。' : 'Mission 需要处理阻塞。查看活动与消息，解决原因后再继续。'}</div>` : '') + renderBlockers() + renderApprovals() + renderRemoteRuntimes() +
     `<div class="tabs" role="tablist" aria-label="Mission 内容">${tabs.map(([key, label]) => `<button role="tab" aria-selected="${key === state.tab}" class="tab ${key === state.tab ? 'active' : ''}" data-tab="${key}">${label}${key === 'agents' ? ` ${agents.length}` : ''}${key === 'tasks' ? ` ${tasks.length}` : ''}</button>`).join('')}</div>${content}`;
 }
 
@@ -582,7 +609,11 @@ async function load(force = false) {
   const version = routeVersion;
   try {
     const app = await api('/api/state');
-    const detail = state.missionId ? await api(`/api/missions/${encodeURIComponent(state.missionId)}`) : null;
+    const missionPath = state.missionId ? `/api/missions/${encodeURIComponent(state.missionId)}` : null;
+    const [detail, runtimes] = missionPath ? await Promise.all([
+      api(missionPath), api(`${missionPath}/runtimes`).catch(() => [])
+    ]) : [null, []];
+    if (detail) detail.runtimes = runtimes;
     if (version !== routeVersion) { pendingLoad = true; return; }
     const snapshot = JSON.stringify({ app, detail, routeVersion });
     const changed = snapshot !== lastSnapshot;
