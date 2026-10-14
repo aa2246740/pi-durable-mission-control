@@ -203,6 +203,47 @@ test("drainAll processes a bounded backlog across successive passes", async (t) 
   assert.equal(coordinator.inspectInbox(binding).every((row) => row.status === "applied"), true);
 });
 
+test("afterRpc sees the applied reply and a fence there cannot drop it", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-limit", taskId: "task-limit", method: "AdmitTurn", args: { generationId: "limit" }
+  }, "uplink-limit");
+  let statusBeforeFence;
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    rpc: async (_binding, request) => ({ kind: "reply", rpcId: request.rpcId, ok: false, error: "Remote operation was rejected" }),
+    afterRpc: () => {
+      statusBeforeFence = coordinator.inspectInbox(binding)[0].status;
+      coordinator.fence(binding);
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.equal(statusBeforeFence, "applied");
+  assert.equal(coordinator.inspectInbox(binding)[0].status, "applied");
+  assert.equal(coordinator.inspectOutbox(binding)[0].status, "cancelled");
+  assert.equal(coordinator.inspectOutbox(binding)[0].envelope.payload.rpcId, "rpc-limit");
+  assert.equal(coordinator.inspectBinding(binding).status, "uncertain");
+});
+
+test("a thrown rpc still fences and then schedules afterRpc", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-throw", taskId: "task-throw", method: "Usage", args: { cost: 1 }
+  }, "uplink-throw");
+  let calls = 0;
+  let statusAtSchedule;
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    rpc: async () => { throw new Error("handler failed"); },
+    afterRpc: () => {
+      calls += 1;
+      statusAtSchedule = coordinator.inspectInbox(binding)[0].status;
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.equal(calls, 1);
+  assert.equal(statusAtSchedule, "uncertain");
+  assert.equal(coordinator.inspectOutbox(binding).length, 0);
+});
+
 test("remote worker commands cannot reach filesystem, shell, or MCP effects", async () => {
   const f = controlFixture();
   const marker = join(f.workspacePath, "remote-effect-marker");
