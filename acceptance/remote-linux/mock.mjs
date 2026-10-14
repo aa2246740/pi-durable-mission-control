@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { workerCrashTool } from "./scenarios/worker-crash.mjs";
+import { coordinatorRestartCall } from "./scenarios/coordinator-restart.mjs";
 import { turnLimitCall } from "./scenarios/turn-limit.mjs";
 
 export const shellQuote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
@@ -32,7 +33,7 @@ export function transcript(body) {
   return results;
 }
 
-export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "default" }) {
+export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "default", hooks }) {
   const names = new Set(body.tools.map((tool) => tool.function.name));
   const system = body.messages.filter((m) => ["system", "developer"].includes(m.role)).map((m) => m.content).join("\n");
   const role = names.has("SpawnAgent") ? "orchestrator" : names.has("bash") ? "worker" : "validator";
@@ -79,6 +80,10 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
     if (task.status === "running") return call("SendMessage", { recipientId: worker.id, mode: "followUp", content: `Implement task ${task.id}. Self-check on Linux, PublishArtifact, UpdateTask review, then Report.` });
     if (task.status === "review") return call("SendMessage", { recipientId: validator.id, mode: "followUp", content: `Independently accept task ${task.id} using ${acceptanceCommand} on the coordinator frozen snapshot, then Report.` });
     throw new Error(`Unexpected task status ${task.status}`);
+  }
+  if (["coordinator-restart", "coordinator-restart-kill"].includes(scenario)) {
+    const decision = coordinatorRestartCall({ role, last, history, state, call, released: hooks?.released });
+    if (decision) return decision;
   }
   if (scenario === "turn-limit") {
     const decision = turnLimitCall({ role, last, history, state, call });
@@ -160,12 +165,12 @@ export async function startMock({ credential, acceptanceCommand, hostTestPath, s
       const body = JSON.parse(Buffer.concat(chunks).toString());
       assert.equal(body.stream, true);
       let decision;
-      try { decision = nextCall(body, { acceptanceCommand, hostTestPath, scenario }); }
+      try { decision = nextCall(body, { acceptanceCommand, hostTestPath, scenario, hooks }); }
       catch (error) {
         record({ role: "protocol", name: "rejected", results: transcript(body) });
         throw error;
       }
-      await hooks?.beforeReply(decision);
+      await hooks?.beforeReply?.(decision);
       record({ ...decision, results: transcript(body) });
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       const id = `chatcmpl-${randomUUID()}`;
