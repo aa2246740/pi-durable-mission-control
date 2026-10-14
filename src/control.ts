@@ -1627,10 +1627,15 @@ export class ControlPlane {
     this.putMission(updated);
     if (action === "pause" || action === "cancel") {
       this.db.prepare("UPDATE outbox SET status='aborted' WHERE mission_id=? AND status='queued'").run(id);
-      this.db.prepare("UPDATE outbox SET status='uncertain',deadline_at=NULL WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')").run(id);
+      this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL
+        WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')
+          AND (?='pause' OR message_id IN (SELECT m.id FROM messages m JOIN agents a
+            ON a.id=json_extract(m.data,'$.recipientId') WHERE json_extract(a.data,'$.machineId')!='local'))`)
+        .run(id, action);
       const messages = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(id) as Row[];
       for (const row of messages) {
         const message = decode<Message>(row.data);
+        if (action === "cancel" && message.status !== "queued" && this.getAgent(message.recipientId)?.machineId === "local") continue;
         const uncertain = message.status === "delivered" || this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status='uncertain' LIMIT 1").get(message.id);
         const next = { ...message, status: uncertain ? "uncertain" : "aborted", error: uncertain ? "Delivery state is uncertain after " + action : "Delivery aborted by mission " + action };
         this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(next.status, json(next), next.id);
@@ -2993,7 +2998,7 @@ export class ControlPlane {
       const next = { ...message, status, ...(status === "uncertain" ? { error: "Worker completed with an uncertain outcome" } : {}) };
       this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(status, json(next), messageId);
       this.event(row.mission_id, `delivery_${status}`, `Delivery ${requestId} ${status}.`, undefined, { messageId, requestId, attempt, epoch, result });
-      if (status === "uncertain") {
+      if (status === "uncertain" && this.getMission(row.mission_id)?.status !== "completed") {
         this.insertSystemBlocker(`delivery:${row.id}`, row.mission_id, "delivery", `Delivery ${requestId} completed with an uncertain outcome. Reconcile it before resuming; it will not be replayed with a new command ID.`);
       }
       return true;
