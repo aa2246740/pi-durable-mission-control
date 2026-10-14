@@ -242,6 +242,14 @@ test("service refuses an occupied home even without a daemon record", { skip: pr
   const f = fixture();
   const control = new ControlPlane(f.home);
   try {
+    for (const malformed of [false, true]) {
+      if (malformed) writeFileSync(join(f.home, "daemon.json"), "malformed");
+      const status = await runCli(["service", "status", "--home", f.home], f.env);
+      assert.equal(status.code, 1);
+      assert.match(status.stdout, /unavailable\/unconfirmed.*ownership lock is held/);
+      assert.doesNotMatch(status.stdout, /is still alive/);
+    }
+    unlinkSync(join(f.home, "daemon.json"));
     const result = await runCli(["service", "install", "--home", f.home, "--port", "0"], f.env);
     assert.equal(result.code, 1);
     assert.match(result.stderr, /ownership lock .* held/);
