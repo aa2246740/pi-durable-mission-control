@@ -4,12 +4,12 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createProvider, createModels } from "@earendil-works/pi-ai/models";
-import { Type, type Model, type TSchema } from "@earendil-works/pi-ai";
+import { Type, type Model, type TSchema, type Message } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { AssistantEntry, createRegistry, defineExtension, defineTool, GenerationTask, Harness, hook, watchEvents } from "@earendil-works/pi-durable";
+import { AssistantEntry, createRegistry, defineExtension, defineTool, GenerationTask, Harness, hook, watchEvents, type UsageState } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ModelProfile, RoleProfile } from "./contracts.js";
 import { workerSystemInstructions } from "./prompts.js";
@@ -346,6 +346,22 @@ export async function openWorkerRuntime(
   }
 }
 
+export function modelResponseEvidence(message: Message) {
+  if (message.role !== "assistant") return undefined;
+  return {
+    modelId: message.model,
+    tools: message.content.flatMap((part) => part.type === "toolCall" ? [part.name] : [])
+  };
+}
+
+export function modelUsageEvidence(usage: UsageState) {
+  const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+  for (const value of Object.values(usage.models)) {
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) totals[key] += value[key];
+  }
+  return totals;
+}
+
 export async function runWorker(config: WorkerConfig): Promise<void> {
   const { harness, root } = await openWorkerRuntime(config);
   const stream = await watchEvents(harness, root.id, BACKGROUND_CONTEXT);
@@ -356,12 +372,29 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     await stream.stop();
     await harness.close(BACKGROUND_CONTEXT);
   };
+  const recordModelEvidence = async (entry: { id: unknown; model?: readonly Message[] }): Promise<void> => {
+    const message = entry.model?.[0];
+    const evidence = message && modelResponseEvidence(message);
+    if (evidence) {
+      const entryId = `${String(entry.id)}:model`;
+      await rpcRequest(config, "Transcript", { role: "model", text: JSON.stringify(evidence), entryId }, entryId);
+    }
+  };
+  const recordModelUsage = async (usage: UsageState): Promise<void> => {
+    const counters = modelUsageEvidence(usage);
+    // An untouched runtime must become ready without waiting for a telemetry RPC.
+    if (counters.totalTokens === 0) return;
+    const text = JSON.stringify(counters);
+    const entryId = `model-usage:${text}`;
+    await rpcRequest(config, "Transcript", { role: "model_usage", text, entryId }, entryId);
+  };
   void Promise.resolve(stream.start(async (events) => {
     for (const event of events) {
       if (event.type === "message_end") {
         const entry = event.entry;
         if (AssistantEntry.is(entry)) {
           sendNotice(config, { type: "turn_end", turnId: String(entry.id), ...(entry.byTaskId === undefined ? {} : { generationId: String(entry.byTaskId) }) });
+          await recordModelEvidence(entry);
           const content = entry.model?.[0]?.content;
           const text = typeof content === "string"
             ? content
@@ -370,6 +403,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
         }
         if (event.entry.kind.startsWith("pi.")) continue;
       }
+      if (event.type === "usage_changed") await recordModelUsage(await harness.usage(BACKGROUND_CONTEXT));
       if (event.type === "turn_end") {
         if (config.profile.cost) {
           const usage = await harness.usage(BACKGROUND_CONTEXT);
@@ -385,6 +419,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     for (const entry of page.items) {
       if (!AssistantEntry.is(entry)) continue;
       sendNotice(config, { type: "turn_end", turnId: String(entry.id), ...(entry.byTaskId === undefined ? {} : { generationId: String(entry.byTaskId) }) });
+      await recordModelEvidence(entry);
       const content = entry.model?.[0]?.content;
       const text = typeof content === "string"
         ? content
@@ -393,6 +428,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     }
     cursor = page.next;
   } while (cursor);
+  await recordModelUsage(await harness.usage(BACKGROUND_CONTEXT));
   const inspection = await harness.inspect(BACKGROUND_CONTEXT);
   for (const record of inspection.submissions) {
     const requestId = record.requestId;
