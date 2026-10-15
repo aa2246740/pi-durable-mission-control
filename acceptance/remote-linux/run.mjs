@@ -65,6 +65,19 @@ export function missionOutcomeReady(detail) {
   return exhausted && detail.agents.every((agent) => ["idle", "offline", "failed"].includes(agent.status));
 }
 
+export function realAgentLocations(detail) {
+  return (detail?.agents ?? []).map((agent) => ({ agentId: agent.id, kind: agent.kind,
+    machineId: agent.machineId ?? null, workspaceId: agent.workspaceId ?? null }));
+}
+
+export function assertRealPublication(detail, artifactId, machineId) {
+  const workers = realAgentLocations(detail).filter((agent) => agent.kind === "worker");
+  const artifact = detail.artifacts.find((value) => value.id === artifactId && value.remoteProvenance?.machineId === machineId &&
+    workers.some((agent) => agent.agentId === value.agentId && agent.machineId === machineId));
+  const locations = workers.map((agent) => `${agent.agentId}: machineId=${agent.machineId ?? "unknown"}, workspaceId=${agent.workspaceId ?? "unknown"}`).join("; ") || "none";
+  assert.ok(artifact, `No publication observed from a remote Linux worker on ${machineId}; worker locations: ${locations}`);
+}
+
 export function stoppedRealRuntimes(runtimes, detail, artifactId, machineId) {
   const artifact = detail.artifacts.find((value) => value.id === artifactId);
   assert.ok(artifact, "Delivery artifact missing from runtime stop check");
@@ -572,6 +585,7 @@ export async function run(options) {
     });
     if (config) {
       await captureReal();
+      assertRealPublication(detail, mutation?.artifactId, machineId);
       assertRealOutcome(detail, acceptanceCommand);
     } else if (restart && !restart.completed) {
       await captureRestart();
@@ -725,7 +739,7 @@ export async function run(options) {
       save("host-runtime.json", hostRuntime);
       await cleanup("host node integrity", async () => assertHostRuntime(hostRuntime));
     }
-    if (detail?.mission.status === "completed" && acceptance) await cleanup("independent container review", async () => {
+    if (detail?.mission.status === "completed" && acceptance && (!config || mutation)) await cleanup("independent container review", async () => {
       const artifact = config ? detail.artifacts.find((value) => value.id === mutation?.artifactId) : detail.artifacts[0];
       assert.ok(artifact, "No frozen artifact for independent review");
       const accepted = detail.tasks.find((task) => task.status === "accepted");
@@ -744,7 +758,7 @@ export async function run(options) {
       save("independent-review.json", review);
       assertIndependentReview(review, acceptance, artifact, receipt);
     });
-    Object.assign(summary, { hostRuntime, independentReview: review, ...(config ? { rejectedPublications } : {}) });
+    Object.assign(summary, { hostRuntime, independentReview: review, ...(config ? { rejectedPublications, agentLocations: realAgentLocations(detail) } : {}) });
     if (config && exportedReal) {
       await cleanup("stopped export records", async () => {
         exportedReal = refreshStoppedExport(join(home, "control.sqlite"), exportedReal);
@@ -782,11 +796,11 @@ export async function run(options) {
       Object.assign(evidence, { hostRuntime, independentReview: review, rejectedPublications });
       save("real-evidence.json", evidence);
       await cleanup("acceptance oracle", async () => {
-        assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle was touched by a local shell command");
+        assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle modification or unverified access by a local tool");
         assert.ok(acceptance.checks.every((check) => check.intact), "Frozen acceptance hash or permissions changed");
       });
       if (summary.status === "passed") await cleanup("final acceptance", async () => assertRealSuccess(exportedReal, evidence, acceptanceCommand, machineId));
-      Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches,
+      Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches, oracleReads: evidence.oracleReads, agentLocations: realAgentLocations(exportedReal),
         modelMismatches: Object.entries(evidence.roles).filter(([, role]) => role.modelMismatch).map(([kind, role]) => ({ kind, configuredModelId: role.configuredModelId, responseModels: role.responseModels })) });
     }
     if (acceptance?.immutable?.applied) await cleanup("frozen acceptance flags", async () => {
