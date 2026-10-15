@@ -612,7 +612,7 @@ test("real publication gate explains local-only completion and preserves agent l
     {agentId:"v",kind:"validator",machineId:"local",workspaceId:"host"}
   ]);
   for (const id of [undefined,"local-artifact"]) assert.throws(()=>assertRealPublication(detail,id,"linux"),
-    {message:"No publication observed from a remote Linux worker on linux; worker locations: w: machineId=local, workspaceId=host"});
+    {message:"No publication observed from a remote Linux worker on linux; mission status: completed; worker locations: w: machineId=local, workspaceId=host"});
   const remote = {...detail,agents:[...detail.agents,{id:"remote",kind:"worker",machineId:"linux",workspaceId:"guest"}],
     artifacts:[...detail.artifacts,{id:"remote-artifact",agentId:"remote",remoteProvenance:{machineId:"linux"}}]};
   assert.doesNotThrow(()=>assertRealPublication(remote,"remote-artifact","linux"));

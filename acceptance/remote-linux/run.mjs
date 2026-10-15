@@ -75,7 +75,7 @@ export function assertRealPublication(detail, artifactId, machineId) {
   const artifact = detail.artifacts.find((value) => value.id === artifactId && value.remoteProvenance?.machineId === machineId &&
     workers.some((agent) => agent.agentId === value.agentId && agent.machineId === machineId));
   const locations = workers.map((agent) => `${agent.agentId}: machineId=${agent.machineId ?? "unknown"}, workspaceId=${agent.workspaceId ?? "unknown"}`).join("; ") || "none";
-  assert.ok(artifact, `No publication observed from a remote Linux worker on ${machineId}; worker locations: ${locations}`);
+  assert.ok(artifact, `No publication observed from a remote Linux worker on ${machineId}; mission status: ${detail.mission.status}; worker locations: ${locations}`);
 }
 
 export function stoppedRealRuntimes(runtimes, detail, artifactId, machineId) {
