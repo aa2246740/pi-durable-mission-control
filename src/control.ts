@@ -43,7 +43,7 @@ import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type Mail
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
 import { normalizeRemoteArtifactPath, REMOTE_ARTIFACT_PATH_ERROR } from "./remote-artifact-path.js";
-import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
+import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS, REMOTE_NONAUTHORIZING_RPC_METHODS } from "./remote-rpc-methods.js";
 import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, parseNodeEffectSpec, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
 import { RemoteArtifactStore, parseRemoteArtifactManifest, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
 import {
@@ -331,18 +331,44 @@ export function tryAcquireDaemonOwnership(home: string): DatabaseSync | undefine
   }
 }
 
-function parityExecutableDownlink(payload: WorkerEnvelope["payload"]): boolean {
+const PARITY_READ_REPLY_METHODS = new Set([...REMOTE_NONAUTHORIZING_RPC_METHODS, "ListMcpTools"]);
+
+function evidenceReceiptResult(result: unknown): boolean {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const record = result as { recorded?: unknown };
+  return record.recorded === true && Object.keys(record).every((key) => key === "recorded" || key === "late");
+}
+
+function pendingApprovalResult(result: unknown): boolean {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const record = result as { status?: unknown; approvalId?: unknown };
+  return record.status === "pending" && typeof record.approvalId === "string" && Object.keys(record).length === 2;
+}
+
+/**
+ * Whether this downlink grants or continues execution.
+ *
+ * The decision follows the durable inbox RPC correlated by `source_inbox_id`
+ * and whether the reply actually carries an effect permit. Successful read
+ * snapshots are not authorization. A result-object shape is used only for the
+ * two already-defined non-authorizing classes: a pending approval status and
+ * a recorded evidence receipt that has no inbox correlation. Deliveries,
+ * approved effects, and permit replies stay blocked.
+ */
+function parityDownlinkAuthorizesExecution(payload: WorkerEnvelope["payload"], sourceMethod: string | null): boolean {
   if (payload.kind === "deliver" || payload.kind === "approved-effect") return true;
   if (payload.kind === "abort" || payload.kind === "shutdown" || payload.kind === "notice" || payload.kind === "rpc") return false;
-  if (payload.kind !== "reply" || !payload.ok) return payload.kind === "reply" ? false : true;
+  if (payload.kind !== "reply") return true;
+  if (!payload.ok) return false;
   const result = payload.result;
-  if (!result || typeof result !== "object" || Array.isArray(result)) return true;
-  const record = result as { [key: string]: unknown };
-  if (Object.hasOwn(record, "effectPermit")) return true;
-  const keys = Object.keys(record);
-  if (record.status === "pending" && typeof record.approvalId === "string" && keys.length === 2) return false;
-  if (record.recorded === true && keys.every((key) => key === "recorded" || key === "late")) return false;
-  return true;
+  if (result && typeof result === "object" && !Array.isArray(result) && Object.hasOwn(result, "effectPermit")) return true;
+  if (pendingApprovalResult(result)) return false;
+  if (sourceMethod !== null) {
+    if (PARITY_READ_REPLY_METHODS.has(sourceMethod) || sourceMethod === "RecordEffectReceipt") return false;
+    if (REMOTE_EFFECT_METHODS.has(sourceMethod)) return true;
+    return !evidenceReceiptResult(result);
+  }
+  return !evidenceReceiptResult(result);
 }
 
 export class ControlPlane {
@@ -1436,7 +1462,24 @@ export class ControlPlane {
     const binding = this.authorizeWorkerMailbox(machineId, token, sessionId, sessionEpoch, rawBinding);
     const agent = this.getAgent(binding.agentId);
     const parity = Boolean(agent && this.missionParityExecutionBlocked(agent.missionId));
-    return { envelopes: this.workerMailbox.pending(binding, 1, parity ? (envelope) => !parityExecutableDownlink(envelope.payload) : undefined) };
+    if (!parity) return { envelopes: this.workerMailbox.pending(binding, 1) };
+    const envelopes = this.workerMailbox.pending(binding, 1, (envelope, sourceMethod) =>
+      !parityDownlinkAuthorizesExecution(envelope.payload, sourceMethod));
+    if (envelopes.length > 0) return { envelopes };
+    const head = this.workerMailbox.headDownlink(binding);
+    // An executable head cannot be skipped. When it blocks later mail, fence
+    // the binding and request the existing runtime stop. Queued rows become
+    // cancelled and an already offered head becomes uncertain; neither is
+    // acknowledged, deleted, or re-offered. A lone executable tail stays
+    // where it is so an already offered head can still be acknowledged.
+    if (head && head.followerCount > 0 && parityDownlinkAuthorizesExecution(head.envelope.payload, head.sourceMethod)) {
+      this.transactionIfNeeded(() => {
+        this.workerMailbox.fence(binding);
+        const stopEpoch = agent && agent.epoch === binding.epoch ? agent.epoch : null;
+        this.remoteRuntimes.requestStop(binding, stopEpoch === null ? "ownership-lost" : "controlled", stopEpoch);
+      });
+    }
+    return { envelopes: [] };
   }
 
   /**
@@ -3625,6 +3668,8 @@ export class ControlPlane {
     }
     const args = request.args && typeof request.args === "object" ? request.args as Record<string, unknown> : {};
     if (current && current.machineId !== "local" && REMOTE_EFFECT_METHODS.has(request.method)) {
+      // Design §4.2: this build does not issue parity remote permits, including read_file.
+      this.rejectParityExecution(mission.id);
       if (mission.status !== "active") throw new HttpError(409, "Mission is not accepting worker commands");
       if (role.kind === "validator" && request.method !== "read_file") throw new HttpError(403, "Validators may only read remote workspaces");
       const runtime = this.remoteRuntimes.activeForAgent(agent.id);

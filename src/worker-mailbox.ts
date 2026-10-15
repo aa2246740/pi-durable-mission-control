@@ -737,19 +737,19 @@ export class DurableWorkerMailbox {
     return freeze(this.atomic(() => this.enqueueWithinTransaction(binding, payload, messageId)));
   }
 
-  pending(value: WorkerBinding, limit = 32, include?: (envelope: WorkerEnvelope) => boolean): readonly WorkerEnvelope[] {
+  pending(value: WorkerBinding, limit = 32, include?: (envelope: WorkerEnvelope, sourceMethod: string | null) => boolean): readonly WorkerEnvelope[] {
     checkLimit(limit);
     const binding = this.checkedBinding(value);
     return freeze(this.atomic(() => {
       this.openRow(binding);
       const rows = this.db.prepare(
-        "SELECT message_id,runtime_id,sequence,sha256,envelope_json,status,source_inbox_id FROM worker_mailbox_outbox WHERE runtime_id=? AND status IN ('queued','offered') ORDER BY sequence"
-      ).all(binding.runtimeId) as OutboxRow[];
+        "SELECT message_id,runtime_id,sequence,sha256,envelope_json,status,source_inbox_id FROM worker_mailbox_outbox WHERE runtime_id=? AND status IN ('queued','offered') ORDER BY sequence LIMIT ?"
+      ).all(binding.runtimeId, limit) as OutboxRow[];
       const selected: OutboxRow[] = [];
       for (const row of rows) {
-        const parsed = this.outboxRow(row);
-        if (include && !include(parsed.envelope)) break;
         if (selected.length >= limit) break;
+        const parsed = this.outboxRow(row);
+        if (include && !include(parsed.envelope, this.sourceRpcMethod(row, parsed.envelope))) break;
         if (row.status === "queued") {
           this.db.prepare("UPDATE worker_mailbox_outbox SET status='offered' WHERE message_id=? AND status='queued'")
             .run(row.message_id);
@@ -758,6 +758,39 @@ export class DurableWorkerMailbox {
       }
       return selected.map((row) => this.outboxRow(row));
     }).map((row) => row.envelope));
+  }
+
+  /**
+   * The next queued or offered downlink and how many later rows it blocks.
+   * Parses only that head. Does not mark it offered.
+   */
+  headDownlink(value: WorkerBinding): { envelope: WorkerEnvelope; status: "queued" | "offered"; sourceMethod: string | null; followerCount: number } | undefined {
+    const binding = this.checkedBinding(value);
+    this.openRow(binding);
+    const row = this.db.prepare(
+      "SELECT message_id,runtime_id,sequence,sha256,envelope_json,status,source_inbox_id FROM worker_mailbox_outbox WHERE runtime_id=? AND status IN ('queued','offered') ORDER BY sequence LIMIT 1"
+    ).get(binding.runtimeId) as OutboxRow | undefined;
+    if (!row || (row.status !== "queued" && row.status !== "offered")) return undefined;
+    const parsed = this.outboxRow(row);
+    const followers = this.db.prepare(
+      "SELECT count(*) AS n FROM worker_mailbox_outbox WHERE runtime_id=? AND status IN ('queued','offered') AND sequence>?"
+    ).get(binding.runtimeId, row.sequence) as { n: number };
+    return {
+      envelope: parsed.envelope,
+      status: row.status,
+      sourceMethod: this.sourceRpcMethod(row, parsed.envelope),
+      followerCount: Number(followers.n)
+    };
+  }
+
+  private sourceRpcMethod(row: OutboxRow, reply: WorkerEnvelope): string | null {
+    if (!row.source_inbox_id) return null;
+    const source = this.existingInbox(row.source_inbox_id);
+    if (!source || source.runtime_id !== row.runtime_id) return null;
+    const request = this.envelope(source.envelope_json, source.sha256);
+    if (request.payload.kind !== "rpc") return null;
+    if (reply.payload.kind === "reply" && reply.payload.rpcId !== request.payload.rpcId) return null;
+    return request.payload.method;
   }
 
   acknowledge(value: WorkerBinding, valueReceipt: WorkerReceipt): boolean {
