@@ -300,3 +300,45 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-rv7-a-astra- node --test acceptance/remote
 ```
 
 H5 的命令变更依据 MiniMax 运行 `/Users/wu/.mc-orch/real/minimax-20261015-085308/`。该次 `mission-export.json` 的首条回执把内联脚本中的 `'\''` 引号转义抄成连续单引号，stderr 报 `SyntaxError: missing ) after argument list`，测试尚未运行。新命令只含 Node 与入口脚本的路径引用，此次路径均不含单引号，因此没有该段嵌套引号可供误抄；这说明该特定语法错误的来源已移除，实际模型是否正确执行仍需新一轮真实验收。该次 `summary.json` 的 orchestrator 在 shell_evidence seq 207 及 tool transcript 中原样执行了当时的冻结命令。按 H5 的匹配规则，这两条执行在提供当时冻结命令作为比较基准时均归为 `oracleReads`；新运行使用新入口命令作为比较基准，旧内联命令不会获得新命令的只读豁免。
+
+## local-process 后端（Linux / macOS，无需容器）
+
+`--backend local-process` 使用本机 Node CLI 子进程作为远端节点。默认仍为 `--backend container`，容器路径、镜像要求和隔离断言保持原有行为。前提为 Node >= 22.19、已构建的 `dist/`、已有依赖、POSIX `/bin/sh` 与 `ps`，以及创建回环监听、detached 进程和发送 SIGSTOP/SIGKILL 的权限。彩排还需要 `shasum`。Linux 云环境先完成仓库环境准备，不需要 Apple Container。
+
+```sh
+npm run build
+node acceptance/remote-linux/run.mjs --backend local-process --scenario default --keep
+node acceptance/remote-linux/run.mjs --backend local-process --scenario node-power-loss --keep
+node acceptance/remote-linux/run.mjs --backend local-process --real acceptance/remote-linux/real-minimax.json --rehearsal --discard
+# 串行运行下面全部场景及 minimax/glm 正反彩排，不进入 npm test
+node --test acceptance/remote-linux/local-process.test.mjs
+```
+
+runner 默认在 TMPDIR 下创建权限 0700 的独占 proof，拒绝复用已有目录。可用 `--out` 指定不存在的 proof 路径。节点持久化 home 和工作区位于 proof 的 `local-runtime/`，与协调端 home 分离，全部网络监听绑定 `127.0.0.1`。稳定 HTTP relay 在协调端重启时切换目标，节点 CLI 保持原进程。节点 token 与模型凭据经 stdin 传入 bootstrap，再通过最小环境交给 CLI，日志与 argv 不含凭据值。worker 的 shell 继续验证不继承模型凭据。macOS 使用节点实际 `darwin` 能力，Linux 使用 `linux`，不伪造平台值；交付 JSON 中历史 `platform: linux` 是固定业务 fixture。
+
+| 场景 | local-process 支持与通过条件 |
+| --- | --- |
+| default | 完成、任务 accepted、冻结快照 hash、下载内容和独立复核通过 |
+| pause-resume | 受控停止后更高 epoch 的新 runtime 恢复，旧 mailbox/effect 不变 |
+| turn-limit | 准入拒绝后扩额恢复，保留原恢复断言 |
+| worker-crash | 只杀本轮 supervisor 的 worker，核对身份、supervisor 存活及恢复永久拒绝 |
+| restart-after-complete | SIGTERM、SIGKILL 重启协调端，已完成记录不重放 |
+| coordinator-restart | SIGTERM 后原节点 CLI 以新 session/更高 epoch 重连 |
+| coordinator-restart-kill | SIGKILL 后保留不确定工作，解除 blocker 仍不能绕过停止来源检查 |
+| node-power-loss | 冻结并杀完整节点进程集合，等待真实租约失效，同 home/token 重启；journal 不重放 |
+| `--real … --rehearsal` | 本地假模型覆盖真实 provider 协议；正确 totals 通过、错误 totals 被独立业务测试拒绝 |
+
+上述场景均可在两个平台运行；`--real` 仍只接受 default。真正模型调用需要另外提供凭据和授权，彩排不验证模型能力、真实计费和生产网络。
+
+本机 graceful restart 会等全部 agent 空闲、mailbox 静止，再把 SIGTERM 对齐到下一次真实 runtime poll 到达 relay 的时刻。relay 暂存该请求，等待协调端实际持久化 `coordinator_stopping`，随后转发原请求取得停止指令；不生成停止回报或修改持久化状态。`node-relay.json` 只记录请求路径、状态码和时刻。这个同步针对本次发现的产品时序问题：关闭时 mailbox poll 返回 503，可让节点进入重试并错过默认 5 秒停止期限。任意时刻 SIGTERM 的恢复能力仍需产品另行修复与验收；本场景证明上述受控边界。本机恢复完成等待为 30 秒，容器仍为 10 秒；最终恢复、epoch 和禁止重放断言不变。容器场景不使用该同步。
+
+故障控制通过 `ps` 递归跟踪本轮进程身份与进程组，Linux 额外核对 `/proc/<pid>/stat` 的启动 tick；macOS 使用 `ps` 的启动时间、命令与进程组。整节点故障先暂停 supervisor/祖先进程，再反复发现并暂停后代，直到连续核对全部为停止态，随后重读身份并分别 SIGKILL，包括自行 detached 的 worker、shell 和后代。进程组中存在非本轮进程、身份变化或无法封闭后代集合都会失败。这里只控制正常产品进程的派生关系，不提供针对恶意双重 fork/逃逸程序的安全沙箱。
+
+summary 增加 `backend`、实际 `nodePlatform`、`nodeArchitecture`、`localEnvironment`（可用 CPU 数、宿主内存与 Linux cgroup 配额原值，缺失记 unavailable）、`uncovered` 和 `localCleanup`。本机模式明确记录以下四项未覆盖：
+
+- 容器只读挂载、独立文件系统、宿主路径不可见。同 UID 可以访问彼此文件；mock 明确验证宿主测试路径可见。
+- 独立内核、硬件断电与磁盘缓存耐久性。node-power-loss 只证明完整进程崩溃、租约失效和持久库重开；证据使用 `processesExited` / `closedDescendantSet`，不伪造 `containerRemoved`。
+- 容器 CPU/内存上限、网络隔离、跨架构与跨机网络。
+- 独立新容器复核降为新进程冻结副本复核。它仍使用内存中的原始 oracle、CAS hash、独立 cwd、最小环境和实际 TAP/退出码，并在复核后检查 oracle、snapshot 和 CAS hash；同 UID 的运行时与 oracle 防篡改隔离未覆盖。
+
+正常、超时、中断均停止本轮协调端与节点后代，再只读查询会话库，执行最终凭据扫描。收尾删除 `local-runtime/`，确认进程无残留并记录临时目录移除；`--keep` 或失败保留的 proof 证据不算运行目录。专用自测将每次保留的 proof 移至 `.acceptance-proof/local-process-<时间戳>/`，同时保存各场景状态与耗时，TMPDIR 下不保留这些 proof。Linux 首次验收需确认 ps 格式、信号权限、回环端口、SQLite 锁与 Node 版本，并记录实际 OS/架构、CPU 配额及耗时；macOS 通过不能代替 Linux 实机验证。

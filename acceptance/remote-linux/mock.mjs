@@ -34,7 +34,7 @@ export function transcript(body) {
   return results;
 }
 
-export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "default", hooks }) {
+export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "default", hooks, platform = "linux", hostPathVisible = false }) {
   const names = new Set(body.tools.map((tool) => tool.function.name));
   const system = body.messages.filter((m) => ["system", "developer"].includes(m.role)).map((m) => m.content).join("\n");
   const role = names.has("SpawnAgent") ? "orchestrator" : names.has("bash") ? "worker" : "validator";
@@ -91,7 +91,7 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
     if (decision) return decision;
   }
   if (role === "worker") {
-    assert.equal(state.executionEnvironment?.platform, "linux");
+    assert.equal(state.executionEnvironment?.platform, platform);
     const owned = state.tasks.find((t) => state.agents.find((a) => a.id === t.ownerId)?.kind === "worker");
     if (!owned || owned.status !== "running") return call("WaitForMessage");
     if (scenario === "node-power-loss") {
@@ -111,7 +111,7 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
     }
     if (last.name === "GetMissionState") return call("write_file", { path: deliveryName, content: JSON.stringify(delivery) + "\n" });
     if (last.name === "write_file") {
-      const code = `const a=require("node:assert/strict");a.equal(process.platform,"linux");a.deepEqual(require("./${deliveryName}"),${JSON.stringify(delivery)});a.equal(require("node:fs").existsSync(${JSON.stringify(hostTestPath)}),false);a.equal(process.env.MC_ACCEPTANCE_MODEL_CREDENTIAL,undefined);console.log("LINUX-SELF-CHECK-OK")`;
+      const code = `const a=require("node:assert/strict");a.equal(process.platform,${JSON.stringify(platform)});a.deepEqual(require("./${deliveryName}"),${JSON.stringify(delivery)});a.equal(require("node:fs").existsSync(${JSON.stringify(hostTestPath)}),${hostPathVisible});a.equal(process.env.MC_ACCEPTANCE_MODEL_CREDENTIAL,undefined);console.log("LINUX-SELF-CHECK-OK")`;
       return call("bash", { command: `command -v node && node -e ${shellQuote(code)}` });
     }
     if (last.name === "bash" && !last.args.command.includes("LIVE-SOURCE-CHANGED")) {
@@ -153,7 +153,7 @@ export function nextCall(body, { acceptanceCommand, hostTestPath, scenario = "de
   throw new Error(`Unexpected ${role} tool progress after ${last?.name}`);
 }
 
-export async function startMock({ credential, acceptanceCommand, hostTestPath, scenario = "default", hooks, record, fail }) {
+export async function startMock({ credential, acceptanceCommand, hostTestPath, scenario = "default", hooks, platform = "linux", hostPathVisible = false, record, fail }) {
   const server = createServer(async (request, response) => {
     try {
       if (await hooks?.handleRequest(request, response)) return;
@@ -170,7 +170,7 @@ export async function startMock({ credential, acceptanceCommand, hostTestPath, s
       const body = JSON.parse(Buffer.concat(chunks).toString());
       assert.equal(body.stream, true);
       let decision;
-      try { decision = nextCall(body, { acceptanceCommand, hostTestPath, scenario, hooks }); }
+      try { decision = nextCall(body, { acceptanceCommand, hostTestPath, scenario, hooks, platform, hostPathVisible }); }
       catch (error) {
         record({ role: "protocol", name: "rejected", results: transcript(body) });
         throw error;
