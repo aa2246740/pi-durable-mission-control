@@ -340,19 +340,63 @@ test("an already paused Mission also persists and enforces the shutdown deadline
 test("shutdown allows node stop evidence and administrator reads while rejecting new business uploads", async t => {
   const f = await fixture(t);
   const adminToken = readFileSync(join(f.home, "control", "admin.token"), "utf8").trim();
+  const appliedEnvelope = { binding: f.assignment.binding, messageId: "applied-before-shutdown", sequence: 1,
+    payload: { kind: "rpc", rpcId: "read-before-shutdown", taskId: `${f.agent.id}:shutdown-read`, method: "GetMissionState", args: {} } };
+  const uploaded = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/mailbox/upload`, {
+    method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ machineId: f.enrolled.machine.id, sessionId: f.session.sessionId,
+      sessionEpoch: f.session.sessionEpoch, binding: f.assignment.binding, envelope: appliedEnvelope })
+  });
+  assert.equal(uploaded.status, 200);
+  const appliedReceipt = await uploaded.json();
+  const until = Date.now() + 1000;
+  while (f.control.workerMailbox.inspectInbox(f.assignment.binding)[0]?.status !== "applied" && Date.now() < until) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.equal(f.control.workerMailbox.inspectInbox(f.assignment.binding)[0].status, "applied");
+  const unappliedReceipt = f.control.nodeWorkerUpload(f.enrolled.machine.id, f.enrolled.token, f.session.sessionId,
+    f.session.sessionEpoch, f.assignment.binding, { ...appliedEnvelope, messageId: "unapplied-before-shutdown", sequence: 2,
+      payload: { ...appliedEnvelope.payload, rpcId: "not-applied" } });
   const closing = f.service.close();
   const read = await fetch(`http://127.0.0.1:${f.service.port}/api/missions/${f.mission.id}`, {
     headers: { authorization: `Bearer ${adminToken}` }
   });
   assert.equal(read.status, 200);
   await read.arrayBuffer();
+  const identity = { machineId: f.enrolled.machine.id, sessionId: f.session.sessionId,
+    sessionEpoch: f.session.sessionEpoch, binding: f.assignment.binding };
+  const inbox = f.control.workerMailbox.inspectInbox(f.assignment.binding);
+  const outbox = f.control.workerMailbox.inspectOutbox(f.assignment.binding);
   for (const path of ["mailbox/upload", "mailbox/poll", "mailbox/ack", "artifacts/chunk", "artifacts/complete"]) {
     const response = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/${path}`, {
-      method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" }, body: "{}"
+      method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" },
+      body: JSON.stringify(identity)
     });
     assert.equal(response.status, 503);
-    await response.arrayBuffer();
+    const body = await response.json();
+    assert.deepEqual(body, { error: "Coordinator is shutting down", ...(path.startsWith("mailbox/") ? { code: "coordinator_shutting_down" } : {}) });
+    assert.equal("envelopes" in body || "acknowledged" in body || "recorded" in body, false,
+      "Legacy nodes must receive failure, never successful settlement or stop evidence");
   }
+  assert.deepEqual(f.control.workerMailbox.inspectInbox(f.assignment.binding), inbox);
+  assert.deepEqual(f.control.workerMailbox.inspectOutbox(f.assignment.binding), outbox);
+  const settlement = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/mailbox/settlement`, {
+    method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ ...identity, entries: [appliedReceipt, unappliedReceipt] })
+  });
+  assert.equal(settlement.status, 200);
+  assert.deepEqual(await settlement.json(), { entries: [{ ...appliedReceipt, applied: true }, { ...unappliedReceipt, applied: false }] });
+  const stops = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/runtimes/poll`, {
+    method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ machineId: f.enrolled.machine.id, sessionId: f.session.sessionId, sessionEpoch: f.session.sessionEpoch })
+  });
+  assert.equal(stops.status, 200);
+  assert.deepEqual(await stops.json(), { directives: [{ action: "stop", binding: f.assignment.binding, descriptorHash: f.assignment.descriptorHash }] });
+  const unauthenticated = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/mailbox/poll`, {
+    method: "POST", headers: { authorization: "Bearer invalid-token", "content-type": "application/json" }, body: JSON.stringify(identity)
+  });
+  assert.equal(unauthenticated.status, 401);
+  assert.deepEqual(await unauthenticated.json(), { error: "Node authentication failed" });
   const result = await fetch(`http://127.0.0.1:${f.service.nodePort}/api/nodes/runtimes/events`, {
     method: "POST", headers: { authorization: `Bearer ${f.enrolled.token}`, "content-type": "application/json" },
     body: JSON.stringify({ machineId: f.enrolled.machine.id, sessionId: f.session.sessionId,

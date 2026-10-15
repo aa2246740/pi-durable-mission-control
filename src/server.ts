@@ -17,6 +17,12 @@ import { sanitizeDiagnostic, WorkerManager } from "./workers.js";
 const BODY_LIMIT = 1024 * 1024;
 const tokenFileName = "admin.token";
 
+class CoordinatorShuttingDown extends HttpError {
+  constructor() {
+    super(503, "Coordinator is shutting down");
+  }
+}
+
 function jsonResponse(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(value));
@@ -182,7 +188,8 @@ export async function startServer(options: ServerOptions) {
   const token = readFileSync(tokenPath, "utf8").trim();
   const shutdownNodeRoutes = new Set([
     "/api/nodes/session", "/api/nodes/poll", "/api/nodes/events", "/api/nodes/runtimes/poll",
-    "/api/nodes/runtimes/events", "/api/nodes/effects/receipts", "/api/nodes/mailbox/settlement"
+    "/api/nodes/runtimes/events", "/api/nodes/effects/receipts", "/api/nodes/mailbox/settlement",
+    "/api/nodes/mailbox/poll", "/api/nodes/mailbox/upload", "/api/nodes/mailbox/ack"
   ]);
   const handleRequest = (nodeOnly: boolean) => async (request: IncomingMessage, response: ServerResponse) => {
     try {
@@ -335,6 +342,12 @@ export async function startServer(options: ServerOptions) {
             text(body.machineId, "machineId", 64), nodeToken,
             text(body.sessionId, "sessionId", 64), positiveSafeInteger(body.sessionEpoch, "sessionEpoch"), body.binding
           ];
+          if (closing) {
+            // Authenticate the session and old binding without accepting or acknowledging
+            // business traffic. Applied uploads remain queryable through settlement.
+            control.nodeWorkerMailboxSettlement(...identity, []);
+            throw new CoordinatorShuttingDown();
+          }
           if (mailboxAction === "upload") {
             const receipt = control.nodeWorkerUpload(...identity, body.envelope);
             jsonResponse(response, 200, receipt);
@@ -721,7 +734,7 @@ export async function startServer(options: ServerOptions) {
       const status = error instanceof HttpError || error instanceof MachineError ? error.status : error instanceof McpConfigurationError ? 400 : 500;
       const message = error instanceof MachineError && error.status === 401 ? "Node authentication failed" :
         error instanceof HttpError || error instanceof MachineError || error instanceof McpConfigurationError ? error.message : "Internal server error";
-      jsonResponse(response, status, { error: message });
+      jsonResponse(response, status, { error: message, ...(error instanceof CoordinatorShuttingDown ? { code: "coordinator_shutting_down" } : {}) });
     }
   };
   const server = createServer(handleRequest(false));

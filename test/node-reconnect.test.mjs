@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { CoordinatorUnavailable, fetchJson, nodeReconnectDelay } from "../dist/node.js";
+import { CoordinatorShuttingDown, CoordinatorUnavailable, fetchJson, nodeReconnectDelay } from "../dist/node.js";
 import { workerStartSpecHash } from "../dist/node-worker-spec.js";
 import { DurableWorkerMailbox } from "../dist/worker-mailbox.js";
 
@@ -35,6 +35,11 @@ async function fixture(t, execution = false) {
     const body = JSON.parse(Buffer.concat(chunks).toString());
     const path = request.url;
     state.requests.push({ path, body });
+    if (path.startsWith("/api/nodes/mailbox/") && state.mailboxFailure) {
+      response.writeHead(503);
+      response.end(JSON.stringify(state.mailboxFailure));
+      return;
+    }
     if (state.failure === "reset") { request.socket.destroy(); return; }
     if (state.failure === "timeout") return;
     if (state.failure) {
@@ -58,7 +63,7 @@ async function fixture(t, execution = false) {
       state.polls++;
       value = { machine, commands: [], leaseMs: 20000 };
     } else if (path === "/api/nodes/runtimes/poll") {
-      value = { directives: descriptor && state.sessionEpoch === 1 ? [{ action: "start", descriptor, descriptorHash: workerStartSpecHash(descriptor) }] : [] };
+      value = { directives: descriptor && state.sessionEpoch === 1 && !body.stopRuntimeId ? [{ action: "start", descriptor, descriptorHash: workerStartSpecHash(descriptor) }] : [] };
     } else if (path === "/api/nodes/mailbox/upload") {
       value = mailbox.receive(body.binding, body.envelope);
     } else if (path === "/api/nodes/mailbox/poll") {
@@ -249,4 +254,56 @@ test("SIGTERM cancels a pending request without waiting for its seven-second tim
   await exit;
   assert.ok(Date.now() - started < 1000, f.output());
   assert.equal(child.exitCode, 0);
+});
+
+for (const path of ["poll", "upload", "ack"]) {
+  test(`structured mailbox ${path} shutdown is distinct from coordinator outage`, async t => {
+    t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ error: "localized message", code: "coordinator_shutting_down" }), { status: 503 }));
+    await assert.rejects(fetchJson(new URL("http://127.0.0.1"), `/api/nodes/mailbox/${path}`, "fixture", {}), CoordinatorShuttingDown);
+    await assert.rejects(fetchJson(new URL("http://127.0.0.1"), "/api/nodes/runtimes/poll", "fixture", {}), CoordinatorUnavailable);
+  });
+}
+
+for (const body of ['{"error":"Coordinator is shutting down"}', '{"code":"another_code","error":"shutdown"}', '{"code":"coordinator_shutting_down","error":"shutdown","extra":true}', '{', 'x'.repeat(1024 * 1024 + 1)]) {
+  test(`legacy or invalid mailbox shutdown response retains outage classification (${body.length} bytes)`, async t => {
+    t.mock.method(globalThis, "fetch", async () => new Response(body, { status: 503 }));
+    await assert.rejects(fetchJson(new URL("http://127.0.0.1"), "/api/nodes/mailbox/poll", "fixture", {}), CoordinatorUnavailable);
+  });
+}
+
+test("mailbox shutdown alone cannot manufacture a requested stop without a matching directive", async t => {
+  const f = await fixture(t, true);
+  const child = f.start();
+  await waitFor(() => f.state.requests.some(({ path }) => path === "/api/nodes/mailbox/upload"));
+  f.state.mailboxFailure = { error: "Closing", code: "coordinator_shutting_down" };
+  // The fixture only offers start directives. A targeted stop query must return
+  // no directive; a shutdown code by itself cannot grant controlled provenance.
+  const descriptorRequests = f.state.requests.length;
+  await waitFor(() => f.state.reports.length > 0);
+  assert.equal(child.exitCode, null, f.output());
+  assert.equal(f.state.registrations.length, 1);
+  assert.ok(f.state.requests.slice(descriptorRequests).some(({ body }) => body.stopRuntimeId === f.descriptor.binding.runtimeId));
+  assert.equal(f.state.reports[0].outcome, "stopped");
+  assert.equal(f.state.reports[0].stopReason, "unexpected");
+  assert.equal(f.output().includes("retrying"), false);
+});
+
+
+test("connection refusal during a live session retains N2 backoff and reconnects without replacing the worker", async t => {
+  const f = await fixture(t, true);
+  const child = f.start();
+  await waitFor(() => f.state.requests.some(({ path }) => path === "/api/nodes/mailbox/upload"));
+  await waitFor(() => f.readRuntime()[0]?.state === "running");
+  const runtime = f.readRuntime()[0];
+  const port = f.server.address().port;
+  f.server.closeAllConnections();
+  await new Promise(resolve => f.server.close(resolve));
+  await waitFor(() => f.output().includes("retrying"));
+  const polls = f.state.polls;
+  assert.equal(child.exitCode, null, f.output());
+  await new Promise(resolve => f.server.listen(port, "127.0.0.1", resolve));
+  await waitFor(() => f.state.polls > polls);
+  assert.equal(f.state.registrations.length, 1);
+  assert.deepEqual(f.readRuntime(), [runtime]);
+  assert.deepEqual(f.state.reports, []);
 });

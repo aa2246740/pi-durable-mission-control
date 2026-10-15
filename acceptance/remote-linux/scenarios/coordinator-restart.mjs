@@ -112,7 +112,7 @@ export function assertIrrecoverableRestart(before, after, evidence) {
 export function createCoordinatorRestartScenario(name, { quiescenceMs = 0, recoveryTimeoutMs = 10000 } = {}) {
   if (!restartScenarios.includes(name)) return;
   const completed = name === "restart-after-complete";
-  const evidence = { scenario: name, snapshots: [], restarts: [], humanActions: [] };
+  const evidence = { scenario: name, recoveryTimeoutMs, snapshots: [], restarts: [], humanActions: [] };
   let context, idleKey, idleAt;
   const scenario = {
     evidence, completed, released: false, mockRequests: 0,
@@ -218,7 +218,7 @@ export function createCoordinatorRestartScenario(name, { quiescenceMs = 0, recov
 }
 
 export function configureCoordinatorRestartRun(restart, { missionId, home, proof, records, api, post, wait, command, save, redact,
-  local, gracefulStop, remotePath = "/work", readTransport, readRequest, downloadContent, containerName: name, machineId, daemonState, spawnDaemon, activateDaemon, setDetail, assertRecovered, assertCoordinatorExit }) {
+  local, signalDelayMs = 0, remotePath = "/work", readTransport, readRequest, downloadContent, containerName: name, machineId, daemonState, spawnDaemon, activateDaemon, setDetail, assertRecovered, assertCoordinatorExit }) {
   const snapshot = async () => {
     const detail = await api(`/api/missions/${missionId}`);
     setDetail(detail);
@@ -252,10 +252,11 @@ export function configureCoordinatorRestartRun(restart, { missionId, home, proof
       assert.equal(originalNode.alive, true, "Node must be alive before coordinator restart");
       const originalMachine = (await api("/api/state")).machines.find((machine) => machine.id === machineId);
       entry.nodeReconnect = { previousPid: originalNode.pid, previousSessionId: originalMachine.sessionId, previousSessionEpoch: originalMachine.sessionEpoch, explicit: false, sameHome: local?.home ?? "/node-home", ...(local ? { backend: "local-process" } : { sameContainer: name }) };
-      if (signal === "SIGTERM" && gracefulStop && restart.evidence.scenario !== "restart-after-complete") {
-        entry.stopSynchronization = "real-runtime-poll-held-until-stop-request-persisted";
-        await gracefulStop(signal);
-      } else previous.child.kill(signal);
+      assert.ok(Number.isSafeInteger(signalDelayMs) && signalDelayMs >= 0 && signalDelayMs <= 1000);
+      entry.stopSynchronization = "none";
+      entry.signalDelayMs = signalDelayMs;
+      await new Promise(resolve => setTimeout(resolve, signalDelayMs));
+      previous.child.kill(signal);
       const timer = setTimeout(() => previous.child.kill("SIGKILL"), 12000);
       await previous.done;
       clearTimeout(timer);

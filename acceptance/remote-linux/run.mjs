@@ -469,11 +469,7 @@ export async function run(options) {
     }
     if (restart) captureRestart = configureCoordinatorRestartRun(restart, {
       missionId: mission.id, home, proof, records, api, post, wait, command, save, redact, assertCoordinatorExit,
-      local, remotePath,
-      gracefulStop: local ? (signal) => nodeRelay.atRuntimePoll(async () => {
-        daemon.child.kill(signal);
-        await wait(async () => (await api(`/api/missions/${mission.id}`)).events.some((event) => event.type === "coordinator_stopping"));
-      }) : undefined,
+      local, remotePath, signalDelayMs: options.coordinatorRestartDelayMs ?? Math.floor(Math.random() * 251),
       readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id),
       readRequest: async (path) => {
         const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });

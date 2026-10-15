@@ -49,12 +49,13 @@ TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario 
 
 ### 运行中协调端重启
 
-`--scenario coordinator-restart` 在远端 worker 第一次 Linux 自查成功后、发布之前暂停 mock 的后续发布决策，等待实际 WaitForMessage 上传结清，再对协调端发送 SIGTERM。`--scenario coordinator-restart-kill` 在同一个位置使用 SIGKILL。两个场景各运行一次独立 Mission，均使用原协调端 home 重启，并等待原容器中的节点自动重连，全程不重启节点 CLI。
+`--scenario coordinator-restart` 在远端 worker 第一次 Linux 自查成功后、发布之前暂停 mock 的后续发布决策，等待实际 WaitForMessage 上传结清，再对协调端发送 SIGTERM。`--scenario coordinator-restart-kill` 在同一个位置使用 SIGKILL。两个场景各运行一次独立 Mission，均使用原协调端 home 重启，并等待原容器中的节点自动重连，全程不重启节点 CLI。 信号不再等待或拦截 runtime poll；默认在 0 到 250 毫秒的随机偏移后发送，证据记录 `stopSynchronization: "none"` 和 `signalDelayMs`。
 
 ```sh
 TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart --keep --out "$PWD/.acceptance-proof/restart-running-term-1"
 TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart-kill --keep --out "$PWD/.acceptance-proof/restart-running-kill-1"
 MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-restart- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/coordinator-restart-container.test.mjs
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-shutdown- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/shutdown-regression.test.mjs
 ```
 
 容器自测顺序运行这三个场景各两次，最后再运行 default、pause-resume、worker-crash 各一次；即使前一次失败也保存结果并继续。任一次场景或清理失败，整个自测非零退出。该自测不进入 `npm test`，要求设置一个 `mc-acc-` 开头、以 `-` 结尾的专属容器前缀。
@@ -64,6 +65,8 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-restart- TMPDIR="$PWD/.acceptance-proof" n
 正常停止会暂停有运行中远端 runtime 的 Mission，持久化受控停止请求并标记中断投递；节点接口在确认期间继续开放。所有 runtime 共用默认 5 秒的等待上限，可用 `MC_REMOTE_SHUTDOWN_TIMEOUT_MS` 设置为 1 至 10000 毫秒。关闭期间管理员写请求返回 503。换新 runtime 时会原子地创建一条新的系统恢复通知，让 worker 读取持久化历史并继续待办工作；旧投递不重放。只有退出前取得完整的 closed/controlled 证据，重启后才保留恢复资格；超时后到达的报告不能恢复资格。没有运行中远端 runtime 的 Mission 保持原有关闭行为。
 
 结局写入 summary 的 `outcome`。`coordinator-restart` 必须为 `recovered`，`coordinator-restart-kill` 必须为 `irrecoverable`。`recovered` 要求恰好一次重分配、同 worker 与同节点、epoch 严格递增、发布在新 runtime 上，并通过 pause-resume 共用的不重放断言。`irrecoverable` 要求 Mission failed、恰好一个 worker_start_failed，且带 `recoverable: false`、机器可读 reason 和非空 diagnostic。此时旧 binding、mailbox、effect、投递和消息必须保持运营者操作前的状态，worker 工具调用不能增加。effect 或投递重放、无证据的新 runtime、active 且没有 blocker 或诊断、重复生成 blocker、resume 后没有终局诊断的停滞都会使场景非零退出并保留证据。
+
+`shutdown-regression.test.mjs` 在 container 和 local-process 后端各用 0、37、131 毫秒偏移验证三次正常关闭恢复，再验证一次 SIGKILL 不可恢复。每次结果和耗时写入独立证据目录及 `results.json`，任一失败均保留并使测试失败。local-process 的完整任务恢复验收窗口为 30 秒，容器为 10 秒；这两个窗口包含发布、验证和 Mission 完成，不改变产品持久化的 5 秒停止确认期限。场景证据记录 `recoveryTimeoutMs`。
 
 `coordinator-restart.json` 保存重启前后与每步运营者操作的只读快照，包括 mission detail、runtimes、blockers、mock 请求计数、工具记录、完整 mailbox binding 和 transport。还保留 `mission-export.json`、每次协调端日志及含节点重连状态的 container.log。`summary.json` 只摘录结局与 HTTP 结果，完整 GET 响应留在场景证据中。
 

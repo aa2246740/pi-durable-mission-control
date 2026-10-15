@@ -129,8 +129,8 @@ test("local runner timeout and interruption retain failed evidence after verifie
 });
 
 
-test("loopback relay holds a real runtime poll through persisted-stop synchronization and forwards credentials privately", async (t) => {
-  let stopped = false;
+test("loopback relay forwards real runtime polls immediately and keeps credentials private", async (t) => {
+  const stopped = false;
   const requests = [];
   const server = createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
@@ -140,17 +140,22 @@ test("loopback relay holds a real runtime poll through persisted-stop synchroniz
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const relay = await localRelay(server.address().port);
   t.after(async () => { await relay.close(); server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); });
-  const gate = relay.atRuntimePoll(async () => { stopped = true; });
   const response = await fetch(`http://127.0.0.1:${relay.port}/api/nodes/runtimes/poll`, { method: "POST", headers: { authorization: "Bearer unit-private-token" }, body: "real-poll-body" });
-  await gate;
-  assert.deepEqual(await response.json(), { stopped: true });
-  assert.deepEqual(requests, [{ path: "/api/nodes/runtimes/poll", credential: "Bearer unit-private-token", body: "real-poll-body", stopped: true }]);
+  assert.deepEqual(await response.json(), { stopped: false });
+  assert.deepEqual(requests, [{ path: "/api/nodes/runtimes/poll", credential: "Bearer unit-private-token", body: "real-poll-body", stopped: false }]);
   assert.equal(JSON.stringify(relay.observations).includes("unit-private-token"), false);
   assert.deepEqual(relay.observations.map(({ phase }) => phase), ["request", "response"]);
 });
 
-test("closing the local relay rejects a pending fault gate", async () => {
-  const relay = await localRelay(1);
-  const pending = assert.rejects(relay.atRuntimePoll(() => assert.fail("No request arrived")), /Relay closed/);
-  await relay.close(); await pending;
+test("closing the local relay destroys an in-flight request without a synchronization gate", async t => {
+  let received;
+  const pending = new Promise(resolve => { received = resolve; });
+  const server = createServer(() => received());
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const relay = await localRelay(server.address().port);
+  t.after(async () => { await relay.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const request = assert.rejects(fetch(`http://127.0.0.1:${relay.port}/api/nodes/runtimes/poll`, { method: "POST", body: "{}" }));
+  await pending;
+  await relay.close();
+  await request;
 });
