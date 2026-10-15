@@ -1,0 +1,512 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { setImmediate as nextImmediate } from "node:timers/promises";
+import { test } from "node:test";
+import { applyWorkerNotice } from "../dist/worker-events.js";
+import { ControlPlane } from "../dist/control.js";
+import { fixture } from "./fixtures/completion.mjs";
+
+
+test("CompleteMission replies before submission settlement and shutdown waits for durable completion", async (t) => {
+  const f = await fixture(t);
+  const completing = f.complete();
+  assert.equal((await f.reply).result.status, "completed");
+  await nextImmediate();
+  assert.equal(f.sent.some((message) => message.type === "shutdown"), false, "the final submission must be allowed to settle after the RPC reply");
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  f.notice({ type: "turn_end", turnId: "complete-turn" });
+  await nextImmediate();
+  assert.equal(f.sent.some((message) => message.type === "shutdown"), false, "turn_end alone is not submission settlement");
+  f.settle();
+  await completing;
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.equal(f.control.db.prepare("SELECT status,attempt FROM outbox WHERE id=?").get(f.row.id).status, "completed");
+  assert.equal(f.sent.filter((message) => message.type === "shutdown").length, 1);
+  assert.equal(f.workers.handles.has(f.agent.id), false);
+  assert.equal(f.control.getAgentPublic(f.agent.id).epoch, f.agent.epoch + 1);
+  assert.deepEqual(f.control.blockers(f.mission.id), []);
+  assert.equal(f.control.exportMission(f.mission.id).events.some((event) => event.type === "delivery_uncertain"), false);
+});
+
+for (const terminal of ["completed", "cancelled"]) {
+  test(`${terminal} shutdown deadline preserves uncertain evidence without pretending completion`, async (t) => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let stopping;
+    if (terminal === "completed") {
+      stopping = f.complete();
+      await f.reply;
+    } else {
+      f.control.missionAction(f.mission.id, "cancel");
+      assert.equal(f.control.message(f.row.message_id).status, "admitted");
+      stopping = f.workers.syncMissionLifecycle(f.mission.id);
+    }
+    await nextImmediate();
+    t.mock.timers.tick(4999);
+    await nextImmediate();
+    assert.equal(f.sent.some((message) => message.type === "shutdown"), false);
+    t.mock.timers.tick(1);
+    await stopping;
+    const outbox = f.control.db.prepare("SELECT status,attempt,result FROM outbox WHERE id=?").get(f.row.id);
+    assert.equal(outbox.status, "uncertain");
+    assert.equal(outbox.attempt, 1);
+    assert.match(outbox.result, /Harness is closed/);
+    assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+    assert.equal(f.control.missionById(f.mission.id).status, terminal);
+    assert.equal(f.control.blockers(f.mission.id).filter((blocker) => blocker.status === "open").length, terminal === "completed" ? 0 : 1);
+    assert.equal(f.control.pendingOutbox().length, 0);
+    assert.equal(f.sent.filter((message) => message.type === "shutdown").length, 1);
+    assert.equal(f.child.listenerCount("message"), 1, "settlement and shutdown listeners are removed");
+    assert.equal(f.child.listenerCount("exit"), 0);
+    assert.match(f.control.getAgentPublic(f.agent.id).error, /5000 ms/);
+    await f.workers.close();
+    f.control.close();
+    const reopened = new ControlPlane(join(f.home, "state"));
+    try {
+      assert.equal(reopened.message(f.row.message_id).status, "uncertain");
+      assert.equal(reopened.blockers(f.mission.id).filter((blocker) => blocker.status === "open").length, terminal === "completed" ? 0 : 1);
+    } finally {
+      reopened.close();
+    }
+  });
+}
+
+test("cancellation drains the local submission and keeps remote interruption immediate", async (t) => {
+  const f = await fixture(t);
+  const message = f.control.sendMessage(f.mission.id, f.owner.id, "Remote input", "followUp", "remote-input");
+  const remoteRow = f.control.pendingOutbox().find((row) => row.message_id === message.id);
+  f.control.markOutboxDispatching(remoteRow.id, f.owner.epoch);
+  f.control.ackOutbox(message.id, remoteRow.request_id, remoteRow.attempt, f.owner.epoch, "admitted");
+  const data = f.control.db.prepare("SELECT data FROM agents WHERE id=?").get(f.owner.id);
+  f.control.db.prepare("UPDATE agents SET data=? WHERE id=?").run(JSON.stringify({ ...JSON.parse(data.data), machineId: "remote-test" }), f.owner.id);
+  f.control.missionAction(f.mission.id, "cancel");
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  assert.equal(f.control.message(message.id).status, "uncertain");
+  const stopping = f.workers.syncMissionLifecycle(f.mission.id);
+  const concurrent = f.workers.stopMission(f.mission.id);
+  await nextImmediate();
+  assert.equal(f.sent.some((message) => message.type === "shutdown"), false);
+  f.settle();
+  await Promise.all([stopping, concurrent]);
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.equal(f.control.missionById(f.mission.id).status, "cancelled");
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [`delivery:${remoteRow.id}`]);
+  assert.equal(f.sent.filter((message) => message.type === "shutdown").length, 1);
+  assert.equal(f.control.getAgentPublic(f.agent.id).epoch, f.agent.epoch + 1);
+});
+
+test("a terminal stop requires every local delivery to settle and ignores stale notices", async (t) => {
+  const f = await fixture(t);
+  const extra = f.control.sendMessage(f.mission.id, f.agent.id, "Already admitted follow-up", "followUp", "extra-input");
+  const extraRow = f.control.pendingOutbox().find((row) => row.message_id === extra.id);
+  f.control.markOutboxDispatching(extraRow.id, f.agent.epoch);
+  f.control.ackOutbox(extra.id, extraRow.request_id, extraRow.attempt, f.agent.epoch, "admitted");
+  const stopping = f.complete();
+  await f.reply;
+  await nextImmediate();
+  const body = { type: "settled", messageId: extra.id, requestId: extraRow.request_id,
+    attempt: extraRow.attempt, submissionId: "extra-submission", status: "done", result: { status: "done" } };
+  f.child.emit("message", { ...body, agentId: f.agent.id, epoch: f.agent.epoch + 1 });
+  f.notice({ ...body, requestId: "wrong-request" });
+  f.settle();
+  await nextImmediate();
+  assert.equal(f.control.message(extra.id).status, "admitted");
+  assert.equal(f.sent.some((message) => message.type === "shutdown"), false);
+  f.notice(body);
+  await stopping;
+  assert.equal(f.control.message(extra.id).status, "completed");
+  assert.deepEqual(f.control.blockers(f.mission.id), []);
+  assert.equal(f.control.pendingOutbox().length, 0);
+});
+
+test("a worker exit during terminal settlement retains uncertainty without waiting for the deadline", async (t) => {
+  const f = await fixture(t);
+  const stopping = f.complete();
+  await f.reply;
+  await nextImmediate();
+  f.child.exitCode = 1;
+  f.child.connected = false;
+  f.child.emit("exit", 1);
+  await stopping;
+  assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+  assert.equal(f.control.db.prepare("SELECT result FROM outbox WHERE id=?").get(f.row.id).result, null);
+  assert.equal(f.sent.some((message) => message.type === "shutdown"), false);
+  assert.deepEqual(f.control.blockers(f.mission.id), []);
+  assert.equal(f.workers.handles.has(f.agent.id), false);
+  assert.equal(f.child.listenerCount("exit"), 0);
+  assert.match(f.control.getAgentPublic(f.agent.id).error, /worker exited/);
+});
+
+test("an unanswered terminal submission remains uncertain even when it settles within the grace period", async (t) => {
+  const f = await fixture(t);
+  const stopping = f.complete();
+  await f.reply;
+  await nextImmediate();
+  f.settle("unanswered", "Submission failed independently of shutdown");
+  await stopping;
+  assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+  assert.match(f.control.db.prepare("SELECT result FROM outbox WHERE id=?").get(f.row.id).result, /failed independently/);
+  assert.deepEqual(f.control.blockers(f.mission.id), []);
+});
+
+test("a terminal worker with no pending delivery closes immediately", async (t) => {
+  const f = await fixture(t);
+  f.settle();
+  await f.complete();
+  assert.equal(f.sent.filter((message) => message.type === "shutdown").length, 1);
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.deepEqual(f.control.blockers(f.mission.id), []);
+});
+
+test("pause still aborts immediately and records interrupted delivery blockers", async (t) => {
+  const f = await fixture(t);
+  f.control.missionAction(f.mission.id, "pause");
+  await f.workers.pauseMission(f.mission.id);
+  assert.deepEqual(f.sent.map((message) => message.type), ["abort", "shutdown"]);
+  assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+  assert.equal(f.control.missionById(f.mission.id).status, "paused");
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [`delivery:${f.row.id}`]);
+});
+
+function requestUserInput(f) {
+  return f.workers.onRpc(f.agent, f.handle, {
+    type: "rpc", id: "question-rpc", token: f.handle.token, agentId: f.agent.id, epoch: f.agent.epoch,
+    method: "RequestUserInput", args: { question: "Confirm the next step" }, taskId: "question"
+  });
+}
+
+test("RequestUserInput replies before settlement and pauses without an extra delivery blocker", async (t) => {
+  const f = await fixture(t);
+  const pausing = requestUserInput(f);
+  const reply = await f.reply;
+  assert.equal(reply.error, undefined);
+  await nextImmediate();
+  assert.deepEqual(f.control.blockers(f.mission.id).map(({ id, kind }) => ({ id, kind })),
+    [{ id: reply.result.id, kind: "user_input" }]);
+  assert.deepEqual(f.sent.map((message) => message.id ?? message.type), ["question-rpc"]);
+  f.notice({ type: "turn_end", turnId: "question-turn" });
+  const concurrent = f.workers.syncMissionLifecycle(f.mission.id);
+  await nextImmediate();
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  assert.equal(f.sent.some((message) => message.type === "abort"), false, "turn_end alone is not settlement");
+  f.settle();
+  await Promise.all([pausing, concurrent]);
+  assert.deepEqual(f.sent.map((message) => message.id ?? message.type), ["question-rpc", "abort", "shutdown"]);
+  assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.deepEqual({ ...f.control.db.prepare("SELECT status,attempt FROM outbox WHERE id=?").get(f.row.id) },
+    { status: "completed", attempt: 1 });
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [reply.result.id]);
+  assert.equal(f.child.listenerCount("message"), 1);
+  assert.equal(f.child.listenerCount("exit"), 0);
+});
+
+for (const outcome of ["timeout", "exited", "unanswered"]) {
+  test(`RequestUserInput ${outcome} preserves the uncertain delivery and blocker`, async (t) => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const pausing = requestUserInput(f);
+    const reply = await f.reply;
+    await nextImmediate();
+    assert.equal(f.control.message(f.row.message_id).status, "admitted");
+    if (outcome === "timeout") {
+      t.mock.timers.tick(4999);
+      await nextImmediate();
+      assert.equal(f.sent.some((message) => message.type === "abort"), false);
+      t.mock.timers.tick(1);
+    } else if (outcome === "exited") {
+      f.child.exitCode = 1;
+      f.child.connected = false;
+      f.child.emit("exit", 1);
+    } else {
+      f.settle("unanswered", "Submission failed after asking the question");
+    }
+    await pausing;
+    assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+    assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+    assert.deepEqual({ ...f.control.db.prepare("SELECT status,attempt FROM outbox WHERE id=?").get(f.row.id) },
+      { status: "uncertain", attempt: 1 });
+    assert.deepEqual(f.control.blockers(f.mission.id).filter((blocker) => blocker.status === "open").map((blocker) => blocker.id).sort(),
+      [reply.result.id, `delivery:${f.row.id}`].sort());
+    assert.equal(f.child.listenerCount("message"), 1);
+    assert.equal(f.child.listenerCount("exit"), 0);
+    if (outcome === "timeout") assert.match(f.control.getAgentPublic(f.agent.id).error, /5000 ms before user-input pause/);
+    if (outcome === "exited") assert.match(f.control.getAgentPublic(f.agent.id).error, /exited before user-input delivery settlement/);
+    if (outcome === "unanswered") assert.match(f.control.db.prepare("SELECT result FROM outbox WHERE id=?").get(f.row.id).result, /failed after asking/);
+  });
+}
+
+test("RequestUserInput with no pending delivery pauses immediately", async (t) => {
+  const f = await fixture(t);
+  f.settle();
+  await requestUserInput(f);
+  const reply = await f.reply;
+  assert.deepEqual(f.sent.map((message) => message.id ?? message.type), ["question-rpc", "abort", "shutdown"]);
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [reply.result.id]);
+});
+
+test("RequestUserInput drains only its caller while local and remote peers pause immediately", async (t) => {
+  const f = await fixture(t);
+  const local = f.owner;
+  const remote = f.control.listAgents(f.mission.id).find((agent) => agent.kind === "validator");
+  const rows = [local, remote].map((agent) => {
+    const message = f.control.sendMessage(f.mission.id, agent.id, "Peer input", "followUp", `peer-${agent.id}`);
+    const row = f.control.pendingOutbox().find((item) => item.message_id === message.id);
+    assert.equal(f.control.markOutboxDispatching(row.id, agent.epoch), true);
+    assert.equal(f.control.ackOutbox(message.id, row.request_id, row.attempt, agent.epoch, "admitted"), true);
+    return row;
+  });
+  f.control.db.prepare("UPDATE agents SET data=? WHERE id=?").run(JSON.stringify({ ...remote, machineId: "remote-test" }), remote.id);
+  const child = new EventEmitter();
+  Object.assign(child, { connected: true, exitCode: null, signalCode: null });
+  const sent = [];
+  child.send = (message, callback) => {
+    sent.push(message.type);
+    callback(null);
+    if (message.type === "abort") child.emit("message", { type: "aborted", agentId: local.id, epoch: local.epoch });
+    if (message.type === "shutdown") {
+      child.emit("message", { type: "closed", agentId: local.id, epoch: local.epoch });
+      child.exitCode = 0;
+      child.connected = false;
+      child.emit("exit", 0);
+    }
+  };
+  f.workers.handles.set(local.id, { child, token: "peer-token", epoch: local.epoch, ready: Promise.resolve(), stopping: false });
+  const queued = f.control.sendMessage(f.mission.id, f.agent.id, "Do not start", "followUp", "queued-question-input");
+  const pausing = requestUserInput(f);
+  const reply = await f.reply;
+  await nextImmediate();
+  assert.deepEqual(sent, ["abort", "shutdown"]);
+  assert.equal(f.control.getAgentPublic(remote.id).epoch, remote.epoch + 1);
+  for (const row of rows) assert.equal(f.control.message(row.message_id).status, "uncertain");
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  assert.equal(f.sent.some((message) => message.type === "abort"), false);
+  f.settle();
+  await pausing;
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.equal(f.control.message(queued.id).status, "aborted");
+  assert.equal(f.sent.some((message) => message.type === "deliver"), false);
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id).sort(),
+    [reply.result.id, ...rows.map((row) => `delivery:${row.id}`)].sort());
+  for (const row of rows) assert.equal(f.control.db.prepare("SELECT attempt FROM outbox WHERE id=?").get(row.id).attempt, 1);
+});
+
+test("RequestUserInput reserves settlement before a concurrent lifecycle sync during its reply", async (t) => {
+  const f = await fixture(t);
+  const send = f.child.send;
+  let concurrent;
+  f.child.send = (message, callback) => {
+    if (message.id === "question-rpc") {
+      f.notice({ type: "turn_end", turnId: "reply-race-turn" });
+      concurrent = f.workers.syncMissionLifecycle(f.mission.id);
+    }
+    send(message, callback);
+  };
+  const pausing = requestUserInput(f);
+  const reply = await f.reply;
+  await nextImmediate();
+  assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  assert.equal(f.sent.some((message) => message.type === "abort"), false);
+  f.settle();
+  await Promise.all([pausing, concurrent]);
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.deepEqual(f.control.blockers(f.mission.id).map((blocker) => blocker.id), [reply.result.id]);
+});
+
+
+async function delayedWrite(f) {
+  const started = join(f.home, "workspace", "shell-started");
+  const shell = f.control.workerCommand({ type: "rpc", id: "shell", token: "test", agentId: f.owner.id, epoch: f.owner.epoch,
+    method: "bash", taskId: "delayed-write", args: {
+      command: "printf ready > shell-started; sleep 1; printf changed-after-terminal > delivery.txt"
+    } });
+  const deadline = Date.now() + 5000;
+  while (!existsSync(started)) {
+    assert.ok(Date.now() < deadline, "Shell did not reach its delayed write");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return { shell, path: join(f.home, "workspace", "delivery.txt") };
+}
+
+test("cancellation stops a delayed external write while the Harness waits for settlement", async (t) => {
+  const f = await fixture(t);
+  const { shell, path } = await delayedWrite(f);
+  f.control.missionAction(f.mission.id, "cancel");
+  const stopping = f.workers.syncMissionLifecycle(f.mission.id);
+  try {
+    const result = await shell;
+    assert.equal(result.exitCode, null, "Cancellation must terminate the external operation before its delayed write");
+    assert.equal(readFileSync(path, "utf8"), "ready");
+    assert.equal(f.control.missionById(f.mission.id).status, "cancelled");
+    assert.equal(f.control.blockers(f.mission.id).filter((blocker) => blocker.kind === "unsafe_execution").length, 1);
+    assert.equal(f.sent.some((message) => message.type === "shutdown"), false);
+    assert.equal(f.control.message(f.row.message_id).status, "admitted");
+  } finally {
+    f.settle();
+    await stopping;
+  }
+});
+
+test("completion refuses an in-flight write and rechecks the changed artifact after it settles", async (t) => {
+  const f = await fixture(t);
+  const { shell, path } = await delayedWrite(f);
+  const complete = (taskId) => f.control.workerCommand({ type: "rpc", id: taskId, token: "test", agentId: f.agent.id,
+    epoch: f.agent.epoch, method: "CompleteMission", taskId, args: {} });
+  try {
+    await assert.rejects(complete("busy-completion"), /Workspace operations must finish before mission completion/);
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+  } finally {
+    await shell;
+  }
+  assert.equal(readFileSync(path, "utf8"), "changed-after-terminal");
+  await assert.rejects(complete("changed-artifact-completion"), /Artifact .* or its source has changed/);
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+});
+
+for (const outcome of ["exited", "timeout", "missing-handle", "settled"]) {
+  test(`cancelled unacknowledged delivery retains actual ${outcome} evidence`, async (t) => {
+    const f = await fixture(t, { admitted: false, settleOnShutdown: false });
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    f.control.missionAction(f.mission.id, "cancel");
+    if (outcome === "missing-handle") f.workers.handles.delete(f.agent.id);
+    const stopping = f.workers.syncMissionLifecycle(f.mission.id);
+    await nextImmediate();
+    if (outcome === "exited") {
+      f.child.exitCode = 1;
+      f.child.connected = false;
+      f.child.emit("exit", 1);
+    } else if (outcome === "timeout") {
+      t.mock.timers.tick(5000);
+    } else if (outcome === "settled") {
+      f.notice({ type: "admitted", messageId: f.row.message_id, requestId: f.row.request_id,
+        attempt: f.row.attempt, submissionId: "final-submission" });
+      f.settle();
+    }
+    await stopping;
+    const expected = outcome === "settled" ? "completed" : "uncertain";
+    assert.equal(f.control.message(f.row.message_id).status, expected);
+    assert.deepEqual({ ...f.control.db.prepare("SELECT status,attempt,deadline_at FROM outbox WHERE id=?").get(f.row.id) },
+      { status: expected, attempt: 1, deadline_at: null });
+    assert.deepEqual(f.control.blockers(f.mission.id).filter((blocker) => blocker.kind === "delivery").map((blocker) => blocker.id),
+      outcome === "settled" ? [] : [`delivery:${f.row.id}`]);
+    assert.equal(f.control.missionById(f.mission.id).status, "cancelled");
+    assert.equal(f.sent.some((message) => message.type === "deliver"), false);
+    assert.equal(f.control.pendingOutbox().length, 0);
+  });
+}
+
+test("interruption rolls back both delivery records and the epoch if blocker persistence fails", async (t) => {
+  const f = await fixture(t, { admitted: false });
+  f.control.missionAction(f.mission.id, "cancel");
+  const messageBefore = f.control.message(f.row.message_id);
+  const outboxBefore = f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(f.row.id);
+  f.control.db.exec("CREATE TEMP TRIGGER reject_delivery_blocker BEFORE INSERT ON blockers BEGIN SELECT RAISE(ABORT, 'blocker write failed'); END");
+  try {
+    assert.throws(() => f.control.markAgentInterrupted(f.agent.id, f.agent.epoch), /blocker write failed/);
+    assert.deepEqual(f.control.message(f.row.message_id), messageBefore);
+    assert.deepEqual(f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(f.row.id), outboxBefore);
+    assert.equal(f.control.getAgentPublic(f.agent.id).epoch, f.agent.epoch);
+  } finally {
+    f.control.db.exec("DROP TRIGGER reject_delivery_blocker");
+    f.settle();
+  }
+});
+
+
+test("an answer during question settlement stays queued and reaches a new owner after pause", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pausing = requestUserInput(f);
+  const reply = await f.reply;
+  await nextImmediate();
+  const deliveries = [];
+  // Replace only the child transport; owner fencing and delivery settlement use
+  // the real control plane through the normal startAgent/dispatchPending path.
+  f.workers.startAgentOnce = async agent => {
+    if (agent.id !== f.agent.id) return;
+    const owner = f.control.claimAgentOwner(agent.id);
+    const child = new EventEmitter();
+    Object.assign(child, { connected: true, exitCode: null, signalCode: null });
+    child.send = (message, callback) => {
+      callback(null);
+      if (message.type === "deliver") {
+        deliveries.push(message);
+        assert.equal(f.control.ackOutbox(message.messageId, message.requestId, message.attempt, owner.epoch, "admitted"), true);
+        applyWorkerNotice(f.control, owner, { type: "settled", agentId: owner.id, epoch: owner.epoch,
+          messageId: message.messageId, requestId: message.requestId, attempt: message.attempt,
+          submissionId: "answer", status: "done", result: { status: "done" } }, String);
+      }
+      if (message.type === "shutdown") {
+        child.emit("message", { type: "closed", agentId: owner.id, epoch: owner.epoch });
+        child.exitCode = 0;
+        child.connected = false;
+        child.emit("exit", 0);
+      }
+    };
+    f.workers.handles.set(owner.id, { child, token: "replacement", epoch: owner.epoch, ready: Promise.resolve(), stopping: false });
+  };
+  f.control.resolveBlocker(reply.result.id, "Proceed with the next step");
+  const answerId = `blocker-resolution:${reply.result.id}`;
+  try {
+    await f.workers.dispatchPending();
+    assert.equal(f.control.message(answerId).status, "queued");
+    assert.equal(f.sent.some(message => message.type === "deliver"), false);
+  } finally {
+    f.settle();
+    t.mock.timers.tick(5000);
+    await pausing;
+  }
+  assert.equal(f.control.message(f.row.message_id).status, "completed");
+  assert.equal(f.control.message(answerId).status, "completed");
+  assert.equal(f.control.message(answerId).attempt, 1);
+  assert.deepEqual(deliveries.map(message => message.messageId), [answerId]);
+  assert.ok(deliveries[0].epoch > f.handle.epoch);
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  assert.equal(f.control.blockers(f.mission.id).some(blocker => blocker.status === "open"), false);
+});
+
+test("manual pause interrupts an existing question settlement without waiting for its deadline", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pausing = requestUserInput(f);
+  await f.reply;
+  await nextImmediate();
+  f.control.missionAction(f.mission.id, "pause");
+  const manual = f.workers.pauseMission(f.mission.id);
+  try {
+    await nextImmediate();
+    assert.equal(f.sent.some(message => message.type === "abort"), true);
+    await Promise.all([pausing, manual]);
+    assert.equal(f.control.message(f.row.message_id).status, "uncertain");
+    assert.equal(f.control.missionById(f.mission.id).status, "paused");
+    assert.equal(Boolean(f.control.getAgentPublic(f.agent.id).error?.includes("5000 ms")), false);
+    assert.equal(f.child.listenerCount("message"), 1);
+    assert.equal(f.child.listenerCount("exit"), 0);
+  } finally {
+    t.mock.timers.tick(5000);
+    await Promise.all([pausing, manual]);
+  }
+});
+
+test("normal coordinator close cancels readiness without failing the local Mission", async t => {
+  const f = await fixture(t);
+  f.settle();
+  const ready = Promise.withResolvers();
+  f.handle.ready = ready.promise;
+  f.child.once("exit", () => ready.reject(new Error("Worker exited before readiness (0)")));
+  const starting = f.workers.startAgent(f.agent);
+  const closing = f.workers.close();
+  const results = await Promise.allSettled([starting, closing]);
+  assert.equal(f.control.missionById(f.mission.id).status, "active");
+  assert.deepEqual(results.map(result => result.status), ["fulfilled", "fulfilled"]);
+  assert.equal(f.control.detail(f.mission.id).events.some(event => event.type === "worker_start_failed"), false);
+  f.control.close();
+  const reopened = new ControlPlane(join(f.home, "state"));
+  try {
+    assert.equal(reopened.missionById(f.mission.id).status, "active");
+    assert.equal(reopened.detail(f.mission.id).events.some(event => event.type === "worker_start_failed"), false);
+  } finally { reopened.close(); }
+});

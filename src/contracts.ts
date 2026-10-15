@@ -121,6 +121,7 @@ export interface MissionStateView {
   mission: Mission; tasks: Task[]; roles: Array<{ roleId: string; name: string; kind: RoleProfile['kind']; profileId: string; modelName: string; modelId: string; profileRevision: number }>;
   agents: Agent[]; approvals: Approval[]; worktrees?: WorktreeRecord[];
   remoteWorkspaces: Array<{ id: string; name: string; machineId: string; path: string; executionEnabled: boolean; executionMode?: "metadata-only" | "workspace-effects" }>;
+  executionEnvironment?: { machineId: string; platform: string; arch: string; node: string; workspacePath: string };
   mcpServers?: Array<{ id: string; name: string; revision: number; tools: Array<{ toolName: string; mode: 'approve' | 'allow' }> }>;
   validationContract?: ValidationContract; requirementCoverage?: RequirementCoverage[];
 }

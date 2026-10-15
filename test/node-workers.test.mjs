@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DurableWorkerMailbox } from "../dist/worker-mailbox.js";
 import { NodeWorkerSupervisor, parseWorkerStartSpec } from "../dist/node-workers.js";
+import { NodeEffectJournal } from "../dist/node-effects.js";
 import { nodeEffectExtinct } from "../dist/node-effect-executor.js";
 
 const waitFor = async (predicate, timeout = 15000) => {
@@ -85,6 +86,39 @@ const supervisorOptions = (home, root, isLeaseCurrent = () => true) => ({
 const closeQuietly = async (supervisor) => {
   if (!supervisor) return;
   await supervisor.close().catch(() => undefined);
+};
+
+const deliveredResults = (handle) => {
+  const sent = [];
+  const originalSend = handle.child.send.bind(handle.child);
+  handle.child.send = (message, callback) => {
+    if (message && typeof message === "object" && Object.hasOwn(message, "result")) sent.push(structuredClone(message));
+    return originalSend(message, callback);
+  };
+  return sent;
+};
+
+const permitEffect = async (supervisor, handle, binding, descriptorHash, effect) => {
+  const { rpcId, taskId, method, args, taskAttempt, messageId, sequence } = effect;
+  handle.child.emit("message", {
+    type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId,
+    epoch: binding.epoch, method, args, taskId
+  });
+  await waitFor(() => supervisor.mailbox.inspectOutbox(binding).some(({ envelope }) =>
+    envelope.payload.kind === "rpc" && envelope.payload.rpcId === rpcId));
+  supervisor.mailbox.receive(binding, {
+    binding, messageId, sequence,
+    payload: {
+      kind: "reply", rpcId, ok: true,
+      result: {
+        effectPermit: {
+          binding, descriptorHash, taskId, method, args, expiresAt: Date.now() + 20000,
+          ...(taskAttempt === undefined ? {} : { taskAttempt })
+        }
+      }
+    }
+  });
+  await supervisor.pump(binding);
 };
 
 const assertProcessGroupExtinct = (pid) => {
@@ -818,6 +852,7 @@ test("asynchronous ENOENT fork errors are handled and leave one uncertain admiss
   const [row] = supervisor.inspect();
   assert.ok(row);
   assert.equal(row.state, "uncertain");
+  assert.equal(row.stopReason, "unexpected");
   assert.equal(row.pid, null);
   assert.equal(row.live, false);
   assert.equal(missingExecutableErrorObserved, true);
@@ -988,6 +1023,7 @@ test("watchdog fences a lease-lost worker and restart preserves uncertain eviden
   assert.equal(stopped.confirmedStopped, true);
   assert.equal(stopped.state, "closed");
   assert.equal(stopped.live, false);
+  assert.equal(stopped.stopReason, "unexpected");
   assertProcessGroupExtinct(started.pid);
 
   lease = true;
@@ -1008,4 +1044,359 @@ test("watchdog fences a lease-lost worker and restart preserves uncertain eviden
   assert.equal(afterRecovery[0].state, "uncertain");
   assert.equal(afterRecovery[0].live, false);
   await assert.rejects(() => recovered.start(spec), /already has uncertain evidence/);
+});
+
+for (const evidence of ["clean", "new-session", "uncertain-mailbox", "missing-effect", "uncertain-effect"]) {
+  test(`coordinator replacement assignment requires settled node evidence: ${evidence}`, async t => {
+    const home = mkdtempSync(join(tmpdir(), "node-reassignment-"));
+    const root = join(home, "root"), nodeHome = join(home, "node");
+    mkdirSync(root);
+    let supervisor = new NodeWorkerSupervisor(supervisorOptions(nodeHome, root));
+    t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+    const oldBinding = bindingFor(`old-${evidence}`);
+    const spec = specFor(oldBinding, root, "");
+    const started = await supervisor.start(spec);
+    const outbound = supervisor.mailbox.pending(oldBinding);
+    if (evidence !== "uncertain-mailbox") {
+      for (const envelope of outbound) {
+        const row = supervisor.mailbox.inspectOutbox(oldBinding).find(item => item.envelope.messageId === envelope.messageId);
+        supervisor.mailbox.acknowledge(oldBinding, { messageId: envelope.messageId, sequence: envelope.sequence, sha256: row.sha256 });
+      }
+    }
+    if (evidence === "missing-effect" || evidence === "uncertain-effect") {
+      const db = new DatabaseSync(join(nodeHome, "node-workers.sqlite"));
+      const journal = new NodeEffectJournal(db);
+      const effect = { binding: oldBinding, descriptorHash: started.descriptorHash, taskId: `${oldBinding.agentId}:effect`,
+        method: "write_file", args: { path: "unsettled.txt", content: "effect" } };
+      journal.admit(effect);
+      if (evidence === "uncertain-effect") {
+        journal.begin(effect);
+        journal.complete(effect, { status: "uncertain", error: "Partial operation" });
+      }
+      db.close();
+    }
+    const stopped = await supervisor.stop(oldBinding);
+    assert.equal(stopped.confirmedStopped, true);
+    const nextBinding = { ...oldBinding, runtimeId: `next-${evidence}`, epoch: oldBinding.epoch + 1 };
+    if (evidence === "new-session") {
+      await supervisor.close();
+      nextBinding.sessionId = "new-node-session-fixture";
+      nextBinding.sessionEpoch++;
+      supervisor = new NodeWorkerSupervisor({ ...supervisorOptions(nodeHome, root),
+        sessionId: nextBinding.sessionId, sessionEpoch: nextBinding.sessionEpoch });
+    }
+    const nextSpec = { ...spec, binding: nextBinding };
+    if (evidence === "clean" || evidence === "new-session") {
+      await assert.rejects(() => supervisor.start(nextSpec), /Another open or uncertain/);
+      const next = await supervisor.start(nextSpec, { coordinatorAssigned: true });
+      assert.equal(next.state, "running");
+      assert.equal(supervisor.mailbox.inspectBinding(oldBinding).status, "closed");
+      assert.equal(supervisor.mailbox.inspectBinding(nextBinding).status, "open");
+      assert.equal(supervisor.inspect().length, 2);
+      assertProcessGroupExtinct(stopped.pid);
+    } else {
+      await assert.rejects(() => supervisor.start(nextSpec, { coordinatorAssigned: true }),
+        evidence === "uncertain-mailbox" ? /unacknowledged or uncertain work/ : /missing or uncertain workspace effect/);
+      assert.equal(supervisor.mailbox.inspectBinding(oldBinding).status, "uncertain");
+      assert.equal(supervisor.inspect().length, 1);
+      assert.equal(existsSync(join(root, "unsettled.txt")), false);
+    }
+  });
+}
+
+
+for (const first of ["requested", "unexpected"]) {
+  test(`node persists first ${first} stop reason across later stop requests and supervisor restart`, async t => {
+    const home = mkdtempSync(join(tmpdir(), "node-stop-reason-"));
+    const workspace = join(home, "workspace");
+    const nodeHome = join(home, "node");
+    mkdirSync(workspace);
+    let supervisor;
+    t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+    const binding = bindingFor(`first-${first}`);
+    supervisor = new NodeWorkerSupervisor(supervisorOptions(nodeHome, home));
+    const started = await supervisor.start(specFor(binding, workspace, ""));
+    if (first === "unexpected") {
+      process.kill(started.pid, "SIGKILL");
+      await waitFor(() => supervisor.inspect()[0]?.stopReason === "unexpected");
+    }
+    const evidence = await supervisor.stop(binding);
+    assert.equal(evidence.stopReason, first);
+    assert.equal(evidence.confirmedStopped, true);
+    assertProcessGroupExtinct(started.pid);
+    assert.equal((await supervisor.stop(binding, "unexpected")).stopReason, first);
+    assert.equal(supervisor.inspectBindings()[0].stopReason, first);
+    await supervisor.close();
+    supervisor = new NodeWorkerSupervisor(supervisorOptions(nodeHome, home));
+    assert.equal(supervisor.inspect()[0].stopReason, first);
+    assert.equal((await supervisor.stop(binding)).stopReason, first);
+  });
+}
+
+test("legacy node runtime stop evidence stays unknown after migration and later requests", async t => {
+  const home = mkdtempSync(join(tmpdir(), "node-legacy-stop-reason-"));
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor(supervisorOptions(home, home));
+  await supervisor.close();
+  const binding = bindingFor("legacy-stop");
+  const db = new DatabaseSync(join(home, "node-workers.sqlite"));
+  db.exec("ALTER TABLE node_worker_runtimes DROP COLUMN stop_reason");
+  db.prepare(`INSERT INTO node_worker_runtimes(runtime_id,agent_id,epoch,binding_json,descriptor_hash,workspace_path,state,pid,confirmed_stopped)
+    VALUES(?,?,?,?,?,?,'closed',NULL,1)`).run(binding.runtimeId, binding.agentId, binding.epoch, JSON.stringify(binding), "a".repeat(64), home);
+  db.close();
+  supervisor = new NodeWorkerSupervisor(supervisorOptions(home, home));
+  supervisor.mailbox.open(binding);
+  assert.equal(supervisor.inspectBindings()[0].stopReason, null);
+  assert.equal((await supervisor.stop(binding)).stopReason, null);
+});
+
+test("replayed PublishArtifact omits the stored task handoff without rewriting the journal", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-publication-replay-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(workspace, "delivery.txt"), "frozen");
+  const binding = bindingFor("publication-replay");
+  const uploads = [];
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    executionMode: "workspace-effects",
+    artifactTransfers: true,
+    uploadArtifact: async ({ spec }) => {
+      uploads.push(spec.taskId);
+      const artifact = {
+        id: `artifact-${spec.taskId}`, name: "Frozen evidence", path: "delivery.txt",
+        sha256: "abc", size: 6, createdAt: "2026-10-14T00:00:00.000Z", taskId: spec.args.taskId
+      };
+      if (!String(spec.taskId).endsWith(":with-handoff")) return artifact;
+      return {
+        ...artifact,
+        task: { id: spec.args.taskId, status: "running" },
+        nextStep: `When delivery is complete, use UpdateTask with taskId=${spec.args.taskId} and status=review, then Report to the orchestrator.`
+      };
+    }
+  });
+  const started = await supervisor.start({
+    ...specFor(binding, workspace, ""), effects: true, artifactTransfers: true
+  });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle?.child);
+  const sent = deliveredResults(handle);
+  const handoffTaskId = `${binding.agentId}:with-handoff`;
+  const plainTaskId = `${binding.agentId}:without-handoff`;
+  const handoffArgs = { name: "Frozen evidence", path: "delivery.txt", taskId: "mission-task-running" };
+  const plainArgs = { name: "Frozen evidence", path: "delivery.txt", taskId: "mission-task-settled" };
+  const notice = "This is a replay of a completed effect. The task status may have changed; use GetMissionState for the current state.";
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-handoff", taskId: handoffTaskId, method: "PublishArtifact", args: handoffArgs,
+    taskAttempt: 1, messageId: "permit-publish-handoff", sequence: 1
+  });
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-plain", taskId: plainTaskId, method: "PublishArtifact", args: plainArgs,
+    taskAttempt: 1, messageId: "permit-publish-plain", sequence: 2
+  });
+  const journalBefore = supervisor.effects.inspect().map((entry) => ({
+    effectId: entry.effectId,
+    receiptJson: supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(entry.effectId).receipt_json,
+    upload: supervisor.pendingEffectReceipts().find((item) => item.effectId === entry.effectId)
+  }));
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-handoff-replay", taskId: handoffTaskId, method: "PublishArtifact", args: handoffArgs,
+    taskAttempt: 1, messageId: "permit-publish-handoff-replay", sequence: 3
+  });
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "rpc-publish-plain-replay", taskId: plainTaskId, method: "PublishArtifact", args: plainArgs,
+    taskAttempt: 1, messageId: "permit-publish-plain-replay", sequence: 4
+  });
+  const originalPermit = supervisor.mailbox.inspectInbox(binding).find(item => item.envelope.messageId === "permit-publish-handoff").envelope;
+  supervisor.mailbox.receive(binding, { ...originalPermit, messageId: "duplicate-publish-permit", sequence: 5 });
+  await supervisor.pump(binding);
+  assert.equal(supervisor.inspect()[0].state, "running");
+  assert.equal(sent.filter(message => message.id === "rpc-publish-handoff").length, 1);
+  const byId = (rpcId) => sent.find((message) => message.id === rpcId)?.result;
+  const firstHandoff = byId("rpc-publish-handoff");
+  const replayHandoff = byId("rpc-publish-handoff-replay");
+  const firstPlain = byId("rpc-publish-plain");
+  const replayPlain = byId("rpc-publish-plain-replay");
+  assert.equal(firstHandoff.status, "succeeded");
+  assert.equal(firstHandoff.result.task.status, "running");
+  assert.match(firstHandoff.result.nextStep, /UpdateTask with taskId=mission-task-running and status=review/);
+  assert.equal(Object.hasOwn(firstHandoff.result, "replayNotice"), false);
+  assert.equal(replayHandoff.status, "succeeded");
+  assert.equal(Object.hasOwn(replayHandoff.result, "task"), false);
+  assert.equal(Object.hasOwn(replayHandoff.result, "nextStep"), false);
+  assert.equal(replayHandoff.result.replayNotice, notice);
+  assert.equal(replayHandoff.result.id, firstHandoff.result.id);
+  assert.equal(replayHandoff.result.taskId, "mission-task-running");
+  assert.equal(JSON.stringify(replayHandoff).includes("UpdateTask"), false);
+  assert.equal(JSON.stringify(replayHandoff).includes("status=review"), false);
+  assert.deepEqual(firstPlain, replayPlain);
+  assert.equal(Object.hasOwn(replayPlain.result, "replayNotice"), false);
+  assert.equal(Object.hasOwn(replayPlain.result, "task"), false);
+  assert.equal(Object.hasOwn(replayPlain.result, "nextStep"), false);
+  assert.deepEqual(uploads, [handoffTaskId, plainTaskId]);
+  assert.equal(supervisor.inspect().find((row) => row.runtimeId === binding.runtimeId).state, "running");
+  for (const before of journalBefore) {
+    const row = supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(before.effectId);
+    const upload = supervisor.pendingEffectReceipts().find((item) => item.effectId === before.effectId);
+    assert.equal(row.receipt_json, before.receiptJson);
+    assert.equal(upload.receiptHash, before.upload.receiptHash);
+    assert.deepEqual(upload.receipt, before.upload.receipt);
+  }
+  const storedHandoff = journalBefore.find((entry) => entry.upload.spec.taskId === handoffTaskId).upload.receipt;
+  assert.equal(storedHandoff.result.task.status, "running");
+  assert.match(storedHandoff.result.nextStep, /status=review/);
+  assert.deepEqual(JSON.parse(JSON.stringify(firstHandoff)), JSON.parse(JSON.stringify(storedHandoff)));
+});
+
+test("replayed write_file, bash, and read_file receipts stay identical to the first result", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-effect-replay-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(workspace, "source.txt"), "original");
+  const binding = bindingFor("effect-replay");
+  let supervisor;
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  supervisor = new NodeWorkerSupervisor({
+    ...supervisorOptions(nodeHome, root),
+    executionMode: "workspace-effects"
+  });
+  const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  assert.ok(handle?.child);
+  const sent = deliveredResults(handle);
+  const cases = [
+    { method: "write_file", taskId: `${binding.agentId}:rewrite`, args: { path: "written.txt", content: "written once" } },
+    { method: "bash", taskId: `${binding.agentId}:append`, args: { command: "printf x >> effect-marker" } },
+    { method: "read_file", taskId: `${binding.agentId}:read`, args: { path: "source.txt" } }
+  ];
+  for (const [index, effect] of cases.entries()) {
+    await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+      ...effect, rpcId: `rpc-${effect.method}`, messageId: `permit-${effect.method}`, sequence: index + 1
+    });
+  }
+  writeFileSync(join(workspace, "written.txt"), "mutated after journal");
+  writeFileSync(join(workspace, "source.txt"), "changed after journal");
+  const journalBefore = supervisor.effects.inspect().map((entry) => ({
+    effectId: entry.effectId,
+    receiptJson: supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(entry.effectId).receipt_json,
+    upload: supervisor.pendingEffectReceipts().find((item) => item.effectId === entry.effectId)
+  }));
+  for (const [index, effect] of cases.entries()) {
+    await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+      ...effect, rpcId: `rpc-${effect.method}-replay`, messageId: `permit-${effect.method}-replay`, sequence: index + 4
+    });
+  }
+  for (const effect of cases) {
+    const first = sent.find((message) => message.id === `rpc-${effect.method}`).result;
+    const replay = sent.find((message) => message.id === `rpc-${effect.method}-replay`).result;
+    assert.deepEqual(replay, first);
+    assert.equal(JSON.stringify(replay).includes("replayNotice"), false);
+    assert.equal(JSON.stringify(replay).includes("nextStep"), false);
+    const stored = journalBefore.find((entry) => entry.upload.spec.method === effect.method);
+    assert.deepEqual(JSON.parse(JSON.stringify(first)), JSON.parse(JSON.stringify(stored.upload.receipt)));
+    const row = supervisor.db.prepare("SELECT receipt_json FROM node_effects WHERE effect_id=?").get(stored.effectId);
+    const upload = supervisor.pendingEffectReceipts().find((item) => item.effectId === stored.effectId);
+    assert.equal(row.receipt_json, stored.receiptJson);
+    assert.equal(upload.receiptHash, stored.upload.receiptHash);
+  }
+  assert.equal(readFileSync(join(workspace, "written.txt"), "utf8"), "mutated after journal");
+  assert.equal(readFileSync(join(workspace, "effect-marker"), "utf8"), "x");
+  assert.equal(readFileSync(join(workspace, "source.txt"), "utf8"), "changed after journal");
+  assert.match(sent.find((message) => message.id === "rpc-read_file").result.result.content, /^original$/);
+  assert.equal(supervisor.inspect().find((row) => row.runtimeId === binding.runtimeId).state, "running");
+});
+
+test("coordinator effect rejection settles without stopping and survives duplicate replay after restart", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-effect-rejection-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  let supervisor;
+  const binding = bindingFor("rejection");
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  const options = { ...supervisorOptions(nodeHome, root), executionMode: "workspace-effects" };
+  supervisor = new NodeWorkerSupervisor(options);
+  const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  const sent = [];
+  const send = handle.child.send.bind(handle.child);
+  handle.child.send = (message, callback) => { sent.push(message); return send(message, callback); };
+  const rpcId = "rejected-publication";
+  handle.child.emit("message", {
+    type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId, epoch: binding.epoch,
+    method: "PublishArtifact", args: { name: "Totals", path: "totals.mjs", taskId: "not-owned" },
+    taskId: `${binding.agentId}:rejected`
+  });
+  await waitFor(() => handle.pendingEffects.has(rpcId));
+  const payload = { kind: "reply", rpcId, ok: false, error: "PublishArtifact taskId must identify a task owned by this worker." };
+  const envelope = { binding, messageId: "rejected-reply", sequence: 1, payload };
+  supervisor.mailbox.receive(binding, envelope);
+  await supervisor.pump(binding);
+  assert.deepEqual(sent.find(message => message.id === rpcId), { id: rpcId, error: payload.error });
+  assert.equal(supervisor.inspect()[0].state, "running");
+  assert.equal(supervisor.mailbox.inspectBinding(binding).status, "open");
+  assert.equal(handle.pendingRpc.has(rpcId), false);
+  assert.equal(handle.pendingEffects.has(rpcId), false);
+  assert.equal(supervisor.mailbox.inspectInbox(binding).find(item => item.envelope.messageId === envelope.messageId).status, "applied");
+  assert.deepEqual(supervisor.effects.inspect(), []);
+  supervisor.mailbox.receive(binding, { ...envelope, messageId: "rejected-reply-duplicate", sequence: 2 });
+  await supervisor.pump(binding);
+  assert.equal(supervisor.inspect()[0].state, "running");
+  assert.equal(sent.filter(message => message.id === rpcId).length, 1);
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "valid-after-rejection", taskId: `${binding.agentId}:valid`, method: "write_file",
+    args: { path: "after.txt", content: "still running" }, messageId: "valid-permit", sequence: 3
+  });
+  assert.equal(readFileSync(join(workspace, "after.txt"), "utf8"), "still running");
+  assert.equal(supervisor.inspect()[0].state, "running");
+  await supervisor.stop(binding, "requested");
+  await supervisor.close();
+  supervisor = new NodeWorkerSupervisor(options);
+  // Restart does not resume historical processes. Exercise dispatch with the saved
+  // binding and empty volatile RPC state, using the actual persisted mailbox.
+  let stops = 0;
+  supervisor.stopHandle = async () => { stops++; };
+  await supervisor.apply({ ...handle, pendingRpc: new Set(), pendingEffects: new Map() }, envelope);
+  assert.equal(stops, 0);
+  assert.equal(supervisor.inspect()[0].stopReason, "requested");
+  await supervisor.apply({ ...handle, pendingRpc: new Set() }, { ...envelope, payload: { ...payload, error: "changed rejection" } });
+  assert.equal(stops, 1, "a changed reply is still a protocol violation");
+});
+
+test("successful malformed or mismatched effect permits still stop the runtime", async () => {
+  const changes = {
+    missing: () => undefined,
+    binding: permit => ({ ...permit, binding: { ...permit.binding, epoch: 2 } }),
+    descriptor: permit => ({ ...permit, descriptorHash: "f".repeat(64) }),
+    task: permit => ({ ...permit, taskId: "another-task" }),
+    method: permit => ({ ...permit, method: "bash" }),
+    args: permit => ({ ...permit, args: { path: "other.txt", content: "changed" } }),
+    attempt: permit => ({ ...permit, taskAttempt: 0 }),
+    incomplete: permit => { const changed = { ...permit }; delete changed.expiresAt; return changed; }
+  };
+  for (const [kind, change] of Object.entries(changes)) {
+    const home = mkdtempSync(join(tmpdir(), `node-permit-${kind}-`));
+    const workspace = join(home, "workspace");
+    mkdirSync(workspace);
+    const binding = bindingFor(`malformed-${kind}`);
+    const supervisor = new NodeWorkerSupervisor({ ...supervisorOptions(join(home, "node"), home), executionMode: "workspace-effects" });
+    try {
+      const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true });
+      const handle = supervisor.handles.get(binding.runtimeId);
+      const rpcId = "invalid-permit", taskId = `${binding.agentId}:write`, args = { path: "never.txt", content: "never" };
+      handle.child.emit("message", { type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId,
+        epoch: binding.epoch, method: "write_file", args, taskId });
+      await waitFor(() => handle.pendingEffects.has(rpcId));
+      const permit = change({ binding, descriptorHash: started.descriptorHash, taskId, method: "write_file", args, expiresAt: Date.now() + 20000 });
+      supervisor.mailbox.receive(binding, { binding, messageId: `invalid-${kind}`, sequence: 1,
+        payload: { kind: "reply", rpcId, ok: true, result: permit ? { effectPermit: permit } : {} } });
+      await supervisor.pump(binding);
+      assert.equal(supervisor.inspect()[0].state, "closed", kind);
+      assert.equal(supervisor.inspect()[0].stopReason, "unexpected", kind);
+      assert.deepEqual(supervisor.effects.inspect(), [], kind);
+      assert.equal(existsSync(join(workspace, "never.txt")), false, kind);
+    } finally { await supervisor.close(); rmSync(home, { recursive: true, force: true }); }
+  }
 });

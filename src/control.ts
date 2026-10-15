@@ -39,10 +39,11 @@ import { parseMcpPermissions, parseMcpServer, type McpServerConfig } from "./mcp
 import { mcpSecretValues, McpOperationError, McpRuntimeManager, redactMcpValue } from "./mcp-runtime.js";
 import { parseScheduleSpec } from "./schedules.js";
 import { MachineRegistry, type NodeCommand, type RemoteMachine } from "./machines.js";
-import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
+import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
-import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
+import { normalizeRemoteArtifactPath, REMOTE_ARTIFACT_PATH_ERROR } from "./remote-artifact-path.js";
+import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, parseNodeEffectSpec, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
 import { RemoteArtifactStore, parseRemoteArtifactManifest, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
 import {
@@ -63,7 +64,38 @@ import {
   type RepositoryIdentity
 } from "./worktrees.js";
 
-export const CONTROL_SCHEMA_VERSION = 8;
+export const CONTROL_SCHEMA_VERSION = 10;
+// Both startup and backup restore hold a transaction while fencing ownership and deliveries.
+export function quarantineTerminalLocalDeliveries(db: DatabaseSync): void {
+  if (!db.isTransaction) throw new Error("Terminal delivery recovery requires a transaction");
+  const rows = db.prepare(`SELECT o.id,o.message_id,o.mission_id,t.status AS mission_status
+    FROM outbox o JOIN missions t ON t.id=o.mission_id
+    JOIN messages m ON m.id=o.message_id
+    JOIN agents a ON a.id=json_extract(m.data,'$.recipientId') AND a.mission_id=t.id
+    WHERE t.status IN ('completed','cancelled') AND COALESCE(json_extract(a.data,'$.machineId'),'local')='local'
+    AND o.status IN ('dispatching','admitted','delivering','delivered')`).all() as Array<{
+      id: string; message_id: string; mission_id: string; mission_status: "completed" | "cancelled";
+    }>;
+  if (!rows.length) return;
+  // A backup may precede the deadline column; restore must not migrate its schema.
+  const hasDeadline = (db.prepare("PRAGMA table_info(outbox)").all() as Array<{ name: string }>).some((column) => column.name === "deadline_at");
+  const updateOutbox = db.prepare(`UPDATE outbox SET status='uncertain',error=?${hasDeadline ? ",deadline_at=NULL" : ""} WHERE id=?`);
+  const updateMessage = db.prepare("UPDATE messages SET status='uncertain',data=json_set(data,'$.status','uncertain','$.error',?) WHERE id=?");
+  const text = "Local delivery outcome is uncertain after coordinator interruption or backup restore; it will not be replayed.";
+  const createdAt = new Date().toISOString();
+  for (const row of rows) {
+    updateOutbox.run(text, row.id);
+    updateMessage.run(text, row.message_id);
+    if (row.mission_status === "cancelled") {
+      const blocker: Blocker = { id: `delivery:${row.id}`, missionId: row.mission_id, kind: "delivery", status: "open", text, createdAt };
+      db.prepare("INSERT OR IGNORE INTO blockers(id,mission_id,status,data) VALUES(?,?,?,?)")
+        .run(blocker.id, row.mission_id, blocker.status, JSON.stringify(blocker));
+    }
+    const event = { missionId: row.mission_id, type: "delivery_uncertain", text, createdAt, data: { messageId: row.message_id, outboxId: row.id } };
+    db.prepare("INSERT INTO events(mission_id,type,data) VALUES(?,?,?)").run(row.mission_id, event.type, JSON.stringify(event));
+  }
+}
+
 const REMOTE_OPERATION_UNAVAILABLE = "Remote operation is unavailable for this agent";
 export class HttpError extends Error {
   readonly status: number;
@@ -73,6 +105,49 @@ export class HttpError extends Error {
     this.status = status;
   }
 }
+
+// Only static, corrective admission messages may cross the remote worker boundary.
+export class RemoteEffectRejection extends HttpError {
+  constructor(status: 400 | 403 | 409, message: string) {
+    super(status, message);
+    this.name = "RemoteEffectRejection";
+  }
+}
+
+export class RemoteRuntimeStopPendingError extends HttpError {
+  constructor(readonly runtimeId: string) {
+    super(409, `Prior remote runtime ${runtimeId}: waiting for the controlled stop report`);
+  }
+}
+
+type RemoteRuntimeRecoveryReason = "remote_runtime_unexpected_stop" | "remote_runtime_uncertain" | "remote_runtime_unproven" | "remote_runtime_rejected";
+export type MissionStartupRecovery =
+  | { recoverable: false; reason: RemoteRuntimeRecoveryReason }
+  | { recoverable: true; reason: "remote_runtime_stop_timeout" };
+
+export class RemoteRuntimeRecoveryError extends HttpError {
+  constructor(readonly reason: RemoteRuntimeRecoveryReason, message: string) {
+    super(409, message);
+  }
+}
+
+function uncertainRuntimeReason(runtime: RemoteRuntimeRow): RemoteRuntimeRecoveryReason {
+  return runtime.last_report_json && JSON.parse(runtime.last_report_json).outcome === "rejected"
+    ? "remote_runtime_rejected" : "remote_runtime_uncertain";
+}
+
+type ArtifactHandoff = { task?: Pick<Task, "id" | "status">; nextStep?: string };
+
+function assertValidationStatus(task: Task): void {
+  if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) {
+    throw new HttpError(409, `Task must be in review or explicit rework before validation. Task ${task.id} is currently ${task.status}. The task owner or orchestrator must use UpdateTask with status=review when delivery is complete. Validators cannot change task status; use SendMessage or Report to notify the orchestrator. Do not ask the user.`);
+  }
+}
+
+type StoredMission = Mission & {
+  // An empty list records an explicit resume; absent means legacy/no failed stop.
+  localWorkerStops?: Array<{ agentId: string; epoch: number; exit: "unconfirmed" | "confirmed" }>;
+};
 
 type Row = { data: string };
 type OutboxRow = { id: string; mission_id: string; message_id: string; attempt: number; request_id: string; retry_count: number };
@@ -230,11 +305,33 @@ export function processExists(pid: number): boolean {
   }
 }
 
+// Keep this file in place: unlinking it could give concurrent owners different locks.
+export function tryAcquireDaemonOwnership(home: string): DatabaseSync | undefined {
+  const path = join(home, "daemon.ownership.sqlite");
+  if (existsSync(path)) {
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Daemon ownership path must be a regular file: ${path}`);
+  }
+  const ownership = new DatabaseSync(path, { timeout: 0 });
+  try {
+    // A separate rollback-mode database leaves control writes independent of the
+    // lifetime lock, which the OS releases even after SIGKILL or reboot.
+    ownership.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;");
+    chmodSync(path, 0o600);
+    return ownership;
+  } catch (error) {
+    ownership.close();
+    if (error instanceof Error && "errcode" in error && (error.errcode === 5 || error.errcode === 6)) return undefined;
+    throw error;
+  }
+}
+
 export class ControlPlane {
   readonly mcpRuntime = new McpRuntimeManager();
   readonly home: string;
   readonly db: DatabaseSync;
   readonly daemonId = randomUUID();
+  private readonly ownership: DatabaseSync;
   private ownerEpoch = 0;
   private closed = false;
   private watchdogFailureLogAt: number | undefined;
@@ -251,13 +348,17 @@ export class ControlPlane {
   constructor(home: string) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.home = realpathSync(home);
-    mkdirSync(join(home, "agents"), { recursive: true, mode: 0o700 });
-    mkdirSync(join(home, "artifacts"), { recursive: true, mode: 0o700 });
-    mkdirSync(join(home, "worktrees"), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(join(home, "control.sqlite"), { timeout: 5000 });
-    this.machineRegistry = new MachineRegistry(this.db);
-    this.remoteRuntimes = new RemoteRuntimeRegistry(this.db);
+    const ownership = tryAcquireDaemonOwnership(this.home);
+    if (!ownership) throw new HttpError(409, "Mission Control already has an owner or offline backup in progress; startup and schema migration are refused while the daemon ownership lock is held");
+    this.ownership = ownership;
+    let db: DatabaseSync | undefined;
     try {
+      mkdirSync(join(home, "agents"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(home, "artifacts"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(home, "worktrees"), { recursive: true, mode: 0o700 });
+      this.db = db = new DatabaseSync(join(home, "control.sqlite"), { timeout: 5000 });
+      this.machineRegistry = new MachineRegistry(this.db);
+      this.remoteRuntimes = new RemoteRuntimeRegistry(this.db);
       this.checkStartupCompatibility();
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
       this.workerMailbox = this.transaction(() => {
@@ -267,7 +368,9 @@ export class ControlPlane {
         const workerMailbox = new DurableWorkerMailbox(this.db, "coordinator");
         this.seedProfiles();
         this.acquireOwner();
+        this.recoverLocalWorkerStops();
         this.fenceRecoveredAgents();
+        this.ensureUncertainDeliveryBlockers();
         MachineRegistry.fenceOnCoordinatorStart(this.db);
         const interruptedRuntimes = this.db.prepare("SELECT runtime_id,agent_id FROM remote_worker_runtimes WHERE state IN ('queued','offered','running','stopping')")
           .all() as Array<{ runtime_id: string; agent_id: string }>;
@@ -283,7 +386,8 @@ export class ControlPlane {
       });
       this.remoteArtifacts = new RemoteArtifactStore(this.db, this.home);
     } catch (error) {
-      this.db.close();
+      try { db?.close(); }
+      finally { this.ownership.close(); }
       throw error;
     }
   }
@@ -296,12 +400,6 @@ export class ControlPlane {
     const version = this.schemaVersion();
     if (version < 0 || version > CONTROL_SCHEMA_VERSION) {
       throw new HttpError(409, `Control database schema ${version} is not supported by this build (maximum ${CONTROL_SCHEMA_VERSION}); use a compatible version or restore a complete backup. Automatic downgrade is not supported.`);
-    }
-    if (this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='daemon_owner'").get()) {
-      const owner = this.db.prepare("SELECT pid FROM daemon_owner WHERE singleton=1").get() as { pid: number } | undefined;
-      if (owner && processExists(owner.pid)) {
-        throw new HttpError(409, `Mission Control already has an owner process (${owner.pid}); schema migration is refused while it is alive`);
-      }
     }
   }
 
@@ -446,6 +544,25 @@ export class ControlPlane {
       .run(this.daemonId, this.ownerEpoch, process.pid, Date.now());
   }
 
+  private recoverLocalWorkerStops(): void {
+    const rows = this.db.prepare("SELECT data FROM missions WHERE status NOT IN ('completed','cancelled')").all() as Row[];
+    for (const row of rows) {
+      const mission = decode<StoredMission>(row.data);
+      // Older snapshots have blocker evidence but no durable exit confirmation.
+      const stops = mission.localWorkerStops ?? this.blockers(mission.id).flatMap(blocker => {
+        const match = /^worker-stop:(.+):(\d+)$/.exec(blocker.id);
+        if (!match || this.getAgent(match[1]!)?.machineId !== "local") return [];
+        return [{ agentId: match[1]!, epoch: Number(match[2]), exit: "unconfirmed" as const }];
+      });
+      if (!stops.length) continue;
+      const status = ["active", "validating"].includes(mission.status) ? "paused" : mission.status;
+      if (mission.localWorkerStops === undefined || status !== mission.status) {
+        this.putMission({ ...mission, localWorkerStops: stops, status, updatedAt: now() });
+        this.event(mission.id, "mission_resume_required", "Local worker stop evidence requires confirmed exit and explicit resume; coordinator restart cannot confirm an old process exit.");
+      }
+    }
+  }
+
   private fenceRecoveredAgents(): void {
     const rows = this.db.prepare("SELECT id,mission_id,status,epoch,data FROM agents").all() as Array<{ id: string; mission_id: string; status: string; epoch: number; data: string }>;
     for (const row of rows) {
@@ -456,9 +573,9 @@ export class ControlPlane {
       const next = { ...agent, status: nextStatus as Agent["status"], epoch: row.epoch + 1, updatedAt: now() };
       this.db.prepare("UPDATE agents SET status=?,epoch=?,data=? WHERE id=?").run(next.status, next.epoch, json(next), row.id);
       if (mission && nextStatus === "recovering") this.event(mission.id, "agent_recovering", `Agent ownership advanced to epoch ${next.epoch}.`, agent.id);
-      if (remote) {
+      if (remote && !this.confirmedRemoteRuntimeStop(this.remoteRuntimes.byAgent(agent.id)?.runtime_id)) {
         this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL,error='Remote delivery outcome is uncertain after coordinator restart'
-          WHERE message_id IN (SELECT id FROM messages WHERE json_extract(data,'$.recipientId')=?) AND status IN ('dispatching','admitted')`).run(agent.id);
+          WHERE message_id IN (SELECT id FROM messages WHERE json_extract(data,'$.recipientId')=?) AND status IN ('dispatching','admitted','delivering','delivered')`).run(agent.id);
         this.db.prepare(`UPDATE messages SET status='uncertain',
           data=json_set(data,'$.status','uncertain','$.error','Remote delivery outcome is uncertain after coordinator restart')
           WHERE json_extract(data,'$.recipientId')=? AND (
@@ -468,6 +585,7 @@ export class ControlPlane {
         if (mission) this.event(mission.id, "remote_runtime_uncertain", "Remote runtime ownership is uncertain after coordinator restart; no delivery was replayed.", agent.id);
       }
     }
+    quarantineTerminalLocalDeliveries(this.db);
     this.db.prepare(`UPDATE outbox SET status='queued',deadline_at=NULL,next_attempt_at=0
       WHERE status IN ('dispatching','admitted') AND mission_id IN (SELECT id FROM missions WHERE status='active')
       AND COALESCE((SELECT json_extract(a.data,'$.machineId') FROM agents a
@@ -477,10 +595,10 @@ export class ControlPlane {
   private seedProfiles(): void {
     const presets: ModelProfile[] = [
       {
-        id: "glm-4.7-coding",
-        name: "GLM-4.7 Coding",
+        id: "glm-5.3-flash-coding",
+        name: "GLM-5.3 Flash Coding",
         api: "openai-completions",
-        modelId: "glm-4.7",
+        modelId: "glm-5.3-flash",
         baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
         credentialEnv: "ZHIPU_API_KEY",
         contextWindow: 128000,
@@ -515,9 +633,9 @@ export class ControlPlane {
     return { seq: Number(result.lastInsertRowid), ...value };
   }
 
-  private getMission(id: string): Mission | undefined {
+  private getMission(id: string): StoredMission | undefined {
     const row = this.db.prepare("SELECT data FROM missions WHERE id=?").get(id) as Row | undefined;
-    return row ? decode<Mission>(row.data) : undefined;
+    return row ? decode<StoredMission>(row.data) : undefined;
   }
 
   validationContract(missionId: string): ValidationContract | undefined {
@@ -640,7 +758,7 @@ export class ControlPlane {
     });
   }
 
-  private putMission(mission: Mission): void {
+  private putMission(mission: StoredMission): void {
     this.db.prepare("INSERT INTO missions(id,status,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data")
       .run(mission.id, mission.status, json(mission));
   }
@@ -749,9 +867,9 @@ export class ControlPlane {
     return this.machineRegistry.poll(machineId, token, sessionId, sessionEpoch);
   }
 
-  nodeRuntimePoll(machineId: string, token: string, sessionId: string, sessionEpoch: number): { directives: RemoteRuntimeDirective[] } {
+  nodeRuntimePoll(machineId: string, token: string, sessionId: string, sessionEpoch: number, stopRuntimeId?: string): { directives: RemoteRuntimeDirective[] } {
     this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
-    return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch) };
+    return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch, stopRuntimeId) };
   }
 
   nodeEffectReceipt(machineId: string, token: string, sessionId: string, sessionEpoch: number, value: unknown): NodeEffectAck {
@@ -849,10 +967,10 @@ export class ControlPlane {
   }
 
   nodeArtifactComplete(machineId: string, token: string, sessionId: string, sessionEpoch: number,
-    rawSpec: unknown, rawManifest: unknown): { artifact: Record<string, unknown> } {
+    rawSpec: unknown, rawManifest: unknown): { artifact: Record<string, unknown> & ArtifactHandoff } {
     const auth = this.authorizeRemoteArtifactTransfer(machineId, token, sessionId, sessionEpoch, rawSpec, rawManifest);
     const transferId = remoteArtifactTransferId(auth.spec, auth.manifest);
-    return this.command(`mission:${auth.mission.id}:remote-artifacts`, transferId, {
+    const result = this.command(`mission:${auth.mission.id}:remote-artifacts`, transferId, {
       spec: auth.spec, manifest: auth.manifest
     }, () => {
       const artifact = this.remoteArtifacts.complete(auth.spec, auth.manifest, (snapshotPath, identity) => ({
@@ -876,6 +994,7 @@ export class ControlPlane {
         sha256: artifact.sha256, size: artifact.size, taskId: artifact.taskId
       } };
     });
+    return { artifact: { ...result.artifact, ...this.artifactHandoff(auth.agent.id, auth.task.id) } };
   }
 
   private recordRemoteEffectReceipt(upload: NodeEffectUpload): NodeEffectAck {
@@ -917,13 +1036,17 @@ export class ControlPlane {
 
   nodeRuntimeReport(machineId: string, token: string, sessionId: string, sessionEpoch: number, report: {
     reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected";
+    stopReason?: "requested" | "unexpected";
   }): { recorded: true; duplicate: boolean } {
     this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
     if (report.binding.machineId !== machineId) throw new HttpError(403, "Runtime report does not belong to this machine");
     try {
       return this.transaction(() => {
+        this.fenceStaleWorkerBindings();
         const saved = this.remoteRuntimes.report(report);
-        this.workerMailbox.fence(report.binding);
+        const deadline = this.coordinatorStopDeadline(report.binding.runtimeId);
+        if (deadline !== undefined && Date.now() >= deadline) this.fenceUnconfirmedRemoteStop(report.binding.runtimeId);
+        if (this.workerMailbox.inspectBinding(report.binding).status !== "closed") this.workerMailbox.fence(report.binding);
         if (!saved.duplicate) {
           const agent = this.getAgent(report.binding.agentId);
           const mission = agent ? this.getMission(agent.missionId) : undefined;
@@ -970,8 +1093,12 @@ export class ControlPlane {
       }
       const active = this.remoteRuntimes.activeForAgent(agentId);
       if (active) {
+        if (active.state === "stopping") this.assertRemoteRuntimeReassignable(active, agent);
         if (active.state === "uncertain" || active.state === "stopping") {
-          throw new HttpError(409, "Remote runtime ownership is unresolved and requires trusted reconciliation");
+          throw new RemoteRuntimeRecoveryError(active.state === "uncertain" ? uncertainRuntimeReason(active) : "remote_runtime_unproven",
+            active.state === "uncertain"
+              ? "Prior remote runtime has an uncertain report or ownership; trusted reconciliation is required"
+              : "Prior remote runtime stop has not been confirmed; trusted reconciliation is required");
         }
         if (active.desired !== "run" || active.machine_id !== machine.id ||
             active.session_id !== machine.sessionId || active.session_epoch !== machine.sessionEpoch ||
@@ -990,8 +1117,12 @@ export class ControlPlane {
         const descriptor = parseWorkerStartSpec(JSON.parse(active.descriptor_json));
         return { binding: descriptor.binding, descriptor, descriptorHash: active.descriptor_hash, existing: true };
       }
-      if (this.remoteRuntimes.byAgent(agentId)) {
-        throw new HttpError(409, "A prior remote runtime still requires trusted ownership reconciliation");
+      const prior = this.remoteRuntimes.byAgent(agentId);
+      if (prior) {
+        this.assertRemoteRuntimeReassignable(prior, agent);
+        // Close the old mailbox and claim the new owner in this same transaction.
+        const binding = parseWorkerStartSpec(JSON.parse(prior.descriptor_json)).binding;
+        if (this.workerMailbox.inspectBinding(binding).status !== "closed") this.workerMailbox.confirmClosed(binding);
       }
       const openMailbox = this.db.prepare("SELECT 1 FROM worker_mailbox_bindings WHERE agent_id=? AND status IN ('open','uncertain') LIMIT 1").get(agentId);
       if (openMailbox) throw new HttpError(409, "Remote worker ownership is uncertain and requires reconciliation");
@@ -1011,12 +1142,162 @@ export class ControlPlane {
       });
       const assigned = this.remoteRuntimes.assign(descriptor);
       this.workerMailbox.open(binding);
+      if (prior) {
+        this.event(mission.id, "remote_runtime_reassigned", "A clean controlled stop allowed a new remote runtime assignment.", agentId,
+          { previousRuntimeId: prior.runtime_id, runtimeId: binding.runtimeId });
+        const coordinatorStop = this.db.prepare(`SELECT 1 FROM events, json_each(events.data,'$.data.runtimeIds') AS stopped
+          WHERE events.mission_id=? AND events.type='coordinator_stopping' AND stopped.value=? LIMIT 1`).get(mission.id, prior.runtime_id);
+        if (coordinatorStop) {
+          const message: Message = {
+            id: `coordinator-resume:${prior.runtime_id}`, missionId: mission.id, senderId: "system:coordinator", recipientId: agentId,
+            content: "Coordinator restart recovery: Read GetMissionState and your durable history. Continue pending work after the operator's reconciliation and explicit resume. Do not repeat completed operations or replay interrupted inputs.",
+            mode: "followUp", status: "queued", attempt: 1, createdAt: now()
+          };
+          this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
+          this.enqueue(message);
+          this.event(mission.id, "coordinator_resume_queued", "Queued one recovery notification for the replacement remote runtime.", agentId,
+            { messageId: message.id, previousRuntimeId: prior.runtime_id, runtimeId: binding.runtimeId });
+        }
+      }
       return { binding, descriptor, descriptorHash: workerStartSpecHash(descriptor), existing: assigned.existing };
     });
   }
 
+  recordRemoteRuntimeStopPending(agent: Agent, runtimeId: string, timeoutMs: number): void {
+    this.event(agent.missionId, "remote_runtime_stop_pending", "Waiting for the prior remote runtime to confirm its controlled stop before assigning a replacement.", agent.id,
+      { runtimeId, timeoutMs });
+  }
+
+  assertRemoteRuntimeReassignable(runtime: RemoteRuntimeRow, agent: Agent): void {
+    const refuse = (reason: string, recoveryReason?: RemoteRuntimeRecoveryReason): never => {
+      const message = `Prior remote runtime ${runtime.runtime_id}: ${reason}; trusted reconciliation is required`;
+      throw recoveryReason ? new RemoteRuntimeRecoveryError(recoveryReason, message) : new HttpError(409, message);
+    };
+    if (runtime.stop_provenance === "unexpected") refuse("unexpected stop", "remote_runtime_unexpected_stop");
+    if (runtime.stop_provenance === "uncertain") refuse("uncertain runtime report", uncertainRuntimeReason(runtime));
+    const stopPending = runtime.desired === "stop" && runtime.state === "stopping" &&
+      runtime.stop_request_reason === "controlled" && runtime.stop_request_epoch === runtime.epoch &&
+      (agent.epoch === runtime.epoch || (agent.epoch === runtime.epoch + 1 && runtime.stop_fenced_epoch === agent.epoch)) &&
+      runtime.stop_provenance === "unproven" && runtime.last_report_json === null;
+    if (!stopPending && (runtime.state !== "closed" || runtime.desired !== "stop")) refuse("stop has not been confirmed", "remote_runtime_unproven");
+    if (!stopPending && !this.confirmedRemoteRuntimeStop(runtime.runtime_id)) refuse("controlled stop cannot be proven from persisted evidence", "remote_runtime_unproven");
+    const binding = parseWorkerStartSpec(JSON.parse(runtime.descriptor_json)).binding;
+    let mailboxStatus: string;
+    try { mailboxStatus = this.workerMailbox.inspectBinding(binding).status; }
+    catch { return refuse("mailbox binding evidence is missing"); }
+    if (mailboxStatus !== "uncertain" && mailboxStatus !== "closed") refuse("mailbox binding is not fenced or closed");
+    // Cancelled entries were fenced before admission. They remain historical
+    // evidence and are never moved to the replacement binding.
+    // An uncertain reply to an already-applied non-authorizing RPC is the same
+    // kind of historical evidence: the request is durable, the reply grants
+    // nothing, and this check does not acknowledge, replay, or rebind it.
+    // Effect permits, approvals, task changes, publish receipts, and durable
+    // deliveries stay fail-closed below and in the mailbox predicate.
+    const outbox = this.workerMailbox.inspectOutbox(binding);
+    if (outbox.some((item) => !this.workerMailbox.outboxSettledForStop(binding, item.envelope.messageId))) {
+      refuse("unacknowledged or uncertain mailbox delivery/RPC reply");
+    }
+    const inbox = this.workerMailbox.inspectInbox(binding);
+    if (inbox.some((item) => !this.workerMailbox.inboxSettledForStop(binding, item.envelope.messageId))) {
+      refuse("unapplied or uncertain mailbox input/RPC");
+    }
+    const durableDelivery = this.db.prepare(`SELECT 1 FROM messages m WHERE json_extract(m.data,'$.recipientId')=? AND (
+      m.status IN ('dispatching','admitted','delivering','delivered') OR
+      (m.status='uncertain' AND NOT EXISTS (
+        SELECT 1 FROM outbox o JOIN blockers b ON b.id='delivery:' || o.id
+          AND b.mission_id=o.mission_id AND b.status='resolved'
+        WHERE o.message_id=m.id AND o.mission_id=m.mission_id AND o.status='uncertain'
+      )) OR
+      EXISTS (
+        SELECT 1 FROM outbox o LEFT JOIN blockers b ON b.id='delivery:' || o.id
+          AND b.mission_id=o.mission_id AND b.status='resolved'
+        WHERE o.message_id=m.id AND (
+          o.status IN ('dispatching','admitted','delivering','delivered') OR (o.status='uncertain' AND b.id IS NULL)
+        )
+      )
+    ) LIMIT 1`).get(agent.id);
+    if (durableDelivery) refuse("uncertain or partially executed durable delivery");
+    const permits = this.db.prepare(`SELECT command_id FROM commands WHERE scope=?
+      AND json_extract(response,'$.effectPermit.binding.runtimeId')=?`).all(`mission:${agent.missionId}:remote-effects`, runtime.runtime_id) as Array<{ command_id: string }>;
+    for (const permit of permits) {
+      const evidence = this.db.prepare(`SELECT json_extract(data,'$.data.receipt') AS receipt FROM events
+        WHERE mission_id=? AND type='remote_effect_receipt' AND json_extract(data,'$.data.effectId')=?
+        ORDER BY seq DESC LIMIT 1`).get(agent.missionId, `${agent.id}\0${permit.command_id}`) as { receipt: string | null } | undefined;
+      const receipt = evidence?.receipt ? parseNodeEffectReceipt(JSON.parse(evidence.receipt), binding) : undefined;
+      if (!receipt) return refuse(`workspace effect ${permit.command_id} has no terminal receipt`);
+      if (receipt.status === "uncertain") refuse(`workspace effect ${permit.command_id} has an uncertain receipt`);
+    }
+    const pendingApproval = this.db.prepare(`SELECT id FROM approvals WHERE mission_id=?
+      AND json_extract(data,'$.remoteEffectBinding.spec.binding.runtimeId')=?
+      AND status IN ('pending','approved','running','uncertain') LIMIT 1`).get(agent.missionId, runtime.runtime_id) as { id: string } | undefined;
+    if (pendingApproval) refuse(`old-binding effect approval ${pendingApproval.id} is unresolved`);
+    const blocker = this.blockers(agent.missionId).find((item) => item.status === "open" && (
+      item.id === `remote-runtime:${runtime.runtime_id}` || item.kind === "unsafe_execution" ||
+      item.agentId === agent.id || item.kind === "delivery" || item.kind === "approval"
+    ));
+    if (blocker) refuse(`unresolved blocker ${blocker.id}`);
+    const otherMailbox = this.db.prepare(`SELECT 1 FROM worker_mailbox_bindings
+      WHERE agent_id=? AND runtime_id!=? AND status IN ('open','uncertain') LIMIT 1`).get(agent.id, runtime.runtime_id);
+    if (otherMailbox) refuse("another mailbox binding requires reconciliation");
+    if (stopPending) throw new RemoteRuntimeStopPendingError(runtime.runtime_id);
+  }
+
   remoteRuntimeReady(binding: WorkerBinding): boolean {
     return this.remoteRuntimes.markReady(binding);
+  }
+
+  pauseForCoordinatorShutdown(missionId: string, runtimeIds: string[], deadlineAt: number): void {
+    this.transaction(() => {
+      const pause = ["active", "validating"].includes(this.getMission(missionId)?.status ?? "");
+      if (pause) this.missionAction(missionId, "pause");
+      this.event(missionId, pause ? "coordinator_stopping" : "coordinator_stop_waiting",
+        "Coordinator shutdown is awaiting remote stop confirmation.", undefined, { runtimeIds, deadlineAt });
+      for (const runtimeId of runtimeIds) {
+        const runtime = this.remoteRuntimes.byRuntime(runtimeId);
+        const agent = runtime ? this.getAgent(runtime.agent_id) : undefined;
+        if (!agent) continue;
+        this.requestRemoteRuntimeStop(agent.id);
+        this.markAgentInterrupted(agent.id, agent.epoch, { controlledRemoteStop: true });
+      }
+    });
+  }
+
+  private coordinatorStopDeadline(runtimeId: string): number | undefined {
+    const row = this.db.prepare(`SELECT MIN(json_extract(events.data,'$.data.deadlineAt')) AS deadline
+      FROM events, json_each(events.data,'$.data.runtimeIds') AS stopped
+      WHERE events.type IN ('coordinator_stopping','coordinator_stop_waiting') AND stopped.value=?`)
+      .get(runtimeId) as { deadline: number | null };
+    return row.deadline ?? undefined;
+  }
+
+  confirmedRemoteRuntimeStop(runtimeId: string | undefined): boolean {
+    const runtime = runtimeId ? this.remoteRuntimes.byRuntime(runtimeId) : undefined;
+    if (!runtime || runtime.state !== "closed" || runtime.desired !== "stop" ||
+        runtime.stop_provenance !== "controlled" || runtime.stop_request_reason !== "controlled" ||
+        runtime.stop_request_epoch !== runtime.epoch || !runtime.last_report_json) return false;
+    const report = decode<{ outcome: string; stopReason?: string }>(runtime.last_report_json);
+    if (report.outcome !== "stopped" || report.stopReason !== "requested") return false;
+    const deadline = this.coordinatorStopDeadline(runtime.runtime_id);
+    if (deadline === undefined) return true;
+    const first = this.db.prepare(`SELECT MIN(created_at) AS confirmedAt FROM remote_worker_runtime_reports
+      WHERE runtime_id=? AND json_extract(body_json,'$.outcome')='stopped'
+        AND json_extract(body_json,'$.stopReason')='requested'`)
+      .get(runtime.runtime_id) as { confirmedAt: number | null };
+    return first.confirmedAt !== null && first.confirmedAt < deadline;
+  }
+
+  fenceUnconfirmedRemoteStop(runtimeId: string): void {
+    const runtime = this.remoteRuntimes.byRuntime(runtimeId);
+    if (!runtime || this.confirmedRemoteRuntimeStop(runtimeId)) return;
+    this.remoteRuntimes.requestStop({
+      runtimeId, machineId: runtime.machine_id, sessionId: runtime.session_id,
+      sessionEpoch: runtime.session_epoch, agentId: runtime.agent_id, epoch: runtime.epoch
+    }, "ownership-lost");
+    const agent = this.getAgent(runtime.agent_id);
+    const recorded = this.db.prepare(`SELECT 1 FROM events WHERE type='coordinator_stop_unconfirmed'
+      AND json_extract(data,'$.data.runtimeId')=? LIMIT 1`).get(runtimeId);
+    if (agent && !recorded) this.event(agent.missionId, "coordinator_stop_unconfirmed",
+      "Coordinator shutdown deadline expired without a controlled remote stop confirmation; recovery remains fail-closed.", agent.id, { runtimeId });
   }
 
   requestRemoteRuntimeStop(agentId: string): boolean {
@@ -1028,7 +1309,10 @@ export class ControlPlane {
         sessionEpoch: active.session_epoch, agentId: active.agent_id, epoch: active.epoch
       };
       this.workerMailbox.fence(binding);
-      return this.remoteRuntimes.requestStop(binding);
+      const agent = this.getAgent(agentId);
+      const controlledEpoch = agent?.epoch === binding.epoch ||
+        (active.stop_request_reason === "controlled" && active.stop_request_epoch === binding.epoch && active.stop_fenced_epoch === agent?.epoch && agent?.epoch === binding.epoch + 1);
+      return this.remoteRuntimes.requestStop(binding, controlledEpoch ? "controlled" : "ownership-lost", agent?.epoch ?? null);
     });
   }
 
@@ -1042,15 +1326,22 @@ export class ControlPlane {
       const fence = (binding: WorkerBinding, registered: boolean): void => {
         const machine = this.machineRegistry.get(binding.machineId);
         const agent = this.getAgent(binding.agentId);
+        const runtime = registered ? this.remoteRuntimes.byRuntime(binding.runtimeId) : undefined;
+        // Quiescence deliberately advances the agent epoch after requesting stop.
+        // The live node still owns physical shutdown of that fenced old runtime.
+        const requestedStop = runtime?.desired === "stop" && runtime.state === "stopping" &&
+          runtime.stop_request_reason === "controlled" && runtime.stop_request_epoch === binding.epoch &&
+          runtime.stop_fenced_epoch === agent?.epoch;
         if (machine?.status === "online" && machine.sessionId === binding.sessionId &&
             machine.sessionEpoch === binding.sessionEpoch && (machine.leaseExpiresAt ?? 0) > Date.now() &&
-            agent?.machineId === binding.machineId && agent.epoch === binding.epoch) return;
+            agent?.machineId === binding.machineId &&
+            (agent.epoch === binding.epoch || (requestedStop && agent.epoch === binding.epoch + 1))) return;
         if (!registered) {
           this.workerMailbox.fence(binding);
           return;
         }
         try { this.workerMailbox.fence(binding); } catch { /* the registered assignment is still fenced below */ }
-        this.remoteRuntimes.requestStop(binding);
+        this.remoteRuntimes.requestStop(binding, "ownership-lost");
         if (agent) {
           this.markAgentInterrupted(agent.id, binding.epoch);
           this.insertSystemBlocker(`remote-runtime:${binding.runtimeId}`, agent.missionId, "delivery",
@@ -1111,6 +1402,67 @@ export class ControlPlane {
   nodeWorkerPoll(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawBinding: unknown): { envelopes: readonly WorkerEnvelope[] } {
     const binding = this.authorizeWorkerMailbox(machineId, token, sessionId, sessionEpoch, rawBinding);
     return { envelopes: this.workerMailbox.pending(binding, 1) };
+  }
+
+  /**
+   * Read-only answer for whether specific uploads on an old binding were applied.
+   * Authentication is the current node session. The binding may already be fenced
+   * and its agent epoch may have advanced. This method never receives, finishes,
+   * acknowledges, fences, or otherwise applies input.
+   */
+  nodeWorkerMailboxSettlement(
+    machineId: string,
+    token: string,
+    sessionId: string,
+    sessionEpoch: number,
+    rawBinding: unknown,
+    rawEntries: unknown
+  ): { entries: MailboxSettlementAnswer[] } {
+    this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
+    const binding = parseWorkerBinding(rawBinding);
+    if (!binding || binding.machineId !== machineId || binding.sessionId !== sessionId || binding.sessionEpoch !== sessionEpoch) {
+      throw new HttpError(403, "Worker binding does not belong to this node session");
+    }
+    const entries = this.settlementQueries(rawEntries);
+    let known = true;
+    try {
+      this.workerMailbox.inspectBinding(binding);
+    } catch {
+      known = false;
+    }
+    const entriesOut = entries.map((entry) => {
+      if (!known) return { ...entry, applied: false };
+      const row = this.db.prepare(
+        "SELECT status, sequence, sha256 FROM worker_mailbox_inbox WHERE message_id=? AND runtime_id=?"
+      ).get(entry.messageId, binding.runtimeId) as { status: string; sequence: number; sha256: string } | undefined;
+      const applied = Boolean(row && row.status === "applied" && row.sequence === entry.sequence && row.sha256 === entry.sha256);
+      return { messageId: entry.messageId, sequence: entry.sequence, sha256: entry.sha256, applied };
+    });
+    return { entries: entriesOut };
+  }
+
+  private settlementQueries(value: unknown): MailboxSettlementQuery[] {
+    if (!Array.isArray(value) || value.length > 32) throw new HttpError(400, "Mailbox settlement entries are invalid");
+    const seen = new Set<string>();
+    return value.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new HttpError(400, "Mailbox settlement entries are invalid");
+      const record = entry as Record<string, unknown>;
+      const keys = Object.keys(record);
+      if (keys.length !== 3 || !keys.includes("messageId") || !keys.includes("sequence") || !keys.includes("sha256")) {
+        throw new HttpError(400, "Mailbox settlement entries are invalid");
+      }
+      const messageId = record.messageId;
+      const sequence = record.sequence;
+      const sha256 = record.sha256;
+      if (typeof messageId !== "string" || messageId.length < 1 || messageId.length > 240 || /\p{Cc}/u.test(messageId) ||
+          typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 1 ||
+          typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) {
+        throw new HttpError(400, "Mailbox settlement entries are invalid");
+      }
+      if (seen.has(messageId)) throw new HttpError(400, "Mailbox settlement entries are invalid");
+      seen.add(messageId);
+      return { messageId, sequence, sha256 };
+    });
   }
 
   nodeWorkerAck(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawBinding: unknown, rawReceipt: unknown): { acknowledged: boolean } {
@@ -1419,6 +1771,8 @@ export class ControlPlane {
       throw new HttpError(409, "Only a paused, blocked, or failed mission can resume");
     } else if (action === "resume" && this.blockers(id).some((blocker) => blocker.status === "open")) {
       throw new HttpError(409, "Resolve mission blockers before resuming");
+    } else if (action === "resume" && mission.localWorkerStops?.some(stop => stop.exit === "unconfirmed")) {
+      throw new HttpError(409, "Local worker exit is not confirmed; explicit resume is refused and answers remain held. A coordinator restart cannot confirm an old process exit.");
     } else if (action === "resume" && mission.turns >= mission.maxTurns) {
       throw new HttpError(409, "Mission turn limit has been reached");
     } else if (action === "resume" && mission.costKnown && mission.maxCost > 0 && mission.cost >= mission.maxCost) {
@@ -1426,21 +1780,36 @@ export class ControlPlane {
     } else if (action === "cancel" && ["completed", "cancelled"].includes(mission.status)) {
       throw new HttpError(409, "Mission is already terminal");
     }
-    return this.transaction(() => {
+    return this.transactionIfNeeded(() => {
     const status: Mission["status"] = action === "resume" ? "active" : action === "pause" ? "paused" : "cancelled";
-    const updated = { ...mission, status, updatedAt: now() };
+    const updated = { ...mission, status, updatedAt: now(),
+      ...(action === "resume" && mission.localWorkerStops?.length ? { localWorkerStops: [] } : {}) };
     this.putMission(updated);
     if (action === "pause" || action === "cancel") {
-      this.db.prepare("UPDATE outbox SET status='aborted' WHERE mission_id=? AND status='queued'").run(id);
-      this.db.prepare("UPDATE outbox SET status='uncertain',deadline_at=NULL WHERE mission_id=? AND status IN ('dispatching','admitted')").run(id);
+      if (action === "cancel") this.clearLocalDeliveryDeadlines(id);
+      const heldAnswers = action === "pause" ? this.queuedAnswersHeldByLocalWorkerStop(id) : new Set<string>();
+      this.db.prepare(`UPDATE outbox SET status='aborted' WHERE mission_id=? AND status='queued'
+        AND message_id NOT IN (SELECT value FROM json_each(?))`).run(id, json([...heldAnswers]));
+      this.db.prepare(`UPDATE outbox SET status='uncertain',deadline_at=NULL
+        WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')
+          AND (?='pause' OR message_id IN (SELECT m.id FROM messages m JOIN agents a
+            ON a.id=json_extract(m.data,'$.recipientId') WHERE json_extract(a.data,'$.machineId')!='local'))`)
+        .run(id, action);
       const messages = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(id) as Row[];
       for (const row of messages) {
         const message = decode<Message>(row.data);
+        if (heldAnswers.has(message.id)) continue;
+        if (action === "cancel" && this.getAgent(message.recipientId)?.machineId === "local" &&
+            this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status IN ('dispatching','admitted','delivering','delivered') LIMIT 1").get(message.id)) {
+          // A sent input can still have a queued message until admission arrives.
+          continue;
+        }
         const uncertain = message.status === "delivered" || this.db.prepare("SELECT 1 FROM outbox WHERE message_id=? AND status='uncertain' LIMIT 1").get(message.id);
         const next = { ...message, status: uncertain ? "uncertain" : "aborted", error: uncertain ? "Delivery state is uncertain after " + action : "Delivery aborted by mission " + action };
         this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(next.status, json(next), next.id);
         this.event(id, uncertain ? "delivery_uncertain" : "delivery_aborted", `Delivery ${next.id} ${uncertain ? "may have reached" : "was not admitted to"} the worker before ${action}.`, undefined, { messageId: next.id, attempt: next.attempt });
       }
+      this.ensureUncertainDeliveryBlockers(id);
     }
     if (action === "resume") {
       this.releaseHeldMessages(id);
@@ -1668,6 +2037,21 @@ export class ControlPlane {
     }
   }
 
+  private remoteExecutionEnvironment(agent: Agent): MissionStateView["executionEnvironment"] {
+    if (agent.machineId === "local") return undefined;
+    const machine = this.machineRegistry.get(agent.machineId);
+    const capabilities = machine?.capabilities;
+    // Capabilities remain stored after lease expiry. Only a live authenticated session may be reported.
+    if (!machine || machine.status !== "online" || !machine.sessionId || (machine.leaseExpiresAt ?? 0) <= Date.now() || !capabilities) return undefined;
+    return {
+      machineId: agent.machineId,
+      platform: capabilities.platform,
+      arch: capabilities.arch,
+      node: capabilities.node,
+      workspacePath: agent.workspacePath
+    };
+  }
+
   getMissionState(agentId: string, epoch: number): MissionStateView & Pick<MissionDetail, "artifacts" | "validationReceipts" | "blockers"> {
     const { mission } = this.authorizeAgent(agentId, epoch, this.getAgent(agentId)?.missionId ?? "");
     const agent = this.getAgent(agentId)!;
@@ -1694,10 +2078,12 @@ export class ControlPlane {
       if (!role || !profile) throw new HttpError(409, `Enabled role ${roleId} has no model profile`);
       return { roleId: role.id, name: role.name, kind: role.kind, profileId: profile.id, modelName: profile.name, modelId: profile.modelId, profileRevision: profile.revision };
     });
+    const executionEnvironment = this.remoteExecutionEnvironment(agent);
     return {
       mission, tasks: detail.tasks, roles, agents: detail.agents, approvals: detail.approvals,
       artifacts: detail.artifacts, validationReceipts: detail.validationReceipts ?? [], blockers: detail.blockers ?? [],
       remoteWorkspaces,
+      ...(executionEnvironment ? { executionEnvironment } : {}),
       worktrees: detail.worktrees ?? [],
       mcpServers: [...new Set((role?.mcpPermissions ?? []).map((grant) => grant.serverId))].flatMap((serverId) => {
         const server = this.mcpServer(serverId);
@@ -2654,6 +3040,13 @@ export class ControlPlane {
     return processed;
   }
 
+  private clearLocalDeliveryDeadlines(missionId: string): void {
+    this.db.prepare(`UPDATE outbox SET deadline_at=NULL
+      WHERE mission_id=? AND status IN ('dispatching','admitted','delivering','delivered')
+        AND message_id IN (SELECT m.id FROM messages m JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')
+          WHERE COALESCE(json_extract(a.data,'$.machineId'),'local')='local')`).run(missionId);
+  }
+
   pendingOutbox(): OutboxRow[] {
     const expired = this.db.prepare(`SELECT o.id,a.id AS agent_id,a.data FROM outbox o
       JOIN messages m ON m.id=o.message_id JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')
@@ -2750,7 +3143,7 @@ export class ControlPlane {
       this.event(row.mission_id, "delivery_uncertain", `Remote delivery ${row.message_id} became uncertain after timeout.`, agentId, { messageId: row.message_id, attempt: row.attempt });
       this.requestRemoteRuntimeStop(agentId);
       const agent = this.getAgent(agentId);
-      this.markAgentInterrupted(agentId, agent?.epoch);
+      this.markAgentInterrupted(agentId, agent?.epoch, { controlledRemoteStop: true });
     });
   }
 
@@ -2780,7 +3173,7 @@ export class ControlPlane {
       const next = { ...message, status, ...(status === "uncertain" ? { error: "Worker completed with an uncertain outcome" } : {}) };
       this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(status, json(next), messageId);
       this.event(row.mission_id, `delivery_${status}`, `Delivery ${requestId} ${status}.`, undefined, { messageId, requestId, attempt, epoch, result });
-      if (status === "uncertain") {
+      if (status === "uncertain" && this.getMission(row.mission_id)?.status !== "completed") {
         this.insertSystemBlocker(`delivery:${row.id}`, row.mission_id, "delivery", `Delivery ${requestId} completed with an uncertain outcome. Reconcile it before resuming; it will not be replayed with a new command ID.`);
       }
       return true;
@@ -2829,15 +3222,18 @@ export class ControlPlane {
   }
 
   setOutboxStatus(id: string, status: string, error?: string): void {
-    const row = this.db.prepare("SELECT mission_id,message_id,attempt FROM outbox WHERE id=?").get(id) as { mission_id: string; message_id: string; attempt: number } | undefined;
-    if (!row) return;
-    this.db.prepare("UPDATE outbox SET status=?,error=? WHERE id=?").run(status, error ?? null, id);
-    const message = this.message(row.message_id);
-    if (message) {
-      const updated = { ...message, status: status === "delivered" ? "delivered" : status, ...(error ? { error } : {}) };
-      this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(updated.status, json(updated), updated.id);
-    }
-    this.event(row.mission_id, `outbox_${status}`, `Outbox attempt ${row.attempt} ${status}.`, undefined, { messageId: row.message_id, attempt: row.attempt, error });
+    this.transactionIfNeeded(() => {
+      const row = this.db.prepare("SELECT mission_id,message_id,attempt FROM outbox WHERE id=?").get(id) as { mission_id: string; message_id: string; attempt: number } | undefined;
+      if (!row) return;
+      this.db.prepare("UPDATE outbox SET status=?,error=? WHERE id=?").run(status, error ?? null, id);
+      const message = this.message(row.message_id);
+      if (message) {
+        const updated = { ...message, status: status === "delivered" ? "delivered" : status, ...(error ? { error } : {}) };
+        this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(updated.status, json(updated), updated.id);
+      }
+      if (status === "uncertain") this.ensureUncertainDeliveryBlockers(row.mission_id);
+      this.event(row.mission_id, `outbox_${status}`, `Outbox attempt ${row.attempt} ${status}.`, undefined, { messageId: row.message_id, attempt: row.attempt, error });
+    });
   }
 
   setOutboxStatusForMessage(messageId: string, status: string, error?: string): void {
@@ -2899,8 +3295,16 @@ export class ControlPlane {
   }
 
   retryOutbox(id: string, error: string): void {
-    const row = this.db.prepare("SELECT retry_count,mission_id FROM outbox WHERE id=?").get(id) as { retry_count: number; mission_id: string } | undefined;
+    const row = this.db.prepare(`SELECT o.retry_count,o.mission_id,m.status AS mission_status
+      FROM outbox o JOIN missions m ON m.id=o.mission_id WHERE o.id=?`).get(id) as {
+        retry_count: number; mission_id: string; mission_status: Mission["status"];
+      } | undefined;
     if (!row) return;
+    // A terminal settlement must retain sent evidence, even for older deadlines or late delivery errors.
+    if (row.mission_status === "completed" || row.mission_status === "cancelled") {
+      this.db.prepare("UPDATE outbox SET deadline_at=NULL WHERE id=?").run(id);
+      return;
+    }
     const retries = row.retry_count + 1;
     const delay = Math.min(60000, 1000 * (2 ** Math.min(retries, 6)));
     this.db.prepare("UPDATE outbox SET retry_count=?,next_attempt_at=?,deadline_at=NULL WHERE id=?").run(retries, Date.now() + delay, id);
@@ -3005,8 +3409,11 @@ export class ControlPlane {
     return this.command(`mission:${mission.id}:blockers`, commandId, { kind, text, taskId }, () => {
       const blocker: Blocker = { id: randomUUID(), missionId: mission.id, agentId, ...(taskId ? { taskId } : {}), kind, status: "open", text, createdAt: now() };
       this.db.prepare("INSERT INTO blockers(id,mission_id,status,data) VALUES(?,?,?,?)").run(blocker.id, mission.id, blocker.status, json(blocker));
-      this.putMission({ ...mission, status: "blocked", updatedAt: now() });
-      this.setAgentStatus(agentId, epoch, "waiting_user");
+      // A shell stopped during terminal shutdown still needs uncertainty evidence.
+      if (mission.status !== "completed" && mission.status !== "cancelled") {
+        this.putMission({ ...mission, status: "blocked", updatedAt: now() });
+        this.setAgentStatus(agentId, epoch, "waiting_user");
+      }
       this.event(mission.id, `${kind}_requested`, text, agentId, { blockerId: blocker.id, commandId });
       return blocker;
     });
@@ -3028,34 +3435,41 @@ export class ControlPlane {
         this.putMission({ ...mission, status: "paused", updatedAt: now() });
       } else if (mission && !remaining && blocker.kind === "user_input" && blocker.agentId &&
         ["blocked", "paused"].includes(mission.status)) {
-        const resume = mission.status === "blocked" &&
+        const explicitResume = this.hasLocalWorkerStopHold(mission.id);
+        const resume = !explicitResume && mission.status === "blocked" &&
           mission.turns < mission.maxTurns &&
           (mission.maxCost <= 0 || !mission.costKnown || mission.cost < mission.maxCost);
         const recipient = this.getAgent(blocker.agentId);
+        const queued = resume || (explicitResume && recipient?.machineId === "local");
         const message: Message | undefined = recipient ? {
           id: `blocker-resolution:${id}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
-          content: resolution, mode: "followUp", status: resume ? "queued" : "aborted", attempt: 1, createdAt: now(),
-          ...(!resume ? { error: "Held until the mission can resume; delivery is not released while paused or over budget." } : {})
+          content: resolution, mode: "followUp", status: queued ? "queued" : "aborted", attempt: 1, createdAt: now(),
+          ...(!queued ? { error: "Held until the mission can resume; delivery is not released while paused or over budget." } : {})
         } : undefined;
         if (message) {
           this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
-          if (resume) this.enqueue(message);
+          if (queued) this.enqueue(message);
           this.event(mission.id, "message_created", resume ? "Human blocker resolution queued for its requesting agent." : "Human blocker resolution held for explicit resume.", recipient!.id, { messageId: message.id, blockerId: id });
         }
         if (resume) {
           this.putMission({ ...mission, status: "active", updatedAt: now() });
           this.releaseHeldMessages(mission.id);
           if (recipient) this.setAgentStatus(recipient.id, recipient.epoch, "idle");
+        } else if (explicitResume) {
+          this.putMission({ ...mission, status: "paused", updatedAt: now() });
+          this.event(mission.id, "mission_resume_required", "Human answer retained; a prior local worker stop requires confirmed exit and explicit resume.");
         }
       } else if (mission && blocker.kind === "user_input" && blocker.agentId) {
         const recipient = this.getAgent(blocker.agentId);
         if (recipient) {
+          const holdQueued = recipient.machineId === "local" && this.hasLocalWorkerStopHold(mission.id);
           const message: Message = {
             id: `blocker-resolution:${id}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
-            content: resolution, mode: "followUp", status: "aborted", attempt: 1, createdAt: now(),
-            error: "Held until all mission blockers are resolved and resume is allowed."
+            content: resolution, mode: "followUp", status: holdQueued ? "queued" : "aborted", attempt: 1, createdAt: now(),
+            ...(!holdQueued ? { error: "Held until all mission blockers are resolved and resume is allowed." } : {})
           };
           this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
+          if (holdQueued) this.enqueue(message);
           this.event(mission.id, "message_created", "Human blocker resolution held for explicit resume.", recipient.id, { messageId: message.id, blockerId: id });
         }
       }
@@ -3098,7 +3512,8 @@ export class ControlPlane {
 
   async workerCommand(request: RpcMessage): Promise<unknown> {
     const current = this.getAgent(request.agentId);
-    if (current && current.machineId !== "local" && !REMOTE_RPC_METHODS.has(request.method) && !REMOTE_EFFECT_METHODS.has(request.method)) {
+    if (current && current.machineId !== "local" && !REMOTE_RPC_METHODS.has(request.method) &&
+        !REMOTE_ORCHESTRATOR_RPC_METHODS.has(request.method) && !REMOTE_EFFECT_METHODS.has(request.method)) {
       throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
     }
     if (current && current.epoch !== request.epoch) {
@@ -3159,12 +3574,17 @@ export class ControlPlane {
       if (artifactPublication) {
         if (descriptor.artifactTransfers !== true || machine.capabilities?.artifactTransfers !== true ||
             machine.capabilities.protocol !== 3) throw new HttpError(409, "Remote artifact transfers were not negotiated for this worker");
-        if (role.kind !== "worker") throw new HttpError(403, "Only a task worker may publish a remote artifact");
-        if (typeof args.taskId !== "string" || !args.taskId.trim()) throw new HttpError(400, "Remote PublishArtifact requires taskId");
+        if (role.kind !== "worker") throw new RemoteEffectRejection(403, "Only a task worker may publish an artifact. Ask the owning worker to publish it.");
+        if (typeof args.taskId !== "string" || !args.taskId.trim()) throw new RemoteEffectRejection(400, "PublishArtifact requires taskId. Use GetMissionState to find your owned task ID.");
         const task = this.task(args.taskId);
-        if (!task || task.missionId !== mission.id || task.ownerId !== agent.id ||
-            !["ready", "assigned", "running", "review", "blocked"].includes(task.status)) {
-          throw new HttpError(409, "Remote artifact task is not owned by this worker");
+        if (!task || task.missionId !== mission.id || task.ownerId !== agent.id) {
+          throw new RemoteEffectRejection(409, "PublishArtifact taskId must identify a task owned by this worker. Use GetMissionState to find your assigned task.");
+        }
+        if (!["ready", "assigned", "running", "review", "blocked"].includes(task.status)) {
+          throw new RemoteEffectRejection(409, "PublishArtifact taskId must identify an active task. Check GetMissionState before publishing.");
+        }
+        if (!Number.isSafeInteger(task.attempt) || task.attempt <= 0) {
+          throw new RemoteEffectRejection(409, "Before PublishArtifact, use UpdateTask with your taskId and status=running to start the task attempt.");
         }
         taskAttempt = task.attempt;
       }
@@ -3174,13 +3594,25 @@ export class ControlPlane {
       if (Reflect.ownKeys(args).length !== keys.length || keys.some((key) => typeof args[key] !== "string") ||
           required.some((key) => !String(args[key]).trim()) ||
           keys.some((key) => Buffer.byteLength(String(args[key])) > (key === "command" ? 32000 : key === "content" ? 256 * 1024 : 4096))) {
-        throw new HttpError(400, "Invalid remote workspace effect arguments");
+        throw new RemoteEffectRejection(400, artifactPublication
+          ? "PublishArtifact requires non-empty string name, path, and taskId only; each must be at most 4096 bytes."
+          : request.method === "bash"
+            ? "bash requires a non-empty string command only, at most 32000 bytes."
+            : "File operations require a non-empty string path; write_file also requires string content, at most 256 KiB. Do not add other arguments.");
       }
-      if (artifactPublication && (String(args.name).length > 200 || String(args.taskId).length > 240 ||
-          String(args.path).startsWith("/") || String(args.path).includes("\\") ||
-          /\p{Cc}/u.test(String(args.name)) || /\p{Cc}/u.test(String(args.path)) ||
-          String(args.path).split("/").some((part) => !part || part === "." || part === ".."))) {
-        throw new HttpError(400, "Remote artifact requires a safe relative path, name, and task ID");
+      if (artifactPublication) {
+        if (String(args.name).length > 200 || /\p{Cc}/u.test(String(args.name))) {
+          throw new RemoteEffectRejection(400, "PublishArtifact name must be at most 200 characters and contain no control characters.");
+        }
+        if (String(args.taskId).length > 240) {
+          throw new RemoteEffectRejection(400, "PublishArtifact taskId must be at most 240 characters. Use your owned task ID from GetMissionState.");
+        }
+        let relative: string;
+        try { relative = normalizeRemoteArtifactPath(String(args.path), descriptor.workspacePath); }
+        catch { throw new RemoteEffectRejection(400, REMOTE_ARTIFACT_PATH_ERROR); }
+        if (relative !== args.path) {
+          throw new RemoteEffectRejection(400, "PublishArtifact RPC path must be workspace-relative. Retry with a path such as totals.mjs.");
+        }
       }
       const binding = {
         runtimeId: runtime.runtime_id, machineId: runtime.machine_id, sessionId: runtime.session_id,
@@ -3350,6 +3782,7 @@ export class ControlPlane {
       case "Report":
         return this.report(agent, request.epoch, request.taskId, getString("summary"), getString("evidence", false));
       case "RequestUserInput": {
+        if (role.kind !== "orchestrator") throw new HttpError(403, "Only the orchestrator may use RequestUserInput. Use Report or SendMessage to notify the orchestrator about progress, workflow problems, or blockers.");
         const question = getString("question");
         return this.createBlocker(agent.id, request.epoch, request.taskId, "user_input", question);
       }
@@ -3462,6 +3895,11 @@ export class ControlPlane {
     return this.command(`mission:${agent.missionId}:completion`, commandId, {}, () => {
       this.authorizeAgent(agent.id, epoch, agent.missionId);
       const detail = this.detail(agent.missionId);
+      if (detail.agents.some((member) => this.activeWorkspaceOperations.has(member.id)) ||
+          [...this.externalProcesses.values()].some((owner) => owner.missionId === agent.missionId) ||
+          this.missionHasValidationFlight(agent.missionId)) {
+        throw new HttpError(409, "Workspace operations must finish before mission completion");
+      }
       if (!detail.tasks.length || detail.tasks.some((task) => task.status !== "accepted")) throw new HttpError(409, "All required tasks need independent accepted validation");
       if (detail.validationContract && (detail.requirementCoverage ?? []).some((coverage) => coverage.status !== "passed")) {
         throw new HttpError(409, "Every current validation assertion must have exactly one accepted task and a passing result");
@@ -3563,6 +4001,7 @@ export class ControlPlane {
       }
       const completed = { ...detail.mission, status: "completed" as const, updatedAt: now() };
       this.putMission(completed);
+      this.clearLocalDeliveryDeadlines(completed.id);
       this.event(completed.id, "mission_completed", "Mission passed completion gates.", agent.id);
       return completed;
     });
@@ -3885,36 +4324,96 @@ export class ControlPlane {
     this.putAgent({ ...agent, error: text, updatedAt: now() });
   }
 
-  failMissionStartup(missionId: string, diagnostic: string): void {
+  failMissionStartup(missionId: string, diagnostic: string, recovery?: MissionStartupRecovery): void {
     const mission = this.getMission(missionId);
     if (!mission || !["active", "blocked"].includes(mission.status)) return;
     this.transaction(() => {
       this.putMission({ ...mission, status: "failed", updatedAt: now() });
-      this.event(missionId, "worker_start_failed", "A worker could not start; correct its configuration or ownership before resuming.", undefined, {
-        diagnostic: diagnostic.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(-1000)
+      this.event(missionId, "worker_start_failed", recovery?.recoverable === false
+        ? "A worker could not start; this remote runtime requires trusted reconciliation, which is not supported in this version."
+        : "A worker could not start; correct its configuration or ownership before resuming.", undefined, {
+        diagnostic: diagnostic.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(-1000),
+        ...recovery
       });
     });
   }
 
-  markAgentInterrupted(agentId: string, expectedEpoch?: number): void {
-    const agent = this.getAgent(agentId);
-    if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
-    const rows = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(agent.missionId) as Row[];
-    for (const row of rows) {
-      const message = decode<Message>(row.data);
-      if (message.recipientId !== agentId) continue;
-      const outbox = this.db.prepare("SELECT id,status FROM outbox WHERE message_id=? ORDER BY attempt DESC LIMIT 1").get(message.id) as { id: string; status: string } | undefined;
-      const uncertain = outbox?.status !== "queued";
-      const status = uncertain ? "uncertain" : "aborted";
-      if (outbox && outbox.status !== status) this.db.prepare("UPDATE outbox SET status=? WHERE id=?").run(status, outbox.id);
-      const next = { ...message, status, error: uncertain ? "Delivery state is uncertain after interrupt" : "Delivery aborted before worker admission" };
-      this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(status, json(next), next.id);
-      this.event(agent.missionId, uncertain ? "delivery_uncertain" : "delivery_aborted", `Delivery ${next.id} ${uncertain ? "may have reached" : "was not admitted to"} the worker before interrupt.`, agentId, { messageId: next.id, attempt: next.attempt });
-      if (uncertain && outbox) {
-        this.insertSystemBlocker(`delivery:${outbox.id}`, agent.missionId, "delivery", `Delivery ${next.id} may have reached the worker before interruption. Reconcile it before resuming.`);
+  blockUnconfirmedLocalWorkerStop(agentId: string, epoch: number): void {
+    this.transactionIfNeeded(() => {
+      const agent = this.getAgent(agentId);
+      if (!agent || agent.machineId !== "local") return;
+      const terminal = ["completed", "cancelled"].includes(this.getMission(agent.missionId)?.status ?? "");
+      this.markAgentInterrupted(agentId, epoch, terminal ? {} : { preserveQueued: true });
+      const diagnostic = "Local worker exit was not confirmed after shutdown and termination signals. Inspect the old process before resolving this blocker and resuming; queued inputs have not been sent.";
+      const current = this.getAgent(agentId)!;
+      if (agent.epoch === epoch) this.recordWorkerDiagnostic(agentId, current.epoch, diagnostic);
+      // A retry still belongs to the old process after its database epoch advances.
+      if (!terminal) {
+        const mission = this.getMission(agent.missionId)!;
+        const stops = mission.localWorkerStops ?? [];
+        if (!stops.some(stop => stop.agentId === agentId && stop.epoch === epoch)) {
+          this.putMission({ ...mission, localWorkerStops: [...stops, { agentId, epoch, exit: "unconfirmed" }], updatedAt: now() });
+        }
+        this.insertSystemBlocker(`worker-stop:${agentId}:${epoch}`, agent.missionId, "unsafe_execution", diagnostic);
       }
-    }
-    this.putAgent({ ...agent, epoch: agent.epoch + 1, status: "offline", updatedAt: now() });
+    });
+  }
+
+  confirmLocalWorkerExit(agentId: string, epoch: number): void {
+    this.transactionIfNeeded(() => {
+      const agent = this.getAgent(agentId);
+      const mission = agent ? this.getMission(agent.missionId) : undefined;
+      if (!mission?.localWorkerStops?.some(stop => stop.agentId === agentId && stop.epoch === epoch && stop.exit === "unconfirmed")) return;
+      this.putMission({ ...mission, updatedAt: now(), localWorkerStops: mission.localWorkerStops.map(stop =>
+        stop.agentId === agentId && stop.epoch === epoch ? { ...stop, exit: "confirmed" } : stop) });
+      this.event(mission.id, "local_worker_exit_confirmed", "Old local worker exit confirmed; explicit resume is still required.", agentId, { epoch });
+    });
+  }
+
+  private hasLocalWorkerStopHold(missionId: string): boolean {
+    const mission = this.getMission(missionId);
+    return Boolean(mission?.localWorkerStops?.length) && !["completed", "cancelled"].includes(mission?.status ?? "");
+  }
+
+  private queuedAnswersHeldByLocalWorkerStop(missionId: string): Set<string> {
+    if (!this.hasLocalWorkerStopHold(missionId)) return new Set();
+    const rows = this.db.prepare(`SELECT m.id FROM messages m
+      JOIN blockers question ON m.id='blocker-resolution:' || question.id
+      JOIN agents a ON a.id=json_extract(m.data,'$.recipientId')
+      JOIN outbox o ON o.message_id=m.id
+      WHERE m.mission_id=? AND m.status='queued' AND o.status='queued'
+        AND json_extract(question.data,'$.kind')='user_input' AND json_extract(a.data,'$.machineId')='local'`).all(missionId) as { id: string }[];
+    return new Set(rows.map(row => row.id));
+  }
+
+  markAgentInterrupted(agentId: string, expectedEpoch?: number, options: { controlledRemoteStop?: true; preserveQueued?: true } = {}): void {
+    this.transactionIfNeeded(() => {
+      const agent = this.getAgent(agentId);
+      if (!agent || (expectedEpoch !== undefined && agent.epoch !== expectedEpoch)) return;
+      const heldAnswers = this.queuedAnswersHeldByLocalWorkerStop(agent.missionId);
+      const rows = this.db.prepare("SELECT data FROM messages WHERE mission_id=? AND status IN ('queued','dispatching','admitted','delivering','delivered')").all(agent.missionId) as Row[];
+      for (const row of rows) {
+        const message = decode<Message>(row.data);
+        if (message.recipientId !== agentId) continue;
+        const outbox = this.db.prepare("SELECT id,status FROM outbox WHERE message_id=? ORDER BY attempt DESC LIMIT 1").get(message.id) as { id: string; status: string } | undefined;
+        if ((options.preserveQueued || heldAnswers.has(message.id)) && message.status === "queued" && outbox?.status === "queued") continue;
+        const uncertain = outbox?.status !== "queued";
+        const status = uncertain ? "uncertain" : "aborted";
+        if (outbox && outbox.status !== status) this.db.prepare("UPDATE outbox SET status=?,deadline_at=NULL WHERE id=?").run(status, outbox.id);
+        const next = { ...message, status, error: uncertain ? "Delivery state is uncertain after interrupt" : "Delivery aborted before worker admission" };
+        this.db.prepare("UPDATE messages SET status=?,data=? WHERE id=?").run(status, json(next), next.id);
+        this.event(agent.missionId, uncertain ? "delivery_uncertain" : "delivery_aborted", `Delivery ${next.id} ${uncertain ? "may have reached" : "was not admitted to"} the worker before interrupt.`, agentId, { messageId: next.id, attempt: next.attempt });
+      }
+      this.ensureUncertainDeliveryBlockers(agent.missionId);
+      const runtime = options.controlledRemoteStop && agent.machineId !== "local" ? this.remoteRuntimes.byAgent(agentId) : undefined;
+      // Repeated controlled stops still settle new deliveries above, but the
+      // persisted fence already rejects traffic from this runtime's old epoch.
+      const alreadyFenced = runtime?.desired === "stop" && runtime.stop_request_reason === "controlled" &&
+        runtime.machine_id === agent.machineId && runtime.stop_request_epoch === runtime.epoch &&
+        runtime.stop_fenced_epoch === agent.epoch && agent.epoch === runtime.epoch + 1;
+      this.putAgent({ ...agent, epoch: alreadyFenced ? agent.epoch : agent.epoch + 1, status: "offline", updatedAt: now() });
+      if (!alreadyFenced) this.remoteRuntimes.markControlledStopFence(agentId, agent.epoch);
+    });
   }
 
   authorizeAgent(agentId: string, epoch: number, missionId: string): { agent: Agent; mission: Mission; role: RoleProfile } {
@@ -3924,6 +4423,19 @@ export class ControlPlane {
     if (!agent || !mission || !role || agent.missionId !== missionId) throw new HttpError(403, "Worker is not authorized for this mission");
     if (agent.epoch !== epoch) throw new HttpError(409, "Worker epoch is fenced");
     return { agent, mission, role };
+  }
+
+  private assertTaskAssignments(missionId: string, ownerId?: string, validatorId?: string): void {
+    const agents = this.listAgents(missionId);
+    const invalidOwner = ownerId && !agents.some((agent) => agent.id === ownerId && agent.kind === "worker");
+    const invalidValidator = validatorId && !agents.some((agent) => agent.id === validatorId && agent.kind === "validator");
+    if (!invalidOwner && !invalidValidator) return;
+    const available = (kind: Agent["kind"]): string => {
+      const matches = agents.filter((agent) => agent.kind === kind);
+      const entries = matches.slice(0, 10).map((agent) => `${agent.id} (${JSON.stringify(agent.title.slice(0, 120))})`);
+      return `${entries.join(", ") || "none"}${matches.length > 10 ? `; ${matches.length - 10} more (use ListAgents)` : ""}`;
+    };
+    throw new HttpError(400, `${invalidOwner ? "Task owner must be a worker" : "Task validator must be a validator"} in this mission. Available worker agents: ${available("worker")}. Available validator agents: ${available("validator")}. roleId is not an agent id; use the agent id returned by SpawnAgent.`);
   }
 
   createTask(agentId: string, epoch: number, commandId: string, input: Omit<Task, "id" | "status" | "attempt">): Task {
@@ -3940,8 +4452,7 @@ export class ControlPlane {
       }
       if (new Set(dependencies).size !== dependencies.length) throw new HttpError(400, "Duplicate task dependency");
       this.validateFulfills(input.missionId, fulfills);
-      if (input.ownerId && !this.listAgents(input.missionId).some((agent) => agent.id === input.ownerId && agent.kind === "worker")) throw new HttpError(400, "Task owner must be a worker in this mission");
-      if (input.validatorId && !this.listAgents(input.missionId).some((agent) => agent.id === input.validatorId && agent.kind === "validator")) throw new HttpError(400, "Task validator must be a validator in this mission");
+      this.assertTaskAssignments(input.missionId, input.ownerId, input.validatorId);
       for (const dependency of dependencies) {
         const prior = this.db.prepare("SELECT data FROM tasks WHERE id=? AND mission_id=?").get(dependency, input.missionId) as Row | undefined;
         if (!prior) throw new HttpError(400, "Task dependency must belong to the same mission");
@@ -3989,8 +4500,7 @@ export class ControlPlane {
       if (change.dependencies) this.checkDependencies(taskId, task.missionId, change.dependencies);
       const ownerId = change.ownerId ?? task.ownerId;
       const validatorId = change.validatorId ?? task.validatorId;
-      if (ownerId && !this.listAgents(task.missionId).some((agent) => agent.id === ownerId && agent.kind === "worker")) throw new HttpError(400, "Task owner must be a worker in this mission");
-      if (validatorId && !this.listAgents(task.missionId).some((agent) => agent.id === validatorId && agent.kind === "validator")) throw new HttpError(400, "Task validator must be a validator in this mission");
+      this.assertTaskAssignments(task.missionId, ownerId, validatorId);
       if (ownerId && validatorId && ownerId === validatorId) throw new HttpError(400, "Task owner and validator must be distinct");
       if (change.status === "review" && (!ownerId || !validatorId || ownerId === validatorId)) throw new HttpError(409, "A task requires a distinct implementation owner and validator before review");
       const nextAttempt = change.status === "running" && task.attempt === 0 ? 1 : task.attempt;
@@ -4078,7 +4588,7 @@ export class ControlPlane {
       if (inFlight) return inFlight.promise;
       throw new HttpError(409, "Validation outcome is uncertain; resolve its blocker before retrying");
     }
-    if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) throw new HttpError(409, "Task must be in review or explicit rework before validation");
+    assertValidationStatus(task);
     if (task.dependencies.some((id) => this.task(id)?.status !== "accepted")) throw new HttpError(409, "Task dependencies must be accepted before validation");
     if (!input.artifactIds.length) throw new HttpError(400, "Validation requires at least one artifact");
     if (new Set(input.artifactIds).size !== input.artifactIds.length) throw new HttpError(400, "Duplicate artifact id");
@@ -4406,7 +4916,7 @@ export class ControlPlane {
     if (!task.ownerId || !task.validatorId || task.ownerId === task.validatorId) throw new HttpError(409, "Task must have a distinct implementation owner and validator");
     if (task.ownerId === agentId) throw new HttpError(403, "A task owner cannot validate its own task");
     if (task.validatorId !== agentId) throw new HttpError(403, "Task is assigned to a different validator");
-    if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) throw new HttpError(409, "Task must be in review or explicit rework before validation");
+    assertValidationStatus(task);
     if (!evidence.trim()) throw new HttpError(400, "Validation evidence is required");
     const receiptRow = this.db.prepare("SELECT data FROM validation_receipts WHERE id=? AND task_id=? AND mission_id=?").get(receiptId, taskId, task.missionId) as Row | undefined;
     if (!receiptRow) throw new HttpError(409, "A genuine validation receipt is required");
@@ -4524,7 +5034,7 @@ export class ControlPlane {
       if (!args || typeof args !== "object") throw new HttpError(400, "Invalid validation approval payload");
       const input = args as { taskId?: unknown; command?: unknown; artifactIds?: unknown };
       const task = validationTask!;
-      if (task.status !== "review" && !(task.status === "blocked" && task.attempt > 0)) throw new HttpError(409, "Task must be in review or explicit rework before validation");
+      assertValidationStatus(task);
       if (typeof input.command !== "string" || !input.command.trim() || !Array.isArray(input.artifactIds) || input.artifactIds.length === 0 || input.artifactIds.some((id) => typeof id !== "string")) {
         throw new HttpError(400, "Validation approval requires a command and artifact ids");
       }
@@ -4907,7 +5417,18 @@ export class ControlPlane {
     });
   }
 
-  publishArtifact(agentId: string, epoch: number, commandId: string, name: string, path: string, bytes: Buffer, taskId?: string): Artifact {
+  private artifactHandoff(agentId: string, taskId?: string): ArtifactHandoff {
+    const task = taskId ? this.task(taskId) : undefined;
+    if (!task || task.ownerId !== agentId) return {};
+    return {
+      task: { id: task.id, status: task.status },
+      ...(task.status === "running" ? {
+        nextStep: `When delivery is complete, use UpdateTask with taskId=${task.id} and status=review, then Report to the orchestrator.`
+      } : {})
+    };
+  }
+
+  publishArtifact(agentId: string, epoch: number, commandId: string, name: string, path: string, bytes: Buffer, taskId?: string): Artifact & ArtifactHandoff {
     const agent = this.getAgent(agentId);
     if (!agent) throw new HttpError(404, "Agent not found");
     if (agent.machineId !== "local") throw new HttpError(409, "Remote agents must publish through the negotiated artifact transfer protocol");
@@ -4915,7 +5436,7 @@ export class ControlPlane {
     if (auth.role.kind === "validator") throw new HttpError(403, "Validators cannot publish workspace artifacts");
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     const size = bytes.length;
-    return this.command(`mission:${agent.missionId}:artifacts`, commandId, { name, path, sha256, size, taskId }, () => {
+    const artifact = this.command(`mission:${agent.missionId}:artifacts`, commandId, { name, path, sha256, size, taskId }, () => {
       const mission = this.getMission(agent.missionId)!;
       let immutable: { workspaceCommit: string; relativePath: string } | undefined;
       if (taskId) {
@@ -4958,6 +5479,7 @@ export class ControlPlane {
       this.event(agent.missionId, "artifact_published", `Artifact ${name} published.`, agentId, { artifactId: artifact.id, sha256 });
       return artifact;
     });
+    return { ...artifact, ...this.artifactHandoff(agentId, taskId) };
   }
 
   recordTranscript(agentId: string, role: TranscriptEntry["role"], text: string, id: string = randomUUID()): void {
@@ -5048,6 +5570,21 @@ export class ControlPlane {
     });
   }
 
+  private ensureUncertainDeliveryBlockers(missionId?: string): void {
+    // Startup also repairs older and restored evidence without reopening a
+    // blocker that a human already resolved or changing the delivery itself.
+    // A completed mission has already passed its blocker gate; its history is left as recorded.
+    const rows = this.db.prepare(`SELECT o.id,o.mission_id,o.message_id FROM outbox o
+      JOIN missions m ON m.id=o.mission_id AND m.status!='completed'
+      LEFT JOIN blockers b ON b.id='delivery:' || o.id
+      WHERE o.status='uncertain' AND b.id IS NULL AND (? IS NULL OR o.mission_id=?)`)
+      .all(missionId ?? null, missionId ?? null) as Array<{ id: string; mission_id: string; message_id: string }>;
+    for (const row of rows) {
+      this.insertSystemBlocker(`delivery:${row.id}`, row.mission_id, "delivery",
+        `Delivery ${row.message_id} may have reached the worker before interruption. Reconcile it before resuming.`);
+    }
+  }
+
   private insertSystemBlocker(id: string, missionId: string, kind: Blocker["kind"], text: string): void {
     if (this.db.prepare("SELECT 1 FROM blockers WHERE id=?").get(id)) return;
     const blocker: Blocker = { id, missionId, kind, status: "open", text, createdAt: now() };
@@ -5066,8 +5603,12 @@ export class ControlPlane {
     if (this.closed) return;
     if (this.mcpRuntime.activeCount) throw new Error("MCP runtime must be asynchronously closed before the control database.");
     this.closed = true;
-    this.db.prepare("DELETE FROM daemon_owner WHERE singleton=1 AND daemon_id=? AND epoch=?").run(this.daemonId, this.ownerEpoch);
-    this.db.close();
+    try {
+      this.db.prepare("DELETE FROM daemon_owner WHERE singleton=1 AND daemon_id=? AND epoch=?").run(this.daemonId, this.ownerEpoch);
+    } finally {
+      try { this.db.close(); }
+      finally { this.ownership.close(); }
+    }
   }
 
   async settlePendingShells(): Promise<void> {

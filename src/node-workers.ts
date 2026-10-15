@@ -4,13 +4,15 @@ import { chmodSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
-  DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope, type JsonValue, type WorkerBinding, type WorkerEnvelope
+  DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope,
+  type JsonValue, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding, type WorkerEnvelope
 } from "./worker-mailbox.js";
 import { parseWorkerNotice, type WorkerNotice } from "./worker-events.js";
 import {
   NodeEffectJournal, type NodeEffectReceipt, type NodeEffectSpec, type NodeEffectUpload
 } from "./node-effects.js";
 import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct, readNodeArtifactChunk, snapshotNodeArtifact, verifyNodeArtifactSnapshot, type NodeArtifactSnapshot } from "./node-effect-executor.js";
+import type { RuntimeStopReason } from "./remote-runtimes.js";
 import type { RemoteArtifactManifest } from "./remote-artifacts.js";
 import { REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { redactDiagnosticChunk, sanitizeDiagnostic } from "./workers.js";
@@ -30,6 +32,7 @@ export interface NodeWorkerSnapshot {
   state: NodeWorkerState;
   pid: number | null;
   confirmedStopped: boolean;
+  stopReason: RuntimeStopReason | null;
   live: boolean;
   diagnostic?: string;
 }
@@ -38,6 +41,7 @@ export interface NodeWorkerStopEvidence {
   runtimeId: string;
   state: "closed" | "uncertain";
   confirmedStopped: boolean;
+  stopReason: RuntimeStopReason | null;
   pid: number | null;
   reason: string;
 }
@@ -67,6 +71,15 @@ export interface NodeWorkerSupervisorOptions {
     readChunk: (offset: number, length: number) => Buffer;
     verifySnapshot: () => void;
   }) => Promise<JsonValue>;
+  /**
+   * Read-only coordinator evidence for uncertain uploads on a stopped binding.
+   * Only ids whose message, sequence, and digest were reported applied may be
+   * treated as settled. A missing or failed answer leaves those rows blocking.
+   */
+  lookupAppliedUploads?: (
+    binding: WorkerBinding,
+    entries: readonly MailboxSettlementQuery[]
+  ) => Promise<readonly MailboxSettlementAnswer[]>;
 }
 
 export class NodeWorkerError extends Error {}
@@ -81,6 +94,7 @@ type RuntimeRow = {
   state: NodeWorkerState;
   pid: number | null;
   confirmed_stopped: number;
+  stop_reason: RuntimeStopReason | null;
 };
 
 type DeliveryKey = string;
@@ -93,6 +107,8 @@ function canonicalJson(value: unknown): string {
   }
   return JSON.stringify(value) ?? "null";
 }
+
+const REPLAYED_PUBLICATION_NOTICE = "This is a replay of a completed effect. The task status may have changed; use GetMissionState for the current state.";
 
 type Handle = {
   binding: WorkerBinding;
@@ -250,6 +266,10 @@ export class NodeWorkerSupervisor {
         pid INTEGER,
         confirmed_stopped INTEGER NOT NULL DEFAULT 0
       )`);
+      const runtimeColumns = this.db.prepare("PRAGMA table_info(node_worker_runtimes)").all() as Array<{ name: string }>;
+      if (!runtimeColumns.some((column) => column.name === "stop_reason")) {
+        this.db.exec("ALTER TABLE node_worker_runtimes ADD COLUMN stop_reason TEXT CHECK(stop_reason IN ('requested','unexpected'))");
+      }
       this.mailbox = new DurableWorkerMailbox(this.db, "node");
       this.db.exec(`CREATE TABLE IF NOT EXISTS node_effect_approvals(
         approval_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL
@@ -307,6 +327,7 @@ export class NodeWorkerSupervisor {
       state: row.state,
       pid: row.pid,
       confirmedStopped: row.confirmed_stopped === 1,
+      stopReason: row.stop_reason,
       live: this.handles.has(row.runtime_id),
       ...(diagnostic === undefined ? {} : { diagnostic })
     };
@@ -317,12 +338,12 @@ export class NodeWorkerSupervisor {
     return rows.map((row) => this.snapshotOf(row));
   }
 
-  inspectBindings(): Array<{ binding: WorkerBinding; descriptorHash: string; state: NodeWorkerState; confirmedStopped: boolean }> {
-    return (this.db.prepare("SELECT binding_json,descriptor_hash,state,confirmed_stopped FROM node_worker_runtimes ORDER BY rowid").all() as Array<{
-      binding_json: string; descriptor_hash: string; state: NodeWorkerState; confirmed_stopped: number;
+  inspectBindings(): Array<{ binding: WorkerBinding; descriptorHash: string; state: NodeWorkerState; confirmedStopped: boolean; stopReason: RuntimeStopReason | null }> {
+    return (this.db.prepare("SELECT binding_json,descriptor_hash,state,confirmed_stopped,stop_reason FROM node_worker_runtimes ORDER BY rowid").all() as Array<{
+      binding_json: string; descriptor_hash: string; state: NodeWorkerState; confirmed_stopped: number; stop_reason: RuntimeStopReason | null;
     }>).map((row) => ({
       binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash,
-      state: row.state, confirmedStopped: row.confirmed_stopped === 1
+      state: row.state, confirmedStopped: row.confirmed_stopped === 1, stopReason: row.stop_reason
     }));
   }
 
@@ -353,7 +374,7 @@ export class NodeWorkerSupervisor {
     return value;
   }
 
-  async start(raw: unknown): Promise<NodeWorkerSnapshot> {
+  async start(raw: unknown, options: { coordinatorAssigned?: boolean } = {}): Promise<NodeWorkerSnapshot> {
     if (this.closed) throw new NodeWorkerError("Supervisor is closed");
     if (this.options.executionEnabled !== true) {
       throw new NodeWorkerError("Node worker execution is not enabled on this supervisor");
@@ -385,12 +406,87 @@ export class NodeWorkerSupervisor {
     if (this.db.prepare("SELECT 1 FROM node_worker_runtimes WHERE agent_id=? AND state IN ('admitted','running','stopping','uncertain') LIMIT 1").get(spec.binding.agentId)) {
       throw new NodeWorkerError("This agent still has unreconciled node runtime evidence");
     }
-    const promise = this.startOnce(spec, hash).finally(() => this.flights.delete(binding.runtimeId));
+    const promise = this.startOnce(spec, hash, options.coordinatorAssigned === true).finally(() => this.flights.delete(binding.runtimeId));
     this.flights.set(binding.runtimeId, { hash, promise });
     return promise;
   }
 
-  private async startOnce(spec: WorkerStartSpec, hash: string): Promise<NodeWorkerSnapshot> {
+  /**
+   * Asks the coordinator, before taking the admission lock, which uncertain
+   * uploads are already applied. Network failure or a missing lookup leaves
+   * those ids unproven so the admission gate still refuses them.
+   */
+  private async provenUploadsForAssignment(binding: WorkerBinding): Promise<Map<string, ReadonlySet<string>>> {
+    const proven = new Map<string, ReadonlySet<string>>();
+    const previous = this.db.prepare("SELECT * FROM node_worker_runtimes WHERE agent_id=?")
+      .all(binding.agentId) as unknown as RuntimeRow[];
+    for (const row of previous) {
+      const oldBinding = parseWorkerBinding(JSON.parse(row.binding_json));
+      if (!oldBinding || row.state !== "closed" || row.confirmed_stopped !== 1 || row.epoch >= binding.epoch ||
+          oldBinding.machineId !== binding.machineId) {
+        continue;
+      }
+      let status = "";
+      try { status = this.mailbox.inspectBinding(oldBinding).status; } catch { continue; }
+      if (status !== "uncertain") continue;
+      const uploads = this.mailbox.inspectOutbox(oldBinding).filter((item) =>
+        item.status === "uncertain" && (item.envelope.payload.kind === "rpc" || item.envelope.payload.kind === "notice"));
+      const ids = new Set<string>();
+      if (uploads.length > 0 && this.options.lookupAppliedUploads) {
+        const entries = uploads.map((item) => ({
+          messageId: item.envelope.messageId, sequence: item.envelope.sequence, sha256: item.sha256
+        }));
+        let answers: readonly MailboxSettlementAnswer[];
+        try {
+          answers = await this.options.lookupAppliedUploads(oldBinding, entries);
+        } catch {
+          throw new NodeWorkerError("Prior node mailbox settlement could not be read");
+        }
+        if (!Array.isArray(answers)) throw new NodeWorkerError("Prior node mailbox settlement could not be read");
+        for (const item of uploads) {
+          const match = answers.find((candidate) => candidate
+            && candidate.messageId === item.envelope.messageId
+            && candidate.sequence === item.envelope.sequence
+            && candidate.sha256 === item.sha256
+            && candidate.applied === true);
+          if (match) ids.add(item.envelope.messageId);
+        }
+      }
+      proven.set(row.runtime_id, ids);
+    }
+    return proven;
+  }
+
+  private closeStoppedMailboxesForAssignment(binding: WorkerBinding, provenUploads: ReadonlyMap<string, ReadonlySet<string>>): void {
+    const previous = this.db.prepare("SELECT * FROM node_worker_runtimes WHERE agent_id=?")
+      .all(binding.agentId) as unknown as RuntimeRow[];
+    for (const row of previous) {
+      const oldBinding = parseWorkerBinding(JSON.parse(row.binding_json));
+      if (!oldBinding || row.state !== "closed" || row.confirmed_stopped !== 1 || row.epoch >= binding.epoch ||
+          oldBinding.machineId !== binding.machineId) {
+        throw new NodeWorkerError("Prior node runtime has no confirmed stop for this agent epoch");
+      }
+      const status = this.mailbox.inspectBinding(oldBinding).status;
+      if (status === "closed") continue;
+      const proven = provenUploads.get(row.runtime_id) ?? new Set<string>();
+      // Same predicate as the coordinator: whitelist replies and uploads the
+      // coordinator has already applied. Nothing here is replayed or rebound.
+      if (status !== "uncertain" ||
+          this.mailbox.inspectOutbox(oldBinding).some((item) => !this.mailbox.outboxSettledForStop(oldBinding, item.envelope.messageId, proven)) ||
+          this.mailbox.inspectInbox(oldBinding).some((item) => !this.mailbox.inboxSettledForStop(oldBinding, item.envelope.messageId))) {
+        throw new NodeWorkerError("Prior node mailbox has unacknowledged or uncertain work");
+      }
+      if (this.effects.inspect().some(item => item.spec.binding.runtimeId === row.runtime_id &&
+          (!item.receipt || item.state === "prepared" || item.state === "executing" || item.receipt.status === "uncertain"))) {
+        throw new NodeWorkerError("Prior node runtime has missing or uncertain workspace effect receipts");
+      }
+      // The authenticated coordinator's new assignment has already passed its
+      // persisted controlled-stop gate. Local evidence must also be settled.
+      this.mailbox.confirmClosed(oldBinding);
+    }
+  }
+
+  private async startOnce(spec: WorkerStartSpec, hash: string, coordinatorAssigned: boolean): Promise<NodeWorkerSnapshot> {
     const binding = spec.binding;
     if (spec.effects && this.options.executionMode !== "workspace-effects") {
       throw new NodeWorkerError("Workspace effects are not enabled for this node session");
@@ -429,8 +525,10 @@ export class NodeWorkerSupervisor {
         ...(this.options.testOnlyArtifactTaskId ? { testOnlyArtifactTaskId: this.options.testOnlyArtifactTaskId } : {})
       } : {})
     };
+    const provenUploads = coordinatorAssigned ? await this.provenUploadsForAssignment(binding) : undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (coordinatorAssigned) this.closeStoppedMailboxesForAssignment(binding, provenUploads ?? new Map());
       const mailboxStatus = this.mailbox.open(binding);
       if (mailboxStatus.status !== "open") throw new NodeWorkerError("Mailbox binding is not open for a new worker");
       this.db.prepare(
@@ -914,7 +1012,7 @@ export class NodeWorkerSupervisor {
       await this.applyApprovedEffect(handle, envelope, payload.approvalId, payload.permit);
       return;
     }
-    const evidence = await this.stopHandle(handle, "A durable shutdown instruction stopped this worker");
+    const evidence = await this.stopHandle(handle, "A durable shutdown instruction stopped this worker", "requested");
     if (evidence.confirmedStopped) {
       try {
         this.mailbox.finish(binding, envelope.messageId);
@@ -931,6 +1029,15 @@ export class NodeWorkerSupervisor {
     effect: { taskId: string; method: "read_file" | "write_file" | "bash" | "PublishArtifact"; args: { [key: string]: JsonValue } }
   ): Promise<void> {
     const binding = handle.binding;
+    if (!payload.ok) {
+      // The applied inbox is durable evidence of a refusal, with no effect entry.
+      if (!this.mailbox.finish(binding, envelope.messageId)) throw new Error("Rejected effect reply was not processing");
+      handle.pendingRpc.delete(payload.rpcId);
+      handle.pendingEffects.delete(payload.rpcId);
+      this.options.onMailboxActivity?.();
+      await this.send(handle, { id: payload.rpcId, error: payload.error });
+      return;
+    }
     const pendingResult = payload.ok && payload.result && typeof payload.result === "object"
       ? payload.result as Record<string, unknown> : undefined;
     if (pendingResult?.status === "pending") {
@@ -986,13 +1093,13 @@ export class NodeWorkerSupervisor {
     const hasAttempt = Object.hasOwn(permitRecord ?? {}, "taskAttempt");
     const exactPermit = Boolean(permitRecord && permitKeys?.length === (hasAttempt ? 7 : 6) &&
       ["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(permitRecord, key)));
-    if (!payload.ok || !exactPermit || !bindingMatches || !descriptorMatches || !taskMatches ||
+    if (!exactPermit || !bindingMatches || !descriptorMatches || !taskMatches ||
         typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) ||
         method !== effect.method || canonicalJson(args) !== canonicalJson(effect.args) ||
         (effect.method === "PublishArtifact" && (typeof permitRecord?.taskAttempt !== "number" || !Number.isSafeInteger(permitRecord.taskAttempt) || permitRecord.taskAttempt <= 0)) ||
         (effect.method !== "PublishArtifact" && hasAttempt)) {
-      await this.send(handle, { id: payload.rpcId, error: payload.ok ? "Coordinator effect permit did not match the requested operation" : payload.error });
-      await this.stopHandle(handle, "A workspace effect permit was rejected or mismatched");
+      await this.send(handle, { id: payload.rpcId, error: "Coordinator effect permit did not match the requested operation" });
+      await this.stopHandle(handle, "A workspace effect permit was mismatched");
       return;
     }
     const spec: NodeEffectSpec = {
@@ -1092,10 +1199,32 @@ export class NodeWorkerSupervisor {
     }
   }
 
+  /**
+   * A stored publication receipt keeps the task status and nextStep from the
+   * original coordinator response. Replaying that object can tell the worker
+   * to UpdateTask after the task has already left running. The journal row,
+   * its hash, and coordinator evidence stay unchanged; only this copy does.
+   */
+  private workerVisibleReceipt(handle: Handle, spec: NodeEffectSpec, durable: NodeEffectReceipt, replayed: boolean): NodeEffectReceipt {
+    const visible = this.redactStructured(handle, durable as unknown as JsonValue) as unknown as NodeEffectReceipt;
+    if (!replayed || spec.method !== "PublishArtifact" || visible.status === "uncertain") return visible;
+    const result = visible.result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) return visible;
+    if (!Object.hasOwn(result, "task") && !Object.hasOwn(result, "nextStep")) return visible;
+    const replayedResult: Record<string, JsonValue> = Object.create(null);
+    for (const [key, value] of Object.entries(result)) {
+      if (key === "task" || key === "nextStep") continue;
+      replayedResult[key] = value;
+    }
+    replayedResult.replayNotice = REPLAYED_PUBLICATION_NOTICE;
+    return { status: visible.status, result: replayedResult };
+  }
+
   private async executePermittedEffect(handle: Handle, spec: NodeEffectSpec, expiresAt: number): Promise<NodeEffectReceipt> {
     const binding = handle.binding;
     let receipt: NodeEffectReceipt | undefined;
     let errorText: string | undefined;
+    let replayed = false;
     try {
       this.effects.admit(spec);
       const prior = this.effects.inspect().find((entry) =>
@@ -1105,6 +1234,7 @@ export class NodeWorkerSupervisor {
       const claim = this.effects.begin(spec);
       if (!claim.execute) {
         receipt = claim.receipt;
+        replayed = true;
       } else {
         try {
           if (handle.stopping || Date.now() >= expiresAt || !this.leaseCurrent(binding)) {
@@ -1144,7 +1274,7 @@ export class NodeWorkerSupervisor {
     if (receipt && canonicalJson(receipt) !== canonicalJson(durable.receipt)) {
       throw new Error("Workspace effect terminal receipt does not match its durable journal evidence");
     }
-    return this.redactStructured(handle, durable.receipt as unknown as JsonValue) as unknown as NodeEffectReceipt;
+    return this.workerVisibleReceipt(handle, spec, durable.receipt, replayed);
   }
 
   private acceptDuplicateEffectReply(
@@ -1152,6 +1282,12 @@ export class NodeWorkerSupervisor {
     rpcId: string,
     payload: Extract<WorkerEnvelope["payload"], { kind: "reply" }>
   ): boolean {
+    if (!payload.ok) {
+      const issued = this.mailbox.inspectOutbox(handle.binding).some(({ envelope }) =>
+        envelope.payload.kind === "rpc" && envelope.payload.rpcId === rpcId && REMOTE_EFFECT_METHODS.has(envelope.payload.method));
+      return issued && this.mailbox.inspectInbox(handle.binding).some(({ envelope, status }) =>
+        status === "applied" && envelope.payload.kind === "reply" && canonicalJson(envelope.payload) === canonicalJson(payload));
+    }
     const cached = handle.completedEffects.get(rpcId);
     if (!cached || !payload.ok || !payload.result || typeof payload.result !== "object") return false;
     const permit = (payload.result as Record<string, unknown>).effectPermit;
@@ -1159,15 +1295,19 @@ export class NodeWorkerSupervisor {
     const record = permit as Record<string, unknown>;
     const keys = Reflect.ownKeys(record);
     const binding = parseWorkerBinding(record.binding);
-    if (keys.length !== 6 || !["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(record, key)) ||
+    const publication = record.method === "PublishArtifact";
+    if (keys.length !== (publication ? 7 : 6) || (publication &&
+        (typeof record.taskAttempt !== "number" || !Number.isSafeInteger(record.taskAttempt) || record.taskAttempt <= 0)) ||
+        !["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(record, key)) ||
         !binding || ["runtimeId", "machineId", "sessionId", "sessionEpoch", "agentId", "epoch"].some(key =>
           binding[key as keyof WorkerBinding] !== handle.binding[key as keyof WorkerBinding]) ||
         record.descriptorHash !== handle.descriptorHash || typeof record.taskId !== "string" ||
-        (record.method !== "read_file" && record.method !== "write_file" && record.method !== "bash") ||
+        (record.method !== "read_file" && record.method !== "write_file" && record.method !== "bash" && record.method !== "PublishArtifact") ||
         !Number.isSafeInteger(record.expiresAt) || record.expiresAt !== cached.expiresAt) return false;
     const spec: NodeEffectSpec = {
       binding, descriptorHash: record.descriptorHash as string, taskId: record.taskId,
-      method: record.method, args: record.args as { [key: string]: JsonValue }
+      method: record.method, args: record.args as { [key: string]: JsonValue },
+      ...(publication ? { taskAttempt: record.taskAttempt as number } : {})
     };
     if (canonicalJson(spec) !== cached.identity) return false;
     const entry = this.effects.inspect().find(item => canonicalJson(item.spec) === cached.identity);
@@ -1196,11 +1336,11 @@ export class NodeWorkerSupervisor {
     } catch {
       // Terminal bindings keep their existing evidence.
     }
-    this.db.prepare("UPDATE node_worker_runtimes SET state='uncertain' WHERE runtime_id=? AND state IN ('admitted','running','stopping')")
+    this.db.prepare("UPDATE node_worker_runtimes SET state='uncertain',stop_reason=COALESCE(stop_reason,'unexpected') WHERE runtime_id=? AND state IN ('admitted','running','stopping')")
       .run(binding.runtimeId);
   }
 
-  async stop(value: WorkerBinding): Promise<NodeWorkerStopEvidence> {
+  async stop(value: WorkerBinding, stopReason: RuntimeStopReason = "requested"): Promise<NodeWorkerStopEvidence> {
     const binding = this.checkedBinding(value);
     const handle = this.handles.get(binding.runtimeId);
     if (!handle) {
@@ -1210,15 +1350,18 @@ export class NodeWorkerSupervisor {
         runtimeId: row.runtime_id,
         state: row.state === "closed" ? "closed" : "uncertain",
         confirmedStopped: row.confirmed_stopped === 1,
+        stopReason: row.stop_reason,
         pid: row.pid,
         reason: "This runtime is no longer live on this supervisor"
       };
     }
-    return this.stopHandle(handle, "An explicit stop request ended this worker");
+    return this.stopHandle(handle, "An explicit stop request ended this worker", stopReason);
   }
 
-  private stopHandle(handle: Handle, reason: string): Promise<NodeWorkerStopEvidence> {
+  private stopHandle(handle: Handle, reason: string, stopReason: RuntimeStopReason = "unexpected"): Promise<NodeWorkerStopEvidence> {
     if (handle.stopping) return handle.stopping;
+    this.db.prepare("UPDATE node_worker_runtimes SET stop_reason=COALESCE(stop_reason,?) WHERE runtime_id=?")
+      .run(stopReason, handle.binding.runtimeId);
     const flight = this.stopOnce(handle, reason);
     handle.stopping = flight;
     return flight;
@@ -1265,14 +1408,15 @@ export class NodeWorkerSupervisor {
     } catch {
       // Terminal bindings keep their existing evidence.
     }
-    // Deliberate boundary: mailbox.confirmClosed stays for a trusted
-    // reconciliation phase, so an uncertain binding keeps blocking replacements.
+    // Physical stop alone keeps the mailbox fenced. Only a new authenticated
+    // coordinator assignment may close it after checking settled local evidence.
     this.db.prepare("UPDATE node_worker_runtimes SET state=?,confirmed_stopped=? WHERE runtime_id=?")
       .run(confirmed ? "closed" : "uncertain", confirmed ? 1 : 0, binding.runtimeId);
     return {
       runtimeId: binding.runtimeId,
       state: confirmed ? "closed" : "uncertain",
       confirmedStopped: confirmed,
+      stopReason: this.row(binding.runtimeId)?.stop_reason ?? null,
       pid: handle.pid,
       reason
     };

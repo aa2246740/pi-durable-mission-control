@@ -12,9 +12,10 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { AssistantEntry, createRegistry, defineExtension, defineTool, GenerationTask, Harness, hook, watchEvents } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ModelProfile, RoleProfile } from "./contracts.js";
-import { AGENT_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS, WORKTREE_INSTRUCTIONS } from "./prompts.js";
+import { workerSystemInstructions, SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION } from "./prompts.js";
+import { normalizeRemoteArtifactPath } from "./remote-artifact-path.js";
 import type { WorkerNotice, WorkerNoticeBody } from "./worker-events.js";
-import { REMOTE_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
+import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 
 export type WorkerConfig = {
   agentId: string;
@@ -27,6 +28,7 @@ export type WorkerConfig = {
   profile: ModelProfile;
   role: RoleProfile;
   runtimeMode?: "remote-metadata-only" | "remote-workspace-effects";
+  remoteWorkspacesAuthorized?: boolean;
   effectApprovals?: true;
   artifactTransfers?: true;
   testOnlyScripted?: boolean;
@@ -134,6 +136,10 @@ function acquireStoreLease(path: string): () => void {
 }
 
 export function rpcRequest(config: WorkerConfig, method: string, args: unknown, taskId: string): Promise<unknown> {
+  if (config.runtimeMode === "remote-workspace-effects" && method === "PublishArtifact" &&
+      args && typeof args === "object" && "path" in args && typeof args.path === "string") {
+    args = { ...args, path: normalizeRemoteArtifactPath(args.path, config.workspacePath) };
+  }
   const id = randomUUID();
   const message: RpcMessage = { type: "rpc", id, token: config.token, agentId: config.agentId, epoch: config.epoch, method, args, taskId: `${config.agentId}:${taskId}` };
   return new Promise((resolve, reject) => {
@@ -184,7 +190,13 @@ function tools(config: WorkerConfig) {
       parameters: Type.Object(properties, { additionalProperties: false }),
       replay: "unsafe" as const,
       execute: async (args, api) => {
-        const result = await call(name, args, api);
+        let result: unknown;
+        try { result = await call(name, args, api); }
+        catch (error) {
+          if (config.runtimeMode !== "remote-workspace-effects" || !REMOTE_EFFECT_METHODS.has(name)) throw error;
+          return { isError: true, content: [{ type: "text" as const,
+            text: JSON.stringify({ error: error instanceof Error ? error.message : "Remote operation failed" }) }] };
+        }
         const approvalPending = Boolean(result && typeof result === "object" && "status" in result && result.status === "pending");
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
@@ -214,7 +226,7 @@ function tools(config: WorkerConfig) {
     tool("Report", "Submit one idempotent handoff to the orchestrator and end this run. Call alone after finishing the work; new messages wake you. Use WaitForMessage instead of repeated waiting reports.", { summary: Type.String(), evidence: Type.String() }),
     tool("RunValidation", "Run a real validation command and record its output and artifact digests.", { taskId: Type.String(), command: Type.String(), artifactIds: Type.Array(Type.String()) }),
     tool("ValidateTask", "Decide task acceptance using a genuine validation receipt.", { taskId: Type.String(), receiptId: Type.String(), passed: Type.Boolean(), evidence: Type.String(), assertionResults: Type.Optional(Type.Array(Type.Object({ assertionId: Type.String(), status: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("untested")]), evidence: Type.String() }, { additionalProperties: false }))) }),
-    tool("PublishArtifact", "Publish a workspace file as an immutable snapshot. Remote workers must provide the ID of their current owned task.", { name: Type.String(), path: Type.String(), taskId: Type.Optional(Type.String()) }),
+    tool("PublishArtifact", "Publish a workspace file as an immutable snapshot. Remote workers must first set their owned task to running with UpdateTask, then provide its taskId. Use a safe workspace-relative path such as totals.mjs, or an absolute path inside the assigned workspace such as /work/totals.mjs. Do not use .., backslashes, or control characters.", { name: Type.String(), path: Type.String(), taskId: Type.Optional(Type.String()) }),
     tool("RequestUserInput", "Ask the user for a decision.", { question: Type.String() }),
     tool("CompleteMission", "Request mission completion after domain gates pass.", {}),
     tool("read_file", "Read a file inside the mission workspace.", { path: Type.String() }),
@@ -224,15 +236,17 @@ function tools(config: WorkerConfig) {
   const selected = config.role.kind === "orchestrator"
     ? [...common, tool("SpawnAgent", "Create a worker or validator agent in this mission.", {
       title: Type.String(), roleId: Type.String(), prompt: Type.String(),
-      targetWorkspaceId: Type.Optional(Type.String({ description: "Remote targets require an execution-enabled node." }))
+      targetWorkspaceId: Type.Optional(Type.String({ description: SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION }))
     })]
     : config.role.kind === "validator"
-      ? common.filter((item) => !["CompleteMission", "write_file", "bash"].includes(item.name))
-      : common;
+      ? common.filter((item) => !["CompleteMission", "RequestUserInput", "write_file", "bash"].includes(item.name))
+      : common.filter((item) => item.name !== "RequestUserInput");
+  const remoteRpcTool = (name: string): boolean => REMOTE_RPC_METHODS.has(name) ||
+    config.role.kind === "orchestrator" && REMOTE_ORCHESTRATOR_RPC_METHODS.has(name);
   const runtimeTools = config.runtimeMode === "remote-metadata-only"
-    ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name))
+    ? selected.filter((item) => item.name === "WaitForMessage" || remoteRpcTool(item.name))
     : config.runtimeMode === "remote-workspace-effects"
-      ? selected.filter((item) => item.name === "WaitForMessage" || REMOTE_RPC_METHODS.has(item.name) ||
+      ? selected.filter((item) => item.name === "WaitForMessage" || remoteRpcTool(item.name) ||
         REMOTE_EFFECT_METHODS.has(item.name) && (item.name !== "PublishArtifact" || config.artifactTransfers === true))
     : selected;
   return defineExtension({ name: "mission-control-tools", tools: runtimeTools });
@@ -264,7 +278,7 @@ export async function openWorkerRuntime(
     faux!.setResponses(config.testOnlyArtifactTransferLoop
       ? [
         fauxAssistantMessage(fauxToolCall("PublishArtifact", {
-            name: "frozen-evidence", path: "artifact.bin",
+            name: "frozen-evidence", path: `${config.workspacePath}/artifact.bin`,
             taskId: config.testOnlyArtifactTaskId ?? "__test_only_current_owned_task__"
           }), { stopReason: "toolUse" }),
           fauxAssistantMessage([
@@ -322,7 +336,7 @@ export async function openWorkerRuntime(
     const agent = {
       extensions: [extension],
       model: { provider: config.testOnlyScripted ? "faux" : `mission-${config.profile.id}`, modelId: config.testOnlyScripted ? "faux-1" : config.profile.modelId },
-      instructions: `${config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS}\n\n${config.role.instructions}${config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : ""}${config.runtimeMode === "remote-metadata-only" ? "\n\nThis runtime is metadata-only: filesystem, shell, MCP, Git, validation execution, and artifact effects are unavailable." : config.runtimeMode === "remote-workspace-effects" ? `\n\nThis runtime permits only node-local read_file, write_file, and bash effects in the assigned workspace.${config.artifactTransfers ? " PublishArtifact captures and uploads a bounded frozen snapshot; always provide the current task ID you own. It does not publish latest-source validation." : ""}${config.effectApprovals ? " Under approval autonomy, write_file and bash may return a durable pending approval and end this worker turn. Wait for the execution outcome; do not retry or poll." : " Approval-mode write_file and bash are unavailable on this node."} bash is not an OS sandbox: it runs as the node's OS user. Only read_file/write_file paths are scoped to the assigned workspace; the shell receives no credential environment variables intentionally.` : ""}`,
+      instructions: workerSystemInstructions(config),
       ...(extension.tools ? { tools: extension.tools } : {}),
       cwd: config.workspacePath
     };

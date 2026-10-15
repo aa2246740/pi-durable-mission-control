@@ -14,6 +14,12 @@ export interface WorkerMailboxDispatcherOptions {
   canDispatch(binding: WorkerBinding): boolean;
   rpc(binding: WorkerBinding, request: WorkerRpcPayload): Promise<WorkerRpcReply>;
   notice(binding: WorkerBinding, notice: WorkerNotice): void;
+  /**
+   * Invoked after an RPC attempt has either been durably finished or fenced.
+   * Implementations must not fence the binding before finishWithReply returns;
+   * scheduling that work here keeps a completed RPC applied.
+   */
+  afterRpc?(binding: WorkerBinding): void;
 }
 
 const CLAIMS_PER_DRAIN = 16;
@@ -64,6 +70,14 @@ export class WorkerMailboxDispatcher {
     }
   }
 
+  private scheduleAfterRpc(binding: WorkerBinding): void {
+    try {
+      this.options.afterRpc?.(binding);
+    } catch {
+      this.fence(binding);
+    }
+  }
+
   private async run(binding: WorkerBinding): Promise<void> {
     let claimedCount = 0;
     try {
@@ -86,16 +100,33 @@ export class WorkerMailboxDispatcher {
             return;
           }
           if (!this.options.mailbox.finish(binding, envelope.messageId)) throw new Error("Worker notice completion was not accepted");
+          // Let a lifecycle microtask fence the binding before the next claim.
+          await Promise.resolve();
           continue;
         }
         if (payload.kind !== "rpc") throw new Error("Unexpected worker uplink payload");
-        const reply = await this.options.rpc(binding, payload);
-        if (!this.options.isCurrent(binding)) {
+        // Persist the reply before afterRpc. A microtask queued inside rpc()
+        // can fence this still-processing inbox before finishWithReply runs.
+        let continueDrain = false;
+        try {
+          const reply = await this.options.rpc(binding, payload);
+          if (!this.options.isCurrent(binding)) {
+            this.fence(binding);
+            return;
+          }
+          if (reply.kind !== "reply" || reply.rpcId !== payload.rpcId) {
+            throw new Error("Worker RPC reply does not match its request");
+          }
+          this.options.mailbox.finishWithReply(binding, envelope.messageId, reply);
+          continueDrain = true;
+        } catch {
           this.fence(binding);
-          return;
+        } finally {
+          this.scheduleAfterRpc(binding);
         }
-        if (reply.kind !== "reply" || reply.rpcId !== payload.rpcId) throw new Error("Worker RPC reply does not match its request");
-        this.options.mailbox.finishWithReply(binding, envelope.messageId, reply);
+        if (!continueDrain) return;
+        // Let a lifecycle microtask fence the binding before the next claim.
+        await Promise.resolve();
       }
     } catch {
       this.fence(binding);

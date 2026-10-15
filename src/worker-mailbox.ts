@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { REMOTE_NONAUTHORIZING_RPC_METHODS } from "./remote-rpc-methods.js";
 import { parseWorkerNotice, type WorkerNotice } from "./worker-events.js";
 
 const MAX_ENVELOPE_BYTES = 512 * 1024;
@@ -63,6 +64,17 @@ export interface WorkerReceipt {
   messageId: string;
   sequence: number;
   sha256: string;
+}
+
+/** Identity of one upload a node asks the coordinator about. Read-only. */
+export interface MailboxSettlementQuery {
+  messageId: string;
+  sequence: number;
+  sha256: string;
+}
+
+export interface MailboxSettlementAnswer extends MailboxSettlementQuery {
+  applied: boolean;
 }
 
 export interface WorkerBindingStatus extends WorkerBinding {
@@ -383,6 +395,12 @@ function incoming(side: MailboxSide, payload: WorkerPayload): boolean {
   return !outgoing(side, payload);
 }
 
+function replyCarriesEffectPermit(payload: WorkerPayload): boolean {
+  if (payload.kind !== "reply" || payload.ok !== true) return false;
+  const result = payload.result;
+  return Boolean(result && typeof result === "object" && !Array.isArray(result) && own(result, "effectPermit"));
+}
+
 function freeze<T>(value: T): T {
   if (value && typeof value === "object") {
     for (const child of Object.values(value as Record<string, unknown>)) freeze(child);
@@ -646,6 +664,13 @@ export class DurableWorkerMailbox {
     return freeze(rows.map((row) => this.outboxRow(row)));
   }
 
+  inspectOutboxMessage(value: WorkerBinding, messageId: string): WorkerMailboxOutboxStatus | undefined {
+    const binding = this.checkedBinding(value);
+    this.bindingRow(binding);
+    const row = this.existingOutbox(messageId);
+    return row?.runtime_id === binding.runtimeId ? this.outboxRow(row) : undefined;
+  }
+
   inspectInbox(value: WorkerBinding): readonly WorkerMailboxInboxStatus[] {
     const binding = this.checkedBinding(value);
     this.bindingRow(binding);
@@ -880,6 +905,76 @@ export class DurableWorkerMailbox {
         .run(incomingId);
       return envelope;
     }));
+  }
+
+  /**
+   * Whether a fenced outbox row no longer blocks closing the binding.
+   *
+   * Acknowledged and cancelled rows are settled. An uncertain coordinator
+   * reply is settled only when it answers an already-applied whitelist RPC
+   * and the reply itself contains no effect permit. An uncertain node upload
+   * is settled only when `appliedUploadIds` contains its message id. The
+   * caller may add an id only after a read-only coordinator answer matched
+   * this row's message id, sequence, and sha256 and reported `applied`.
+   * The row status is left unchanged: settlement does not replay or rebind it.
+   * Any other uncertain, queued, or offered row still blocks.
+   */
+  outboxSettledForStop(value: WorkerBinding, messageId: string, appliedUploadIds?: ReadonlySet<string>): boolean {
+    const binding = this.checkedBinding(value);
+    if (!validId(messageId)) return false;
+    const row = this.existingOutbox(messageId);
+    if (!row || row.runtime_id !== binding.runtimeId) return false;
+    if (row.status === "acknowledged" || row.status === "cancelled") return true;
+    if (row.status !== "uncertain") return false;
+    if (this.uncertainReplySettled(row)) return true;
+    if (this.side !== "node" || !appliedUploadIds?.has(row.message_id)) return false;
+    const envelope = this.envelope(row.envelope_json, row.sha256);
+    return envelope.payload.kind === "rpc" || envelope.payload.kind === "notice";
+  }
+
+  /**
+   * Whether a fenced inbox row no longer blocks closing the binding.
+   *
+   * Applied and cancelled rows are settled. On the node, an uncertain reply
+   * to a whitelist RPC already stored in this mailbox's outbox is settled:
+   * the worker was stopped while handling a non-authorizing result. Business
+   * deliveries, effect-permit replies, and every coordinator inbox row that
+   * is not applied or cancelled still block. Status is not changed.
+   */
+  inboxSettledForStop(value: WorkerBinding, messageId: string): boolean {
+    const binding = this.checkedBinding(value);
+    if (!validId(messageId)) return false;
+    const row = this.existingInbox(messageId);
+    if (!row || row.runtime_id !== binding.runtimeId) return false;
+    if (row.status === "applied" || row.status === "cancelled") return true;
+    if (row.status !== "uncertain" || this.side !== "node") return false;
+    return this.uncertainInboundReplySettled(binding, row);
+  }
+
+  private uncertainReplySettled(row: OutboxRow): boolean {
+    if (!row.source_inbox_id) return false;
+    const reply = this.envelope(row.envelope_json, row.sha256);
+    if (reply.payload.kind !== "reply" || replyCarriesEffectPermit(reply.payload)) return false;
+    const source = this.existingInbox(row.source_inbox_id);
+    if (!source || source.runtime_id !== row.runtime_id || source.status !== "applied") return false;
+    const request = this.envelope(source.envelope_json, source.sha256);
+    if (request.payload.kind !== "rpc" || request.payload.rpcId !== reply.payload.rpcId) return false;
+    return REMOTE_NONAUTHORIZING_RPC_METHODS.has(request.payload.method);
+  }
+
+  private uncertainInboundReplySettled(binding: WorkerBinding, row: InboxRow): boolean {
+    const reply = this.envelope(row.envelope_json, row.sha256);
+    if (reply.payload.kind !== "reply" || replyCarriesEffectPermit(reply.payload)) return false;
+    const rpcId = reply.payload.rpcId;
+    const matches = this.db.prepare(
+      "SELECT message_id,runtime_id,sequence,sha256,envelope_json,status,source_inbox_id FROM worker_mailbox_outbox WHERE runtime_id=? AND json_extract(envelope_json,'$.payload.kind')='rpc' AND json_extract(envelope_json,'$.payload.rpcId')=?"
+    ).all(binding.runtimeId, rpcId) as OutboxRow[];
+    return matches.some((upload) => {
+      const request = this.envelope(upload.envelope_json, upload.sha256);
+      return request.payload.kind === "rpc"
+        && request.payload.rpcId === rpcId
+        && REMOTE_NONAUTHORIZING_RPC_METHODS.has(request.payload.method);
+    });
   }
 
   confirmClosed(value: WorkerBinding): WorkerBindingStatus {

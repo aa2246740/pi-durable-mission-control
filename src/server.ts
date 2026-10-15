@@ -5,8 +5,9 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 import type { ModelProfile, RoleProfile } from "./contracts.js";
+import { artifactContentDisposition, artifactDownloadName } from "./artifact-download.js";
 import { McpConfigurationError } from "./mcp-config.js";
-import { ControlPlane, HttpError, parseCreateMissionInput, parseValidationContractUpdateInput } from "./control.js";
+import { ControlPlane, HttpError, RemoteEffectRejection, parseCreateMissionInput, parseValidationContractUpdateInput } from "./control.js";
 import { MachineError } from "./machines.js";
 import { applyWorkerNotice } from "./worker-events.js";
 import { parseWorkerBinding, type JsonValue, type WorkerBinding, type WorkerRpcPayload } from "./worker-mailbox.js";
@@ -81,15 +82,26 @@ function exactKeys(body: Record<string, unknown>, allowed: string[]): void {
   if (unknown.length) throw new HttpError(400, `Unexpected fields: ${unknown.join(", ")}`);
 }
 
-export type ServerOptions = { home: string; port: number; nodePort?: number; testOnlyScripted?: boolean; testOnlyToolLoop?: boolean };
+export type ServerOptions = { home: string; port: number; nodePort?: number; testOnlyScripted?: boolean; testOnlyToolLoop?: boolean; remoteRuntimeStopTimeoutMs?: number; remoteShutdownTimeoutMs?: number; onDaemonStop?: () => void };
 
 export async function startServer(options: ServerOptions) {
+  const remoteRuntimeStopTimeoutMs = options.remoteRuntimeStopTimeoutMs ?? Number(process.env.MC_REMOTE_RUNTIME_STOP_TIMEOUT_MS ?? 60000);
+  if (!Number.isSafeInteger(remoteRuntimeStopTimeoutMs) || remoteRuntimeStopTimeoutMs < 1 || remoteRuntimeStopTimeoutMs > 2147483647) {
+    throw new HttpError(400, "Remote runtime stop timeout must be an integer between 1 and 2147483647 milliseconds");
+  }
+  const remoteShutdownTimeoutMs = options.remoteShutdownTimeoutMs ?? Number(process.env.MC_REMOTE_SHUTDOWN_TIMEOUT_MS ?? 5000);
+  if (!Number.isSafeInteger(remoteShutdownTimeoutMs) || remoteShutdownTimeoutMs < 1 || remoteShutdownTimeoutMs > 10000) {
+    throw new HttpError(400, "Remote shutdown timeout must be an integer between 1 and 10000 milliseconds");
+  }
+  let closing = false;
+  let closeFlight: Promise<void> | undefined;
   const home = resolve(options.home);
   const control = new ControlPlane(home);
   const workers = new WorkerManager(
     control,
     options.testOnlyScripted === true,
-    options.testOnlyScripted === true && options.testOnlyToolLoop === true
+    options.testOnlyScripted === true && options.testOnlyToolLoop === true,
+    remoteRuntimeStopTimeoutMs
   );
   const lifecycleFlights = new Set<Promise<void>>();
   const scheduleLifecycleSync = (missionId: string, owner?: { id: string; epoch: number }): void => {
@@ -126,7 +138,6 @@ export async function startServer(options: ServerOptions) {
       return enabled === true;
     },
     rpc: async (binding, payload: WorkerRpcPayload) => {
-      const owner = control.getAgentPublic(binding.agentId);
       try {
         const result = await control.workerCommand({
           type: "rpc",
@@ -141,14 +152,17 @@ export async function startServer(options: ServerOptions) {
         return { kind: "reply", rpcId: payload.rpcId, ok: true, result: normalizeRpcResult(result) };
       } catch (error) {
         if (error instanceof HttpError && error.status >= 400 && error.status < 500) {
-          return { kind: "reply", rpcId: payload.rpcId, ok: false, error: "Remote operation was rejected" };
+          return { kind: "reply", rpcId: payload.rpcId, ok: false, error: error instanceof RemoteEffectRejection ? error.message : "Remote operation was rejected" };
         }
         throw error;
-      } finally {
-        if (owner && owner.missionId) {
-          scheduleLifecycleSync(owner.missionId, { id: owner.id, epoch: owner.epoch });
-        }
       }
+    },
+    // Lifecycle sync can fence this binding. It must run only after the
+    // dispatcher has stored finishWithReply, including when the RPC itself
+    // blocked the mission. The error path still schedules sync after fence.
+    afterRpc: (binding) => {
+      const owner = control.getAgentPublic(binding.agentId);
+      if (owner?.missionId) scheduleLifecycleSync(owner.missionId, { id: owner.id, epoch: owner.epoch });
     },
     notice: (binding, notice) => {
       const owner = control.getAgentPublic(binding.agentId);
@@ -166,22 +180,33 @@ export async function startServer(options: ServerOptions) {
   const tokenPath = join(home, tokenFileName);
   if (!existsSync(tokenPath)) writeFileSync(tokenPath, randomBytes(32).toString("hex"), { mode: 0o600, flag: "wx" });
   const token = readFileSync(tokenPath, "utf8").trim();
+  const shutdownNodeRoutes = new Set([
+    "/api/nodes/session", "/api/nodes/poll", "/api/nodes/events", "/api/nodes/runtimes/poll",
+    "/api/nodes/runtimes/events", "/api/nodes/effects/receipts", "/api/nodes/mailbox/settlement"
+  ]);
   const handleRequest = (nodeOnly: boolean) => async (request: IncomingMessage, response: ServerResponse) => {
     try {
       response.setHeader("x-content-type-options", "nosniff");
       response.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'");
       if (!isLocalHost(request.headers.host)) throw new HttpError(403, "Host is not a loopback host");
+      const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
       const origin = request.headers.origin;
+      if (url.pathname === "/api/daemon/stop" && origin !== undefined) throw new HttpError(403, "Daemon shutdown rejects browser origins");
       if (origin) {
         const originUrl = new URL(origin);
         if (originUrl.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(originUrl.hostname)) throw new HttpError(403, "Origin is not local");
         if (request.headers.host && originUrl.host !== request.headers.host) throw new HttpError(403, "Cross-origin request rejected");
       }
-      const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
       const method = request.method ?? "GET";
       const mutation = ["POST", "PATCH", "PUT", "DELETE"].includes(method);
       if (request.headers["sec-fetch-site"] === "cross-site") throw new HttpError(403, "Cross-site request rejected");
       const nodeRoute = url.pathname.startsWith("/api/nodes/");
+      const readRequestBody = async (): Promise<Record<string, unknown>> => {
+        const body = await readBody(request);
+        if (closing && (!nodeRoute || !shutdownNodeRoutes.has(url.pathname))) throw new HttpError(503, "Coordinator is shutting down");
+        return body;
+      };
+      if (closing && mutation && (!nodeRoute || !shutdownNodeRoutes.has(url.pathname))) throw new HttpError(503, "Coordinator is shutting down");
       if (nodeOnly && !nodeRoute) throw new HttpError(404, "Node listener does not expose administrator routes");
       if (nodeRoute) {
         if (request.headers.origin !== undefined || request.headers.cookie !== undefined) throw new MachineError(403, "Node authentication failed");
@@ -192,7 +217,7 @@ export async function startServer(options: ServerOptions) {
         const nodeToken = authorization.slice("Bearer ".length);
         if (method !== "POST") throw new MachineError(404, "Node route not found");
         if (url.pathname === "/api/nodes/session") {
-          const body = await readBody(request);
+          const body = await readRequestBody();
           exactKeys(body, ["machineId", "capabilities", "registrationId"]);
           return jsonResponse(response, 200, control.nodeSession(
             text(body.machineId, "machineId", 64),
@@ -202,7 +227,7 @@ export async function startServer(options: ServerOptions) {
           ));
         }
         if (url.pathname === "/api/nodes/poll") {
-          const body = await readBody(request);
+          const body = await readRequestBody();
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch"]);
           return jsonResponse(response, 200, control.nodePoll(
             text(body.machineId, "machineId", 64),
@@ -212,7 +237,7 @@ export async function startServer(options: ServerOptions) {
           ));
         }
         if (url.pathname === "/api/nodes/events") {
-          const body = await readBody(request);
+          const body = await readRequestBody();
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "commandId", "outcome"]);
           return jsonResponse(response, 200, control.nodeEvent(
             text(body.machineId, "machineId", 64),
@@ -224,7 +249,7 @@ export async function startServer(options: ServerOptions) {
           ));
         }
         if (url.pathname === "/api/nodes/effects/receipts") {
-          const body = await readBody(request);
+          const body = await readRequestBody();
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "upload"]);
           if (Object.keys(body).length !== 4) throw new MachineError(400, "Receipt upload fields are required");
           return jsonResponse(response, 200, control.nodeEffectReceipt(
@@ -236,7 +261,7 @@ export async function startServer(options: ServerOptions) {
           ));
         }
         if (url.pathname === "/api/nodes/artifacts/chunk") {
-          const body = await readBody(request);
+          const body = await readRequestBody();
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "spec", "manifest", "offset", "chunkBase64"]);
           if (typeof body.offset !== "number" || !Number.isSafeInteger(body.offset) || body.offset < 0) {
             throw new MachineError(400, "Artifact chunk offset must be a non-negative safe integer");
@@ -247,7 +272,7 @@ export async function startServer(options: ServerOptions) {
           ));
         }
         if (url.pathname === "/api/nodes/artifacts/complete") {
-          const body = await readBody(request);
+          const body = await readRequestBody();
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "spec", "manifest"]);
           return jsonResponse(response, 200, control.nodeArtifactComplete(
             text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
@@ -255,29 +280,46 @@ export async function startServer(options: ServerOptions) {
           ));
         }
         if (url.pathname === "/api/nodes/runtimes/poll") {
-          const body = await readBody(request);
-          exactKeys(body, ["machineId", "sessionId", "sessionEpoch"]);
+          const body = await readRequestBody();
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "stopRuntimeId"]);
           return jsonResponse(response, 200, control.nodeRuntimePoll(
             text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
-            positiveSafeInteger(body.sessionEpoch, "sessionEpoch")
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch"),
+            body.stopRuntimeId === undefined ? undefined : text(body.stopRuntimeId, "stopRuntimeId", 128)
           ));
         }
         if (url.pathname === "/api/nodes/runtimes/events") {
-          const body = await readBody(request);
-          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "reportId", "binding", "descriptorHash", "outcome"]);
+          const body = await readRequestBody();
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "reportId", "binding", "descriptorHash", "outcome", "stopReason"]);
           const binding = parseWorkerBinding(body.binding);
           if (!binding || typeof body.reportId !== "string" ||
               !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.reportId) ||
               typeof body.descriptorHash !== "string" || !/^[0-9a-f]{64}$/.test(body.descriptorHash) ||
-              !["stopped", "uncertain", "rejected"].includes(String(body.outcome))) {
+              !["stopped", "uncertain", "rejected"].includes(String(body.outcome)) ||
+              (body.stopReason !== undefined && body.stopReason !== "requested" && body.stopReason !== "unexpected")) {
             throw new MachineError(400, "Runtime report is invalid");
           }
-          return jsonResponse(response, 200, control.nodeRuntimeReport(
+          const result = control.nodeRuntimeReport(
             text(body.machineId, "machineId", 64), nodeToken, text(body.sessionId, "sessionId", 64),
             positiveSafeInteger(body.sessionEpoch, "sessionEpoch"), {
               reportId: body.reportId, binding, descriptorHash: body.descriptorHash,
-              outcome: body.outcome as "stopped" | "uncertain" | "rejected"
+              outcome: body.outcome as "stopped" | "uncertain" | "rejected",
+              ...(body.stopReason === undefined ? {} : { stopReason: body.stopReason })
             }
+          );
+          await workers.remoteRuntimeReported(binding.agentId, binding.runtimeId);
+          return jsonResponse(response, 200, result);
+        }
+        if (url.pathname === "/api/nodes/mailbox/settlement") {
+          const body = await readRequestBody();
+          exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "binding", "entries"]);
+          return jsonResponse(response, 200, control.nodeWorkerMailboxSettlement(
+            text(body.machineId, "machineId", 64),
+            nodeToken,
+            text(body.sessionId, "sessionId", 64),
+            positiveSafeInteger(body.sessionEpoch, "sessionEpoch"),
+            body.binding,
+            body.entries
           ));
         }
         const mailboxAction = new Map([
@@ -286,7 +328,7 @@ export async function startServer(options: ServerOptions) {
           ["/api/nodes/mailbox/ack", "ack"]
         ]).get(url.pathname);
         if (mailboxAction) {
-          const body = await readBody(request);
+          const body = await readRequestBody();
           exactKeys(body, ["machineId", "sessionId", "sessionEpoch", "binding",
             ...(mailboxAction === "upload" ? ["envelope"] : mailboxAction === "ack" ? ["receipt"] : [])]);
           const identity: [string, string, string, number, unknown] = [
@@ -307,6 +349,22 @@ export async function startServer(options: ServerOptions) {
         }
         throw new MachineError(404, "Node route not found");
       }
+      if (url.pathname === "/api/daemon/stop") {
+        const adminPort = (server.address() as AddressInfo).port;
+        const localHost = request.headers.host === `127.0.0.1:${adminPort}` || request.headers.host === `localhost:${adminPort}`;
+        if (method !== "POST" || !localHost || request.headers.origin !== undefined ||
+            request.headers.cookie !== undefined || request.headers["sec-fetch-site"] !== undefined ||
+            !safeEqual(request.headers.authorization ?? "", `Bearer ${token}`)) {
+          throw new HttpError(403, "Daemon shutdown requires a local administrator bearer request");
+        }
+        if (request.headers["x-mission-control-daemon-id"] !== control.daemonId) {
+          throw new HttpError(409, "Daemon incarnation does not match");
+        }
+        response.writeHead(202, { "connection": "close", "cache-control": "no-store" }).end();
+        void close();
+        options.onDaemonStop?.();
+        return;
+      }
       if (url.pathname === "/api/bootstrap" && method === "GET") {
         response.writeHead(204, { "set-cookie": `mission-control-auth=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/`, "cache-control": "no-store" });
         response.end();
@@ -323,24 +381,24 @@ export async function startServer(options: ServerOptions) {
         }
       }
       if (method === "POST" && url.pathname === "/api/machines") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["id", "name"]);
         const enrolled = control.enrollMachine(text(body.id, "id", 64), text(body.name, "name", 120));
         return jsonResponse(response, 201, enrolled);
       }
       const machineRevokeMatch = /^\/api\/machines\/([^/]+)\/revoke$/.exec(url.pathname);
       if (machineRevokeMatch && method === "POST") {
-        exactKeys(await readBody(request), []);
+        exactKeys(await readRequestBody(), []);
         return jsonResponse(response, 200, control.revokeMachine(decodeURIComponent(machineRevokeMatch[1]!)));
       }
       const machineReenrollMatch = /^\/api\/machines\/([^/]+)\/reenroll$/.exec(url.pathname);
       if (machineReenrollMatch && method === "POST") {
-        exactKeys(await readBody(request), []);
+        exactKeys(await readRequestBody(), []);
         return jsonResponse(response, 201, control.reenrollMachine(decodeURIComponent(machineReenrollMatch[1]!)));
       }
       const machineProbeMatch = /^\/api\/machines\/([^/]+)\/probe$/.exec(url.pathname);
       if (machineProbeMatch && method === "POST") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["path", "requestId"]);
         const command = control.probeMachine(
           decodeURIComponent(machineProbeMatch[1]!),
@@ -370,19 +428,19 @@ export async function startServer(options: ServerOptions) {
       });
       if (method === "GET" && url.pathname === "/api/health") return jsonResponse(response, 200, { pid: process.pid, daemonId: control.daemonId });
       if (method === "POST" && url.pathname === "/api/mcp-servers") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         const saved = await control.upsertMcpServer(body);
         return jsonResponse(response, 201, saved);
       }
       const mcpDiscoverMatch = /^\/api\/mcp-servers\/([^/]+)\/discover$/.exec(url.pathname);
       if (mcpDiscoverMatch && method === "POST") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["workspaceId"]);
         const result = await control.discoverMcpServer(decodeURIComponent(mcpDiscoverMatch[1]!), text(body.workspaceId, "workspaceId"));
         return jsonResponse(response, 200, result);
       }
       if (method === "POST" && url.pathname === "/api/profiles") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["id", "name", "api", "modelId", "baseUrl", "credentialEnv", "contextWindow", "maxTokens", "reasoning", "toolCalling", "vision", "cost"]);
         if (!["openai-completions", "openai-responses", "anthropic-messages"].includes(String(body.api))) throw new HttpError(400, "Unsupported API type");
         for (const field of ["reasoning", "toolCalling", "vision"]) if (typeof body[field] !== "boolean") throw new HttpError(400, `${field} must be boolean`);
@@ -419,7 +477,7 @@ export async function startServer(options: ServerOptions) {
         return jsonResponse(response, 201, saved);
       }
       if (method === "POST" && url.pathname === "/api/roles") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["id", "name", "kind", "instructions", "profileId", "mcpPermissions"]);
         if (!["orchestrator", "worker", "validator"].includes(String(body.kind))) throw new HttpError(400, "Invalid role kind");
         const role: RoleProfile = { id: typeof body.id === "string" ? text(body.id, "id") : randomUUID(), name: text(body.name, "name"), kind: body.kind as RoleProfile["kind"], instructions: text(body.instructions, "instructions"), profileId: text(body.profileId, "profileId"), ...(body.mcpPermissions === undefined ? {} : { mcpPermissions: body.mcpPermissions as NonNullable<RoleProfile["mcpPermissions"]> }) };
@@ -428,7 +486,7 @@ export async function startServer(options: ServerOptions) {
         return jsonResponse(response, 201, saved);
       }
       if (method === "POST" && url.pathname === "/api/workspaces") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         if (body.machineId !== undefined && body.machineId !== "local") {
           exactKeys(body, ["name", "machineId", "probeCommandId"]);
           return jsonResponse(response, 201, control.addRemoteWorkspace(
@@ -446,7 +504,7 @@ export async function startServer(options: ServerOptions) {
         return jsonResponse(response, 201, control.addWorkspace(text(body.name, "name"), path));
       }
       if (method === "POST" && url.pathname === "/api/missions") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         if (Object.keys(body).some((key) => !["title", "goal", "acceptance", "workspaceId", "remoteWorkspaceIds", "roleIds", "maxTurns", "maxCost", "autonomy", "assertions", "workspaceStrategy"].includes(key))) {
           throw new HttpError(400, "Unexpected mission field");
         }
@@ -455,7 +513,7 @@ export async function startServer(options: ServerOptions) {
       }
       const scheduleCollectionMatch = /^\/api\/missions\/([^/]+)\/schedules$/.exec(url.pathname);
       if (scheduleCollectionMatch && method === "POST") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["requestId", "name", "prompt", "schedule", "enabled"]);
         const saved = control.createSchedule(
           decodeURIComponent(scheduleCollectionMatch[1]!),
@@ -469,7 +527,7 @@ export async function startServer(options: ServerOptions) {
       }
       const scheduleMatch = /^\/api\/missions\/([^/]+)\/schedules\/([^/]+)$/.exec(url.pathname);
       if (scheduleMatch && method === "PATCH") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["requestId", "expectedRevision", "name", "prompt", "schedule", "enabled"]);
         if (typeof body.enabled !== "boolean") throw new HttpError(400, "enabled must be boolean");
         const saved = control.updateSchedule(
@@ -486,7 +544,7 @@ export async function startServer(options: ServerOptions) {
       }
       const scheduleActionMatch = /^\/api\/missions\/([^/]+)\/schedules\/([^/]+)\/(hold|resume|delete)$/.exec(url.pathname);
       if (scheduleActionMatch && method === "POST") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["requestId", "expectedRevision"]);
         const missionId = decodeURIComponent(scheduleActionMatch[1]!);
         const scheduleId = decodeURIComponent(scheduleActionMatch[2]!);
@@ -502,7 +560,7 @@ export async function startServer(options: ServerOptions) {
       }
       const watchdogMatch = /^\/api\/missions\/([^/]+)\/watchdog$/.exec(url.pathname);
       if (watchdogMatch && method === "POST") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["requestId", "expectedRevision", "autoWake"]);
         if (typeof body.autoWake !== "boolean") throw new HttpError(400, "autoWake must be boolean");
         const saved = control.configureWatchdog(
@@ -515,7 +573,7 @@ export async function startServer(options: ServerOptions) {
       }
       const missionMatch = /^\/api\/missions\/([^/]+)$/.exec(url.pathname);
       if (missionMatch && method === "PATCH") {
-        const body = await readBody(request); exactKeys(body, ["title", "maxTurns", "maxCost"]);
+        const body = await readRequestBody(); exactKeys(body, ["title", "maxTurns", "maxCost"]);
         if (body.title !== undefined) return jsonResponse(response, 200, control.patchMission(decodeURIComponent(missionMatch[1]!), text(body.title, "title")));
         if (body.maxTurns !== undefined || body.maxCost !== undefined) return jsonResponse(response, 200, control.updateMissionLimits(
           decodeURIComponent(missionMatch[1]!),
@@ -524,12 +582,18 @@ export async function startServer(options: ServerOptions) {
         ));
         throw new HttpError(400, "At least one supported mission field is required");
       }
-      if (missionMatch && method === "GET") return jsonResponse(response, 200, control.detail(decodeURIComponent(missionMatch[1]!)));
+      if (missionMatch && method === "GET") {
+        const detail = control.detail(decodeURIComponent(missionMatch[1]!));
+        return jsonResponse(response, 200, {
+          ...detail,
+          artifacts: detail.artifacts.map((artifact) => ({ ...artifact, downloadName: artifactDownloadName(artifact) }))
+        });
+      }
       const runtimeMatch = /^\/api\/missions\/([^/]+)\/runtimes$/.exec(url.pathname);
       if (runtimeMatch && method === "GET") return jsonResponse(response, 200, control.remoteRuntimeSnapshots(decodeURIComponent(runtimeMatch[1]!)));
       const contractMatch = /^\/api\/missions\/([^/]+)\/validation-contract$/.exec(url.pathname);
       if (contractMatch && method === "PUT") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         const contract = control.updateValidationContract(decodeURIComponent(contractMatch[1]!), parseValidationContractUpdateInput(body));
         return jsonResponse(response, 200, contract);
       }
@@ -537,7 +601,7 @@ export async function startServer(options: ServerOptions) {
       if (exportMatch && method === "GET") return jsonResponse(response, 200, control.exportMission(decodeURIComponent(exportMatch[1]!)));
       const actionMatch = /^\/api\/missions\/([^/]+)\/(start|pause|resume|cancel)$/.exec(url.pathname);
       if (actionMatch && method === "POST") {
-        exactKeys(await readBody(request), []);
+        exactKeys(await readRequestBody(), []);
         const mission = control.missionAction(decodeURIComponent(actionMatch[1]!), actionMatch[2] as "start" | "pause" | "resume" | "cancel");
         if (mission.status === "active") await workers.startMission(mission.id);
         else if (mission.status === "paused") await workers.pauseMission(mission.id);
@@ -548,7 +612,7 @@ export async function startServer(options: ServerOptions) {
       }
       const agentsMatch = /^\/api\/missions\/([^/]+)\/agents$/.exec(url.pathname);
       if (agentsMatch && method === "POST") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         if (Object.keys(body).some((key) => !["title", "roleId", "prompt", "requestId", "targetWorkspaceId"].includes(key))) {
           throw new HttpError(400, "Unexpected agent field");
         }
@@ -559,21 +623,21 @@ export async function startServer(options: ServerOptions) {
       }
       const messageMatch = /^\/api\/missions\/([^/]+)\/messages$/.exec(url.pathname);
       if (messageMatch && method === "POST") {
-        const body = await readBody(request); exactKeys(body, ["recipientId", "content", "mode", "requestId"]);
+        const body = await readRequestBody(); exactKeys(body, ["recipientId", "content", "mode", "requestId"]);
         if (body.mode !== "steer" && body.mode !== "followUp") throw new HttpError(400, "Invalid message mode");
         const message = control.sendMessage(decodeURIComponent(messageMatch[1]!), text(body.recipientId, "recipientId"), text(body.content, "content"), body.mode, text(body.requestId, "requestId"));
         await workers.dispatchPending();
         return jsonResponse(response, 201, message);
       }
       if (method === "POST" && /^\/api\/agents\/[^/]+\/interrupt$/.test(url.pathname)) {
-        exactKeys(await readBody(request), []);
+        exactKeys(await readRequestBody(), []);
         const id = decodeURIComponent(url.pathname.split("/")[3]!);
         await workers.interruptAgent(id);
         return jsonResponse(response, 200, control.getAgentPublic(id));
       }
       const agentMatch = /^\/api\/agents\/([^/]+)$/.exec(url.pathname);
       if (agentMatch && method === "PATCH") {
-        const body = await readBody(request); exactKeys(body, ["profileId"]);
+        const body = await readRequestBody(); exactKeys(body, ["profileId"]);
         const agent = control.updateAgentProfile(decodeURIComponent(agentMatch[1]!), text(body.profileId, "profileId"));
         await workers.stopAgent(agent.id);
         if (control.missionForAgent(agent.id)?.status === "active") {
@@ -586,7 +650,7 @@ export async function startServer(options: ServerOptions) {
       if (transcriptMatch && method === "GET") return jsonResponse(response, 200, { entries: control.transcript(decodeURIComponent(transcriptMatch[1]!)) });
       const approvalMatch = /^\/api\/approvals\/([^/]+)$/.exec(url.pathname);
       if (approvalMatch && method === "POST") {
-        const body = await readBody(request); exactKeys(body, ["decision"]);
+        const body = await readRequestBody(); exactKeys(body, ["decision"]);
         if (body.decision !== "approved" && body.decision !== "denied") throw new HttpError(400, "Invalid approval decision");
         const approval = control.resolveApproval(decodeURIComponent(approvalMatch[1]!), body.decision);
         const mission = control.missionById(approval.missionId);
@@ -602,7 +666,7 @@ export async function startServer(options: ServerOptions) {
       }
       const blockerMatch = /^\/api\/blockers\/([^/]+)\/resolve$/.exec(url.pathname);
       if (blockerMatch && method === "POST") {
-        const body = await readBody(request);
+        const body = await readRequestBody();
         exactKeys(body, ["resolution"]);
         const blocker = control.resolveBlocker(decodeURIComponent(blockerMatch[1]!), text(body.resolution, "resolution"));
         if (control.missionById(blocker.missionId)?.status === "active") await workers.dispatchPending();
@@ -634,7 +698,10 @@ export async function startServer(options: ServerOptions) {
         if (!artifact.snapshotPath) throw new HttpError(409, "Artifact snapshot is unavailable");
         const bytes = readFileSync(artifact.snapshotPath);
         if (createHash("sha256").update(bytes).digest("hex") !== artifact.sha256) throw new HttpError(409, "Artifact digest changed");
-        response.writeHead(200, { "content-type": "application/octet-stream", "content-length": bytes.length });
+        response.writeHead(200, {
+          "content-type": "application/octet-stream", "content-length": bytes.length,
+          "content-disposition": artifactContentDisposition(artifact)
+        });
         response.end(bytes);
         return;
       }
@@ -721,23 +788,24 @@ export async function startServer(options: ServerOptions) {
     if (!existsSync(target)) throw new HttpError(404, "UI asset not found");
     return readFileSync(target);
   }
-  return {
-    server,
-    control,
-    workers,
-    port: (server.address() as AddressInfo).port,
-    nodePort: (nodeServer?.address() as AddressInfo | null)?.port,
-    close: async () => {
+  function close(): Promise<void> {
+    return closeFlight ??= (async () => {
+      closing = true;
       clearInterval(heartbeat);
+      // prepareCoordinatorShutdown persists every stop request before its first
+      // await. Local cleanup starts immediately while node reports stay reachable.
+      const remoteStopped = workers.prepareCoordinatorShutdown(remoteShutdownTimeoutMs);
+      const failures: unknown[] = [];
+      const localStopped = Promise.all([
+        workers.close().catch((error) => { failures.push(error); }),
+        control.mcpRuntime.close().catch((error) => { failures.push(error); }),
+        mailboxDispatcher.close().catch((error) => { failures.push(error); })
+      ]);
+      await remoteStopped.catch((error) => { failures.push(error); });
       for (const client of sseClients) client.end();
       const listenerClosed = closeListeners();
-      const failures: unknown[] = [];
-      await mailboxDispatcher.close();
+      await localStopped;
       await Promise.all([...lifecycleFlights]);
-      await Promise.all([
-        workers.close().catch((error) => { failures.push(error); }),
-        control.mcpRuntime.close().catch((error) => { failures.push(error); })
-      ]);
       try {
         await control.settlePendingOperations();
       } catch (error) {
@@ -750,6 +818,14 @@ export async function startServer(options: ServerOptions) {
       }
       if (failures.length) throw new AggregateError(failures, "Mission Control shutdown did not settle all owned resources");
       control.close();
-    }
+    })();
+  }
+  return {
+    server,
+    control,
+    workers,
+    port: (server.address() as AddressInfo).port,
+    nodePort: (nodeServer?.address() as AddressInfo | null)?.port,
+    close
   };
 }

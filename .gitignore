@@ -19,3 +19,6 @@ coverage/
 *.img
 *.iso
 *.bundle
+
+# Local Apple Container acceptance evidence.
+.acceptance-proof/

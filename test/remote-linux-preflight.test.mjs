@@ -1,0 +1,520 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { defaultContainerRun, runProbeProcess, classifyProbe, containerArgs, containerEnv, containerPrefix, parseOptions, publishReport, runPreflight, uniqueTargets } from "../acceptance/remote-linux/preflight.mjs";
+import { readConfig } from "../acceptance/remote-linux/real.mjs";
+
+const preflightPath = fileURLToPath(new URL("../acceptance/remote-linux/preflight.mjs", import.meta.url));
+const secret = 'preflight-secret-"quoted"\\tail';
+
+const temporary = (t) => {
+  const path = mkdtempSync(join(tmpdir(), "mc-preflight-"));
+  t.after(() => rmSync(path, { recursive: true, force: true }));
+  return path;
+};
+
+function writeSecrets(directory, text = `UNIT_KEY=${secret}\nOTHER_KEY=${secret}-other\n`) {
+  const path = join(directory, "secrets.env");
+  writeFileSync(path, text, { mode: 0o600 });
+  return path;
+}
+
+function profile(baseUrl, api, modelId = "preflight-model", credentialEnv = "UNIT_KEY") {
+  return {
+    name: "Preflight",
+    api,
+    modelId,
+    baseUrl,
+    credentialEnv,
+    contextWindow: 128000,
+    maxTokens: 8192,
+    reasoning: true,
+    toolCalling: true,
+    vision: false
+  };
+}
+
+function writeConfig(directory, config) {
+  const path = join(directory, "models.json");
+  writeFileSync(path, JSON.stringify(config));
+  return path;
+}
+
+function openaiStream(tool, modelName) {
+  const first = tool
+    ? { role: "assistant", tool_calls: [{ index: 0, id: "call_ping", type: "function", function: { name: "ping", arguments: "" } }] }
+    : { role: "assistant", content: "hello" };
+  const second = tool
+    ? { tool_calls: [{ index: 0, function: { arguments: "{}" } }] }
+    : { content: "" };
+  const finish = tool ? "tool_calls" : "stop";
+  const chunks = [
+    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: modelName, choices: [{ index: 0, delta: first, finish_reason: null }] },
+    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: modelName, choices: [{ index: 0, delta: second, finish_reason: null }] },
+    { id: "chatcmpl-preflight", object: "chat.completion.chunk", created: 1, model: modelName, choices: [{ index: 0, delta: {}, finish_reason: finish }], usage: { prompt_tokens: 11, completion_tokens: 4, total_tokens: 15 } }
+  ];
+  return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+}
+
+function anthropicStream(tool, modelName) {
+  const blocks = tool
+    ? [
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_ping", name: "ping", input: {} } }],
+      ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } }],
+      ["content_block_stop", { type: "content_block_stop", index: 0 }]
+    ]
+    : [
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "hello" } }],
+      ["content_block_stop", { type: "content_block_stop", index: 0 }]
+    ];
+  const events = [
+    ["message_start", { type: "message_start", message: { id: "msg_preflight", type: "message", role: "assistant", model: modelName, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 9, output_tokens: 1 } } }],
+    ...blocks,
+    ["message_delta", { type: "message_delta", delta: { stop_reason: tool ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } }],
+    ["message_stop", { type: "message_stop" }]
+  ];
+  return events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join("");
+}
+
+async function startServer(t, mode) {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString("utf8");
+    const record = { url: request.url, body, authorization: request.headers.authorization, apiKey: request.headers["x-api-key"] };
+    requests.push(record);
+    if (mode === "timeout") return;
+    const anthropic = request.url.includes("/messages");
+    if (mode === "unauthorized" || mode === "echo") {
+      const echoed = record.authorization?.replace(/^Bearer /, "") || record.apiKey || "";
+      const payload = JSON.stringify({ error: { message: `rejected ${echoed}`, type: "authentication_error" } });
+      response.writeHead(401, { "content-type": "application/json" });
+      response.end(payload);
+      return;
+    }
+    let requested = "preflight-model";
+    try {
+      const parsed = JSON.parse(body);
+      if (typeof parsed.model === "string" && parsed.model.length > 0) requested = parsed.model;
+    } catch { /* A malformed body still gets a named fake model. */ }
+    const modelName = mode === "mismatch" ? "mapped-from-endpoint" : requested;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (["missing-finish-reason", "timeout-after-tool", "provider-error-after-tool", "cancelled-after-tool", "length-after-tool"].includes(mode)) {
+      const stream = anthropic ? anthropicStream(true, modelName) : openaiStream(true, modelName);
+      const prefix = stream.split("\n\n").slice(0, anthropic ? 4 : 2).join("\n\n") + "\n\n";
+      response.write(prefix);
+      if (mode === "timeout-after-tool") return;
+      if (mode === "missing-finish-reason") { response.end(anthropic ? "" : "data: [DONE]\n\n"); return; }
+      if (anthropic) {
+        const reason = mode === "length-after-tool" ? "max_tokens" : "refusal";
+        response.end(`event: message_delta\ndata: ${JSON.stringify({type:"message_delta",delta:{stop_reason:reason},usage:{output_tokens:4}})}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`);
+      } else {
+        const reason = mode === "length-after-tool" ? "length" : mode === "cancelled-after-tool" ? "cancelled" : "network_error";
+        response.end(`data: ${JSON.stringify({id:"chatcmpl-preflight",object:"chat.completion.chunk",created:1,model:modelName,choices:[{index:0,delta:{},finish_reason:reason}]})}\n\ndata: [DONE]\n\n`);
+      }
+      return;
+    }
+    response.end(anthropic ? anthropicStream(mode === "tool" || mode === "mismatch", modelName) : openaiStream(mode === "tool" || mode === "mismatch", modelName));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }));
+  const port = server.address().port;
+  return {
+    requests,
+    origin: `http://127.0.0.1:${port}`,
+    openai: `http://127.0.0.1:${port}/v1`,
+    anthropic: `http://127.0.0.1:${port}/anthropic`
+  };
+}
+
+function configFor(server, workerApi = "openai-completions") {
+  return {
+    orchestrator: profile(server.anthropic, "anthropic-messages", "preflight-anthropic"),
+    worker: profile(workerApi === "anthropic-messages" ? server.anthropic : server.openai, workerApi, workerApi === "anthropic-messages" ? "preflight-anthropic" : "preflight-openai"),
+    validator: profile(server.anthropic, "anthropic-messages", "preflight-anthropic")
+  };
+}
+
+function escaped(value) {
+  return JSON.stringify(value).slice(1, -1);
+}
+
+function assertClean(text) {
+  assert.equal(text.includes(secret), false);
+  assert.equal(text.includes(escaped(secret)), false);
+  assert.equal(text.includes(`${secret}-other`), false);
+  assert.equal(text.includes(escaped(`${secret}-other`)), false);
+}
+
+function assertNoSecret(value) {
+  const visit = (item) => {
+    if (typeof item === "string") {
+      assert.equal(item.includes(secret), false);
+      assert.equal(item.includes(escaped(secret)), false);
+      return;
+    }
+    if (Array.isArray(item)) item.forEach(visit);
+    else if (item && typeof item === "object") Object.values(item).forEach(visit);
+  };
+  visit(value);
+}
+
+function runCli(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [preflightPath, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+test("preflight options require a real config and secrets file", () => {
+  assert.equal(parseOptions(["--real", "models.json", "--secrets-file", "unit.env", "--from-container"]).fromContainer, true);
+  assert.equal(parseOptions(["--real", "models.json", "--secrets-file", "unit.env", "--timeout-ms", "250"]).timeoutMs, 250);
+  for (const args of [[], ["--real", "models.json"], ["--secrets-file", "unit.env"], ["--real", "models.json", "--secrets-file", "unit.env", "--keep"]]) {
+    assert.throws(() => parseOptions(args));
+  }
+  assert.equal(classifyProbe({ httpOk: true, toolCalled: true, httpStatus: 200, error: null }), null);
+  assert.equal(classifyProbe({ httpOk: false, toolCalled: false, httpStatus: 401, error: "401 no" }), "auth");
+});
+
+test("examples collapse repeated provider combinations", () => {
+  const mini = readConfig(new URL("../acceptance/remote-linux/real-minimax.json", import.meta.url));
+  const glm = readConfig(new URL("../acceptance/remote-linux/real-glm.json", import.meta.url));
+  assert.deepEqual(uniqueTargets(mini).map((target) => target.roles), [["orchestrator", "validator"], ["worker"]]);
+  assert.deepEqual(uniqueTargets(glm).map((target) => target.roles), [["orchestrator", "worker", "validator"]]);
+});
+
+test("local OpenAI and Anthropic endpoints must return one ping tool call", async (t) => {
+  const directory = temporary(t);
+  const server = await startServer(t, "tool");
+  const configPath = writeConfig(directory, configFor(server));
+  const report = await runPreflight({ configPath, secretsFile: writeSecrets(directory), timeoutMs: 5000 });
+  assert.equal(report.pass, true);
+  assert.equal(report.checks.length, 2);
+  assert.deepEqual(report.checks.map((check) => check.roles), [["orchestrator", "validator"], ["worker"]]);
+  assert.deepEqual(report.checks.map((check) => check.transport), ["host", "host"]);
+  for (const check of report.checks) {
+    assert.equal(check.httpOk, true);
+    assert.equal(check.httpStatus, 200);
+    assert.equal(check.toolCalled, true);
+    assert.equal(check.errorCategory, null);
+    assert.equal(check.error, null);
+    assert.equal(check.responseModel, check.modelId);
+    assert.equal(check.responseModelReason, null);
+    assert.equal(check.modelMismatch, false);
+    assert.ok(check.latencyMs >= 0);
+    assert.ok(check.usage.totalTokens > 0);
+  }
+  assert.deepEqual(report.modelMismatches, []);
+  assert.equal(report.notice, undefined);
+  assert.equal(server.requests.length, 2);
+  const parsed = server.requests.map((request) => ({ url: request.url, body: JSON.parse(request.body) }));
+  const anthropic = parsed.find((request) => request.url.includes("/messages")).body;
+  const openai = parsed.find((request) => request.url.includes("/chat/completions")).body;
+  assert.equal(anthropic.max_tokens, 1024);
+  // Like product runs, the probe leaves tool choice to the model (some endpoints only accept auto).
+  assert.equal(anthropic.tool_choice, undefined);
+  assert.equal(anthropic.tools[0].name, "ping");
+  assert.equal(openai.max_completion_tokens, 1024);
+  assert.equal(openai.tool_choice, undefined);
+  assert.equal(openai.tools[0].function.name, "ping");
+  assert.equal(server.requests.some((request) => request.apiKey === secret), true);
+  assert.equal(server.requests.some((request) => request.authorization === `Bearer ${secret}`), true);
+  assertNoSecret(report);
+  const cli = await runCli(["--real", configPath, "--secrets-file", writeSecrets(directory), "--timeout-ms", "5000"]);
+  assert.equal(cli.status, 0, cli.stdout + cli.stderr);
+  assertClean(cli.stdout);
+  assertClean(cli.stderr);
+  assert.equal(JSON.parse(cli.stdout).pass, true);
+  assert.equal(server.requests.length, 4);
+});
+
+test("authentication, missing tool calls, and timeouts fail closed without retries", async (t) => {
+  const directory = temporary(t);
+  for (const mode of ["unauthorized", "text", "timeout"]) {
+    const server = await startServer(t, mode === "text" ? "text" : mode);
+    const report = await runPreflight({ configPath: writeConfig(directory, configFor(server)), secretsFile: writeSecrets(directory), timeoutMs: mode === "timeout" ? 400 : 5000 });
+    assert.equal(report.pass, false);
+    assert.equal(report.checks.length, 2);
+    assert.equal(server.requests.length, 2);
+    for (const check of report.checks) {
+      assert.equal(check.toolCalled, false);
+      assert.equal(check.modelMismatch, false);
+      if (mode === "unauthorized") {
+        assert.equal(check.httpOk, false);
+        assert.equal(check.httpStatus, 401);
+        assert.equal(check.errorCategory, "auth");
+        assert.equal(check.responseModel, null);
+        assert.match(check.responseModelReason, /before a response model/);
+      } else if (mode === "text") {
+        assert.equal(check.httpOk, true);
+        assert.equal(check.httpStatus, 200);
+        assert.equal(check.errorCategory, "no-tool-call");
+        assert.equal(check.responseModel, check.modelId);
+        assert.ok(check.usage.totalTokens > 0);
+      } else {
+        assert.equal(check.httpOk, false);
+        assert.equal(check.errorCategory, "timeout");
+        assert.equal(check.responseModel, null);
+        assert.match(check.responseModelReason, /before a response model/);
+        assert.ok(check.latencyMs >= 300);
+        assert.ok(check.latencyMs < 5000);
+      }
+    }
+    assertNoSecret(report);
+  }
+});
+
+test("a different response model is reported without failing the tool-call check", async (t) => {
+  const directory = temporary(t);
+  const server = await startServer(t, "mismatch");
+  const configPath = writeConfig(directory, configFor(server));
+  const report = await runPreflight({ configPath, secretsFile: writeSecrets(directory), timeoutMs: 5000 });
+  assert.equal(report.pass, true);
+  assert.equal(report.notice, "API response model differs from configured modelId");
+  assert.equal(report.modelMismatches.length, 2);
+  assert.deepEqual(report.modelMismatches.map((item) => item.responseModel), ["mapped-from-endpoint", "mapped-from-endpoint"]);
+  for (const check of report.checks) {
+    assert.equal(check.httpOk, true);
+    assert.equal(check.toolCalled, true);
+    assert.equal(check.errorCategory, null);
+    assert.equal(check.responseModel, "mapped-from-endpoint");
+    assert.equal(check.responseModelReason, null);
+    assert.equal(check.modelMismatch, true);
+    assert.notEqual(check.responseModel, check.modelId);
+  }
+  const cli = await runCli(["--real", configPath, "--secrets-file", writeSecrets(directory), "--timeout-ms", "5000"]);
+  assert.equal(cli.status, 0, cli.stdout + cli.stderr);
+  const parsed = JSON.parse(cli.stdout);
+  assert.equal(parsed.pass, true);
+  assert.equal(parsed.modelMismatches.length, 2);
+  assert.match(cli.stdout, /mapped-from-endpoint/);
+});
+
+test("provider error bodies that echo a credential are redacted", async (t) => {
+  const directory = temporary(t);
+  const server = await startServer(t, "echo");
+  const configPath = writeConfig(directory, configFor(server));
+  const secretsFile = writeSecrets(directory);
+  const cli = await runCli(["--real", configPath, "--secrets-file", secretsFile, "--timeout-ms", "5000"]);
+  assert.equal(cli.status, 1, cli.stdout + cli.stderr);
+  assertClean(cli.stdout);
+  assertClean(cli.stderr);
+  assert.match(cli.stdout, /\[REDACTED\]/);
+  const report = JSON.parse(cli.stdout);
+  assert.equal(report.pass, false);
+  assert.equal(report.checks.every((check) => check.errorCategory === "auth"), true);
+  assert.equal(report.checks.every((check) => check.error.includes("[REDACTED]")), true);
+  assert.equal(server.requests.length, 2);
+  assert.equal(publishReport({ error: `echo ${secret}` }, [secret]).includes(secret), false);
+});
+
+test("rejected secrets files do not echo credential bytes", async (t) => {
+  const directory = temporary(t);
+  const configPath = writeConfig(directory, configFor({ openai: "http://127.0.0.1:9/v1", anthropic: "http://127.0.0.1:9/anthropic" }));
+  const secretsFile = join(directory, "open.env");
+  writeFileSync(secretsFile, `UNIT_KEY=${secret}\n`, { mode: 0o644 });
+  const cli = await runCli(["--real", configPath, "--secrets-file", secretsFile]);
+  assert.equal(cli.status, 1);
+  assertClean(cli.stdout);
+  assertClean(cli.stderr);
+  const report = JSON.parse(cli.stdout);
+  assert.equal(report.pass, false);
+  assert.deepEqual(report.checks, []);
+  assert.match(report.error, /Secrets file rejected/);
+});
+
+test("container preflight sends the worker credential only on stdin", async (t) => {
+  const directory = temporary(t);
+  const server = await startServer(t, "tool");
+  const prefix = containerPrefix();
+  const args = containerArgs({ name: `${prefix}unit`, image: "node:22-bookworm-slim" });
+  assert.equal(args.includes("--rm"), true);
+  assert.equal(args.includes(`${prefix}unit`), true);
+  assert.ok(args.filter((arg) => arg.endsWith(":ro")).length >= 2);
+  assertClean(args.join("\n"));
+  assertClean(Object.values(containerEnv()).join("\n"));
+  const report = await runPreflight({
+    configPath: writeConfig(directory, configFor(server)),
+    secretsFile: writeSecrets(directory),
+    fromContainer: true,
+    timeoutMs: 5000,
+    containerRun: ({ args: launchArgs, env, stdin }) => {
+      assert.equal(launchArgs.includes("--rm"), true);
+      assertClean(JSON.stringify({ launchArgs, env }));
+      const payload = JSON.parse(stdin);
+      assert.equal(payload.credential === secret, true);
+      assert.equal(payload.profile.modelId, "preflight-openai");
+      const child = spawn(process.execPath, [preflightPath, "--container-probe"], { stdio: ["pipe", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.stdin.end(stdin);
+      return new Promise((resolve, reject) => {
+        child.on("error", reject);
+        child.on("close", (code) => {
+          assert.equal(code, 0, stderr);
+          assertClean(stdout);
+          assertClean(stderr);
+          resolve(JSON.parse(stdout));
+        });
+      });
+    }
+  });
+  assert.equal(report.pass, true, JSON.stringify(report));
+  assert.deepEqual(report.checks.map((check) => [check.transport, check.toolCalled]), [["host", true], ["container", true]]);
+  assert.equal(server.requests.filter((request) => request.url.includes("/messages")).length, 1);
+  assert.equal(server.requests.filter((request) => request.url.includes("/chat/completions")).length, 1);
+  assertNoSecret(report);
+});
+
+test("a shared worker combination is probed once from the container entry", async (t) => {
+  const directory = temporary(t);
+  const server = await startServer(t, "tool");
+  const shared = profile(server.openai, "openai-completions", "preflight-openai");
+  const report = await runPreflight({
+    configPath: writeConfig(directory, { orchestrator: shared, worker: shared, validator: shared }),
+    secretsFile: writeSecrets(directory),
+    fromContainer: true,
+    timeoutMs: 5000,
+    containerRun: ({ stdin }) => {
+      const child = spawn(process.execPath, [preflightPath, "--container-probe"], { stdio: ["pipe", "pipe", "pipe"] });
+      let stdout = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stdin.end(stdin);
+      return new Promise((resolve, reject) => {
+        child.on("error", reject);
+        child.on("close", (code) => {
+          assert.equal(code, 0);
+          resolve(JSON.parse(stdout));
+        });
+      });
+    }
+  });
+  assert.equal(report.pass, true);
+  assert.equal(report.checks.length, 1);
+  assert.equal(report.checks[0].transport, "container");
+  assert.deepEqual(report.checks[0].roles, ["orchestrator", "worker", "validator"]);
+  assert.equal(server.requests.length, 1);
+});
+
+// Regressions from the independent review: a tool name alone is no success signal.
+test("preflight rejects incomplete, failed, cancelled and timed-out streams after a ping", async (t) => {
+  const directory = temporary(t);
+  for (const mode of ["missing-finish-reason", "timeout-after-tool", "provider-error-after-tool", "cancelled-after-tool", "length-after-tool"]) {
+    const server = await startServer(t, mode);
+    const shared = profile(server.openai, "openai-completions");
+    const report = await runPreflight({ configPath: writeConfig(directory, {orchestrator:shared,worker:shared,validator:shared}),
+      secretsFile: writeSecrets(directory), timeoutMs: mode === "timeout-after-tool" ? 500 : 5000 });
+    assert.equal(report.pass, false, mode);
+    assert.equal(server.requests.length, 1, "failed probes must not retry");
+    const [check] = report.checks;
+    assert.equal(check.httpOk, true, mode);
+    assert.equal(check.toolCalled, true, mode);
+    assert.notEqual(check.errorCategory, null, mode);
+    assert.ok(check.error, mode);
+    if (mode === "timeout-after-tool") assert.equal(check.errorCategory, "timeout");
+    assertNoSecret(report);
+  }
+});
+
+test("Anthropic partial tools, refusal and output limits also fail preflight", async (t) => {
+  const directory = temporary(t);
+  for (const mode of ["missing-finish-reason", "provider-error-after-tool", "length-after-tool"]) {
+    const server = await startServer(t, mode);
+    const shared = profile(server.anthropic, "anthropic-messages");
+    const report = await runPreflight({configPath:writeConfig(directory,{orchestrator:shared,worker:shared,validator:shared}),secretsFile:writeSecrets(directory),timeoutMs:5000});
+    assert.equal(report.pass, false, mode);
+    assert.equal(report.checks[0].httpOk, true);
+    assert.equal(report.checks[0].toolCalled, true);
+    assert.notEqual(report.checks[0].errorCategory, null);
+    assert.equal(server.requests.length, 1);
+  }
+});
+
+
+test("container probe owns cleanup after timeout, exceptions and both interruption signals", async () => {
+  for (const mode of ["success","timeout","exception","SIGINT","SIGTERM","late-SIGTERM"]) {
+    const signals=new EventEmitter(), calls=[], containers=new Set();
+    let owned;
+    const command=async args => {
+      calls.push(args);
+      if(args[0]==="list") return [...containers].join("\n");
+      if(args[0]==="image") return JSON.stringify([{configuration:{name:"node:22-bookworm-slim"},variants:[{platform:{architecture:"arm64",os:"linux"}}]}]);
+      assert.equal(args[1],owned,"must only mutate the container created by this probe");
+      if(args[0]==="stop" && mode==="late-SIGTERM") signals.emit("SIGTERM");
+      if(args[0]==="delete") containers.delete(args[1]);
+      return "";
+    };
+    const result=await defaultContainerRun({profile:profile("http://127.0.0.1:9/v1","openai-completions"),credential:secret,timeoutMs:10,maxTokens:100},
+      {command,signals,runProcess:async (_command,args,_stdin,_credential,_timeout,signal)=>{
+        owned=args[args.indexOf("--name")+1];containers.add(owned);
+        if(mode==="exception") throw Error("spawn failed");
+        if(mode.startsWith("SIG")) {
+          const aborted=new Promise(resolve=>signal.addEventListener("abort",resolve,{once:true}));
+          signals.emit(mode);await aborted;
+        }
+        return {httpOk:true,toolCalled:true,errorCategory:mode==="timeout"?"timeout":null,error:mode==="timeout"?"timeout":null};
+      }});
+    assert.equal(result.cleanupVerified,true,mode);
+    assert.equal(result.containerName,owned);
+    assert.equal(containers.size,0);
+    assert.deepEqual(calls.filter(args=>["stop","delete"].includes(args[0])),[["stop",owned],["delete",owned]]);
+    assert.deepEqual(calls.at(-1),["list","--all","--quiet"]);
+    assert.equal(signals.listenerCount("SIGINT"),0);
+    assert.equal(signals.listenerCount("SIGTERM"),0);
+    if(mode.includes("SIG")) {assert.equal(result.interrupted,true);assert.match(result.error,/Interrupted by SIG/);assert.equal(result.errorCategory,"container");}
+    else assert.equal(result.errorCategory,mode==="success"?null:mode==="timeout"?"timeout":"container");
+  }
+});
+
+test("container cleanup failure cannot pass and preexisting containers are never removed", async () => {
+  for(const existing of [false,true]) {
+    const calls=[], signals=new EventEmitter();
+    let name=existing?`${containerPrefix()}someone-else`:undefined;
+    const command=async args=>{
+      calls.push(args);
+      if(args[0]==="list")return name??"";
+      if(args[0]==="image")return JSON.stringify([{configuration:{name:"node:22-bookworm-slim"},variants:[{platform:{architecture:"arm64",os:"linux"}}]}]);
+      throw Error("cannot clean up");
+    };
+    const result=await defaultContainerRun({profile:profile("http://127.0.0.1:9/v1","openai-completions"),credential:secret,timeoutMs:10,maxTokens:100},
+      {command,signals,runProcess:async(_command,args)=>{name=args[args.indexOf("--name")+1];return {httpOk:true,toolCalled:true,errorCategory:null};}});
+    assert.equal(result.cleanupVerified,false);
+    assert.equal(result.errorCategory,"container");
+    assert.match(result.error,/Residual/);
+    if(existing)assert.equal(calls.some(args=>["stop","delete"].includes(args[0])),false);
+  }
+});
+
+test("probe process terminates on its deadline and an abort signal", async () => {
+  const timeout=await runProbeProcess(process.execPath,["-e","setInterval(()=>{},1000)"],"",secret,100);
+  assert.equal(timeout.errorCategory,"timeout");
+  const controller=new AbortController();
+  const pending=runProbeProcess(process.execPath,["-e","setInterval(()=>{},1000)"],"",secret,10000,controller.signal);
+  controller.abort(Error("Interrupted by SIGINT"));
+  const result=await pending;
+  assert.equal(result.errorCategory,"container");
+  assert.match(result.error,/Interrupted by SIGINT/);
+});
+
+test("interrupted container probes stop the remaining provider combinations", async(t)=>{
+  const directory=temporary(t), worker=profile("http://127.0.0.1:9/v1","openai-completions");
+  const configPath=writeConfig(directory,{orchestrator:worker,worker,validator:{...worker,modelId:"never-called"}});
+  const report=await runPreflight({configPath,secretsFile:writeSecrets(directory),fromContainer:true,
+    containerRun:async()=>({httpOk:false,toolCalled:false,errorCategory:"container",error:"Interrupted by SIGTERM",interrupted:true,containerName:"unit",cleanupVerified:true})});
+  assert.equal(report.pass,false);
+  assert.equal(report.checks.length,1);
+  assert.equal(report.checks[0].interrupted,true);
+  assert.equal(report.checks[0].cleanupVerified,true);
+});

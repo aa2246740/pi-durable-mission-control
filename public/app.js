@@ -22,8 +22,14 @@ async function api(path, method = 'GET', body) {
   const text = await response.text();
   let result;
   try { result = text ? JSON.parse(text) : {}; } catch { throw new Error(`后台返回了非 JSON 内容（${response.status}）。`); }
-  if (!response.ok) throw new Error(typeof result.error === 'string' ? result.error : result.error?.message || result.message || `请求失败（${response.status}）`);
+  if (!response.ok) throw new Error(uiErrorDescription(typeof result.error === 'string' ? result.error : result.error?.message || result.message || `请求失败（${response.status}）`));
   return result;
+}
+
+function uiErrorDescription(message) {
+  return String(message ?? '').replace('Workspace operations must finish before mission completion', '暂时无法完成 Mission：仍有工作区操作、shell 命令或验证在执行，请等待它们结束。')
+    .replace('Local worker exit is not confirmed; explicit resume is refused and answers remain held. A coordinator restart cannot confirm an old process exit.', '无法继续执行：旧本地进程退出尚未确认，回答仍被保留。需确认旧进程已退出后再显式恢复；重启协调端不能确认旧进程退出。')
+    .replace('Resolve mission blockers before resuming', '无法继续执行：请先处理所有未解决的阻塞。');
 }
 
 function toast(message) {
@@ -93,7 +99,7 @@ function button(label, action, id = '', type = '') { return `<button class="butt
 function empty(title, description, actions = '', compact = false) { return `<div class="empty ${compact ? 'compact' : ''}"><div class="empty-symbol">↗</div><h2>${e(title)}</h2><p>${e(description)}</p>${actions}</div>`; }
 function stat(label, value, note) { return `<div class="stat"><div class="stat-label">${e(label)}<span>↗</span></div><div class="stat-value">${e(value)}</div><div class="stat-note">${e(note)}</div></div>`; }
 function profileName(id) { const p = state.app.profiles.find((item) => item.id === id); return p ? p.name : id || '未配置'; }
-function agentName(id) { if (id === 'user') return '你'; if (id === 'system:scheduler') return '定时唤醒'; if (id === 'system:watchdog') return '推进监测'; return state.detail?.agents.find((agent) => agent.id === id)?.title || id || '系统'; }
+function agentName(id) { if (id === 'user') return '你'; if (id === 'system:scheduler') return '定时唤醒'; if (id === 'system:watchdog') return '推进监测'; if (id === 'system:coordinator') return '协调端恢复通知'; return state.detail?.agents.find((agent) => agent.id === id)?.title || id || '系统'; }
 function workspaceName(id) { return state.app.workspaces.find((workspace) => workspace.id === id)?.name || id; }
 function renderNav() {
   $('#nav').innerHTML = navItems.map(([key, icon, label]) => `<a href="#${key}" class="nav-item ${state.section === key ? 'active' : ''}" ${state.section === key ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${label}${key === 'missions' ? `<span class="nav-count">${state.app.missions.length}</span>` : ''}</a>`).join('');
@@ -288,8 +294,63 @@ async function machineAction(name, id) {
   }, '提交只读检查');
 }
 
+const shortRuntimeId = (id) => String(id ?? '未记录').slice(0, 8);
+
+function eventDescription(event) {
+  if (event.type === 'remote_runtime_reassigned') return `受控停止后已重新分配远端运行时：旧 ${shortRuntimeId(event.data?.previousRuntimeId)} → 新 ${shortRuntimeId(event.data?.runtimeId)}`;
+  const descriptions = {
+    coordinator_stopping: '协调端正在正常停止，Mission 已暂停，等待远端运行时确认停止。',
+    coordinator_stop_waiting: '协调端正在正常停止，等待远端运行时确认停止；Mission 保持原状态。',
+    coordinator_stop_unconfirmed: `协调端停止超时，未收到远端运行时 ${shortRuntimeId(event.data?.runtimeId)} 的受控停止确认。恢复已被禁止，请核对旧进程和未结清的工作。`,
+    coordinator_resume_queued: '已为新远端运行时排队一条协调端恢复通知。代理将读取持久历史继续待办，不会重放旧操作。',
+    local_worker_exit_confirmed: '旧本地进程已确认退出。处理阻塞后，仍需点击“继续执行”显式恢复。'
+  };
+  if (descriptions[event.type]) return descriptions[event.type];
+  if (event.type === 'delivery_uncertain') return `消息 ${event.data?.messageId || '未记录'} 的投递结果不确定，可能已被代理接收。${['completed', 'cancelled'].includes(state.detail?.mission.status) ? 'Mission 已结束，此记录仅保留历史证据，不新增待处理问题，也不会重放消息。' : '请核对投递与实际工作，处理对应阻塞后再继续；系统不会自动重放。'}`;
+  return uiErrorDescription(event.text);
+}
+
+function renderRemoteRuntimes() {
+  const runtimes = state.detail.runtimes || [];
+  if (!runtimes.length) return '';
+  const runtimeNames = { queued: '排队中', offered: '已下发', running: '运行中', stopping: '停止中', closed: '已关闭', uncertain: '状态不确定', run: '运行', stop: '停止', unproven: '尚未证实', controlled: '受控停止', unexpected: '意外停止', stopped: '已停止', rejected: '已拒绝' };
+  const runtimeBadge = (value) => `<span class="badge ${e(value)}">${e(runtimeNames[value] || value || '未记录')}</span>`;
+  return `<section class="panel"><h3>远端运行时</h3><div class="cards">${runtimes.map((runtime) => {
+    const { binding } = runtime;
+    const warning = ['unexpected', 'uncertain'].includes(runtime.stopProvenance);
+    const machine = state.app.machines.find((item) => item.id === binding.machineId);
+    return `<article class="agent-card ${warning ? 'error-panel' : ''}"><h3>${e(agentName(binding.agentId))}</h3><p class="agent-meta">机器：${e(machine?.name || binding.machineId)}<br>运行时：<span class="mono" title="${e(binding.runtimeId)}">${e(shortRuntimeId(binding.runtimeId))}</span><br>执行代次（epoch）：${e(binding.epoch)}</p><p class="text">状态：${runtimeBadge(runtime.state)}<br>期望状态：${runtimeBadge(runtime.desired)}<br>停止来源：${runtimeBadge(runtime.stopProvenance)}<br>最后报告结果：${runtime.report ? runtimeBadge(runtime.report.outcome) : '尚无报告'}${runtime.report?.stopReason ? `<br>报告停止原因：${e(({ requested: '响应停止请求', unexpected: '意外停止（包括节点会话失效后重连）' })[runtime.report.stopReason] || runtime.report.stopReason)}` : ''}</p>${warning ? '<div class="notice">需要人工核对远端进程与未结清的工作，系统不会自动重放</div>' : ''}<p class="agent-meta">创建时间：${e(date(runtime.createdAt))}<br>更新时间：${e(date(runtime.updatedAt))}</p></article>`;
+  }).join('')}</div></section>`;
+}
+
+const localWorkerStopExplanation = '需确认旧进程已退出后再显式恢复。处理所有阻塞后，仍需点击“继续执行”；排队输入和回答不会自动发送。';
+
+function localWorkerStopHold() {
+  return !['completed', 'cancelled'].includes(state.detail.mission.status) && Boolean(state.detail.mission.localWorkerStops?.length);
+}
+
+const unrecoverableRuntimeExplanation = '这是远端运行时的意外或无法证明的停止。当前版本不支持可信对账，此 Mission 无法继续。请先核对远端工作区和未结清的工作，再新建 Mission。系统不会重放任何工作。';
+
+function latestStartupFailure() {
+  return state.detail.events.slice().reverse().find((item) => item.type === 'worker_start_failed')?.data;
+}
+
+function renderLocalWorkerStopDiagnostic() {
+  if (!localWorkerStopHold()) return '';
+  return `<div class="notice error-panel" id="local-worker-stop-diagnostic"><strong>本地进程停止门禁</strong><p class="text">${e(localWorkerStopExplanation)}</p>${state.detail.mission.localWorkerStops.map((stop) => `<p class="small-muted">${e(agentName(stop.agentId))} · 代次 ${e(stop.epoch)}：${stop.exit === 'confirmed' ? '已确认退出，可处理阻塞后显式恢复' : '退出尚未确认，继续执行已禁用'}</p>`).join('')}</div>`;
+}
+
+function renderRecoveryDiagnostic() {
+  if (state.detail.mission.status !== 'failed') return '';
+  const failure = latestStartupFailure();
+  const diagnostic = failure?.diagnostic;
+  const unrecoverable = failure?.recoverable === false;
+  if (!diagnostic && !unrecoverable) return '';
+  return `<div class="notice error-panel" id="recovery-diagnostic"><strong>恢复诊断</strong>${diagnostic ? `<p class="text danger-text">${e(diagnostic)}</p>` : ''}${e(unrecoverable ? unrecoverableRuntimeExplanation : '修复原因后可再次恢复')}</div>`;
+}
+
 function timeline(events, limit = 40) {
-  return events.length ? `<div class="timeline">${events.slice(-limit).reverse().map((event) => `<div class="event"><span class="event-dot"></span><div><p>${e(event.text)}</p><small>#${event.seq} · ${e(event.type)} · ${date(event.createdAt)}</small></div></div>`).join('')}</div>` : '<p class="small-muted">尚无活动。启动后会在这里记录真实事件。</p>';
+  return events.length ? `<div class="timeline">${events.slice(-limit).reverse().map((event) => `<div class="event"><span class="event-dot"></span><div><p>${e(eventDescription(event))}</p><small>#${event.seq} · ${e(event.type)} · ${date(event.createdAt)}</small></div></div>`).join('')}</div>` : '<p class="small-muted">尚无活动。启动后会在这里记录真实事件。</p>';
 }
 
 function renderAgents(agents) {
@@ -435,12 +496,12 @@ function executionOutput(receipt) {
 function renderBlockers() {
   const blockers = state.detail.blockers || [];
   const open = blockers.filter((item) => item.status === 'open');
-  return open.map((item) => `<section class="panel approval"><div class="card-top"><h3>${item.kind === 'user_input' ? '团队需要你的回答' : '需要人工处理'}</h3>${badge('blocked')}</div><p class="text">${e(item.text)}</p>${item.kind === 'unsafe_execution' ? '<p class="notice">命令可能已经产生外部影响。请先核对真实状态，不要把“没有收到结果”理解为“没有执行”。记录处置不等于自动重跑。</p>' : ''}${button(item.kind === 'user_input' ? '回答团队' : '记录处理结果', 'resolve-blocker', item.id, 'secondary')}</section>`).join('');
+  return open.map((item) => `<section class="panel approval"><div class="card-top"><h3>${item.kind === 'user_input' ? '团队需要你的回答' : '需要人工处理'}</h3>${badge('blocked')}</div><p class="text">${e(item.kind === 'unsafe_execution' && item.id.startsWith('worker-stop:') ? '本地进程退出未确认。请先核对旧进程，再记录处理结果；排队输入尚未发送。' : item.text)}</p>${item.kind === 'unsafe_execution' ? '<p class="notice">命令可能已经产生外部影响。请先核对真实状态，不要把“没有收到结果”理解为“没有执行”。记录处置不等于自动重跑。</p>' : ''}${button(item.kind === 'user_input' ? '回答团队' : '记录处理结果', 'resolve-blocker', item.id, 'secondary')}</section>`).join('');
 }
 
 function renderArtifacts() {
   return `<div class="section-head"><h2>交付物</h2><a class="button secondary small" href="/api/missions/${encodeURIComponent(state.missionId)}/export" download>导出证据</a></div>` +
-    (state.detail.artifacts.length ? `<div class="table-wrap"><table><thead><tr><th>交付物</th><th>来源</th><th>内容身份 SHA-256</th><th>操作</th></tr></thead><tbody>${state.detail.artifacts.map((a) => `<tr><td>${e(a.name)}<small>源文件：${e(a.path)}</small><small>${a.snapshotPath ? '后台保留独立快照' : '未记录独立快照'}</small>${a.workspaceCommit ? `<small class="mono">发布提交：${e(a.workspaceCommit)}<br>提交内路径：${e(a.relativePath)}</small>` : ''}</td><td>${e(agentName(a.agentId))}<small>${date(a.createdAt)}</small></td><td class="mono digest">${e(a.sha256)}<small>${a.size} bytes</small></td><td><a class="button secondary small" href="/api/artifacts/${encodeURIComponent(a.id)}/content" download>下载</a></td></tr>`).join('')}</tbody></table></div>` : empty('还没有交付物', '代理需要发布实际文件，并由后台保存交付快照，模型口头承诺不算交付。', '', true)) +
+    (state.detail.artifacts.length ? `<div class="table-wrap"><table><thead><tr><th>交付物</th><th>来源</th><th>内容身份 SHA-256</th><th>操作</th></tr></thead><tbody>${state.detail.artifacts.map((a) => `<tr><td>${e(a.name)}<small>源文件：${e(a.path)}</small><small>${a.snapshotPath ? '后台保留独立快照' : '未记录独立快照'}</small>${a.workspaceCommit ? `<small class="mono">发布提交：${e(a.workspaceCommit)}<br>提交内路径：${e(a.relativePath)}</small>` : ''}</td><td>${e(agentName(a.agentId))}<small>${date(a.createdAt)}</small></td><td class="mono digest">${e(a.sha256)}<small>${a.size} bytes</small></td><td><a class="button secondary small" href="/api/artifacts/${encodeURIComponent(a.id)}/content" download="${e(a.downloadName)}">下载</a></td></tr>`).join('')}</tbody></table></div>` : empty('还没有交付物', '代理需要发布实际文件，并由后台保存交付快照，模型口头承诺不算交付。', '', true)) +
     `<div class="section-head"><h2>独立验收记录（含历史版本）</h2></div><p class="small-muted">以下保留每次验收的原始结论；当前需求是否通过，以“需求覆盖”中的当前版本为准。旧版 Mission 仍按原有验收规则判断。</p>` +
     (state.detail.validations.length ? state.detail.validations.map((v) => `<article class="panel"><div class="card-top"><h3>${e(state.detail.tasks.find((t) => t.id === v.taskId)?.title || v.taskId)}</h3>${badge(v.passed ? 'accepted' : 'failed')}</div><pre class="output">${e(v.evidence)}</pre><p class="small-muted">验收者 ${e(agentName(v.agentId))} · ${date(v.createdAt)}<br>执行回执：${e(v.receiptId || '未关联')} · 任务修订 ${e(v.taskRevision ?? '未记录')}</p></article>`).join('') : '<p class="small-muted">尚无验收结论。执行者不能验收自己的工作，运行命令也不等于已经接受交付。</p>') +
     `<div class="section-head"><h2>真实命令回执</h2><span class="small-muted">保留成功与失败，不能用新结果覆盖旧失败</span></div>` +
@@ -535,7 +596,13 @@ function renderDetail() {
   const controls = [badge(mission.status)];
   if (mission.status === 'draft') controls.push(button('启动 Mission', 'start'));
   if (['active', 'validating'].includes(mission.status)) controls.push(button('暂停', 'pause', '', 'secondary'));
-  if (['paused', 'blocked', 'failed'].includes(mission.status)) controls.push(button('继续执行', 'resume'));
+  if (['paused', 'blocked', 'failed'].includes(mission.status)) {
+    controls.push(localWorkerStopHold() && mission.localWorkerStops.some((stop) => stop.exit !== 'confirmed')
+      ? `<button class="button" data-action="resume" disabled aria-disabled="true" aria-describedby="local-worker-stop-diagnostic" title="${e(localWorkerStopExplanation)}">继续执行</button>`
+      : mission.status === 'failed' && latestStartupFailure()?.recoverable === false
+      ? `<button class="button" data-action="resume" disabled aria-disabled="true" aria-describedby="recovery-diagnostic" title="${e(unrecoverableRuntimeExplanation)}">${e('继续执行')}</button>`
+      : button('继续执行', 'resume'));
+  }
   if (!['completed', 'cancelled'].includes(mission.status)) controls.push(button('取消', 'cancel', '', 'secondary danger'));
   if (['draft', 'paused', 'blocked', 'failed'].includes(mission.status)) controls.push(button('调整预算', 'edit-limits', '', 'secondary'));
   controls.push(button('重命名', 'rename', '', 'secondary'));
@@ -552,9 +619,9 @@ function renderDetail() {
   if (state.tab === 'schedules') content = renderSchedules();
   if (state.tab === 'artifacts') content = renderArtifacts();
   if (state.tab === 'events') content = `<section class="panel">${timeline(events, 300)}</section>`;
-  return `<a class="back-link" href="#missions">← 所有 Missions</a>` + heading(`MISSION / ${mission.id.slice(0, 8).toUpperCase()}`, mission.title, `${workspaceName(mission.workspaceId)} · ${mission.autonomy === 'trusted' ? '可信自主执行' : '工具操作需审批'} · 创建于 ${date(mission.createdAt)}`, controls.join('')) +
+  return `<a class="back-link" href="#missions">← 所有 Missions</a>` + heading(`MISSION / ${mission.id.slice(0, 8).toUpperCase()}`, mission.title, `${workspaceName(mission.workspaceId)} · ${mission.autonomy === 'trusted' ? '可信自主执行' : '工具操作需审批'} · 创建于 ${date(mission.createdAt)}`, controls.join('')) + renderRecoveryDiagnostic() + renderLocalWorkerStopDiagnostic() +
     `<div class="stats">${stat('任务验收', `${accepted} / ${tasks.length}`, '独立验证后才能完成')}${stat('活跃代理', `${agents.filter((a) => a.status === 'running').length} / ${agents.length}`, '各自保持上下文')}${stat('执行轮次', `${mission.turns} / ${mission.maxTurns}`, '达到上限后停止派工')}${stat('已记录模型费用', mission.costKnown ? `$${Number(mission.cost).toFixed(4)}` : '未定价', mission.costKnown ? `${mission.maxCost > 0 ? `上限 $${mission.maxCost}` : '未设置费用上限'} · 不含未结算请求` : '未配置单价，不假装免费')}</div>` +
-    (['paused', 'blocked'].includes(mission.status) ? `<div class="notice">${mission.status === 'paused' ? '已冻结新派工。迟到报告仍会保存，但不会偷偷唤醒负责人。' : 'Mission 需要处理阻塞。查看活动与消息，解决原因后再继续。'}</div>` : '') + renderBlockers() + renderApprovals() +
+    (['paused', 'blocked'].includes(mission.status) ? `<div class="notice">${mission.status === 'paused' ? '已冻结新派工。迟到报告仍会保存，但不会偷偷唤醒负责人。' : 'Mission 需要处理阻塞。查看活动与消息，解决原因后再继续。'}</div>` : '') + renderBlockers() + renderApprovals() + renderRemoteRuntimes() +
     `<div class="tabs" role="tablist" aria-label="Mission 内容">${tabs.map(([key, label]) => `<button role="tab" aria-selected="${key === state.tab}" class="tab ${key === state.tab ? 'active' : ''}" data-tab="${key}">${label}${key === 'agents' ? ` ${agents.length}` : ''}${key === 'tasks' ? ` ${tasks.length}` : ''}</button>`).join('')}</div>${content}`;
 }
 
@@ -582,7 +649,11 @@ async function load(force = false) {
   const version = routeVersion;
   try {
     const app = await api('/api/state');
-    const detail = state.missionId ? await api(`/api/missions/${encodeURIComponent(state.missionId)}`) : null;
+    const missionPath = state.missionId ? `/api/missions/${encodeURIComponent(state.missionId)}` : null;
+    const [detail, runtimes] = missionPath ? await Promise.all([
+      api(missionPath), api(`${missionPath}/runtimes`).catch(() => [])
+    ]) : [null, []];
+    if (detail) detail.runtimes = runtimes;
     if (version !== routeVersion) { pendingLoad = true; return; }
     const snapshot = JSON.stringify({ app, detail, routeVersion });
     const changed = snapshot !== lastSnapshot;

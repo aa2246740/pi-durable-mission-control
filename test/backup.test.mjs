@@ -319,7 +319,7 @@ test("backup refuses a live SQLite owner without creating output", async (t) => 
   try {
     const result = await runCli(["backup", "--home", f.home, "--out", output]);
     assert.equal(result.code, 1);
-    assert.match(result.stderr, /owner process .* is alive/);
+    assert.match(result.stderr, /daemon ownership lock is held/);
     assert.equal(existsSync(output), false);
   } finally {
     control.close();
@@ -469,6 +469,10 @@ test("approved operations and held deliveries remain uncertain after explicit re
     assert.equal(heldOutbox.status, "uncertain");
     assert.equal(heldOutbox.deadline_at, null);
     assert.equal(heldOutbox.result, "held-result");
+    assert.equal(reopened.blockers(mission.id).find(item => item.id === "delivery:backup-held-outbox")?.status, "open");
+    const unreconciled = reopened.db.prepare(`SELECT o.id FROM outbox o LEFT JOIN blockers b ON b.id='delivery:' || o.id
+      WHERE o.mission_id=? AND o.status='uncertain' AND b.id IS NULL`).all(mission.id);
+    assert.deepEqual(unreconciled, []);
 
     for (const blocker of reopened.blockers(mission.id).filter((item) => item.status === "open")) {
       reopened.resolveBlocker(blocker.id, "Reviewed the real workspace; do not replay the uncertain operation.");

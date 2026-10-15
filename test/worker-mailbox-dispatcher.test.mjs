@@ -183,6 +183,72 @@ test("a closed notice does not confirm or release runtime ownership", async (t) 
   assert.throws(() => coordinator.open({ ...binding, runtimeId: "replacement-runtime" }), /owner|owns this agent/i);
 });
 
+test("a notice lifecycle microtask fences before the next RPC is claimed", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "notice",
+    notice: { type: "turn_end", agentId: binding.agentId, epoch: binding.epoch, turnId: "last-turn" }
+  }, "turn-end-notice");
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-after-turn", taskId: "task-after-turn", method: "Transcript",
+    args: { role: "assistant", text: "must not execute", entryId: "after-turn" }
+  }, "rpc-after-turn");
+  let rpcCalls = 0;
+  let statusBeforeFence;
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    isCurrent: () => coordinator.inspectBinding(binding).status === "open",
+    notice: () => {
+      void Promise.resolve().then(() => {
+        statusBeforeFence = coordinator.inspectInbox(binding).map((row) => row.status);
+        coordinator.fence(binding);
+      });
+    },
+    rpc: async (_binding, request) => {
+      rpcCalls += 1;
+      return { kind: "reply", rpcId: request.rpcId, ok: true, result: { done: true } };
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.deepEqual({
+    rpcCalls,
+    inbox: coordinator.inspectInbox(binding).map((row) => row.status),
+    outbox: coordinator.inspectOutbox(binding).length,
+    settled: coordinator.inboxSettledForStop(binding, "rpc-after-turn")
+  }, { rpcCalls: 0, inbox: ["applied", "cancelled"], outbox: 0, settled: true });
+  assert.deepEqual(statusBeforeFence, ["applied", "received"]);
+  assert.equal(coordinator.inspectBinding(binding).status, "uncertain");
+  await dispatcher.drain(binding);
+  assert.equal(rpcCalls, 0);
+});
+
+test("a notice without a lifecycle stop still drains the following RPC", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "notice", notice: { type: "ready", agentId: binding.agentId, epoch: binding.epoch }
+  }, "ready-before-rpc");
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-after-ready", taskId: "task-after-ready", method: "GetMissionState", args: {}
+  }, "rpc-after-ready");
+  const handled = [];
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    notice: (_binding, notice) => { handled.push(notice.type); },
+    rpc: async (_binding, request) => {
+      handled.push(request.method);
+      return { kind: "reply", rpcId: request.rpcId, ok: true, result: { active: true } };
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.deepEqual(handled, ["ready", "GetMissionState"]);
+  assert.deepEqual(coordinator.inspectInbox(binding).map((row) => row.status), ["applied", "applied"]);
+  assert.equal(coordinator.inspectBinding(binding).status, "open");
+  const replies = coordinator.pending(binding);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].payload.kind, "reply");
+  assert.equal(replies[0].payload.rpcId, "rpc-after-ready");
+  assert.equal(replies[0].payload.ok, true);
+  assert.equal(replies[0].payload.result.active, true);
+});
+
 test("drainAll processes a bounded backlog across successive passes", async (t) => {
   const { node, coordinator } = fixture(t);
   for (let index = 0; index < 17; index += 1) {
@@ -201,6 +267,47 @@ test("drainAll processes a bounded backlog across successive passes", async (t) 
   await dispatcher.drainAll();
   assert.equal(handled, 17);
   assert.equal(coordinator.inspectInbox(binding).every((row) => row.status === "applied"), true);
+});
+
+test("afterRpc sees the applied reply and a fence there cannot drop it", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-limit", taskId: "task-limit", method: "AdmitTurn", args: { generationId: "limit" }
+  }, "uplink-limit");
+  let statusBeforeFence;
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    rpc: async (_binding, request) => ({ kind: "reply", rpcId: request.rpcId, ok: false, error: "Remote operation was rejected" }),
+    afterRpc: () => {
+      statusBeforeFence = coordinator.inspectInbox(binding)[0].status;
+      coordinator.fence(binding);
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.equal(statusBeforeFence, "applied");
+  assert.equal(coordinator.inspectInbox(binding)[0].status, "applied");
+  assert.equal(coordinator.inspectOutbox(binding)[0].status, "cancelled");
+  assert.equal(coordinator.inspectOutbox(binding)[0].envelope.payload.rpcId, "rpc-limit");
+  assert.equal(coordinator.inspectBinding(binding).status, "uncertain");
+});
+
+test("a thrown rpc still fences and then schedules afterRpc", async (t) => {
+  const { node, coordinator } = fixture(t);
+  receive(coordinator, node, {
+    kind: "rpc", rpcId: "rpc-throw", taskId: "task-throw", method: "Usage", args: { cost: 1 }
+  }, "uplink-throw");
+  let calls = 0;
+  let statusAtSchedule;
+  const dispatcher = new WorkerMailboxDispatcher(options(coordinator, {
+    rpc: async () => { throw new Error("handler failed"); },
+    afterRpc: () => {
+      calls += 1;
+      statusAtSchedule = coordinator.inspectInbox(binding)[0].status;
+    }
+  }));
+  await dispatcher.drain(binding);
+  assert.equal(calls, 1);
+  assert.equal(statusAtSchedule, "uncertain");
+  assert.equal(coordinator.inspectOutbox(binding).length, 0);
 });
 
 test("remote worker commands cannot reach filesystem, shell, or MCP effects", async () => {

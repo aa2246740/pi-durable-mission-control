@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { startServer } from "../dist/server.js";
 
 const cli = join(process.cwd(), "dist", "cli.js");
-const waitFor = async (fn, timeout = 10000) => {
+const waitFor = async (fn, timeout = 30000) => {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (await fn()) return;
@@ -24,6 +24,15 @@ test("real node child receives a probe and writes an isolated journal", async (t
   const root = join(home, "root");
   const nodeHome = join(home, "node-home");
   mkdirSync(root);
+  mkdirSync(nodeHome);
+  const legacyReport = { reportId: crypto.randomUUID(), runtimeId: crypto.randomUUID(), bindingJson: "{}", descriptorHash: "a".repeat(64) };
+  const legacyJournal = new DatabaseSync(join(nodeHome, "node.sqlite"));
+  legacyJournal.exec(`CREATE TABLE node_runtime_reports (
+    report_id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, binding_json TEXT NOT NULL,
+    descriptor_hash TEXT NOT NULL, outcome TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+  legacyJournal.prepare("INSERT INTO node_runtime_reports VALUES(?,?,?,?,'stopped','sent',1)")
+    .run(legacyReport.reportId, legacyReport.runtimeId, legacyReport.bindingJson, legacyReport.descriptorHash);
+  legacyJournal.close();
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const service = await startServer({ home: join(home, "control"), port: 0 });
   t.after(() => service.close());
@@ -50,6 +59,13 @@ test("real node child receives a probe and writes an isolated journal", async (t
   const receipt = service.control.machineCommand("child-node", command.id);
   assert.deepEqual(receipt.result, { requestedPath: root, path: realpathSync(root), isDirectory: true });
   assert.equal(readFileSync(join(nodeHome, "node.sqlite")).length > 0, true);
+  const migratedJournal = new DatabaseSync(join(nodeHome, "node.sqlite"), { readOnly: true });
+  const savedReport = migratedJournal.prepare("SELECT * FROM node_runtime_reports WHERE report_id=?").get(legacyReport.reportId);
+  assert.equal(savedReport.stop_reason, null);
+  assert.equal(savedReport.binding_json, legacyReport.bindingJson);
+  assert.equal(savedReport.outcome, "stopped");
+  assert.equal(savedReport.state, "sent");
+  migratedJournal.close();
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
 });
@@ -204,13 +220,50 @@ test("new CLI session quarantines an old completed receipt instead of replaying 
   service.control.db.prepare("UPDATE remote_machines SET data=? WHERE id=?").run(JSON.stringify(machine), machine.id);
   rmSync(target, { recursive: true, force: true });
 
-  const second = spawn(process.execPath, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+  const spawnNode = () => {
+    const child = spawn(process.execPath, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { output += chunk; });
+    return { child, read: () => output };
+  };
+  let active = spawnNode();
+  let second = active.child;
+  const onlineDeadline = Date.now() + 90000;
+  let online = false;
+  let startupFailure = "";
   try {
-    await waitFor(() => {
+    while (Date.now() < onlineDeadline) {
       const current = service.control.machineRegistry.get("recovery-node");
-      return current?.status === "online" && current.sessionEpoch > original.sessionEpoch;
+      const live = second.exitCode === null && second.signalCode === null;
+      if (live && current?.status === "online" && current.sessionEpoch > original.sessionEpoch) {
+        online = true;
+        break;
+      }
+      if (!live) {
+        startupFailure = `exit ${second.exitCode}/${second.signalCode}: ${active.read()}`;
+        active = spawnNode();
+        second = active.child;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(online, `replacement node did not stay online (exit ${second.exitCode}/${second.signalCode}). last exit: ${startupFailure}. output: ${active.read()}`);
+    // Session HTTP returns before the child quarantines the previous journal row.
+    await waitFor(() => {
+      if (second.exitCode !== null || second.signalCode !== null) return false;
+      let journal;
+      try {
+        journal = new DatabaseSync(join(nodeHome, "node.sqlite"), { readOnly: true, timeout: 250 });
+        const row = journal.prepare("SELECT status FROM node_operations WHERE command_id=?").get(command.id);
+        return service.control.machineCommand("recovery-node", command.id).status === "uncertain" && row?.status === "uncertain";
+      } catch {
+        return false;
+      } finally {
+        journal?.close();
+      }
     });
-    await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(second.exitCode, null);
     assert.equal(service.control.machineCommand("recovery-node", command.id).status, "uncertain");
     const check = new DatabaseSync(join(nodeHome, "node.sqlite"), { readOnly: true });

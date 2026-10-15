@@ -5,7 +5,11 @@ import { chmodSync, existsSync, mkdirSync, realpathSync, statSync } from "node:f
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { NodeCommand, NodeCapabilities } from "./machines.js";
 import { NODE_EXECUTION_PROTOCOL_VERSION, NODE_PROTOCOL_VERSION, NODE_WORKSPACE_EFFECTS_PROTOCOL_VERSION } from "./machines.js";
-import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type JsonValue, type WorkerBinding } from "./worker-mailbox.js";
+import {
+  DurableWorkerMailbox, parseWorkerBinding, parseWorkerEnvelope, parseWorkerReceipt,
+  type JsonValue, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding
+} from "./worker-mailbox.js";
+import type { RuntimeReport, RuntimeStopReason } from "./remote-runtimes.js";
 import { NodeWorkerSupervisor } from "./node-workers.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { REMOTE_ARTIFACT_CHUNK_BYTES, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
@@ -18,6 +22,8 @@ const productVersion = String((require("../package.json") as { version: string }
 const BODY_LIMIT = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 7000;
 const POLL_INTERVAL_MS = 3000;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
 const MAILBOX_IDLE_INTERVAL_MS = 150;
 const MAX_ACTIVE_DRAIN_ROUNDS = 4;
 const TOKEN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -58,6 +64,29 @@ class CoordinatorConflict extends Error {
   constructor() {
     super(genericError().message);
   }
+}
+
+export class CoordinatorUnavailable extends Error {
+  constructor() {
+    super("Node coordinator temporarily unavailable");
+  }
+}
+
+class CoordinatorSessionExpired extends Error {}
+
+export function nodeReconnectDelay(attempt: number, random = Math.random()): number {
+  const ceiling = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.min(attempt, 5));
+  return Math.floor(ceiling * (0.5 + random * 0.5));
+}
+
+function transportFailure(error: unknown): boolean {
+  if (!object(error)) return false;
+  if (typeof error.code === "string" && [
+    "ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH",
+    "ETIMEDOUT", "EPIPE", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT", "UND_ERR_SOCKET"
+  ].includes(error.code)) return true;
+  return transportFailure(error.cause) || (Array.isArray(error.errors) && error.errors.some(transportFailure));
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -207,90 +236,93 @@ export function inspectWorkspace(requestedPath: string, roots: string[]): { requ
 
 class NodeJournal {
   readonly db: DatabaseSync;
+  private readonly ownership: DatabaseSync;
   private readonly ownerId = randomUUID();
 
   constructor(readonly home: string, coordinatorId: string, machineId: string) {
     if (existsSync(home) && !statSync(home).isDirectory()) throw new Error("node home must be a directory");
     mkdirSync(home, { recursive: true, mode: 0o700 });
-    const databasePath = resolve(home, "node.sqlite");
-    this.db = new DatabaseSync(databasePath, { timeout: 5000 });
-    this.db.exec("BEGIN IMMEDIATE");
+    const ownershipPath = resolve(home, "node.ownership.sqlite");
+    this.ownership = new DatabaseSync(ownershipPath, { timeout: 0 });
     try {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS node_owner (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner_id TEXT NOT NULL, pid INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS node_operations (
-          command_id TEXT PRIMARY KEY, requested_path TEXT NOT NULL, status TEXT NOT NULL,
-          outcome TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS node_runtime_reports (
-          report_id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, binding_json TEXT NOT NULL,
-          descriptor_hash TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('stopped','uncertain','rejected')),
-          state TEXT NOT NULL CHECK(state IN ('pending','sent')), created_at INTEGER NOT NULL
-        );
-      `);
-      const existing = this.db.prepare("SELECT owner_id,pid FROM node_owner WHERE singleton=1").get() as { owner_id: string; pid: number } | undefined;
-      if (existing) {
-        if (!Number.isSafeInteger(existing.pid) || existing.pid < 1 || existing.pid === process.pid) {
-          throw new Error("another node owner is already running");
-        }
-        try {
-          process.kill(existing.pid, 0);
-        } catch (error) {
-          if (!(error && typeof error === "object" && "code" in error && error.code === "ESRCH")) {
-            throw new Error("another node owner is already running");
-          }
-          this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?")
-            .run(existing.owner_id, existing.pid);
-        }
-        if (this.db.prepare("SELECT 1 FROM node_owner WHERE singleton=1").get()) {
-          throw new Error("another node owner is already running");
-        }
-      }
-      this.db.prepare("INSERT INTO node_owner(singleton,owner_id,pid) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET owner_id=excluded.owner_id,pid=excluded.pid")
-        .run(this.ownerId, process.pid);
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS node_identity (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          coordinator_id TEXT NOT NULL,
-          machine_id TEXT NOT NULL,
-          registration_id TEXT
-        );
-      `);
-      const operationColumns = this.db.prepare("PRAGMA table_info(node_operations)").all() as Array<{ name: string }>;
-      if (!operationColumns.some((column) => column.name === "session_id")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_id TEXT");
-      if (!operationColumns.some((column) => column.name === "session_epoch")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_epoch INTEGER");
-      const identity = this.db.prepare("SELECT coordinator_id,machine_id FROM node_identity WHERE singleton=1").get() as {
-        coordinator_id: string; machine_id: string;
-      } | undefined;
-      if (identity && (identity.coordinator_id !== coordinatorId || identity.machine_id !== machineId)) {
-        throw new Error("node home is bound to a different coordinator or machine");
-      }
-      if (!identity) {
-        this.db.prepare("INSERT INTO node_identity(singleton,coordinator_id,machine_id,registration_id) VALUES(1,?,?,NULL)")
-          .run(coordinatorId, machineId);
-      }
-      this.db.prepare("UPDATE node_operations SET status='uncertain',updated_at=? WHERE status='admitted'").run(Date.now());
-      this.db.exec("COMMIT");
+      // A separate rollback-mode database keeps journal writes independent of
+      // the lifetime lock. The OS releases the lock even after SIGKILL or reboot.
+      this.ownership.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;");
     } catch (error) {
-      try { this.db.exec("ROLLBACK"); } catch {}
-      this.db.close();
-      throw error;
+      this.ownership.close();
+      throw new Error("another node owner is already running", { cause: error });
     }
     try {
-      this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
-      chmodSync(home, 0o700);
-      chmodSync(databasePath, 0o600);
-    } catch (error) {
+      chmodSync(ownershipPath, 0o600);
+      const databasePath = resolve(home, "node.sqlite");
+      this.db = new DatabaseSync(databasePath, { timeout: 5000 });
       try {
         this.db.exec("BEGIN IMMEDIATE");
-        this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?").run(this.ownerId, process.pid);
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS node_owner (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner_id TEXT NOT NULL, pid INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS node_operations (
+            command_id TEXT PRIMARY KEY, requested_path TEXT NOT NULL, status TEXT NOT NULL,
+            outcome TEXT, updated_at INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS node_runtime_reports (
+            report_id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, binding_json TEXT NOT NULL,
+            descriptor_hash TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('stopped','uncertain','rejected')),
+            state TEXT NOT NULL CHECK(state IN ('pending','sent')), created_at INTEGER NOT NULL
+          );
+        `);
+        const reportColumns = this.db.prepare("PRAGMA table_info(node_runtime_reports)").all() as Array<{ name: string }>;
+        if (!reportColumns.some((column) => column.name === "stop_reason")) {
+          this.db.exec("ALTER TABLE node_runtime_reports ADD COLUMN stop_reason TEXT CHECK(stop_reason IN ('requested','unexpected'))");
+        }
+        this.db.prepare("INSERT INTO node_owner(singleton,owner_id,pid) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET owner_id=excluded.owner_id,pid=excluded.pid")
+          .run(this.ownerId, process.pid);
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS node_identity (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            coordinator_id TEXT NOT NULL,
+            machine_id TEXT NOT NULL,
+            registration_id TEXT
+          );
+        `);
+        const operationColumns = this.db.prepare("PRAGMA table_info(node_operations)").all() as Array<{ name: string }>;
+        if (!operationColumns.some((column) => column.name === "session_id")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_id TEXT");
+        if (!operationColumns.some((column) => column.name === "session_epoch")) this.db.exec("ALTER TABLE node_operations ADD COLUMN session_epoch INTEGER");
+        const identity = this.db.prepare("SELECT coordinator_id,machine_id FROM node_identity WHERE singleton=1").get() as {
+          coordinator_id: string; machine_id: string;
+        } | undefined;
+        if (identity && (identity.coordinator_id !== coordinatorId || identity.machine_id !== machineId)) {
+          throw new Error("node home is bound to a different coordinator or machine");
+        }
+        if (!identity) {
+          this.db.prepare("INSERT INTO node_identity(singleton,coordinator_id,machine_id,registration_id) VALUES(1,?,?,NULL)")
+            .run(coordinatorId, machineId);
+        }
+        this.db.prepare("UPDATE node_operations SET status='uncertain',updated_at=? WHERE status='admitted'").run(Date.now());
         this.db.exec("COMMIT");
-      } catch {
+      } catch (error) {
         try { this.db.exec("ROLLBACK"); } catch {}
+        this.db.close();
+        throw error;
       }
-      this.db.close();
+      try {
+        this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
+        chmodSync(home, 0o700);
+        chmodSync(databasePath, 0o600);
+      } catch (error) {
+        try {
+          this.db.exec("BEGIN IMMEDIATE");
+          this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?").run(this.ownerId, process.pid);
+          this.db.exec("COMMIT");
+        } catch {
+          try { this.db.exec("ROLLBACK"); } catch {}
+        }
+        this.db.close();
+        throw error;
+      }
+    } catch (error) {
+      this.ownership.close();
       throw error;
     }
   }
@@ -388,23 +420,28 @@ class NodeJournal {
     this.db.prepare("UPDATE node_operations SET status='uncertain',updated_at=? WHERE status='admitted'").run(Date.now());
   }
 
-  recordRuntimeReport(binding: WorkerBinding, descriptorHash: string, outcome: "stopped" | "uncertain" | "rejected"): { reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected" } {
-    const prior = this.db.prepare("SELECT report_id,binding_json FROM node_runtime_reports WHERE runtime_id=? AND descriptor_hash=? AND outcome=? ORDER BY created_at LIMIT 1")
-      .get(binding.runtimeId, descriptorHash, outcome) as { report_id: string; binding_json: string } | undefined;
+  recordRuntimeReport(binding: WorkerBinding, descriptorHash: string, outcome: RuntimeReport["outcome"], stopReason: RuntimeStopReason | null): RuntimeReport {
+    const first = this.db.prepare("SELECT stop_reason FROM node_runtime_reports WHERE runtime_id=? ORDER BY created_at,rowid LIMIT 1")
+      .get(binding.runtimeId) as { stop_reason: RuntimeStopReason | null } | undefined;
+    const reason = first ? first.stop_reason : stopReason;
+    const prior = this.db.prepare("SELECT report_id,binding_json,stop_reason FROM node_runtime_reports WHERE runtime_id=? AND descriptor_hash=? AND outcome=? ORDER BY created_at LIMIT 1")
+      .get(binding.runtimeId, descriptorHash, outcome) as { report_id: string; binding_json: string; stop_reason: RuntimeStopReason | null } | undefined;
     if (prior) {
       const priorBinding = JSON.parse(prior.binding_json) as WorkerBinding;
       if (!sameBinding(priorBinding, binding)) throw new Error("Runtime report binding conflicts with its durable history");
-      return { reportId: prior.report_id, binding: priorBinding, descriptorHash, outcome };
+      return { reportId: prior.report_id, binding: priorBinding, descriptorHash, outcome,
+        ...(prior.stop_reason === null ? {} : { stopReason: prior.stop_reason }) };
     }
     const reportId = randomUUID();
-    this.db.prepare("INSERT INTO node_runtime_reports(report_id,runtime_id,binding_json,descriptor_hash,outcome,state,created_at) VALUES(?,?,?,?,?,'pending',?)")
-      .run(reportId, binding.runtimeId, JSON.stringify(binding), descriptorHash, outcome, Date.now());
-    return { reportId, binding, descriptorHash, outcome };
+    this.db.prepare("INSERT INTO node_runtime_reports(report_id,runtime_id,binding_json,descriptor_hash,outcome,stop_reason,state,created_at) VALUES(?,?,?,?,?,?,'pending',?)")
+      .run(reportId, binding.runtimeId, JSON.stringify(binding), descriptorHash, outcome, reason, Date.now());
+    return { reportId, binding, descriptorHash, outcome, ...(reason === null ? {} : { stopReason: reason }) };
   }
 
-  pendingRuntimeReports(): Array<{ reportId: string; binding: WorkerBinding; descriptorHash: string; outcome: "stopped" | "uncertain" | "rejected" }> {
-    return (this.db.prepare("SELECT report_id,binding_json,descriptor_hash,outcome FROM node_runtime_reports WHERE state='pending' ORDER BY created_at,report_id").all() as Array<{ report_id: string; binding_json: string; descriptor_hash: string; outcome: "stopped" | "uncertain" | "rejected" }>)
-      .map((row) => ({ reportId: row.report_id, binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash, outcome: row.outcome }));
+  pendingRuntimeReports(): RuntimeReport[] {
+    return (this.db.prepare("SELECT report_id,binding_json,descriptor_hash,outcome,stop_reason FROM node_runtime_reports WHERE state='pending' ORDER BY created_at,report_id").all() as Array<{ report_id: string; binding_json: string; descriptor_hash: string; outcome: RuntimeReport["outcome"]; stop_reason: RuntimeStopReason | null }>)
+      .map((row) => ({ reportId: row.report_id, binding: JSON.parse(row.binding_json) as WorkerBinding, descriptorHash: row.descriptor_hash, outcome: row.outcome,
+        ...(row.stop_reason === null ? {} : { stopReason: row.stop_reason }) }));
   }
 
   sentRuntimeReport(reportId: string): void {
@@ -431,14 +468,16 @@ class NodeJournal {
       this.db.prepare("DELETE FROM node_owner WHERE singleton=1 AND owner_id=? AND pid=?").run(this.ownerId, process.pid);
       this.db.exec("COMMIT");
     } finally {
-      this.db.close();
+      try { this.db.close(); }
+      finally { this.ownership.close(); }
     }
   }
 }
 
 export async function fetchJson(base: URL, path: string, token: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
   const onAbort = (): void => controller.abort();
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let bodyComplete = false;
@@ -454,10 +493,14 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
       body: JSON.stringify(body)
     });
     const length = Number(response.headers.get("content-length") ?? "0");
-    if (!response.ok || (Number.isFinite(length) && length > BODY_LIMIT)) {
+    if ([502, 503, 504].includes(response.status)) {
       controller.abort();
       await response.body?.cancel().catch(() => undefined);
-      if (response.status === 409) throw new CoordinatorConflict();
+      throw new CoordinatorUnavailable();
+    }
+    if ((!response.ok && response.status !== 409) || (Number.isFinite(length) && length > BODY_LIMIT)) {
+      controller.abort();
+      await response.body?.cancel().catch(() => undefined);
       throw genericError();
     }
     reader = response.body?.getReader();
@@ -478,11 +521,20 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
     bodyComplete = true;
     let parsed: unknown;
     try { parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")); } catch { throw genericError(); }
+    if (response.status === 409) {
+      if (!object(parsed) || !exactKeys(parsed, ["error"]) || typeof parsed.error !== "string") throw genericError();
+      if (["Node session is fenced; stop local work and isolate this node",
+        "Node lease expired; isolate this node and reconnect", "Registration is no longer valid"].includes(parsed.error)) {
+        throw new CoordinatorSessionExpired();
+      }
+      throw new CoordinatorConflict();
+    }
     return parsed;
   } catch (error) {
-    if (error instanceof CoordinatorConflict) throw error;
+    if (error instanceof CoordinatorConflict || error instanceof CoordinatorSessionExpired || error instanceof CoordinatorUnavailable) throw error;
     controller.abort();
     if (reader && !bodyComplete) await reader.cancel().catch(() => undefined);
+    if (!signal?.aborted && (timedOut || transportFailure(error))) throw new CoordinatorUnavailable();
     throw genericError();
   } finally {
     clearTimeout(timer);
@@ -520,6 +572,61 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function parseMailboxSettlement(value: unknown, requested: readonly MailboxSettlementQuery[]): MailboxSettlementAnswer[] {
+  if (!object(value) || !exactKeys(value, ["entries"]) || !Array.isArray(value.entries) || value.entries.length !== requested.length) {
+    throw genericError();
+  }
+  const entries = value.entries;
+  return requested.map((entry, index) => {
+    const row = entries[index];
+    if (!object(row) || !exactKeys(row, ["messageId", "sequence", "sha256", "applied"]) ||
+        row.messageId !== entry.messageId || row.sequence !== entry.sequence || row.sha256 !== entry.sha256 ||
+        typeof row.applied !== "boolean") {
+      throw genericError();
+    }
+    return { messageId: entry.messageId, sequence: entry.sequence, sha256: entry.sha256, applied: row.applied };
+  });
+}
+
+/**
+ * Asks the coordinator whether specific uploads on an old binding were applied.
+ * Uses the current session credential. A conflict or malformed answer fails
+ * closed and never treats the upload as applied.
+ */
+export async function queryAppliedMailboxUploads(
+  coordinator: string,
+  token: string,
+  session: { machineId: string; sessionId: string; sessionEpoch: number },
+  binding: WorkerBinding,
+  entries: readonly MailboxSettlementQuery[],
+  signal?: AbortSignal
+): Promise<MailboxSettlementAnswer[]> {
+  if (entries.length === 0) return [];
+  const base = safeCoordinatorUrl(coordinator);
+  const answers: MailboxSettlementAnswer[] = [];
+  for (let offset = 0; offset < entries.length; offset += 32) {
+    const batch = entries.slice(offset, offset + 32);
+    const parsed = parseMailboxSettlement(await fetchJson(base, "/api/nodes/mailbox/settlement", token, {
+      machineId: session.machineId,
+      sessionId: session.sessionId,
+      sessionEpoch: session.sessionEpoch,
+      binding,
+      entries: batch
+    }, signal), batch);
+    answers.push(...parsed);
+  }
+  return answers;
+}
+
+class LocalMailboxFence extends Error {}
+
+function mailboxOperation<T>(mailbox: DurableWorkerMailbox, binding: WorkerBinding, operation: () => T): T {
+  if (mailbox.inspectBinding(binding).status !== "open") {
+    throw new LocalMailboxFence("Worker mailbox was fenced during exchange");
+  }
+  return operation();
+}
+
 export async function exchangeWorkerMailbox(
   coordinator: string,
   token: string,
@@ -531,10 +638,12 @@ export async function exchangeWorkerMailbox(
   const base = safeCoordinatorUrl(coordinator);
   const identity = { machineId: binding.machineId, sessionId: binding.sessionId, sessionEpoch: binding.sessionEpoch, binding };
   let progressed = false;
-  for (const envelope of mailbox.pending(binding, 1)) {
+  for (const envelope of mailboxOperation(mailbox, binding, () => mailbox.pending(binding, 1))) {
     const receipt = parseWorkerReceipt(await fetchJson(base, "/api/nodes/mailbox/upload", token, { ...identity, envelope }, signal));
-    if (!receipt) throw genericError();
-    mailbox.acknowledge(binding, receipt);
+    const offered = mailbox.inspectOutboxMessage(binding, envelope.messageId);
+    if (!receipt || receipt.messageId !== envelope.messageId || receipt.sequence !== envelope.sequence ||
+        receipt.sha256 !== offered?.sha256) throw genericError();
+    mailboxOperation(mailbox, binding, () => mailbox.acknowledge(binding, receipt));
     progressed = true;
   }
   const response = await fetchJson(base, "/api/nodes/mailbox/poll", token, identity, signal);
@@ -543,8 +652,11 @@ export async function exchangeWorkerMailbox(
       !("envelopes" in response) || !Array.isArray(response.envelopes) || response.envelopes.length > 1) {
     throw genericError();
   }
-  for (const envelope of response.envelopes) {
-    const receipt = mailbox.receive(binding, envelope);
+  for (const rawEnvelope of response.envelopes) {
+    const envelope = parseWorkerEnvelope(rawEnvelope);
+    if (!envelope || !sameBinding(envelope.binding, binding) ||
+        envelope.payload.kind === "notice" || envelope.payload.kind === "rpc") throw genericError();
+    const receipt = mailboxOperation(mailbox, binding, () => mailbox.receive(binding, envelope));
     const result = await fetchJson(base, "/api/nodes/mailbox/ack", token, { ...identity, receipt }, signal);
     if (!result || typeof result !== "object" || Array.isArray(result) ||
         Object.keys(result).length !== 1 || !("acknowledged" in result) || result.acknowledged !== true) {
@@ -587,7 +699,6 @@ export async function runNode(options: NodeOptions): Promise<void> {
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
-  const registrationId = journal.registrationId();
   let leaseDeadline = 0;
   let mailboxActivityGeneration = 0;
   let wakeMailboxWait: (() => void) | undefined;
@@ -616,19 +727,54 @@ export async function runNode(options: NodeOptions): Promise<void> {
   let runtimeTask: Promise<void> | undefined;
   let runtimeFailure: unknown;
   const runtimeStartFlights = new Map<string, { descriptorHash: string; promise: Promise<void> }>();
+  let retryAttempt = 0;
+  let unavailable = false;
+  const retryConnection = async (signal: AbortSignal): Promise<void> => {
+    unavailable = true;
+    const ms = nodeReconnectDelay(retryAttempt++);
+    process.stderr.write(`Node coordinator unavailable; retrying in ${ms} ms\n`);
+    await delay(ms, signal);
+  };
+  const connectionRestored = (): void => {
+    if (unavailable) process.stderr.write("Node coordinator connection restored\n");
+    unavailable = false;
+    retryAttempt = 0;
+  };
   const sessionBody = {
     machineId: options.machineId,
     capabilities: capabilities(roots, credentialRefs, options.executionMode),
-    registrationId
+    registrationId: journal.registrationId()
   };
-  try {
+  const runSession = async (): Promise<void> => {
     let session: NodeSession;
-    try {
-      session = parseNodeSession(await fetchJson(coordinator, "/api/nodes/session", token, sessionBody, abort.signal), options.machineId);
-    } catch (error) {
-      if (error instanceof CoordinatorConflict) journal.rotateRegistrationId(registrationId);
-      throw error;
+    while (true) {
+      try {
+        session = parseNodeSession(await fetchJson(coordinator, "/api/nodes/session", token, sessionBody, abort.signal), options.machineId);
+        break;
+      } catch (error) {
+        if (stopping) return;
+        if (error instanceof CoordinatorSessionExpired) {
+          journal.rotateRegistrationId(sessionBody.registrationId);
+          sessionBody.registrationId = journal.registrationId();
+          continue;
+        }
+        if (error instanceof CoordinatorConflict) journal.rotateRegistrationId(sessionBody.registrationId);
+        if (!(error instanceof CoordinatorUnavailable)) throw error;
+        await retryConnection(abort.signal);
+      }
     }
+    connectionRestored();
+    const cycleAbort = new AbortController();
+    const cycleSignal = AbortSignal.any([abort.signal, cycleAbort.signal]);
+    let endingSession = false;
+    let connected = false;
+    const endSession = (): void => {
+      endingSession = true;
+      connected = false;
+      leaseDeadline = 0;
+      cycleAbort.abort();
+      notifyMailboxActivity();
+    };
     journal.sessionStarted(session);
     if (options.executionMode) {
       const runtimeSession = session;
@@ -655,11 +801,11 @@ export async function runNode(options: NodeOptions): Promise<void> {
           const post = async (path: string, body: unknown): Promise<unknown> => {
             current();
             try {
-              return await fetchJson(coordinator, path, token, body, abort.signal);
+              return await fetchJson(coordinator, path, token, body, cycleSignal);
             } catch (error) {
-              if (error instanceof CoordinatorConflict) throw error;
+              if (!(error instanceof CoordinatorUnavailable)) throw error;
               current();
-              return fetchJson(coordinator, path, token, body, abort.signal);
+              return fetchJson(coordinator, path, token, body, cycleSignal);
             }
           };
           const base = { machineId: options.machineId, sessionId: session!.sessionId, sessionEpoch: session!.sessionEpoch, spec, manifest };
@@ -681,6 +827,11 @@ export async function runNode(options: NodeOptions): Promise<void> {
           return (completed as { artifact: JsonValue }).artifact;
         },
         onMailboxActivity: notifyMailboxActivity,
+        lookupAppliedUploads: (oldBinding, entries) => queryAppliedMailboxUploads(
+          options.coordinator, token,
+          { machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch },
+          oldBinding, entries, cycleSignal
+        ),
         ...(options.testOnlyScripted ? { testOnlyScripted: true } : {}),
         ...(options.testOnlyToolLoop ? { testOnlyToolLoop: true } : {}),
         ...(options.testOnlyWorkspaceEffectLoop ? { testOnlyWorkspaceEffectLoop: true } : {}),
@@ -696,14 +847,24 @@ export async function runNode(options: NodeOptions): Promise<void> {
       const postRuntimeReport = async (report: ReturnType<NodeJournal["pendingRuntimeReports"]>[number]): Promise<void> => {
         const ack = await fetchJson(coordinator, "/api/nodes/runtimes/events", token, {
           machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch, ...report
-        }, abort.signal);
+        }, cycleSignal);
         if (!validRuntimeReportAck(ack)) throw genericError();
         journal.sentRuntimeReport(report.reportId);
+      };
+      const stopAndReport = async (runtime: ReturnType<NodeWorkerSupervisor["inspectBindings"]>[number], stopReason: RuntimeStopReason): Promise<void> => {
+        let evidence;
+        try {
+          evidence = await supervisor!.stop(runtime.binding, stopReason);
+        } catch {
+          journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, "uncertain", "unexpected");
+          return;
+        }
+        journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
       };
       let nextAssignmentPoll = 0;
       let activeRounds = 0;
       const mailboxFencedBindings = new Set<string>();
-      while (!stopping) {
+      while (!stopping && !endingSession) {
         const roundGeneration = mailboxActivityGeneration;
         for (const upload of supervisor.pendingEffectReceipts()) {
           const ack = await fetchJson(coordinator, "/api/nodes/effects/receipts", token, {
@@ -711,16 +872,16 @@ export async function runNode(options: NodeOptions): Promise<void> {
             sessionId: session.sessionId,
             sessionEpoch: session.sessionEpoch,
             upload
-          }, abort.signal);
+          }, cycleSignal);
           supervisor.acknowledgeEffectReceipt(upload, ack);
         }
         for (const report of journal.pendingRuntimeReports()) {
           await postRuntimeReport(report);
         }
-        if (Date.now() >= nextAssignmentPoll) {
+        if (connected && Date.now() >= nextAssignmentPoll) {
           const runtimeResponse = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {
             machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
-          }, abort.signal);
+          }, cycleSignal);
           if (!object(runtimeResponse) || !exactKeys(runtimeResponse, ["directives"]) ||
               !Array.isArray(runtimeResponse.directives) || runtimeResponse.directives.length > 1) throw genericError();
           nextAssignmentPoll = Date.now() + POLL_INTERVAL_MS;
@@ -743,10 +904,10 @@ export async function runNode(options: NodeOptions): Promise<void> {
               continue;
             }
             const descriptorHash = rawDirective.descriptorHash;
-            const flight = supervisor.start(descriptor).then(() => undefined, () => {
+            const flight = supervisor.start(descriptor, { coordinatorAssigned: true }).then(() => undefined, () => {
               try {
                 const admitted = supervisor?.inspectBindings().some((item) => sameBinding(item.binding, binding));
-                journal.recordRuntimeReport(binding, descriptorHash, admitted ? "uncertain" : "rejected");
+                journal.recordRuntimeReport(binding, descriptorHash, admitted ? "uncertain" : "rejected", "unexpected");
               } catch {
                 runtimeFailure = genericError();
                 abort.abort();
@@ -768,13 +929,13 @@ export async function runNode(options: NodeOptions): Promise<void> {
               continue;
             }
             if (!localRuntime) {
-              journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain");
+              journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain", null);
             } else {
               try {
                 const evidence = await supervisor.stop(binding);
-                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
               } catch {
-                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain");
+                journal.recordRuntimeReport(binding, rawDirective.descriptorHash, "uncertain", localRuntime.stopReason);
               }
             }
             notifyMailboxActivity();
@@ -789,22 +950,36 @@ export async function runNode(options: NodeOptions): Promise<void> {
             const priorReport = journal.runtimeReportIdentity(binding.runtimeId);
             if (priorReport && (!sameBinding(priorReport.binding, binding) || priorReport.descriptorHash !== runtime.descriptorHash)) throw genericError();
             if (!journal.hasRuntimeReport(binding.runtimeId, runtime.descriptorHash, outcome)) {
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, outcome);
+              journal.recordRuntimeReport(binding, runtime.descriptorHash, outcome, runtime.stopReason);
             }
             continue;
           }
           if (mailboxFencedBindings.has(binding.runtimeId)) continue;
           try {
-            progress = await exchangeWorkerMailbox(options.coordinator, token, supervisor.mailbox, binding, abort.signal) || progress;
+            progress = await exchangeWorkerMailbox(options.coordinator, token, supervisor.mailbox, binding, cycleSignal) || progress;
           } catch (error) {
-            if (!(error instanceof CoordinatorConflict)) throw error;
+            if (!(error instanceof CoordinatorConflict) && !(error instanceof LocalMailboxFence)) throw error;
             mailboxFencedBindings.add(binding.runtimeId);
-            try {
-              const evidence = await supervisor.stop(binding);
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
-            } catch {
-              journal.recordRuntimeReport(binding, runtime.descriptorHash, "uncertain");
+            let stopReason: RuntimeStopReason = "unexpected";
+            if (error instanceof CoordinatorConflict) {
+              // A mailbox fence can precede the regular stop-directive poll.
+              // A session fence ends this cycle; other protocol failures remain fatal.
+              const response = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {
+                machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
+                stopRuntimeId: binding.runtimeId
+              }, cycleSignal);
+              if (!object(response) || !exactKeys(response, ["directives"]) || !Array.isArray(response.directives) ||
+                  response.directives.length > 1) throw genericError();
+              const directive: unknown = response.directives[0];
+              if (directive !== undefined) {
+                if (!object(directive) || !exactKeys(directive, ["action", "binding", "descriptorHash"]) ||
+                    directive.action !== "stop" || directive.descriptorHash !== runtime.descriptorHash) throw genericError();
+                const stopBinding = parseWorkerBinding(directive.binding);
+                if (!stopBinding || !sameBinding(stopBinding, binding)) throw genericError();
+                stopReason = "requested";
+              }
             }
+            await stopAndReport(runtime, stopReason);
             notifyMailboxActivity();
             continue;
           }
@@ -823,7 +998,7 @@ export async function runNode(options: NodeOptions): Promise<void> {
       }
     };
     const handleRuntimeFailure = async (error: unknown): Promise<void> => {
-      if (stopping) return;
+      if (stopping || endingSession) return;
       runtimeFailure = error;
       stopping = true;
       leaseDeadline = 0;
@@ -832,52 +1007,96 @@ export async function runNode(options: NodeOptions): Promise<void> {
         for (const runtime of supervisor.inspectBindings()) {
           if (["closed", "uncertain"].includes(runtime.state)) continue;
           try {
-            const evidence = await supervisor.stop(runtime.binding);
-            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain");
+            const evidence = await supervisor.stop(runtime.binding, "unexpected");
+            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
           } catch {
-            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, "uncertain");
+            journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, "uncertain", "unexpected");
           }
         }
       }
     };
-    while (true) {
-      if (runtimeFailure) throw runtimeFailure;
-      if (stopping) break;
-      for (const receipt of journal.pendingReceipts(session)) {
-        try {
-          await fetchJson(coordinator, "/api/nodes/events", token, {
-            machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
-            commandId: receipt.commandId, outcome: receipt.outcome
-          }, abort.signal);
-          journal.sent(receipt.commandId, session);
-        } catch {
-          if (stopping) break;
-          throw genericError();
+    while (!endingSession) {
+      try {
+        if (runtimeFailure) throw runtimeFailure;
+        if (stopping) break;
+        for (const receipt of journal.pendingReceipts(session)) {
+          try {
+            await fetchJson(coordinator, "/api/nodes/events", token, {
+              machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch,
+              commandId: receipt.commandId, outcome: receipt.outcome
+            }, cycleSignal);
+            journal.sent(receipt.commandId, session);
+          } catch (error) {
+            if (stopping || endingSession) break;
+            throw error;
+          }
         }
-      }
-      if (stopping) break;
-      const ordinaryPollStarted = performance.now();
-      const ordinaryPollResponse = await fetchJson(coordinator, "/api/nodes/poll", token, {
-        machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
-      }, abort.signal);
-      leaseDeadline = ordinaryPollStarted + session.leaseMs;
-      const polled = parseNodePoll(ordinaryPollResponse, options.machineId, session);
-      if (supervisor && !runtimeTask) {
-        runtimeTask = runRuntimeLoop().catch(handleRuntimeFailure);
-      }
-      for (const command of polled.commands) {
-        const operation = journal.operation(command, session);
-        if (operation.status !== "admitted") continue;
-        let outcome: NonNullable<JournalOperation["outcome"]>;
-        try {
-          outcome = { ok: true, result: inspectWorkspace(command.payload.path, roots) };
-        } catch (error) {
-          outcome = { ok: false, error: error instanceof Error ? error.message : "workspace probe failed" };
+        if (stopping) break;
+        const ordinaryPollStarted = performance.now();
+        const ordinaryPollResponse = await fetchJson(coordinator, "/api/nodes/poll", token, {
+          machineId: options.machineId, sessionId: session.sessionId, sessionEpoch: session.sessionEpoch
+        }, cycleSignal);
+        leaseDeadline = ordinaryPollStarted + session.leaseMs;
+        const polled = parseNodePoll(ordinaryPollResponse, options.machineId, session);
+        connected = true;
+        connectionRestored();
+        if (supervisor && !runtimeTask) {
+          runtimeTask = (async () => {
+            while (!stopping && !endingSession) {
+              try {
+                await runRuntimeLoop();
+              } catch (error) {
+                if (stopping || endingSession) return;
+                if (error instanceof CoordinatorSessionExpired) { endSession(); return; }
+                if (!(error instanceof CoordinatorUnavailable)) { await handleRuntimeFailure(error); return; }
+                connected = false;
+                await retryConnection(cycleSignal);
+              }
+            }
+          })();
         }
-        journal.complete(command.id, session, outcome);
+        for (const command of polled.commands) {
+          const operation = journal.operation(command, session);
+          if (operation.status !== "admitted") continue;
+          let outcome: NonNullable<JournalOperation["outcome"]>;
+          try {
+            outcome = { ok: true, result: inspectWorkspace(command.payload.path, roots) };
+          } catch (error) {
+            outcome = { ok: false, error: error instanceof Error ? error.message : "workspace probe failed" };
+          }
+          journal.complete(command.id, session, outcome);
+        }
+        await delay(POLL_INTERVAL_MS, cycleSignal);
+      } catch (error) {
+        if (stopping || endingSession) break;
+        if (error instanceof CoordinatorSessionExpired) { endSession(); break; }
+        if (!(error instanceof CoordinatorUnavailable)) throw error;
+        connected = false;
+        await retryConnection(cycleSignal);
       }
-      await delay(POLL_INTERVAL_MS, abort.signal);
     }
+    if (runtimeFailure) throw runtimeFailure;
+    if (endingSession && !stopping) {
+      await runtimeTask;
+      runtimeTask = undefined;
+      await Promise.all([...runtimeStartFlights.values()].map((flight) => flight.promise));
+      if (runtimeFailure) throw runtimeFailure;
+      if (supervisor) {
+        for (const runtime of supervisor.inspectBindings()) {
+          if (["closed", "uncertain"].includes(runtime.state) && journal.hasRuntimeReport(runtime.binding.runtimeId, runtime.descriptorHash)) continue;
+          const evidence = await supervisor.stop(runtime.binding, "unexpected");
+          journal.recordRuntimeReport(runtime.binding, runtime.descriptorHash, evidence.confirmedStopped ? "stopped" : "uncertain", evidence.stopReason);
+        }
+        await supervisor.close();
+        supervisor = undefined;
+      }
+      journal.markAdmittedUncertain();
+      sessionBody.registrationId = journal.registrationId();
+      process.stderr.write("Node session expired; old workers stopped, obtaining a new session\n");
+    }
+  };
+  try {
+    while (!stopping) await runSession();
   } catch {
     if (runtimeFailure) throw genericError();
     if (!stopping) throw genericError();

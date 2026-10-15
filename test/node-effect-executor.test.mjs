@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { constants, appendFileSync, chmodSync, closeSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { abortNodeEffect, executeNodeEffect, nodeEffectExtinct, readNodeArtifactChunk, snapshotNodeArtifact, verifyNodeArtifactSnapshot } from "../dist/node-effect-executor.js";
@@ -54,10 +54,86 @@ test("shell has minimal environment, returns output, and abort confirms group ex
   assert.throws(() => readFileSync(marker));
 });
 
+function expectedNodePath(nodeDirectory) {
+  const ordered = [nodeDirectory, "/usr/local/bin", "/usr/bin", "/bin"];
+  const seen = new Set();
+  return ordered.filter((entry) => {
+    if (!entry || seen.has(entry)) return false;
+    seen.add(entry);
+    return true;
+  }).join(":");
+}
+
+test("bash PATH leads with the node agent directory and drops the caller environment", async t => {
+  const root = mkdtempSync(join(tmpdir(), "node-effect-path-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const callerBin = join(root, "caller-only-bin");
+  const injectedBin = join(root, "injected-node-bin");
+  mkdirSync(callerBin);
+  mkdirSync(injectedBin);
+  writeFileSync(join(callerBin, "node"), "#!/bin/sh\nprintf caller-node\n");
+  writeFileSync(join(injectedBin, "node"), "#!/bin/sh\nprintf injected-node\n");
+  chmodSync(join(callerBin, "node"), 0o755);
+  chmodSync(join(injectedBin, "node"), 0o755);
+  const previous = {
+    PATH: process.env.PATH,
+    MC_NODE_EFFECT_SECRET: process.env.MC_NODE_EFFECT_SECRET,
+    AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+    MC_NODE_DIRECTORY: process.env.MC_NODE_DIRECTORY
+  };
+  const secret = "mc-node-effect-secret-must-not-leak-9f3a";
+  process.env.PATH = `${callerBin}:/opt/homebrew/bin`;
+  process.env.MC_NODE_EFFECT_SECRET = secret;
+  process.env.AWS_SECRET_ACCESS_KEY = secret;
+  process.env.MC_NODE_DIRECTORY = callerBin;
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  const nodeDirectory = dirname(process.execPath);
+  const listed = await executeNodeEffect(spec("bash", { command: "printf '%s\\n' \"$(command -v node)\"; env" }), root);
+  assert.equal(listed.status, "succeeded");
+  assert.equal(listed.result.exitCode, 0);
+  const lines = listed.result.stdout.split("\n").filter((line) => line.length > 0);
+  assert.equal(lines[0], process.execPath);
+  assert.equal(dirname(lines[0]), nodeDirectory);
+  const env = Object.fromEntries(lines.slice(1).map((line) => {
+    const separator = line.indexOf("=");
+    return [line.slice(0, separator), line.slice(separator + 1)];
+  }));
+  const shellBookkeeping = new Set(["PWD", "SHLVL", "_"]);
+  assert.deepEqual(Object.keys(env).filter((key) => key !== "HOME" && key !== "LANG" && key !== "PATH" && !shellBookkeeping.has(key)), []);
+  assert.equal(env.PATH, expectedNodePath(nodeDirectory));
+  assert.equal(env.HOME, root);
+  assert.equal(env.LANG, "C");
+  if (env.PWD !== undefined) assert.equal(env.PWD, root);
+  assert.equal(env.PATH.split(":").includes(callerBin), false);
+  if (nodeDirectory !== "/opt/homebrew/bin") assert.equal(env.PATH.split(":").includes("/opt/homebrew/bin"), false);
+  assert.equal(`${listed.result.stdout}${listed.result.stderr}`.includes(secret), false);
+  assert.equal(`${listed.result.stdout}${listed.result.stderr}`.includes("MC_NODE_EFFECT_SECRET"), false);
+  assert.equal(`${listed.result.stdout}${listed.result.stderr}`.includes("AWS_SECRET_ACCESS_KEY"), false);
+  assert.equal(`${listed.result.stdout}${listed.result.stderr}`.includes(callerBin), false);
+
+  const injected = await executeNodeEffect(spec("bash", { command: "printf '%s\\n%s' \"$(command -v node)\" \"$PATH\"" }), root, { nodeDirectory: injectedBin });
+  assert.equal(injected.status, "succeeded");
+  const [injectedNode, injectedPath] = injected.result.stdout.split("\n");
+  assert.equal(injectedNode, join(injectedBin, "node"));
+  assert.equal(injectedPath, expectedNodePath(injectedBin));
+  assert.equal(injected.result.stdout.includes(callerBin), false);
+  assert.equal(injected.result.stdout.includes(secret), false);
+
+  const deduped = await executeNodeEffect(spec("bash", { command: "printf '%s' \"$PATH\"" }), root, { nodeDirectory: "/usr/bin" });
+  assert.equal(deduped.status, "succeeded");
+  assert.equal(deduped.result.stdout, "/usr/bin:/usr/local/bin:/bin");
+});
+
 test("shell timeout kills the process group and preserves uncertainty about partial effects", async t => {
   const root = mkdtempSync(join(tmpdir(), "node-effect-timeout-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const result = await executeNodeEffect(spec("bash", { command: "printf partial > partial.txt; sleep 30" }), root, { timeoutMs: 50 });
+  const result = await executeNodeEffect(spec("bash", { command: "printf partial > partial.txt; sleep 30" }), root, { timeoutMs: 8000 });
   assert.equal(result.status, "uncertain");
   assert.match(result.error, /timed out/);
   assert.equal(readFileSync(join(root, "partial.txt"), "utf8"), "partial");

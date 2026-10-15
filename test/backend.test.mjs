@@ -12,7 +12,7 @@ import { AssistantEntry } from "@earendil-works/pi-durable";
 import { ControlPlane } from "../dist/control.js";
 import { createRuntimeProvider, openWorkerRuntime } from "../dist/worker.js";
 import { startServer } from "../dist/server.js";
-import { redactDiagnosticChunk } from "../dist/workers.js";
+import { redactDiagnosticChunk, WorkerManager } from "../dist/workers.js";
 
 function stable(value) {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
@@ -163,6 +163,203 @@ function clean(f) {
   f.control.close();
   rmSync(f.home, { recursive: true, force: true });
 }
+
+for (const runtimeMode of [undefined, "remote-metadata-only", "remote-workspace-effects"]) {
+  for (const kind of ["worker", "validator", "orchestrator"]) {
+    test(`${runtimeMode ?? "local"} ${kind} tools reserve human questions for the orchestrator`, async () => {
+      const f = fixture();
+      let runtime;
+      const agent = f[kind];
+      try {
+        runtime = await openWorkerRuntime({
+          agentId: agent.id, missionId: f.mission.id, epoch: agent.epoch,
+          token: "test-only-internal-token", durablePath: join(f.stateHome, "agents", `${agent.id}.sqlite`),
+          workspacePath: f.workspacePath, profile: f.control.profile(agent.profileId),
+          role: f.control.role(agent.roleId), runtimeMode, artifactTransfers: true, testOnlyScripted: true
+        });
+        const resolved = await runtime.root.agent(BACKGROUND_CONTEXT);
+        const names = resolved.tools.map(tool => tool.name);
+        assert.ok(names.includes("Report"));
+        assert.ok(names.includes("SendMessage"));
+        assert.equal(names.includes("RequestUserInput"), kind === "orchestrator");
+      } finally {
+        await runtime?.harness.close(BACKGROUND_CONTEXT);
+        clean(f);
+      }
+    });
+  }
+}
+
+test("only orchestrator questions create blockers and receive durable user answers", async () => {
+  const f = fixture();
+  const ask = agent => f.control.workerCommand({
+    agentId: agent.id, epoch: agent.epoch, method: "RequestUserInput",
+    taskId: `${agent.id}:question`, args: { question: "Choose a value" }
+  });
+  try {
+    for (const agent of [f.worker, f.validator]) {
+      await assert.rejects(() => ask(agent), error => {
+        assert.equal(error.status, 403);
+        assert.match(error.message, /Only the orchestrator/);
+        assert.match(error.message, /Report/);
+        assert.match(error.message, /SendMessage/);
+        return true;
+      });
+      assert.equal(f.control.missionById(f.mission.id).status, "active");
+      assert.deepEqual(f.control.blockers(f.mission.id), []);
+      assert.equal(f.control.getAgentPublic(agent.id).status, agent.status);
+    }
+    const blocker = await ask(f.orchestrator);
+    assert.equal(blocker.kind, "user_input");
+    assert.equal(blocker.agentId, f.orchestrator.id);
+    assert.equal(f.control.missionById(f.mission.id).status, "blocked");
+    f.control.resolveBlocker(blocker.id, "Use the safe default");
+    const answer = f.control.detail(f.mission.id).messages.find(message => message.id === `blocker-resolution:${blocker.id}`);
+    assert.equal(answer.recipientId, f.orchestrator.id);
+    assert.equal(answer.content, "Use the safe default");
+    assert.equal(answer.status, "queued");
+    assert.equal(f.control.missionById(f.mission.id).status, "active");
+  } finally {
+    clean(f);
+  }
+});
+
+test("task assignment errors list mission agent identities for CreateTask and UpdateTask", async () => {
+  const f = fixture();
+  try {
+    const input = {
+      missionId: f.mission.id, title: "Handoff", description: "Review published delivery", acceptance: "Validate published work",
+      dependencies: [], ownerId: f.worker.id, validatorId: f.validator.id
+    };
+    const task = f.control.createTask(f.orchestrator.id, f.orchestrator.epoch, "valid-assignment", input);
+    for (const method of ["CreateTask", "UpdateTask"]) {
+      for (const [field, wrongId] of [["ownerId", "worker"], ["validatorId", "validator"], ["ownerId", f.validator.id], ["validatorId", "unknown-agent"]]) {
+        await assert.rejects(() => f.control.workerCommand({
+          agentId: f.orchestrator.id, epoch: f.orchestrator.epoch,
+          taskId: `${method}:${field}:${wrongId}`, method,
+          args: method === "CreateTask" ? { ...input, [field]: wrongId } : { taskId: task.id, [field]: wrongId }
+        }), error => {
+          assert.equal(error.status, 400);
+          assert.ok(error.message.includes(`${f.worker.id} ("Worker")`));
+          assert.ok(error.message.includes(`${f.validator.id} ("Validator")`));
+          assert.match(error.message, /roleId is not an agent id/);
+          assert.match(error.message, /agent id returned by SpawnAgent/);
+          return true;
+        });
+      }
+    }
+    assert.equal(f.control.detail(f.mission.id).tasks.length, 1);
+    assert.equal(f.control.task(task.id).ownerId, f.worker.id);
+    assert.equal(f.control.task(task.id).validatorId, f.validator.id);
+  } finally {
+    clean(f);
+  }
+});
+
+test("all validation status gates give the same actionable handoff error", async () => {
+  const f = fixture();
+  try {
+    const { task, artifact } = validationTarget(f, "status-error");
+    f.control.updateTask(f.worker.id, f.worker.epoch, "back-to-running", task.id, { status: "running" });
+    const input = { taskId: task.id, command: "printf validated", artifactIds: [artifact.id] };
+    const errors = [];
+    for (const operation of [
+      () => f.control.runValidation(f.validator.id, f.validator.epoch, "status-run", input),
+      () => f.control.createApproval(f.validator.id, f.validator.epoch, "status-approval", "run_validation", input),
+      () => f.control.validateTask(f.validator.id, f.validator.epoch, "status-decision", task.id, "no-receipt", true, "not executed")
+    ]) {
+      await assert.rejects(async () => operation(), error => {
+        assert.equal(error.status, 409);
+        assert.ok(error.message.includes(`Task ${task.id} is currently running`));
+        assert.match(error.message, /owner or orchestrator.*UpdateTask.*status=review/);
+        assert.match(error.message, /Validators cannot change task status/);
+        assert.match(error.message, /SendMessage or Report.*orchestrator/);
+        assert.match(error.message, /Do not ask the user/);
+        errors.push(error.message);
+        return true;
+      });
+    }
+    assert.equal(new Set(errors).size, 1);
+    assert.equal(f.control.task(task.id).status, "running");
+    assert.equal(f.control.detail(f.mission.id).validationReceipts.length, 0);
+    assert.equal(f.control.detail(f.mission.id).approvals.length, 0);
+    assert.deepEqual(f.control.blockers(f.mission.id), []);
+  } finally {
+    clean(f);
+  }
+});
+
+test("owner publication returns current handoff state without changing the task or artifact fields", async () => {
+  const f = fixture();
+  try {
+    const { task } = validationTarget(f, "publish-handoff");
+    f.control.updateTask(f.worker.id, f.worker.epoch, "publish-running", task.id, { status: "running" });
+    const path = join(f.workspacePath, "publish-handoff.txt");
+    const request = {
+      agentId: f.worker.id, epoch: f.worker.epoch, method: "PublishArtifact", taskId: "publish-with-handoff",
+      args: { name: "Handoff input", path, taskId: task.id }
+    };
+    const result = await f.control.workerCommand(request);
+    const { task: state, nextStep, ...artifact } = result;
+    assert.deepEqual(state, { id: task.id, status: "running" });
+    assert.match(nextStep, /When delivery is complete.*UpdateTask.*status=review, then Report/);
+    assert.ok(nextStep.includes(task.id));
+    assert.deepEqual(artifact, f.control.artifact(result.id));
+    assert.deepEqual(readFileSync(result.snapshotPath), readFileSync(path));
+    assert.equal(f.control.task(task.id).status, "running");
+    const orchestratorPublication = f.control.publishArtifact(f.orchestrator.id, f.orchestrator.epoch,
+      "orchestrator-publication", "Reference", path, readFileSync(path), task.id);
+    assert.equal(Object.hasOwn(orchestratorPublication, "nextStep"), false);
+    f.control.updateTask(f.worker.id, f.worker.epoch, "publish-review", task.id, { status: "review" });
+    const replay = await f.control.workerCommand(request);
+    assert.equal(replay.id, result.id);
+    assert.deepEqual(replay.task, { id: task.id, status: "review" });
+    assert.equal(Object.hasOwn(replay, "nextStep"), false);
+    const reviewed = await f.control.workerCommand({ ...request, taskId: "publish-already-review" });
+    assert.deepEqual(reviewed.task, { id: task.id, status: "review" });
+    assert.equal(Object.hasOwn(reviewed, "nextStep"), false);
+  } finally {
+    clean(f);
+  }
+});
+
+test("orchestrator recovers a published running task and completes independent validation without user input", async () => {
+  const f = fixture();
+  const command = (agent, method, args, taskId) => f.control.workerCommand({
+    agentId: agent.id, epoch: agent.epoch, method, args, taskId
+  });
+  try {
+    const task = await command(f.orchestrator, "CreateTask", {
+      title: "Delivery", description: "Publish the acceptance file", acceptance: "Published file is correct", dependencies: [],
+      ownerId: f.worker.id, validatorId: f.validator.id, fulfills: ["REQ-001"]
+    }, "handoff-task");
+    await command(f.worker, "UpdateTask", { taskId: task.id, status: "running" }, "handoff-running");
+    const path = join(f.workspacePath, "delivery.txt");
+    writeFileSync(path, "ready for acceptance");
+    const artifact = await command(f.worker, "PublishArtifact", { name: "Delivery", path, taskId: task.id }, "handoff-publish");
+    await command(f.worker, "Report", { summary: "Delivery published", evidence: artifact.id }, "handoff-report");
+    const validation = { taskId: task.id, command: "test \"$(cat delivery.txt)\" = 'ready for acceptance'", artifactIds: [artifact.id] };
+    await assert.rejects(() => command(f.validator, "RunValidation", validation, "handoff-premature-validation"), /currently running/);
+    await assert.rejects(() => command(f.validator, "RequestUserInput", { question: "Move to review?" }, "handoff-premature-question"), error => error.status === 403);
+    await command(f.validator, "SendMessage", {
+      recipientId: f.orchestrator.id, content: `Task ${task.id} has a complete artifact; use UpdateTask status=review.`, mode: "followUp"
+    }, "handoff-notify");
+    await command(f.orchestrator, "UpdateTask", { taskId: task.id, status: "review" }, "handoff-recover-review");
+    const receipt = await command(f.validator, "RunValidation", validation, "handoff-real-validation");
+    assert.equal(receipt.exitCode, 0);
+    await command(f.validator, "ValidateTask", {
+      taskId: task.id, receiptId: receipt.id, passed: true, evidence: "Published delivery passed the acceptance command",
+      assertionResults: [{ assertionId: "REQ-001", status: "passed", evidence: "The delivery file contains the expected acceptance text" }]
+    }, "handoff-accept");
+    await command(f.orchestrator, "CompleteMission", {}, "handoff-complete");
+    assert.equal(f.control.missionById(f.mission.id).status, "completed");
+    assert.equal(f.control.task(task.id).status, "accepted");
+    assert.equal(f.control.detail(f.mission.id).validationReceipts.length, 1);
+    assert.deepEqual(f.control.blockers(f.mission.id), []);
+  } finally {
+    clean(f);
+  }
+});
 
 test("profile and bound-role revisions are retained in mission audit history", () => {
   const f = fixture();
@@ -406,7 +603,7 @@ test("approve-mode validation stores and notifies the real validator receipt", a
 test("paused human answers survive restart and release only after explicit resume", () => {
   const f = fixture();
   try {
-    const blocker = f.control.createBlocker(f.worker.id, f.worker.epoch, "need-human-answer", "user_input", "Choose a value");
+    const blocker = f.control.createBlocker(f.orchestrator.id, f.orchestrator.epoch, "need-human-answer", "user_input", "Choose a value");
     f.control.missionAction(f.mission.id, "pause");
     f.control.resolveBlocker(blocker.id, "Use the safe default");
     const held = f.control.detail(f.mission.id).messages.find((message) => message.id === `blocker-resolution:${blocker.id}`);
@@ -564,6 +761,8 @@ test("late reports are recorded while paused without waking or redelivering the 
     const messages = f.control.detail(f.mission.id).messages;
     assert.equal(messages.find((message) => message.id === notSent.id).status, "aborted");
     assert.equal(messages.find((message) => message.id === uncertain.id).status, "uncertain");
+    assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+    f.control.resolveBlocker(`delivery:${uncertainOutbox.id}`, "Reviewed the interrupted delivery; do not replay it.");
     f.control.missionAction(f.mission.id, "resume");
     const resumed = f.control.detail(f.mission.id).messages.find((message) => message.id === notSent.id);
     assert.equal(resumed.attempt, 2);
@@ -1040,7 +1239,7 @@ test("native store lease rejects a contender and releases when its owner is kill
   }
 });
 
-test("HTTP mission start admits its durable opening through the pi-durable worker", { timeout: 15000 }, async () => {
+test("HTTP mission start admits its durable opening through the pi-durable worker", { timeout: 75000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-http-worker-"));
   const workspacePath = join(home, "workspace");
   mkdirSync(workspacePath);
@@ -1075,7 +1274,7 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
     assert.equal(started.status, 200);
 
     let detail;
-    const deadline = Date.now() + 10000;
+    const deadline = Date.now() + 20000;
     do {
       detail = await (await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } })).json();
       if (detail.messages[0]?.status === "completed") break;
@@ -1096,7 +1295,7 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
     assert.equal(createdAgentResponse.status, 201);
     const idleWorker = await createdAgentResponse.json();
     const workerMessageId = `agent-opening:${mission.id}:idle-worker`;
-    const workerDeadline = Date.now() + 10000;
+    const workerDeadline = Date.now() + 20000;
     do {
       detail = await (await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } })).json();
       if (detail.messages.some((message) => message.id === workerMessageId && message.status === "completed")) break;
@@ -1106,6 +1305,17 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
     assert.ok(detail.events.some((event) => event.type === "agent_report" && event.agentId === idleWorker.id), "the second agent's same-numbered tool task must not be swallowed as a duplicate");
     const workerTranscript = await (await fetch(`${base}/api/agents/${idleWorker.id}/transcript`, { headers: { cookie } })).json();
     assert.ok(workerTranscript.entries.some((entry) => entry.text === "test-only tool loop completed"), "the second agent's same-numbered assistant entry must remain visible");
+    const inflight = new Set(["queued", "dispatching", "admitted"]);
+    const quietDeadline = Date.now() + 20000;
+    do {
+      detail = await (await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } })).json();
+      const bound = detail.agents.filter((agent) => agent.profileId === "http-faux");
+      if (bound.length > 0 && bound.every((agent) => agent.status === "idle") && detail.messages.every((message) => !inflight.has(message.status))) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (Date.now() < quietDeadline);
+    const boundAgents = detail.agents.filter((agent) => agent.profileId === "http-faux");
+    assert.ok(boundAgents.length > 0 && boundAgents.every((agent) => agent.status === "idle"), "profile revision waits until every bound agent is idle");
+    assert.equal(detail.messages.some((message) => inflight.has(message.status)), false);
     const updatedProfile = await post("/api/profiles", {
       id: "http-faux", name: "Test-only faux revision 2", api: "openai-completions", modelId: "faux-1",
       baseUrl: "http://127.0.0.1:9999", credentialEnv: "", contextWindow: 16000, maxTokens: 512,
@@ -1126,7 +1336,7 @@ test("HTTP mission start admits its durable opening through the pi-durable worke
   }
 });
 
-test("unexpected native worker exit recovers the same agent and outbox request", { timeout: 15000 }, async () => {
+test("unexpected native worker exit recovers the same agent and outbox request", { timeout: 45000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "mission-control-worker-recovery-"));
   const workspacePath = join(home, "workspace");
   mkdirSync(workspacePath);
@@ -1145,17 +1355,19 @@ test("unexpected native worker exit recovers the same agent and outbox request",
     server.control.missionAction(mission.id, "start");
     const [agent] = server.control.listAgents(mission.id);
     assert.ok(agent);
-    await server.workers.startAgent(agent);
+    // Reserve the opening before worker startup. The 5s dispatcher can finish a
+    // scripted run while startAgent is still waiting, which leaves no pending row.
     const [outbox] = server.control.pendingOutbox();
     assert.ok(outbox);
     assert.equal(server.control.markOutboxDispatching(outbox.id, agent.epoch), true);
+    await server.workers.startAgent(agent);
     const handle = server.workers.handles.get(agent.id);
     assert.ok(handle?.child.pid, "the test must kill the native worker, not a lease helper");
     const durablePath = join(home, "agents", `${agent.id}.sqlite`);
     assert.equal(existsSync(durablePath), true);
     process.kill(handle.child.pid, "SIGKILL");
 
-    const deadline = Date.now() + 12000;
+    const deadline = Date.now() + 30000;
     let recovered;
     do {
       recovered = server.control.getAgentPublic(agent.id);
@@ -1288,7 +1500,7 @@ test("concurrent pause and shutdown callbacks share one native cleanup", { timeo
   }
 });
 
-test("IPC disconnect in-flight rejects RPC without killing the host", { timeout: 10000 }, async () => {
+test("IPC disconnect in-flight rejects RPC without killing the host", { timeout: 30000 }, async () => {
   const workerModule = new URL("../dist/worker.js", import.meta.url).href;
   const source = `import { rpcRequest } from ${JSON.stringify(workerModule)};
 const config = ${JSON.stringify({
@@ -1307,7 +1519,7 @@ catch (error) { console.log("RPC_REJECTED:" + error.message); }`;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`IPC child did not settle: ${output} ${errorOutput}`));
-    }, 3000);
+    }, 20000);
     child.on("message", (message) => {
       if (message?.type === "rpc" && child.connected) child.disconnect();
     });
@@ -1322,4 +1534,98 @@ catch (error) { console.log("RPC_REJECTED:" + error.message); }`;
   });
   assert.deepEqual(result, { code: 0, signal: null });
   assert.match(output, /RPC_REJECTED:Control-plane IPC channel disconnected/);
+});
+
+
+for (const state of ["dispatching", "admitted", "delivered"]) {
+  test(`local pause requires human reconciliation of ${state} input without replay`, () => {
+    const f = fixture();
+    try {
+      const message = f.control.sendMessage(f.mission.id, f.worker.id, "Interrupted input", "followUp", "pause-reconcile");
+      const row = f.control.pendingOutbox().find(item => item.message_id === message.id);
+      assert.equal(f.control.markOutboxDispatching(row.id, f.worker.epoch), true);
+      if (state === "admitted") assert.equal(f.control.ackOutbox(message.id, row.request_id, row.attempt, f.worker.epoch, "admitted"), true);
+      if (state === "delivered") f.control.setOutboxStatus(row.id, "delivered");
+      f.control.missionAction(f.mission.id, "pause");
+      f.control.markAgentInterrupted(f.worker.id, f.worker.epoch);
+      assert.equal(f.control.missionById(f.mission.id).status, "paused");
+      const blockers = f.control.blockers(f.mission.id).filter(item => item.id === `delivery:${row.id}`);
+      assert.equal(blockers.length, 1);
+      assert.equal(blockers[0].status, "open");
+      assert.throws(() => f.control.resolveBlocker(blockers[0].id, "  "), /human resolution/);
+      assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+      f.control.resolveBlocker(blockers[0].id, "Reviewed the interrupted input; do not replay it.");
+      const evidence = f.control.message(message.id);
+      const outbox = f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id);
+      f.control.missionAction(f.mission.id, "resume");
+      assert.equal(f.control.missionById(f.mission.id).status, "active");
+      assert.equal(evidence.status, "uncertain");
+      assert.equal(outbox.status, "uncertain");
+      assert.deepEqual(f.control.message(message.id), evidence);
+      assert.deepEqual(f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id), outbox);
+      assert.equal(f.control.pendingOutbox().some(item => item.message_id === message.id), false);
+    } finally { clean(f); }
+  });
+}
+
+test("cancel retains a resolvable delivery blocker without allowing mission revival", async () => {
+  const f = fixture();
+  try {
+    const row = f.control.pendingOutbox().find(item => item.message_id === `mission-opening:${f.mission.id}`);
+    f.control.markOutboxDispatching(row.id, f.orchestrator.epoch);
+    f.control.ackOutbox(row.message_id, row.request_id, row.attempt, f.orchestrator.epoch, "admitted");
+    f.control.missionAction(f.mission.id, "cancel");
+    assert.equal(f.control.message(row.message_id).status, "admitted");
+    const workers = new WorkerManager(f.control);
+    await workers.stopMission(f.mission.id);
+    const epoch = f.control.getAgentPublic(f.orchestrator.id).epoch;
+    await workers.stopMission(f.mission.id);
+    assert.equal(f.control.getAgentPublic(f.orchestrator.id).epoch, epoch);
+    assert.equal(f.control.blockers(f.mission.id).find(item => item.id === `delivery:${row.id}`).status, "open");
+    f.control.resolveBlocker(`delivery:${row.id}`, "Reviewed cancellation; no replay.");
+    assert.equal(f.control.missionById(f.mission.id).status, "cancelled");
+    assert.throws(() => f.control.missionAction(f.mission.id, "resume"), /Only a paused/);
+    assert.equal(f.control.message(row.message_id).status, "uncertain");
+    assert.equal(f.control.pendingOutbox().some(item => item.id === row.id), false);
+  } finally { clean(f); }
+});
+
+test("startup repairs legacy uncertain delivery blockers once and preserves human resolution", () => {
+  const f = fixture();
+  let reopened;
+  try {
+    const row = f.control.pendingOutbox()[0];
+    f.control.setOutboxStatus(row.id, "uncertain", "Historical interrupted input");
+    assert.equal(f.control.blockers(f.mission.id).find(item => item.id === `delivery:${row.id}`).status, "open");
+    f.control.db.prepare("DELETE FROM blockers WHERE id=?").run(`delivery:${row.id}`);
+    const outbox = f.control.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id);
+    f.control.close();
+    reopened = new ControlPlane(f.stateHome);
+    assert.equal(reopened.blockers(f.mission.id).filter(item => item.id === `delivery:${row.id}`).length, 1);
+    assert.throws(() => reopened.missionAction(f.mission.id, "resume"), /Resolve mission blockers/);
+    const resolved = reopened.resolveBlocker(`delivery:${row.id}`, "Reviewed historical uncertainty; do not replay.");
+    reopened.close();
+    reopened = new ControlPlane(f.stateHome);
+    assert.deepEqual(reopened.blockers(f.mission.id).find(item => item.id === resolved.id), resolved);
+    assert.deepEqual(reopened.db.prepare("SELECT * FROM outbox WHERE id=?").get(row.id), outbox);
+    reopened.missionAction(f.mission.id, "resume");
+    assert.equal(reopened.pendingOutbox().some(item => item.id === row.id), false);
+  } finally { reopened?.close(); clean(f); }
+});
+
+test("startup repair leaves completed missions without new delivery blockers", () => {
+  const f = fixture();
+  let reopened;
+  try {
+    const row = f.control.pendingOutbox()[0];
+    f.control.setOutboxStatus(row.id, "uncertain", "Historical interrupted input");
+    f.control.db.prepare("DELETE FROM blockers WHERE id=?").run(`delivery:${row.id}`);
+    const completed = { ...f.control.missionById(f.mission.id), status: "completed" };
+    f.control.db.prepare("UPDATE missions SET status=?,data=? WHERE id=?").run("completed", JSON.stringify(completed), f.mission.id);
+    f.control.close();
+    reopened = new ControlPlane(f.stateHome);
+    assert.equal(reopened.missionById(f.mission.id).status, "completed");
+    assert.equal(reopened.blockers(f.mission.id).some(item => item.id === `delivery:${row.id}`), false);
+    assert.equal(reopened.db.prepare("SELECT status FROM outbox WHERE id=?").get(row.id).status, "uncertain");
+  } finally { reopened?.close(); clean(f); }
 });

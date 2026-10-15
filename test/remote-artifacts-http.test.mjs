@@ -136,11 +136,32 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   const detail = control.detail(mission.id);
   const artifact = detail.artifacts.find(item => item.taskId === task.id);
   assert.ok(artifact, nodeOutput);
+  assert.equal(artifact.path, join(root, "artifact.bin"), "remote artifacts keep their source path for provenance");
+  assert.equal(artifact.relativePath, "artifact.bin");
   assert.equal(artifact.remoteProvenance.taskAttempt, runningTask.attempt);
   assert.equal(artifact.sha256, createHash("sha256").update(original).digest("hex"));
   assert.equal(detail.events.filter(event => event.type === "artifact_published").length, 1);
+  const publicationReceipt = detail.events.find(event => event.type === "remote_effect_receipt" &&
+    event.data.receipt.result?.id === artifact.id)?.data.receipt;
+  assert.ok(publicationReceipt, "the node must forward the handoff fields to the worker effect result");
+  assert.deepEqual(publicationReceipt.result.task, { id: task.id, status: "running" });
+  assert.match(publicationReceipt.result.nextStep, /UpdateTask.*status=review, then Report/);
   assert.equal(JSON.stringify(detail).includes(original.toString("base64")), false);
   assert.equal(node.exitCode, null, nodeOutput);
+
+  const base = `http://127.0.0.1:${service.port}`;
+  const page = await fetch(base);
+  const cookie = page.headers.get("set-cookie").split(";")[0];
+  await page.text();
+  const download = await fetch(`${base}/api/artifacts/${artifact.id}/content`, { headers: { cookie } });
+  assert.equal(download.status, 200);
+  assert.equal(download.headers.get("content-disposition"),
+    "attachment; filename=\"artifact.bin\"; filename*=UTF-8''artifact.bin");
+  assert.equal(download.headers.get("content-type"), "application/octet-stream");
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), original);
+  const browserDetail = await fetch(`${base}/api/missions/${mission.id}`, { headers: { cookie } });
+  assert.equal(browserDetail.status, 200);
+  assert.equal((await browserDetail.json()).artifacts.find(item => item.id === artifact.id).downloadName, "artifact.bin");
 
   const transfer = control.db.prepare(
     "SELECT transfer_id,spec_json,manifest_json FROM remote_artifact_transfers WHERE status='complete'"
@@ -172,7 +193,14 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   control.db.prepare("UPDATE commands SET response=? WHERE scope=? AND command_id=?")
     .run(JSON.stringify(expiredPermitResponse), originalPermitScope, completeBody.spec.taskId);
   const duplicate = await postNode(completeUrl, completeBody);
-  assert.equal(duplicate.status, 200, await duplicate.text());
+  assert.equal(duplicate.status, 200);
+  const duplicatePublication = await duplicate.json();
+  assert.equal(duplicatePublication.artifact.id, artifact.id);
+  assert.equal(duplicatePublication.artifact.sha256, artifact.sha256);
+  assert.deepEqual(duplicatePublication.artifact.task, { id: task.id, status: "running" });
+  assert.match(duplicatePublication.artifact.nextStep, /When delivery is complete.*UpdateTask.*status=review, then Report/);
+  assert.ok(duplicatePublication.artifact.nextStep.includes(task.id));
+  assert.equal(control.task(task.id).status, "running");
   control.db.prepare("UPDATE commands SET response=? WHERE scope=? AND command_id=?")
     .run(originalPermitRow.response, originalPermitScope, completeBody.spec.taskId);
   const staleDuplicate = await fetch(completeUrl, {
@@ -253,7 +281,10 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   const secondComplete = await postNode(completeUrl, {
     ...completeBody, spec: secondSpec, manifest: secondManifest
   });
-  assert.equal(secondComplete.status, 200, await secondComplete.text());
+  assert.equal(secondComplete.status, 200);
+  const secondPublication = await secondComplete.json();
+  assert.deepEqual(secondPublication.artifact.task, { id: task.id, status: "running" });
+  assert.match(secondPublication.artifact.nextStep, /UpdateTask.*status=review, then Report/);
   const secondDetail = control.detail(mission.id);
   assert.equal(secondDetail.artifacts.length, 2);
   assert.equal(secondDetail.events.filter(event => event.type === "artifact_published").length, 2);
@@ -262,6 +293,12 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   writeFileSync(join(root, "artifact.bin"), "mutated-after-publication");
   const validationOrchestrator = control.getAgentPublic(orchestrator.id);
   control.updateTask(validationOrchestrator.id, validationOrchestrator.epoch, "artifact-task-review", task.id, { status: "review" });
+  const reviewedPublicationResponse = await postNode(completeUrl, completeBody);
+  assert.equal(reviewedPublicationResponse.status, 200);
+  const reviewedPublication = await reviewedPublicationResponse.json();
+  assert.equal(reviewedPublication.artifact.id, artifact.id);
+  assert.deepEqual(reviewedPublication.artifact.task, { id: task.id, status: "review" });
+  assert.equal(Object.hasOwn(reviewedPublication.artifact, "nextStep"), false);
   const currentWorker = control.getAgentPublic(worker.id);
   await assert.rejects(control.runValidation(currentWorker.id, currentWorker.epoch, "artifact-owner-self-validation", {
     taskId: task.id, command: "exit 0", artifactIds: [artifact.id]

@@ -312,3 +312,59 @@ test("coordinator restart and lease expiry fence remote delivery without requeue
   ).status, "online");
   assert.equal(recovered.getMission(mission.id).status, "blocked");
 });
+
+test("requested remote stop permits epoch fencing without adding a completion blocker", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-runtime-requested-stop-"));
+  const fixture = createAssignedRemoteRuntime(home);
+  const { control, assignment, mission, agent, enrolled, session } = fixture;
+  t.after(() => { control.close(); rmSync(home, { recursive: true, force: true }); });
+  const completed = { ...control.getMission(mission.id), status: "completed" };
+  control.db.prepare("UPDATE missions SET status=?,data=? WHERE id=?").run(completed.status, JSON.stringify(completed), mission.id);
+  const currentEpoch = control.getAgentPublic(agent.id).epoch;
+  assert.equal(control.requestRemoteRuntimeStop(agent.id), true);
+  control.markAgentInterrupted(agent.id, currentEpoch);
+  control.fenceStaleWorkerBindings();
+  assert.deepEqual(control.blockers(mission.id), []);
+  assert.equal(control.getAgentPublic(agent.id).epoch, currentEpoch + 1);
+  assert.equal(control.remoteRuntimeForAgent(agent.id).state, "stopping");
+  assert.throws(() => control.nodeWorkerPoll(enrolled.machine.id, enrolled.token, session.sessionId, session.sessionEpoch, assignment.binding),
+    (error) => error.status === 409);
+  assert.deepEqual(control.blockers(mission.id), []);
+  assert.deepEqual(reportToCoordinator(fixture, { reportId: crypto.randomUUID(), binding: assignment.binding,
+    descriptorHash: assignment.descriptorHash, outcome: "stopped", stopReason: "requested" }), { recorded: true, duplicate: false });
+  assert.equal(control.remoteRuntimeForAgent(agent.id).state, "closed");
+  assert.deepEqual(control.blockers(mission.id), []);
+});
+
+test("requested remote stop still blocks when the machine lease expires", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-runtime-stopping-expiry-"));
+  const fixture = createAssignedRemoteRuntime(home);
+  const { control, assignment, mission, agent, enrolled } = fixture;
+  t.after(() => { control.close(); rmSync(home, { recursive: true, force: true }); });
+  const currentEpoch = control.getAgentPublic(agent.id).epoch;
+  control.requestRemoteRuntimeStop(agent.id);
+  control.markAgentInterrupted(agent.id, currentEpoch);
+  control.db.prepare("UPDATE remote_machines SET data=json_set(data,'$.leaseExpiresAt',?) WHERE id=?").run(Date.now() - 1, enrolled.machine.id);
+  control.fenceStaleWorkerBindings();
+  assert.equal(control.getMission(mission.id).status, "blocked");
+  assert.ok(control.blockers(mission.id).some((b) => b.id === `remote-runtime:${assignment.binding.runtimeId}`));
+});
+
+
+test("targeted stop polling returns only the requested runtime on that machine", t => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-runtime-targeted-stop-"));
+  const fixture = createAssignedRemoteRuntime(home);
+  const { control, mission, agent, assignment, enrolled, session } = fixture;
+  t.after(() => { control.close(); rmSync(home, { recursive: true, force: true }); });
+  const otherAgent = control.createAgent(mission.id, "Other remote worker", agent.roleId, "Metadata turn.",
+    crypto.randomUUID(), agent.workspaceId);
+  const other = control.assignRemoteRuntime(otherAgent.id);
+  const poll = runtimeId => control.nodeRuntimePoll(enrolled.machine.id, enrolled.token,
+    session.sessionId, session.sessionEpoch, runtimeId).directives;
+  assert.deepEqual(poll(other.binding.runtimeId), []);
+  control.requestRemoteRuntimeStop(agent.id);
+  control.requestRemoteRuntimeStop(otherAgent.id);
+  assert.deepEqual(poll(crypto.randomUUID()), []);
+  assert.deepEqual(poll(other.binding.runtimeId), [{ action: "stop", binding: other.binding, descriptorHash: other.descriptorHash }]);
+  assert.deepEqual(poll(assignment.binding.runtimeId), [{ action: "stop", binding: assignment.binding, descriptorHash: assignment.descriptorHash }]);
+});
