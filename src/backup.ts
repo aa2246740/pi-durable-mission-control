@@ -26,6 +26,7 @@ import { DurableWorkerMailbox } from "./worker-mailbox.js";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import type { WorktreeRecord } from "./contracts.js";
 import { CONTROL_SCHEMA_VERSION, quarantineTerminalLocalDeliveries, tryAcquireDaemonOwnership } from "./control.js";
+import { assertSupportedFoundationWorkflows } from "./workflow-schema.js";
 
 const BACKUP_FORMAT = "mission-control-backup";
 const BACKUP_FORMAT_VERSION = 1;
@@ -353,6 +354,15 @@ function readWorktreeMetadata(db: DatabaseSync): {
   return { worktrees, worktreeMissions };
 }
 
+function assertBackupFoundationWorkflows(db: DatabaseSync): void {
+  try {
+    assertSupportedFoundationWorkflows(db);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid workflow record";
+    throw new Error(`Control database contains a mission workflow record this build cannot preserve: ${message}`);
+  }
+}
+
 function inspectControlDatabase(path: string): {
   controlSchemaVersion: number;
   worktrees: BackupManifest["worktrees"];
@@ -364,6 +374,7 @@ function inspectControlDatabase(path: string): {
     if (!Number.isSafeInteger(controlSchemaVersion) || controlSchemaVersion < 0 || controlSchemaVersion > CONTROL_SCHEMA_VERSION) {
       throw new Error(`Control database schema ${controlSchemaVersion} is not supported by this build (maximum ${CONTROL_SCHEMA_VERSION})`);
     }
+    assertBackupFoundationWorkflows(db);
     return { controlSchemaVersion, ...readWorktreeMetadata(db) };
   } finally {
     db.close();
@@ -906,6 +917,12 @@ export function restoreHome(from: string, targetHome: string): RestoreSummary {
   const controlVersion = checkIntegrity(join(backupPath, "control.sqlite"));
   if (controlVersion !== manifest.controlSchemaVersion || controlVersion > CONTROL_SCHEMA_VERSION) {
     throw new Error(`Backup control database schema ${controlVersion} does not match its manifest or exceeds this build's maximum ${CONTROL_SCHEMA_VERSION}`);
+  }
+  const workflowDb = new DatabaseSync(join(backupPath, "control.sqlite"), { readOnly: true });
+  try {
+    assertBackupFoundationWorkflows(workflowDb);
+  } finally {
+    workflowDb.close();
   }
   const databaseWorktrees = readDatabaseWorktreeMetadata(join(backupPath, "control.sqlite"));
   const manifestWorktrees = { worktrees: manifest.worktrees, worktreeMissions: manifest.worktreeMissions };

@@ -47,6 +47,19 @@ import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METH
 import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, parseNodeEffectSpec, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
 import { RemoteArtifactStore, parseRemoteArtifactManifest, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
 import {
+  assertSupportedFoundationWorkflows,
+  canonicalMissionWorkflowData,
+  HttpError,
+  missionParityGateEnabled,
+  parseMissionWorkflowDataV1,
+  parseRoleBindings,
+  parseStoredMissionWorkflowRow,
+  parseWorkflowPolicyRequest,
+  WorkflowOperationError,
+  type MissionWorkflowRecord
+} from "./workflow-schema.js";
+import { projectWorkflowExport, projectWorkflowRead, type WorkflowReadState } from "./workflow-observability.js";
+import {
   addAgentWorktree,
   addDetachedWorktree,
   branchExists,
@@ -64,7 +77,8 @@ import {
   type RepositoryIdentity
 } from "./worktrees.js";
 
-export const CONTROL_SCHEMA_VERSION = 10;
+export const CONTROL_SCHEMA_VERSION = 11;
+export { HttpError };
 // Both startup and backup restore hold a transaction while fencing ownership and deliveries.
 export function quarantineTerminalLocalDeliveries(db: DatabaseSync): void {
   if (!db.isTransaction) throw new Error("Terminal delivery recovery requires a transaction");
@@ -97,15 +111,6 @@ export function quarantineTerminalLocalDeliveries(db: DatabaseSync): void {
 }
 
 const REMOTE_OPERATION_UNAVAILABLE = "Remote operation is unavailable for this agent";
-export class HttpError extends Error {
-  readonly status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
 // Only static, corrective admission messages may cross the remote worker boundary.
 export class RemoteEffectRejection extends HttpError {
   constructor(status: 400 | 403 | 409, message: string) {
@@ -344,8 +349,10 @@ export class ControlPlane {
   readonly workerMailbox: DurableWorkerMailbox;
   readonly remoteRuntimes: RemoteRuntimeRegistry;
   readonly remoteArtifacts: RemoteArtifactStore;
+  readonly missionParityEnabled: boolean;
 
   constructor(home: string) {
+    this.missionParityEnabled = missionParityGateEnabled();
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.home = realpathSync(home);
     const ownership = tryAcquireDaemonOwnership(this.home);
@@ -364,6 +371,7 @@ export class ControlPlane {
       this.workerMailbox = this.transaction(() => {
         this.checkStartupCompatibility();
         this.migrate();
+        assertSupportedFoundationWorkflows(this.db);
         RemoteArtifactStore.migrate(this.db);
         const workerMailbox = new DurableWorkerMailbox(this.db, "coordinator");
         this.seedProfiles();
@@ -507,6 +515,13 @@ export class ControlPlane {
         id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS worktrees_mission_idx ON worktrees(mission_id,id);
+      CREATE TABLE IF NOT EXISTS mission_workflows (
+        mission_id TEXT PRIMARY KEY REFERENCES missions(id),
+        mode TEXT NOT NULL CHECK(mode IN ('classic','parity-v1')),
+        phase TEXT NOT NULL CHECK(phase IN ('planning','awaiting_plan_acceptance','executing')),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        data TEXT NOT NULL CHECK(json_valid(data))
+      );
     `);
     MachineRegistry.migrate(this.db);
     DurableWorkerMailbox.migrate(this.db, "coordinator");
@@ -1697,6 +1712,9 @@ export class ControlPlane {
   missionAction(id: string, action: "start" | "pause" | "resume" | "cancel"): Mission {
     const mission = this.getMission(id);
     if (!mission) throw new HttpError(404, "Mission not found");
+    if ((action === "start" || action === "resume") && this.parityWorkflow(id)) {
+      throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
+    }
     if (action === "start") {
       return this.command(`mission:${id}:lifecycle`, "mission-start", { action }, () => {
         const current = this.getMission(id);
@@ -3320,6 +3338,9 @@ export class ControlPlane {
       if (!agent || agent.epoch !== epoch) throw new HttpError(409, "Worker epoch is fenced");
       const mission = this.getMission(agent.missionId);
       if (!mission) throw new HttpError(404, "Mission not found");
+      if (this.parityWorkflow(mission.id)) {
+        throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity admission is not available in this build");
+      }
       const prior = this.db.prepare("SELECT 1 FROM generation_admissions WHERE agent_id=? AND generation_id=?").get(agentId, generationId);
       const reason = mission.status !== "active" ? "Mission is not accepting model turns"
         : !prior && mission.turns >= mission.maxTurns ? "Mission turn limit exhausted" : undefined;
@@ -5520,7 +5541,8 @@ export class ControlPlane {
       worktrees: this.listWorktrees(id),
       ...(validationContract ? { validationContract } : {}),
       ...(validationContract ? { requirementCoverage: this.requirementCoverage(id) } : {}),
-      ...(validationContract ? { validationContractHistory: this.validationContractHistory(id) } : {})
+      ...(validationContract ? { validationContractHistory: this.validationContractHistory(id) } : {}),
+      workflow: this.storedWorkflow(id)
     };
   }
 
@@ -5538,10 +5560,46 @@ export class ControlPlane {
     const generationAdmissions = this.db.prepare("SELECT * FROM generation_admissions WHERE mission_id=? ORDER BY turn_number").all(id);
     const generationDenials = this.db.prepare("SELECT * FROM generation_denials WHERE mission_id=? ORDER BY created_at").all(id);
     const transcripts = detail.agents.map((agent) => ({ agentId: agent.id, entries: this.transcript(agent.id) }));
+    const workflowExport = projectWorkflowExport(detail.workflow, CONTROL_SCHEMA_VERSION);
     return {
-      format: "mission-control-replay-v1", exportedAt: now(), ...detail, transcripts, commands, outbox, generationAdmissions, generationDenials,
+      format: "mission-control-replay-v1", exportedAt: now(), ...workflowExport, ...detail, transcripts, commands, outbox, generationAdmissions, generationDenials,
       validationContractHistory: this.validationContractHistory(id)
     };
+  }
+
+  missionWorkflow(id: string): WorkflowReadState {
+    if (!this.getMission(id)) throw new HttpError(404, "Mission not found");
+    return projectWorkflowRead(this.storedWorkflow(id), this.missionParityEnabled);
+  }
+
+  recordFoundationWorkflow(missionId: string, input: { policy: unknown; roleBindings: unknown }): MissionWorkflowRecord {
+    return this.transaction(() => {
+      if (!this.getMission(missionId)) throw new HttpError(404, "Mission not found");
+      if (this.storedWorkflow(missionId)) throw new WorkflowOperationError(409, "OPERATION_REJECTED", "Mission workflow foundation record already exists");
+      const timestamp = now();
+      const data = parseMissionWorkflowDataV1({
+        schemaVersion: 1,
+        policy: parseWorkflowPolicyRequest(input.policy),
+        policyRevision: 1,
+        roleBindings: parseRoleBindings(input.roleBindings),
+        createdAt: timestamp,
+        updatedAt: timestamp
+      });
+      this.db.prepare("INSERT INTO mission_workflows(mission_id,mode,phase,revision,data) VALUES(?,?,?,?,?)")
+        .run(missionId, "parity-v1", "planning", 1, canonicalMissionWorkflowData(data));
+      return this.storedWorkflow(missionId)!;
+    });
+  }
+
+  private storedWorkflow(missionId: string): MissionWorkflowRecord | null {
+    const row = this.db.prepare("SELECT mission_id, mode, phase, revision, data FROM mission_workflows WHERE mission_id=?").get(missionId);
+    if (!row) return null;
+    return parseStoredMissionWorkflowRow(row);
+  }
+
+  private parityWorkflow(missionId: string): MissionWorkflowRecord | null {
+    const workflow = this.storedWorkflow(missionId);
+    return workflow?.mode === "parity-v1" ? workflow : null;
   }
 
   reconcileInFlightOperations(): void {

@@ -8,6 +8,7 @@ import type { ModelProfile, RoleProfile } from "./contracts.js";
 import { artifactContentDisposition, artifactDownloadName } from "./artifact-download.js";
 import { McpConfigurationError } from "./mcp-config.js";
 import { ControlPlane, HttpError, RemoteEffectRejection, parseCreateMissionInput, parseValidationContractUpdateInput } from "./control.js";
+import { adminErrorBody } from "./workflow-schema.js";
 import { MachineError } from "./machines.js";
 import { applyWorkerNotice } from "./worker-events.js";
 import { parseWorkerBinding, type JsonValue, type WorkerBinding, type WorkerRpcPayload } from "./worker-mailbox.js";
@@ -599,6 +600,10 @@ export async function startServer(options: ServerOptions) {
       }
       const exportMatch = /^\/api\/missions\/([^/]+)\/export$/.exec(url.pathname);
       if (exportMatch && method === "GET") return jsonResponse(response, 200, control.exportMission(decodeURIComponent(exportMatch[1]!)));
+      const workflowMatch = /^\/api\/missions\/([^/]+)\/workflow$/.exec(url.pathname);
+      if (workflowMatch && method === "GET") {
+        return jsonResponse(response, 200, control.missionWorkflow(decodeURIComponent(workflowMatch[1]!)));
+      }
       const actionMatch = /^\/api\/missions\/([^/]+)\/(start|pause|resume|cancel)$/.exec(url.pathname);
       if (actionMatch && method === "POST") {
         exactKeys(await readRequestBody(), []);
@@ -721,7 +726,11 @@ export async function startServer(options: ServerOptions) {
       const status = error instanceof HttpError || error instanceof MachineError ? error.status : error instanceof McpConfigurationError ? 400 : 500;
       const message = error instanceof MachineError && error.status === 401 ? "Node authentication failed" :
         error instanceof HttpError || error instanceof MachineError || error instanceof McpConfigurationError ? error.message : "Internal server error";
-      jsonResponse(response, status, { error: message });
+      if (nodeOnly) {
+        jsonResponse(response, status, { error: message });
+        return;
+      }
+      jsonResponse(response, status, adminErrorBody(error, status, message));
     }
   };
   const server = createServer(handleRequest(false));

@@ -104,12 +104,12 @@ test("artifact downloads still require authentication and verified snapshots", a
   writeFileSync(artifact.snapshotPath, "tampered snapshot");
   const tampered = await fetch(url, { headers: f.headers });
   assert.equal(tampered.status, 409);
-  assert.deepEqual(await tampered.json(), { error: "Artifact digest changed" });
+  assert.deepEqual(await tampered.json(), { error: "Artifact digest changed", code: "OPERATION_REJECTED" });
   assert.equal(tampered.headers.get("content-disposition"), null);
   delete artifact.snapshotPath;
   f.control.db.prepare("UPDATE artifacts SET data=? WHERE id=?").run(JSON.stringify(artifact), artifact.id);
   const missingSnapshot = await fetch(url, { headers: f.headers });
   assert.equal(missingSnapshot.status, 409);
-  assert.deepEqual(await missingSnapshot.json(), { error: "Artifact snapshot is unavailable" });
+  assert.deepEqual(await missingSnapshot.json(), { error: "Artifact snapshot is unavailable", code: "OPERATION_REJECTED" });
   assert.equal(missingSnapshot.headers.get("content-disposition"), null);
 });
