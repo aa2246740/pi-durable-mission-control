@@ -3,19 +3,21 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { ControlPlane, RemoteRuntimeRecoveryError, RemoteRuntimeStopPendingError } from "../dist/control.js";
+import { ControlPlane, HttpError, RemoteRuntimeRecoveryError, RemoteRuntimeStopPendingError } from "../dist/control.js";
 import { WorkerManager } from "../dist/workers.js";
 import { startServer } from "../dist/server.js";
+import { NodeWorkerSupervisor } from "../dist/node-workers.js";
+import { exchangeWorkerMailbox } from "../dist/node.js";
 import { nodeEffectUpload } from "../dist/node-effects.js";
 
-function fixture(t, executionMode = "workspace-effects", autonomy = "trusted", capabilityOverrides = {}) {
+function fixture(t, executionMode = "workspace-effects", autonomy = "trusted", capabilityOverrides = {}, service) {
   const home = mkdtempSync(join(tmpdir(), "remote-effects-control-"));
   let control;
-  t.after(() => { control?.close(); rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { if (!service) control?.close(); rmSync(home, { recursive: true, force: true }); });
   const localPath = join(home, "local");
   const remotePath = join(home, "remote");
   mkdirSync(localPath); mkdirSync(remotePath);
-  control = new ControlPlane(join(home, "control"));
+  control = service?.control ?? new ControlPlane(join(home, "control"));
   const local = control.addWorkspace("Local", localPath);
   const enrolled = control.enrollMachine(`effects-${crypto.randomUUID()}`, "Effects node");
   const capabilities = {
@@ -1115,3 +1117,99 @@ for (const cause of ["coordinator-restart", "lease-loss", "admission-timeout"]) 
     } finally { reopened?.close(); }
   });
 }
+
+test("remote artifact admission gives actionable denials before attempt zero or unsafe arguments can become permits", async t => {
+  const { control, agent, mission, roleIds } = fixture(t, "workspace-effects", "trusted", { artifactTransfers: true });
+  const orchestrator = control.listAgents(mission.id).find(item => item.kind === "orchestrator");
+  const validator = control.createAgent(mission.id, "Validator", roleIds[2], "validate", "create-validator");
+  const task = control.createTask(orchestrator.id, orchestrator.epoch, "publication-task", {
+    missionId: mission.id, title: "Totals", description: "", acceptance: "published", dependencies: [],
+    ownerId: agent.id, validatorId: validator.id, fulfills: ["REQ-001"]
+  });
+  const publish = (args, suffix) => control.workerCommand(request(agent, "PublishArtifact", args, suffix));
+  const args = { name: "Totals", path: "totals.mjs", taskId: task.id };
+  assert.equal(task.attempt, 0);
+  await assert.rejects(() => publish(args, "attempt-zero"), error => {
+    assert.equal(error.name, "RemoteEffectRejection");
+    assert.match(error.message, /UpdateTask.*status=running/);
+    return true;
+  });
+  control.updateTask(orchestrator.id, orchestrator.epoch, "publication-running", task.id, { status: "running" });
+  for (const [index, invalid] of [
+    { ...args, path: "/outside/totals.mjs" }, { ...args, path: "../totals.mjs" },
+    { ...args, path: "a/../totals.mjs" }, { ...args, path: "a\\totals.mjs" },
+    { ...args, path: "totals\u0000.mjs" }, { ...args, taskId: "other-mission-task" },
+    { name: "Totals", path: "totals.mjs" }, { ...args, name: "" }
+  ].entries()) {
+    await assert.rejects(() => publish(invalid, `invalid-${index}`), error => {
+      assert.equal(error.name, "RemoteEffectRejection");
+      assert.match(error.message, /path|taskId|name/);
+      assert.equal(error.message.includes("other-mission-task"), false);
+      return true;
+    });
+  }
+  const result = await publish(args, "valid-publication");
+  assert.equal(result.effectPermit.taskAttempt, 1);
+  assert.deepEqual(result.effectPermit.args, args);
+  assert.equal(control.remoteRuntimeForAgent(agent.id).state, "running");
+  assert.deepEqual(control.blockers(mission.id), []);
+  assert.equal(control.detail(mission.id).events.some(event => event.type === "remote_runtime_uncertain"), false);
+  assert.equal(control.detail(mission.id).events.filter(event => event.type === "remote_effect_authorized").length, 1);
+});
+
+test("HTTP effect denials reach the worker with corrective text while the runtime continues", async t => {
+  const home = mkdtempSync(join(tmpdir(), "remote-effect-http-rejections-"));
+  const service = await startServer({ home: join(home, "control"), port: 0, nodePort: 0 });
+  service.workers.startAgent = async () => {};
+  let supervisor;
+  t.after(async () => { await supervisor?.close(); await service.close(); rmSync(home, { recursive: true, force: true }); });
+  const f = fixture(t, "workspace-effects", "trusted", { artifactTransfers: true }, service);
+  const { control, agent, mission, assignment, enrolled, roleIds } = f;
+  supervisor = new NodeWorkerSupervisor({
+    home: join(home, "node"), machineId: enrolled.machine.id, sessionId: f.session.sessionId,
+    sessionEpoch: f.session.sessionEpoch, roots: [f.remotePath], credentialRefs: [],
+    executionEnabled: true, executionMode: "workspace-effects", artifactTransfers: true, testOnlyScripted: true, isLeaseCurrent: () => true
+  });
+  await supervisor.start(assignment.descriptor);
+  const handle = supervisor.handles.get(assignment.binding.runtimeId);
+  const sent = [];
+  const send = handle.child.send.bind(handle.child);
+  handle.child.send = (message, callback) => { sent.push(message); return send(message, callback); };
+  const orchestrator = control.listAgents(mission.id).find(item => item.kind === "orchestrator");
+  const validator = control.createAgent(mission.id, "Validator", roleIds[2], "validate", "http-validator");
+  const task = control.createTask(orchestrator.id, orchestrator.epoch, "http-task", {
+    missionId: mission.id, title: "Totals", description: "", acceptance: "published", dependencies: [],
+    ownerId: agent.id, validatorId: validator.id, fulfills: ["REQ-001"]
+  });
+  const invoke = async (id, method, args) => {
+    handle.child.emit("message", { type: "rpc", id, token: handle.token, agentId: agent.id, epoch: agent.epoch,
+      method, args, taskId: `${agent.id}:${id}` });
+    const deadline = Date.now() + 10000;
+    while (!sent.some(message => message.id === id)) {
+      assert.ok(Date.now() < deadline, `reply for ${id} did not arrive`);
+      await exchangeWorkerMailbox(`http://127.0.0.1:${service.nodePort}`, enrolled.token, supervisor.mailbox, assignment.binding);
+      await supervisor.pump(assignment.binding);
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.equal(supervisor.inspect()[0].state, "running");
+    assert.equal(control.remoteRuntimeForAgent(agent.id).state, "running");
+    assert.deepEqual(control.blockers(mission.id), []);
+    return sent.find(message => message.id === id);
+  };
+  const args = { name: "Totals", path: "totals.mjs", taskId: task.id };
+  assert.match((await invoke("zero-attempt", "PublishArtifact", args)).error, /UpdateTask.*status=running/);
+  control.updateTask(orchestrator.id, orchestrator.epoch, "http-running", task.id, { status: "running" });
+  assert.match((await invoke("outside", "PublishArtifact", { ...args, path: "/outside/totals.mjs" })).error, /path.*workspace/);
+  assert.match((await invoke("not-owned", "PublishArtifact", { ...args, taskId: "private-other-task" })).error, /taskId.*owned by this worker/);
+  assert.deepEqual(supervisor.effects.inspect(), []);
+  const result = await invoke("good-write", "write_file", { path: "totals.mjs", content: "export const total = 42;" });
+  assert.equal(result.result.status, "succeeded");
+  assert.equal(control.detail(mission.id).events.some(event => event.type === "remote_runtime_uncertain"), false);
+  const original = control.workerCommand.bind(control);
+  control.workerCommand = async request => {
+    if (request.method === "GetMissionState") throw new HttpError(409, "PRIVATE mission ID, credential and stack sentinel");
+    return original(request);
+  };
+  assert.equal((await invoke("private-error", "GetMissionState", {})).error, "Remote operation was rejected");
+  assert.equal(JSON.stringify(sent).includes("PRIVATE"), false);
+});

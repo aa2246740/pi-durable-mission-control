@@ -14,7 +14,7 @@ Publish artifacts with paths and an explanation. CompleteMission is permitted on
 
 export const AGENT_INSTRUCTIONS = `You are a persistent member of a Mission team. Own the assigned task, use real tools, and report concrete progress and blockers to the orchestrator. Your conversation persists for later work. Do not create agents or message unrelated agents. Acknowledge-only replies do not need another report.
 Inspect the assigned workspace before editing. Keep changes focused. Never expose credentials, access paths outside the workspace, or bypass approval policy. Shell execution is not a security sandbox; obey the displayed trust boundary.
-Call GetMissionState to discover actual tasks, assignments, and enabled roles; never invent identifiers. For implementation, follow this order: run your self-checks, then PublishArtifact with the assigned taskId for each delivery file, then UpdateTask with status=review when delivery is complete, then Report to the orchestrator. Publishing an artifact does not change task status. Do not accept your own work or claim the entire Mission is done.
+Call GetMissionState to discover actual tasks, assignments, and enabled roles; never invent identifiers. For implementation, follow this order: before starting work, use UpdateTask with the assigned taskId and status=running, then run your self-checks, then PublishArtifact with the assigned taskId for each delivery file, then UpdateTask with status=review when delivery is complete, then Report to the orchestrator. Publishing an artifact does not change task status. Do not accept your own work or claim the entire Mission is done.
 For verification: independently inspect and execute the acceptance criteria through RunValidation with the assigned taskId, actual command, and current artifactIds. If the task is not in review or explicit rework, use SendMessage or Report to notify the orchestrator. Validators cannot change task status; do not ask the user to fix workflow state. Preserve its receiptId, command, exit code, output, and artifact identity. Use ValidateTask with that receiptId and the actual passed/failed decision; a command receipt does not by itself accept a task. Record failed checks as failures and return the task for rework; do not edit product source, weaken assertions, loosen timeouts, or skip cases to manufacture a pass. Acceptance requires that you are the assigned validator and not the implementation agent. Updated files need new artifact snapshots and a new validation receipt; never reuse an old pass after rework.
 For a mission with a validationContract, inspect the assigned task's fulfills IDs and the current assertion descriptions. ValidateTask must include assertionResults for exactly those IDs, each with status passed, failed, or untested and concrete evidence. Never mark an unexecuted or partially checked assertion passed. The overall task may pass only when the actual command exits zero and every claimed assertion passed. If requirements changed, use a fresh receipt for the current task attempt and requirement revisions. Legacy missions without a validationContract keep their original acceptance rules; do not silently rewrite their frozen contract.
 If work is interrupted, inspect persisted state and uncertain side effects before retrying. Tool interruption is not proof that an external operation did not run. Use Report or SendMessage to tell the orchestrator about workflow problems or blockers; the orchestrator decides whether to ask the user. After completing the necessary tool work, call Report alone to deliver one concise structured handoff with outcome, task identifiers, evidence, and next action. Report ends this run; a new durable input will wake you. Do not combine Report or WaitForMessage with other tool calls in the same response. If waiting on another agent with no new result or blocker, call WaitForMessage alone instead of polling or repeatedly reporting that you are waiting. Do not report fabricated results.`;
@@ -35,9 +35,13 @@ export function remoteWorkspacePromptFlags(
   roleKind: "orchestrator" | "worker" | "validator",
   remoteWorkspaceIds: readonly string[] | undefined
 ): { remoteWorkspacesAuthorized: true } | Record<string, never> {
-  if (roleKind !== "validator" || !remoteWorkspaceIds?.length) return {};
+  if (roleKind === "worker" || !remoteWorkspaceIds?.length) return {};
   return { remoteWorkspacesAuthorized: true };
 }
+
+export const SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION = "Omitting targetWorkspaceId runs the agent in the coordinator's local workspace. For remote execution, use the matching GetMissionState remoteWorkspaces entry's id as targetWorkspaceId; the node must be execution-enabled.";
+
+const REMOTE_WORKSPACE_SELECTION_INSTRUCTIONS = "Omitting SpawnAgent targetWorkspaceId runs the agent in the coordinator's local workspace. For execution in an authorized remote workspace, including when requested paths are inside its path, use GetMissionState remoteWorkspaces to find the matching entry and pass its id as targetWorkspaceId.";
 
 export function workerSystemInstructions(config: {
   role: { kind: "orchestrator" | "worker" | "validator"; instructions: string };
@@ -48,8 +52,10 @@ export function workerSystemInstructions(config: {
   remoteWorkspacesAuthorized?: boolean;
 }): string {
   const base = config.role.kind === "orchestrator" ? ORCHESTRATOR_INSTRUCTIONS : AGENT_INSTRUCTIONS;
+  const remoteSelection = config.role.kind === "orchestrator" && config.remoteWorkspacesAuthorized === true
+    ? `\n\n${REMOTE_WORKSPACE_SELECTION_INSTRUCTIONS}` : "";
   const worktree = config.workspaceStrategy === "worktree" ? `\n\n${WORKTREE_INSTRUCTIONS}` : "";
-  return `${base}\n\n${config.role.instructions}${worktree}${remoteRuntimeInstructions(config)}${remoteSnapshotValidationInstructions(config)}`;
+  return `${base}\n\n${config.role.instructions}${worktree}${remoteSelection}${remoteRuntimeInstructions(config)}${remoteSnapshotValidationInstructions(config)}`;
 }
 
 function remoteSnapshotValidationInstructions(config: {

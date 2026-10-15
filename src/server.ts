@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import type { ModelProfile, RoleProfile } from "./contracts.js";
 import { artifactContentDisposition, artifactDownloadName } from "./artifact-download.js";
 import { McpConfigurationError } from "./mcp-config.js";
-import { ControlPlane, HttpError, parseCreateMissionInput, parseValidationContractUpdateInput } from "./control.js";
+import { ControlPlane, HttpError, RemoteEffectRejection, parseCreateMissionInput, parseValidationContractUpdateInput } from "./control.js";
 import { MachineError } from "./machines.js";
 import { applyWorkerNotice } from "./worker-events.js";
 import { parseWorkerBinding, type JsonValue, type WorkerBinding, type WorkerRpcPayload } from "./worker-mailbox.js";
@@ -152,7 +152,7 @@ export async function startServer(options: ServerOptions) {
         return { kind: "reply", rpcId: payload.rpcId, ok: true, result: normalizeRpcResult(result) };
       } catch (error) {
         if (error instanceof HttpError && error.status >= 400 && error.status < 500) {
-          return { kind: "reply", rpcId: payload.rpcId, ok: false, error: "Remote operation was rejected" };
+          return { kind: "reply", rpcId: payload.rpcId, ok: false, error: error instanceof RemoteEffectRejection ? error.message : "Remote operation was rejected" };
         }
         throw error;
       }
