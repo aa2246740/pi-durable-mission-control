@@ -43,9 +43,22 @@ import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type Mail
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
 import { normalizeRemoteArtifactPath, REMOTE_ARTIFACT_PATH_ERROR } from "./remote-artifact-path.js";
-import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
+import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS, REMOTE_NONAUTHORIZING_RPC_METHODS } from "./remote-rpc-methods.js";
 import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, parseNodeEffectSpec, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
 import { RemoteArtifactStore, parseRemoteArtifactManifest, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
+import {
+  assertSupportedFoundationWorkflows,
+  canonicalMissionWorkflowData,
+  HttpError,
+  missionParityGateEnabled,
+  parseMissionWorkflowDataV1,
+  parseRoleBindings,
+  parseStoredMissionWorkflowRow,
+  parseWorkflowPolicyRequest,
+  WorkflowOperationError,
+  type MissionWorkflowRecord
+} from "./workflow-schema.js";
+import { projectWorkflowExport, projectWorkflowRead, type WorkflowReadState } from "./workflow-observability.js";
 import {
   addAgentWorktree,
   addDetachedWorktree,
@@ -64,7 +77,8 @@ import {
   type RepositoryIdentity
 } from "./worktrees.js";
 
-export const CONTROL_SCHEMA_VERSION = 10;
+export const CONTROL_SCHEMA_VERSION = 11;
+export { HttpError };
 // Both startup and backup restore hold a transaction while fencing ownership and deliveries.
 export function quarantineTerminalLocalDeliveries(db: DatabaseSync): void {
   if (!db.isTransaction) throw new Error("Terminal delivery recovery requires a transaction");
@@ -97,15 +111,6 @@ export function quarantineTerminalLocalDeliveries(db: DatabaseSync): void {
 }
 
 const REMOTE_OPERATION_UNAVAILABLE = "Remote operation is unavailable for this agent";
-export class HttpError extends Error {
-  readonly status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
 // Only static, corrective admission messages may cross the remote worker boundary.
 export class RemoteEffectRejection extends HttpError {
   constructor(status: 400 | 403 | 409, message: string) {
@@ -326,6 +331,46 @@ export function tryAcquireDaemonOwnership(home: string): DatabaseSync | undefine
   }
 }
 
+const PARITY_READ_REPLY_METHODS = new Set([...REMOTE_NONAUTHORIZING_RPC_METHODS, "ListMcpTools"]);
+
+function evidenceReceiptResult(result: unknown): boolean {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const record = result as { recorded?: unknown };
+  return record.recorded === true && Object.keys(record).every((key) => key === "recorded" || key === "late");
+}
+
+function pendingApprovalResult(result: unknown): boolean {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const record = result as { status?: unknown; approvalId?: unknown };
+  return record.status === "pending" && typeof record.approvalId === "string" && Object.keys(record).length === 2;
+}
+
+/**
+ * Whether this downlink grants or continues execution.
+ *
+ * The decision follows the durable inbox RPC correlated by `source_inbox_id`
+ * and whether the reply actually carries an effect permit. Successful read
+ * snapshots are not authorization. A result-object shape is used only for the
+ * two already-defined non-authorizing classes: a pending approval status and
+ * a recorded evidence receipt that has no inbox correlation. Deliveries,
+ * approved effects, and permit replies stay blocked.
+ */
+function parityDownlinkAuthorizesExecution(payload: WorkerEnvelope["payload"], sourceMethod: string | null): boolean {
+  if (payload.kind === "deliver" || payload.kind === "approved-effect") return true;
+  if (payload.kind === "abort" || payload.kind === "shutdown" || payload.kind === "notice" || payload.kind === "rpc") return false;
+  if (payload.kind !== "reply") return true;
+  if (!payload.ok) return false;
+  const result = payload.result;
+  if (result && typeof result === "object" && !Array.isArray(result) && Object.hasOwn(result, "effectPermit")) return true;
+  if (pendingApprovalResult(result)) return false;
+  if (sourceMethod !== null) {
+    if (PARITY_READ_REPLY_METHODS.has(sourceMethod) || sourceMethod === "RecordEffectReceipt") return false;
+    if (REMOTE_EFFECT_METHODS.has(sourceMethod)) return true;
+    return !evidenceReceiptResult(result);
+  }
+  return !evidenceReceiptResult(result);
+}
+
 export class ControlPlane {
   readonly mcpRuntime = new McpRuntimeManager();
   readonly home: string;
@@ -344,8 +389,10 @@ export class ControlPlane {
   readonly workerMailbox: DurableWorkerMailbox;
   readonly remoteRuntimes: RemoteRuntimeRegistry;
   readonly remoteArtifacts: RemoteArtifactStore;
+  readonly missionParityEnabled: boolean;
 
   constructor(home: string) {
+    this.missionParityEnabled = missionParityGateEnabled();
     mkdirSync(home, { recursive: true, mode: 0o700 });
     this.home = realpathSync(home);
     const ownership = tryAcquireDaemonOwnership(this.home);
@@ -364,6 +411,7 @@ export class ControlPlane {
       this.workerMailbox = this.transaction(() => {
         this.checkStartupCompatibility();
         this.migrate();
+        assertSupportedFoundationWorkflows(this.db);
         RemoteArtifactStore.migrate(this.db);
         const workerMailbox = new DurableWorkerMailbox(this.db, "coordinator");
         this.seedProfiles();
@@ -507,6 +555,13 @@ export class ControlPlane {
         id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS worktrees_mission_idx ON worktrees(mission_id,id);
+      CREATE TABLE IF NOT EXISTS mission_workflows (
+        mission_id TEXT PRIMARY KEY REFERENCES missions(id),
+        mode TEXT NOT NULL CHECK(mode IN ('classic','parity-v1')),
+        phase TEXT NOT NULL CHECK(phase IN ('planning','awaiting_plan_acceptance','executing')),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        data TEXT NOT NULL CHECK(json_valid(data))
+      );
     `);
     MachineRegistry.migrate(this.db);
     DurableWorkerMailbox.migrate(this.db, "coordinator");
@@ -869,7 +924,11 @@ export class ControlPlane {
 
   nodeRuntimePoll(machineId: string, token: string, sessionId: string, sessionEpoch: number, stopRuntimeId?: string): { directives: RemoteRuntimeDirective[] } {
     this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
-    return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch, stopRuntimeId) };
+    return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch, stopRuntimeId, (row) => {
+      if (row.desired !== "run") return true;
+      const agent = this.getAgent(row.agent_id);
+      return !agent || !this.missionParityExecutionBlocked(agent.missionId);
+    }) };
   }
 
   nodeEffectReceipt(machineId: string, token: string, sessionId: string, sessionEpoch: number, value: unknown): NodeEffectAck {
@@ -1401,7 +1460,26 @@ export class ControlPlane {
 
   nodeWorkerPoll(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawBinding: unknown): { envelopes: readonly WorkerEnvelope[] } {
     const binding = this.authorizeWorkerMailbox(machineId, token, sessionId, sessionEpoch, rawBinding);
-    return { envelopes: this.workerMailbox.pending(binding, 1) };
+    const agent = this.getAgent(binding.agentId);
+    const parity = Boolean(agent && this.missionParityExecutionBlocked(agent.missionId));
+    if (!parity) return { envelopes: this.workerMailbox.pending(binding, 1) };
+    const envelopes = this.workerMailbox.pending(binding, 1, (envelope, sourceMethod) =>
+      !parityDownlinkAuthorizesExecution(envelope.payload, sourceMethod));
+    if (envelopes.length > 0) return { envelopes };
+    const head = this.workerMailbox.headDownlink(binding);
+    // An executable head cannot be skipped. When it blocks later mail, fence
+    // the binding and request the existing runtime stop. Queued rows become
+    // cancelled and an already offered head becomes uncertain; neither is
+    // acknowledged, deleted, or re-offered. A lone executable tail stays
+    // where it is so an already offered head can still be acknowledged.
+    if (head && head.followerCount > 0 && parityDownlinkAuthorizesExecution(head.envelope.payload, head.sourceMethod)) {
+      this.transactionIfNeeded(() => {
+        this.workerMailbox.fence(binding);
+        const stopEpoch = agent && agent.epoch === binding.epoch ? agent.epoch : null;
+        this.remoteRuntimes.requestStop(binding, stopEpoch === null ? "ownership-lost" : "controlled", stopEpoch);
+      });
+    }
+    return { envelopes: [] };
   }
 
   /**
@@ -1697,6 +1775,9 @@ export class ControlPlane {
   missionAction(id: string, action: "start" | "pause" | "resume" | "cancel"): Mission {
     const mission = this.getMission(id);
     if (!mission) throw new HttpError(404, "Mission not found");
+    if ((action === "start" || action === "resume") && this.missionParityExecutionBlocked(id)) {
+      throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
+    }
     if (action === "start") {
       return this.command(`mission:${id}:lifecycle`, "mission-start", { action }, () => {
         const current = this.getMission(id);
@@ -1853,12 +1934,17 @@ export class ControlPlane {
           recipientId: agent.id,
           content: prompt,
           mode: "followUp",
-          status: mission.status === "paused" ? "aborted" : "queued",
-          attempt: 1,
-          createdAt: now()
-        };
-        this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, missionId, message.status, json(message));
-        if (message.status === "queued") this.enqueue(message);
+        status: mission.status === "paused" || this.missionParityExecutionBlocked(missionId) ? "aborted" : "queued",
+        attempt: 1,
+        createdAt: now(),
+        ...(mission.status === "paused" || this.missionParityExecutionBlocked(missionId)
+          ? { error: mission.status === "paused"
+            ? "Held while mission is paused; delivery will start after explicit resume"
+            : "Held because mission parity execution is not available in this build." }
+          : {})
+      };
+      this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, missionId, message.status, json(message));
+      if (message.status === "queued") this.enqueue(message);
       }
       return agent;
     });
@@ -2188,6 +2274,7 @@ export class ControlPlane {
       const recipient = this.getAgent(recipientId);
       if (!mission || !recipient || recipient.missionId !== missionId) throw new HttpError(404, "Recipient not found in this mission");
       if (["cancelled", "completed", "failed"].includes(mission.status)) throw new HttpError(409, "Mission is not accepting messages");
+      const held = mission.status === "paused" || this.missionParityExecutionBlocked(missionId);
       const message: Message = {
         id: randomUUID(),
         missionId,
@@ -2195,13 +2282,15 @@ export class ControlPlane {
         recipientId,
         content,
         mode,
-        status: mission.status === "paused" ? "aborted" : "queued",
+        status: held ? "aborted" : "queued",
         attempt: 1,
         createdAt: now(),
-        ...(mission.status === "paused" ? { error: "Held while mission is paused; delivery will start after explicit resume" } : {})
+        ...(held ? { error: mission.status === "paused"
+          ? "Held while mission is paused; delivery will start after explicit resume"
+          : "Held because mission parity execution is not available in this build." } : {})
       };
       this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, missionId, message.status, json(message));
-      if (mission.status !== "paused") this.enqueue(message);
+      if (!held) this.enqueue(message);
       this.event(missionId, "message_created", `User message queued for ${recipient.title}.`, recipient.id, { messageId: message.id });
       return message;
     });
@@ -2583,6 +2672,7 @@ export class ControlPlane {
         const gate = this.scheduleGate(mission);
         reason = gate.reason;
         recipientId = gate.recipientId;
+        if (!reason && this.missionParityExecutionBlocked(mission.id)) reason = "capability_unavailable";
         if (!reason) outcome = "queued";
       }
       let nextRunAt: string | null = null;
@@ -2921,8 +3011,9 @@ export class ControlPlane {
               ? "delivery_pending"
               : "needs_attention";
           } else if (elapsed >= watchdogIdleThresholdMs) {
-            diagnosis = state.autoWake ? "wake_queued" : "stalled";
-            if (state.autoWake && activeGate.recipientId) {
+            const wakeAllowed = state.autoWake && !this.missionParityExecutionBlocked(missionId);
+            diagnosis = wakeAllowed ? "wake_queued" : "stalled";
+            if (wakeAllowed && activeGate.recipientId) {
               const wakeId = `watchdog-wake:${missionId}:${fingerprint}`;
               const messageId = `watchdog-message:${missionId}:${fingerprint}`;
               const requestId = `${messageId}:1`;
@@ -3064,6 +3155,7 @@ export class ControlPlane {
   }
 
   dispatchRemoteOutbox(row: OutboxRow, message: Message, agent: Agent): boolean {
+    if (this.missionParityExecutionBlocked(row.mission_id)) return false;
     return this.transaction(() => {
       const freshAgent = this.getAgent(agent.id);
       const freshMessage = this.message(message.id);
@@ -3320,6 +3412,9 @@ export class ControlPlane {
       if (!agent || agent.epoch !== epoch) throw new HttpError(409, "Worker epoch is fenced");
       const mission = this.getMission(agent.missionId);
       if (!mission) throw new HttpError(404, "Mission not found");
+      if (this.missionParityExecutionBlocked(mission.id)) {
+        throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity admission is not available in this build");
+      }
       const prior = this.db.prepare("SELECT 1 FROM generation_admissions WHERE agent_id=? AND generation_id=?").get(agentId, generationId);
       const reason = mission.status !== "active" ? "Mission is not accepting model turns"
         : !prior && mission.turns >= mission.maxTurns ? "Mission turn limit exhausted" : undefined;
@@ -3433,6 +3528,18 @@ export class ControlPlane {
       const remaining = this.blockers(blocker.missionId).some((item) => item.status === "open");
       if (mission?.status === "blocked" && !remaining && blocker.kind !== "user_input") {
         this.putMission({ ...mission, status: "paused", updatedAt: now() });
+      } else if (mission && blocker.kind === "user_input" && blocker.agentId && this.missionParityExecutionBlocked(mission.id)) {
+        const recipient = this.getAgent(blocker.agentId);
+        if (recipient) {
+          const message: Message = {
+            id: `blocker-resolution:${id}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
+            content: resolution, mode: "followUp", status: "aborted", attempt: 1, createdAt: now(),
+            error: "Held because mission parity execution is not available in this build."
+          };
+          this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
+          this.event(mission.id, "message_created", "Human blocker resolution recorded without releasing delivery.", recipient.id, { messageId: message.id, blockerId: id });
+        }
+        if (!remaining && mission.status === "blocked") this.putMission({ ...mission, status: "paused", updatedAt: now() });
       } else if (mission && !remaining && blocker.kind === "user_input" && blocker.agentId &&
         ["blocked", "paused"].includes(mission.status)) {
         const explicitResume = this.hasLocalWorkerStopHold(mission.id);
@@ -3556,8 +3663,13 @@ export class ControlPlane {
     if (!["Transcript", "Report", "Usage", "AdmitTurn"].includes(request.method) && mission.status !== "active" && !(request.method === "ValidateTask" && mission.status === "validating")) {
       throw new HttpError(409, "Mission is not accepting worker commands");
     }
+    if (this.missionParityExecutionBlocked(mission.id) && !["Transcript", "Usage", "GetMissionState", "ListAgents", "ListMcpTools", "read_file", "RecordEffectReceipt", "AdmitTurn"].includes(request.method)) {
+      throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
+    }
     const args = request.args && typeof request.args === "object" ? request.args as Record<string, unknown> : {};
     if (current && current.machineId !== "local" && REMOTE_EFFECT_METHODS.has(request.method)) {
+      // Design §4.2: this build does not issue parity remote permits, including read_file.
+      this.rejectParityExecution(mission.id);
       if (mission.status !== "active") throw new HttpError(409, "Mission is not accepting worker commands");
       if (role.kind === "validator" && request.method !== "read_file") throw new HttpError(403, "Validators may only read remote workspaces");
       const runtime = this.remoteRuntimes.activeForAgent(agent.id);
@@ -3865,11 +3977,14 @@ export class ControlPlane {
 
   private enqueueAgentMessage(sender: Agent, recipient: Agent, content: string, mode: "steer" | "followUp"): Message {
     const mission = this.getMission(sender.missionId);
-    const held = mission?.status === "paused";
+    const parityHeld = mission ? this.missionParityExecutionBlocked(mission.id) : false;
+    const held = mission?.status === "paused" || parityHeld;
     const message: Message = {
       id: randomUUID(), missionId: sender.missionId, senderId: sender.id, recipientId: recipient.id, content, mode,
       status: held ? "aborted" : "queued", attempt: 1, createdAt: now(),
-      ...(held ? { error: "Held while mission is paused; delivery will start after explicit resume" } : {})
+      ...(held ? { error: parityHeld && mission?.status !== "paused"
+        ? "Held because mission parity execution is not available in this build."
+        : "Held while mission is paused; delivery will start after explicit resume" } : {})
     };
     this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, message.missionId, message.status, json(message));
     if (!held) this.enqueue(message);
@@ -4164,6 +4279,9 @@ export class ControlPlane {
     if (!row) throw new HttpError(404, "Approval not found");
     const previous = decode<Approval>(row.data);
     if (previous.remoteEffectBinding) {
+      if (this.missionParityExecutionBlocked(previous.missionId) && (previous.status === "pending" || previous.status === "approved")) {
+        throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
+      }
       this.reconcileRemoteEffectApprovals();
       const current = this.db.prepare("SELECT data FROM approvals WHERE id=?").get(id) as Row | undefined;
       if (!current) throw new HttpError(404, "Approval not found");
@@ -4175,6 +4293,7 @@ export class ControlPlane {
     if (previous.status !== "approved") throw new HttpError(409, "Approval must be approved before execution");
     if (previous.remoteEffectBinding) return previous;
     if (!agent || !mission || mission.status !== "active") throw new HttpError(409, "Approved operation cannot run outside an active mission");
+    this.rejectParityExecution(mission.id);
     if (agent.machineId !== "local") throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
     if (previous.tool === "run_validation") {
       const binding = previous as Approval & Partial<ValidationApprovalBinding>;
@@ -5252,6 +5371,7 @@ export class ControlPlane {
             `Remote approval ${approval.id} became stale before dispatch; no effect was sent.`);
         });
       } else if (approval.status === "approved") {
+        if (this.missionParityExecutionBlocked(approval.missionId)) continue;
         try {
           this.dispatchRemoteEffectApproval(approval);
         } catch (error) {
@@ -5278,6 +5398,7 @@ export class ControlPlane {
   }
 
   private dispatchRemoteEffectApproval(approval: Approval): void {
+    if (this.missionParityExecutionBlocked(approval.missionId)) return;
     const remote = approval.remoteEffectBinding;
     if (!remote || !this.remoteEffectApprovalCurrent(approval)) return;
     const binding = remote.spec.binding;
@@ -5520,7 +5641,8 @@ export class ControlPlane {
       worktrees: this.listWorktrees(id),
       ...(validationContract ? { validationContract } : {}),
       ...(validationContract ? { requirementCoverage: this.requirementCoverage(id) } : {}),
-      ...(validationContract ? { validationContractHistory: this.validationContractHistory(id) } : {})
+      ...(validationContract ? { validationContractHistory: this.validationContractHistory(id) } : {}),
+      workflow: this.storedWorkflow(id)
     };
   }
 
@@ -5538,10 +5660,56 @@ export class ControlPlane {
     const generationAdmissions = this.db.prepare("SELECT * FROM generation_admissions WHERE mission_id=? ORDER BY turn_number").all(id);
     const generationDenials = this.db.prepare("SELECT * FROM generation_denials WHERE mission_id=? ORDER BY created_at").all(id);
     const transcripts = detail.agents.map((agent) => ({ agentId: agent.id, entries: this.transcript(agent.id) }));
+    const workflowExport = projectWorkflowExport(detail.workflow, CONTROL_SCHEMA_VERSION);
     return {
-      format: "mission-control-replay-v1", exportedAt: now(), ...detail, transcripts, commands, outbox, generationAdmissions, generationDenials,
+      format: "mission-control-replay-v1", exportedAt: now(), ...workflowExport, ...detail, transcripts, commands, outbox, generationAdmissions, generationDenials,
       validationContractHistory: this.validationContractHistory(id)
     };
+  }
+
+  missionWorkflow(id: string): WorkflowReadState {
+    if (!this.getMission(id)) throw new HttpError(404, "Mission not found");
+    return projectWorkflowRead(this.storedWorkflow(id), this.missionParityEnabled);
+  }
+
+  recordFoundationWorkflow(missionId: string, input: { policy: unknown; roleBindings: unknown }): MissionWorkflowRecord {
+    return this.transaction(() => {
+      if (!this.getMission(missionId)) throw new HttpError(404, "Mission not found");
+      if (this.storedWorkflow(missionId)) throw new WorkflowOperationError(409, "OPERATION_REJECTED", "Mission workflow foundation record already exists");
+      const timestamp = now();
+      const data = parseMissionWorkflowDataV1({
+        schemaVersion: 1,
+        policy: parseWorkflowPolicyRequest(input.policy),
+        policyRevision: 1,
+        roleBindings: parseRoleBindings(input.roleBindings),
+        createdAt: timestamp,
+        updatedAt: timestamp
+      });
+      this.db.prepare("INSERT INTO mission_workflows(mission_id,mode,phase,revision,data) VALUES(?,?,?,?,?)")
+        .run(missionId, "parity-v1", "planning", 1, canonicalMissionWorkflowData(data));
+      return this.storedWorkflow(missionId)!;
+    });
+  }
+
+  private storedWorkflow(missionId: string): MissionWorkflowRecord | null {
+    const row = this.db.prepare("SELECT mission_id, mode, phase, revision, data FROM mission_workflows WHERE mission_id=?").get(missionId);
+    if (!row) return null;
+    return parseStoredMissionWorkflowRow(row);
+  }
+
+  private parityWorkflow(missionId: string): MissionWorkflowRecord | null {
+    const workflow = this.storedWorkflow(missionId);
+    return workflow?.mode === "parity-v1" ? workflow : null;
+  }
+
+  missionParityExecutionBlocked(missionId: string): boolean {
+    return this.parityWorkflow(missionId) !== null;
+  }
+
+  private rejectParityExecution(missionId: string): void {
+    if (this.missionParityExecutionBlocked(missionId)) {
+      throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
+    }
   }
 
   reconcileInFlightOperations(): void {

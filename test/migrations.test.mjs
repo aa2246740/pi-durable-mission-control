@@ -75,6 +75,7 @@ test("legacy migration adds missing columns without rewriting evidence or replay
     assert.equal(delivery.next_attempt_at, null);
     assert.equal(delivery.result, null);
     assert.equal(control.db.prepare("SELECT count(*) AS n FROM worktrees").get().n, 0);
+    assert.equal(control.db.prepare("SELECT count(*) AS n FROM mission_workflows").get().n, 0);
   } finally {
     control.close();
   }
@@ -128,6 +129,7 @@ test("failed initialization rolls back all DDL, version changes and ownership, t
     assert.deepEqual(schema(db), beforeSchema);
     assert.deepEqual(db.prepare("SELECT * FROM outbox").all(), beforeRows);
     assert.equal(db.prepare("SELECT name FROM sqlite_schema WHERE name='daemon_owner'").get(), undefined);
+    assert.equal(db.prepare("SELECT name FROM sqlite_schema WHERE name='mission_workflows'").get(), undefined);
     db.exec("DROP TRIGGER migration_fault");
   } finally {
     db.close();
@@ -191,6 +193,7 @@ test("a stale current PID does not block legacy migration or epoch advancement",
     const owner = control.db.prepare("SELECT daemon_id, epoch FROM daemon_owner").get();
     assert.equal(owner.daemon_id, control.daemonId);
     assert.equal(owner.epoch, 8);
+    assert.equal(control.db.prepare("SELECT count(*) AS n FROM mission_workflows").get().n, 0);
   } finally { control.close(); }
 });
 
@@ -248,4 +251,31 @@ test("schema 9 inferred controlled stop is downgraded without request and node e
     upgraded.remoteRuntimes.report({ ...report, reportId: crypto.randomUUID(), stopReason: "requested" });
     assert.equal(upgraded.remoteRuntimes.byRuntime(binding.runtimeId).stop_provenance, "unproven");
   } finally { upgraded.close(); }
+});
+
+test("schema 10 upgrades by adding only mission_workflows and reopening does not migrate again", (t) => {
+  const f = fixture(t);
+  const initial = new ControlPlane(f.home);
+  const upgradedTables = initial.db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all().map((row) => row.name);
+  initial.close();
+  const db = new DatabaseSync(f.path);
+  db.exec("DROP TABLE mission_workflows; PRAGMA user_version=10");
+  const beforeTables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all().map((row) => row.name);
+  db.close();
+  const upgraded = new ControlPlane(f.home);
+  try {
+    assert.equal(version(upgraded.db), CONTROL_SCHEMA_VERSION);
+    const afterTables = upgraded.db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all().map((row) => row.name);
+    assert.deepEqual(afterTables, upgradedTables);
+    assert.deepEqual(afterTables.filter((name) => !beforeTables.includes(name)), ["mission_workflows"]);
+    for (const name of ["plan_drafts", "mission_plans", "milestones", "task_runs", "task_budgets", "workflow_assets", "environment_specs"]) {
+      assert.equal(afterTables.includes(name), false);
+    }
+    assert.equal(upgraded.db.prepare("SELECT count(*) AS n FROM mission_workflows").get().n, 0);
+  } finally { upgraded.close(); }
+  const reopened = new ControlPlane(f.home);
+  try {
+    assert.equal(version(reopened.db), CONTROL_SCHEMA_VERSION);
+    assert.deepEqual(reopened.db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all().map((row) => row.name), upgradedTables);
+  } finally { reopened.close(); }
 });

@@ -1,4 +1,20 @@
 import type { McpPermission, McpServerConfig } from "./mcp-config.js";
+import type { MissionWorkflowRecord } from "./workflow-schema.js";
+export type {
+  EffectiveExecutionConfig,
+  ErrorCode,
+  MissionWorkflowDataV1,
+  MissionWorkflowRecord,
+  ModelProfileSnapshot,
+  RoleBinding,
+  RoleProfileSnapshot,
+  ReasoningEffort,
+  SafeErrorDetails,
+  WorkflowDigestDomain,
+  WorkflowPolicy,
+  WorkflowSlot
+} from "./workflow-schema.js";
+export type { WorkflowReadState } from "./workflow-observability.js";
 
 export type MissionStatus = 'draft' | 'active' | 'paused' | 'blocked' | 'validating' | 'completed' | 'failed' | 'cancelled';
 export type AgentStatus = 'idle' | 'running' | 'waiting_approval' | 'waiting_user' | 'recovering' | 'offline' | 'error';
@@ -165,6 +181,7 @@ export interface MissionDetail {
   schedules?: MissionSchedule[]; scheduleOccurrences?: ScheduleOccurrence[];
   watchdog?: MissionWatchdog; watchdogWakes?: WatchdogWake[];
   worktrees?: WorktreeRecord[];
+  workflow: MissionWorkflowRecord | null;
 }
 export interface AppState {
   missions: Mission[]; profiles: ModelProfile[]; roles: RoleProfile[]; workspaces: Workspace[];

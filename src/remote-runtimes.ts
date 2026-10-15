@@ -116,14 +116,14 @@ export class RemoteRuntimeRegistry {
     return { binding, descriptor, descriptorHash, existing: false };
   }
 
-  poll(machineId: string, sessionId: string, sessionEpoch: number, stopRuntimeId?: string): RemoteRuntimeDirective[] {
+  poll(machineId: string, sessionId: string, sessionEpoch: number, stopRuntimeId?: string, allow?: (row: RemoteRuntimeRow) => boolean): RemoteRuntimeDirective[] {
     const rows = this.db.prepare(`SELECT * FROM remote_worker_runtimes
       WHERE machine_id=? AND (
         (desired='run' AND state IN ('queued','offered') AND session_id=? AND session_epoch=?) OR
         (desired='stop' AND state IN ('stopping','offered','uncertain'))
-      ) AND (? IS NULL OR (runtime_id=? AND desired='stop')) ORDER BY COALESCE(last_offered_at,0),created_at,runtime_id LIMIT 1`)
+      ) AND (? IS NULL OR (runtime_id=? AND desired='stop')) ORDER BY COALESCE(last_offered_at,0),created_at,runtime_id`)
       .all(machineId, sessionId, sessionEpoch, stopRuntimeId ?? null, stopRuntimeId ?? null) as RemoteRuntimeRow[];
-    const row = rows[0];
+    const row = rows.find((candidate) => allow ? allow(candidate) : true);
     if (!row) return [];
     const at = Date.now();
     this.db.prepare("UPDATE remote_worker_runtimes SET state=CASE WHEN desired='run' THEN 'offered' ELSE state END,last_offered_at=?,updated_at=? WHERE runtime_id=?")

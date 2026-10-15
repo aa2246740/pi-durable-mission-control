@@ -8,6 +8,7 @@ import type { ModelProfile, RoleProfile } from "./contracts.js";
 import { artifactContentDisposition, artifactDownloadName } from "./artifact-download.js";
 import { McpConfigurationError } from "./mcp-config.js";
 import { ControlPlane, HttpError, RemoteEffectRejection, parseCreateMissionInput, parseValidationContractUpdateInput } from "./control.js";
+import { adminErrorBody } from "./workflow-schema.js";
 import { MachineError } from "./machines.js";
 import { applyWorkerNotice } from "./worker-events.js";
 import { parseWorkerBinding, type JsonValue, type WorkerBinding, type WorkerRpcPayload } from "./worker-mailbox.js";
@@ -185,9 +186,15 @@ export async function startServer(options: ServerOptions) {
     "/api/nodes/runtimes/events", "/api/nodes/effects/receipts", "/api/nodes/mailbox/settlement"
   ]);
   const handleRequest = (nodeOnly: boolean) => async (request: IncomingMessage, response: ServerResponse) => {
+    let nodeRoute = false;
     try {
       response.setHeader("x-content-type-options", "nosniff");
       response.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'");
+      try {
+        nodeRoute = new URL(request.url ?? "/", "http://127.0.0.1").pathname.startsWith("/api/nodes/");
+      } catch {
+        nodeRoute = false;
+      }
       if (!isLocalHost(request.headers.host)) throw new HttpError(403, "Host is not a loopback host");
       const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
       const origin = request.headers.origin;
@@ -200,7 +207,7 @@ export async function startServer(options: ServerOptions) {
       const method = request.method ?? "GET";
       const mutation = ["POST", "PATCH", "PUT", "DELETE"].includes(method);
       if (request.headers["sec-fetch-site"] === "cross-site") throw new HttpError(403, "Cross-site request rejected");
-      const nodeRoute = url.pathname.startsWith("/api/nodes/");
+      nodeRoute = url.pathname.startsWith("/api/nodes/");
       const readRequestBody = async (): Promise<Record<string, unknown>> => {
         const body = await readBody(request);
         if (closing && (!nodeRoute || !shutdownNodeRoutes.has(url.pathname))) throw new HttpError(503, "Coordinator is shutting down");
@@ -599,6 +606,10 @@ export async function startServer(options: ServerOptions) {
       }
       const exportMatch = /^\/api\/missions\/([^/]+)\/export$/.exec(url.pathname);
       if (exportMatch && method === "GET") return jsonResponse(response, 200, control.exportMission(decodeURIComponent(exportMatch[1]!)));
+      const workflowMatch = /^\/api\/missions\/([^/]+)\/workflow$/.exec(url.pathname);
+      if (workflowMatch && method === "GET") {
+        return jsonResponse(response, 200, control.missionWorkflow(decodeURIComponent(workflowMatch[1]!)));
+      }
       const actionMatch = /^\/api\/missions\/([^/]+)\/(start|pause|resume|cancel)$/.exec(url.pathname);
       if (actionMatch && method === "POST") {
         exactKeys(await readRequestBody(), []);
@@ -721,7 +732,11 @@ export async function startServer(options: ServerOptions) {
       const status = error instanceof HttpError || error instanceof MachineError ? error.status : error instanceof McpConfigurationError ? 400 : 500;
       const message = error instanceof MachineError && error.status === 401 ? "Node authentication failed" :
         error instanceof HttpError || error instanceof MachineError || error instanceof McpConfigurationError ? error.message : "Internal server error";
-      jsonResponse(response, status, { error: message });
+      if (nodeOnly || nodeRoute) {
+        jsonResponse(response, status, { error: message });
+        return;
+      }
+      jsonResponse(response, status, adminErrorBody(error, status, message));
     }
   };
   const server = createServer(handleRequest(false));
