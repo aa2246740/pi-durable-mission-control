@@ -236,7 +236,7 @@ export function parseKillOutput(stdout) {
   return JSON.parse(line);
 }
 
-export async function observeWorkerCrash({ crash, current, missionId, containerName, records, api, post, exec, transport, save }) {
+export async function observeWorkerCrash({ crash, current, missionId, containerName, records, api, post, exec, killWorker, transport, save }) {
   const runtimes = crash.killed ? await api(`/api/missions/${missionId}/runtimes`) : [];
   if (runtimes.length === 1 && !crash.stoppedRuntime && ["closed", "uncertain"].includes(runtimes[0].state)) {
     crash.stoppedRuntime = runtimes[0];
@@ -254,14 +254,14 @@ export async function observeWorkerCrash({ crash, current, missionId, containerN
   if (action.type === "kill") {
     let stdout;
     try {
-      stdout = await exec(["exec", containerName, "node", "-e", workerKillSource()]);
+      stdout = killWorker ? JSON.stringify(await killWorker()) : await exec(["exec", containerName, "node", "-e", workerKillSource()]);
     } catch (error) {
       crash.kill = { ok: false, containerName, error: error instanceof Error ? error.message : String(error) };
       save();
       throw error;
     }
     const evidence = parseKillOutput(stdout);
-    evidence.containerName = containerName;
+    if (!killWorker) evidence.containerName = containerName;
     crash.kill = evidence;
     save();
     if (!evidence.ok) throw new Error(`Could not kill the assigned worker: ${evidence.reason ?? "kill was not confirmed"}`);

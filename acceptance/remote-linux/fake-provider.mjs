@@ -13,10 +13,10 @@ export function rehearsalSecrets(proof, config) {
   return { path, credentials: readSecrets(path, names) };
 }
 
-export function rehearsalConfig(config, hostPort, relayPort) {
+export function rehearsalConfig(config, hostPort, relayPort, relayHost = "192.168.64.1") {
   return Object.fromEntries(kinds.map((kind) => {
     assert.ok(["anthropic-messages", "openai-completions"].includes(config[kind].api), "Rehearsal supports anthropic-messages and openai-completions only");
-    return [kind, { ...config[kind], baseUrl: `http://${kind === "worker" ? `192.168.64.1:${relayPort}` : `127.0.0.1:${hostPort}`}/${kind}` }];
+    return [kind, { ...config[kind], baseUrl: `http://${kind === "worker" ? `${relayHost}:${relayPort}` : `127.0.0.1:${hostPort}`}/${kind}` }];
   }));
 }
 
@@ -51,7 +51,7 @@ export const totalsSource = `export function totalCents(lines) {
 `;
 const wrongSource = "export const totalCents = lines => lines.reduce((sum, line) => sum + line.quantity * line.unitPriceCents, 0);\n";
 
-export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementation = false }) {
+export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementation = false, platform = "linux", remotePath = "/work" }) {
   if (role === "orchestrator") {
     const state = transcript(body).findLast((result) => result.name === "GetMissionState")?.value;
     if (state?.tasks.some((task) => task.status === "blocked") && state.validationReceipts?.some((receipt) => acceptanceCommandMatch(acceptanceCommand, receipt.command) && receipt.exitCode !== 0)) {
@@ -82,17 +82,17 @@ export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementati
   const task = state.tasks[0];
   if (!task || (role === "worker" ? !["ready", "assigned", "running"].includes(task.status) : task.status !== "review")) return call("WaitForMessage");
   if (role === "worker") {
-    assert.equal(state.executionEnvironment?.platform, "linux");
+    assert.equal(state.executionEnvironment?.platform, platform);
     if (last.name === "GetMissionState") return call("UpdateTask", { taskId: task.id, status: "running" });
     if (last.name === "UpdateTask" && last.args.status === "running") return call("write_file", { path: "totals.mjs", content: wrongImplementation ? wrongSource : totalsSource });
-    if (last.name === "write_file") return call("bash", { command: `command -v node && node --input-type=module -e ${shellQuote("import assert from 'node:assert/strict'; import {totalCents} from './totals.mjs'; assert.equal(process.platform,'linux'); assert.equal(totalCents([{quantity:2,unitPriceCents:125},{quantity:3,unitPriceCents:70}]),460); console.log('LINUX-SELF-CHECK-OK');")}` });
+    if (last.name === "write_file") return call("bash", { command: `command -v node && node --input-type=module -e ${shellQuote(`import assert from 'node:assert/strict'; import {totalCents} from './totals.mjs'; assert.equal(process.platform,${JSON.stringify(platform)}); assert.equal(totalCents([{quantity:2,unitPriceCents:125},{quantity:3,unitPriceCents:70}]),460); console.log('LINUX-SELF-CHECK-OK');`)}` });
     if (last.name === "bash") {
       assert.equal(last.value.status, "succeeded");
       assert.equal(last.value.result?.exitCode, 0, "Linux self-check failed");
-      return call("PublishArtifact", { name: "Order totals", path: "/work/totals.mjs", taskId: "not-an-owned-task" });
+      return call("PublishArtifact", { name: "Order totals", path: join(remotePath, "totals.mjs"), taskId: "not-an-owned-task" });
     }
     if (last.name === "PublishArtifact") {
-      if (rejectedPublication) return call("PublishArtifact", { name: "Order totals", path: "/work/totals.mjs", taskId: task.id });
+      if (rejectedPublication) return call("PublishArtifact", { name: "Order totals", path: join(remotePath, "totals.mjs"), taskId: task.id });
       assert.equal(last.value.status, "succeeded");
       assert.ok(last.value.result?.id, "Publication did not return an artifact ID");
       return call("UpdateTask", { taskId: task.id, status: "review", evidence: "Linux self-check passed; totals.mjs published." });
@@ -149,7 +149,7 @@ export function validateRequest(request, body, profile, credential, role) {
   assert.ok(header === (profile.api === "anthropic-messages" ? credential : `Bearer ${credential}`), "Provider credential header mismatch");
 }
 
-export async function startFakeProvider({ config, credentials, acceptanceCommand, wrongImplementation, record, fail }) {
+export async function startFakeProvider({ config, credentials, acceptanceCommand, wrongImplementation, platform = "linux", remotePath = "/work", record, fail }) {
   const server = createServer(async (request, response) => {
     try {
       const role = request.url?.split("/")[1];
@@ -159,7 +159,7 @@ export async function startFakeProvider({ config, credentials, acceptanceCommand
       const body = JSON.parse(Buffer.concat(chunks).toString());
       validateRequest(request, body, config[role], credentials[config[role].credentialEnv], role);
       const normalized = normalizeMessages(body, config[role].api);
-      const decision = rehearsalCall(normalized, { role, acceptanceCommand, wrongImplementation });
+      const decision = rehearsalCall(normalized, { role, acceptanceCommand, wrongImplementation, platform, remotePath });
       record({ role, name: decision.name, model: body.model, api: config[role].api });
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       response.end(encodeReply(config[role].api, body.model, decision));

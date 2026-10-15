@@ -49,12 +49,13 @@ TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario 
 
 ### 运行中协调端重启
 
-`--scenario coordinator-restart` 在远端 worker 第一次 Linux 自查成功后、发布之前暂停 mock 的后续发布决策，等待实际 WaitForMessage 上传结清，再对协调端发送 SIGTERM。`--scenario coordinator-restart-kill` 在同一个位置使用 SIGKILL。两个场景各运行一次独立 Mission，均使用原协调端 home 重启，并等待原容器中的节点自动重连，全程不重启节点 CLI。
+`--scenario coordinator-restart` 在远端 worker 第一次 Linux 自查成功后、发布之前暂停 mock 的后续发布决策，等待实际 WaitForMessage 上传结清，再对协调端发送 SIGTERM。`--scenario coordinator-restart-kill` 在同一个位置使用 SIGKILL。两个场景各运行一次独立 Mission，均使用原协调端 home 重启，并等待原容器中的节点自动重连，全程不重启节点 CLI。 信号不再等待或拦截 runtime poll；默认在 0 到 250 毫秒的随机偏移后发送，证据记录 `stopSynchronization: "none"` 和 `signalDelayMs`。
 
 ```sh
 TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart --keep --out "$PWD/.acceptance-proof/restart-running-term-1"
 TMPDIR="$PWD/.acceptance-proof" node acceptance/remote-linux/run.mjs --scenario coordinator-restart-kill --keep --out "$PWD/.acceptance-proof/restart-running-kill-1"
 MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-restart- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/coordinator-restart-container.test.mjs
+MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-shutdown- TMPDIR="$PWD/.acceptance-proof" node --test acceptance/remote-linux/shutdown-regression.test.mjs
 ```
 
 容器自测顺序运行这三个场景各两次，最后再运行 default、pause-resume、worker-crash 各一次；即使前一次失败也保存结果并继续。任一次场景或清理失败，整个自测非零退出。该自测不进入 `npm test`，要求设置一个 `mc-acc-` 开头、以 `-` 结尾的专属容器前缀。
@@ -64,6 +65,8 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-restart- TMPDIR="$PWD/.acceptance-proof" n
 正常停止会暂停有运行中远端 runtime 的 Mission，持久化受控停止请求并标记中断投递；节点接口在确认期间继续开放。所有 runtime 共用默认 5 秒的等待上限，可用 `MC_REMOTE_SHUTDOWN_TIMEOUT_MS` 设置为 1 至 10000 毫秒。关闭期间管理员写请求返回 503。换新 runtime 时会原子地创建一条新的系统恢复通知，让 worker 读取持久化历史并继续待办工作；旧投递不重放。只有退出前取得完整的 closed/controlled 证据，重启后才保留恢复资格；超时后到达的报告不能恢复资格。没有运行中远端 runtime 的 Mission 保持原有关闭行为。
 
 结局写入 summary 的 `outcome`。`coordinator-restart` 必须为 `recovered`，`coordinator-restart-kill` 必须为 `irrecoverable`。`recovered` 要求恰好一次重分配、同 worker 与同节点、epoch 严格递增、发布在新 runtime 上，并通过 pause-resume 共用的不重放断言。`irrecoverable` 要求 Mission failed、恰好一个 worker_start_failed，且带 `recoverable: false`、机器可读 reason 和非空 diagnostic。此时旧 binding、mailbox、effect、投递和消息必须保持运营者操作前的状态，worker 工具调用不能增加。effect 或投递重放、无证据的新 runtime、active 且没有 blocker 或诊断、重复生成 blocker、resume 后没有终局诊断的停滞都会使场景非零退出并保留证据。
+
+`shutdown-regression.test.mjs` 在 container 和 local-process 后端各用 0、37、131 毫秒偏移验证三次正常关闭恢复，再验证一次 SIGKILL 不可恢复。每次结果和耗时写入独立证据目录及 `results.json`，任一失败均保留并使测试失败。local-process 的完整任务恢复验收窗口为 30 秒，容器为 10 秒；这两个窗口包含发布、验证和 Mission 完成，不改变产品持久化的 5 秒停止确认期限。场景证据记录 `recoveryTimeoutMs`。
 
 `coordinator-restart.json` 保存重启前后与每步运营者操作的只读快照，包括 mission detail、runtimes、blockers、mock 请求计数、工具记录、完整 mailbox binding 和 transport。还保留 `mission-export.json`、每次协调端日志及含节点重连状态的 container.log。`summary.json` 只摘录结局与 HTTP 结果，完整 GET 响应留在场景证据中。
 
@@ -300,3 +303,45 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-rv7-a-astra- node --test acceptance/remote
 ```
 
 H5 的命令变更依据 MiniMax 运行 `/Users/wu/.mc-orch/real/minimax-20261015-085308/`。该次 `mission-export.json` 的首条回执把内联脚本中的 `'\''` 引号转义抄成连续单引号，stderr 报 `SyntaxError: missing ) after argument list`，测试尚未运行。新命令只含 Node 与入口脚本的路径引用，此次路径均不含单引号，因此没有该段嵌套引号可供误抄；这说明该特定语法错误的来源已移除，实际模型是否正确执行仍需新一轮真实验收。该次 `summary.json` 的 orchestrator 在 shell_evidence seq 207 及 tool transcript 中原样执行了当时的冻结命令。按 H5 的匹配规则，这两条执行在提供当时冻结命令作为比较基准时均归为 `oracleReads`；新运行使用新入口命令作为比较基准，旧内联命令不会获得新命令的只读豁免。
+
+## local-process 后端（Linux / macOS，无需容器）
+
+`--backend local-process` 使用本机 Node CLI 子进程作为远端节点。默认仍为 `--backend container`，容器路径、镜像要求和隔离断言保持原有行为。前提为 Node >= 22.19、已构建的 `dist/`、已有依赖、POSIX `/bin/sh` 与 `ps`，以及创建回环监听、detached 进程和发送 SIGSTOP/SIGKILL 的权限。彩排还需要 `shasum`。Linux 云环境先完成仓库环境准备，不需要 Apple Container。
+
+```sh
+npm run build
+node acceptance/remote-linux/run.mjs --backend local-process --scenario default --keep
+node acceptance/remote-linux/run.mjs --backend local-process --scenario node-power-loss --keep
+node acceptance/remote-linux/run.mjs --backend local-process --real acceptance/remote-linux/real-minimax.json --rehearsal --discard
+# 串行运行下面全部场景及 minimax/glm 正反彩排，不进入 npm test
+node --test acceptance/remote-linux/local-process.test.mjs
+```
+
+runner 默认在 TMPDIR 下创建权限 0700 的独占 proof，拒绝复用已有目录。可用 `--out` 指定不存在的 proof 路径。节点持久化 home 和工作区位于 proof 的 `local-runtime/`，与协调端 home 分离，全部网络监听绑定 `127.0.0.1`。稳定 HTTP relay 在协调端重启时切换目标，节点 CLI 保持原进程。节点 token 与模型凭据经 stdin 传入 bootstrap，再通过最小环境交给 CLI，日志与 argv 不含凭据值。worker 的 shell 继续验证不继承模型凭据。macOS 使用节点实际 `darwin` 能力，Linux 使用 `linux`，不伪造平台值；交付 JSON 中历史 `platform: linux` 是固定业务 fixture。
+
+| 场景 | local-process 支持与通过条件 |
+| --- | --- |
+| default | 完成、任务 accepted、冻结快照 hash、下载内容和独立复核通过 |
+| pause-resume | 受控停止后更高 epoch 的新 runtime 恢复，旧 mailbox/effect 不变 |
+| turn-limit | 准入拒绝后扩额恢复，保留原恢复断言 |
+| worker-crash | 只杀本轮 supervisor 的 worker，核对身份、supervisor 存活及恢复永久拒绝 |
+| restart-after-complete | SIGTERM、SIGKILL 重启协调端，已完成记录不重放 |
+| coordinator-restart | SIGTERM 后原节点 CLI 以新 session/更高 epoch 重连 |
+| coordinator-restart-kill | SIGKILL 后保留不确定工作，解除 blocker 仍不能绕过停止来源检查 |
+| node-power-loss | 冻结并杀完整节点进程集合，等待真实租约失效，同 home/token 重启；journal 不重放 |
+| `--real … --rehearsal` | 本地假模型覆盖真实 provider 协议；正确 totals 通过、错误 totals 被独立业务测试拒绝 |
+
+上述场景均可在两个平台运行；`--real` 仍只接受 default。真正模型调用需要另外提供凭据和授权，彩排不验证模型能力、真实计费和生产网络。
+
+本机 graceful restart 会等全部 agent 空闲、mailbox 静止，再经过独立于 runtime poll 的偏移发送 SIGTERM。默认偏移为 0..250ms；专用关闭回归在两个后端各使用 0、37、131ms 三个偏移，并加入一次 SIGKILL 对照。relay 立即转发请求，`node-relay.json` 只记录请求路径、状态码和时刻。关闭期间经过认证的 mailbox 503 携带 `coordinator_shutting_down`，节点据此查询匹配的停止指令，并在同一会话上继续上报停止结果。产品默认停止期限仍为 5 秒；本机完整恢复窗口为 30 秒，容器为 10 秒。验收继续核对新 runtime 的 epoch 增长、旧 mailbox/effect 保持不变和投递不重放。
+
+故障控制通过 `ps` 递归跟踪本轮进程身份与进程组，Linux 额外核对 `/proc/<pid>/stat` 的启动 tick；macOS 使用 `ps` 的启动时间、命令与进程组。整节点故障先暂停 supervisor/祖先进程，再反复发现并暂停后代，直到连续核对全部为停止态，随后重读身份并分别 SIGKILL，包括自行 detached 的 worker、shell 和后代。进程组中存在非本轮进程、身份变化或无法封闭后代集合都会失败。这里只控制正常产品进程的派生关系，不提供针对恶意双重 fork/逃逸程序的安全沙箱。
+
+summary 增加 `backend`、实际 `nodePlatform`、`nodeArchitecture`、`localEnvironment`（可用 CPU 数、宿主内存与 Linux cgroup 配额原值，缺失记 unavailable）、`uncovered` 和 `localCleanup`。本机模式明确记录以下四项未覆盖：
+
+- 容器只读挂载、独立文件系统、宿主路径不可见。同 UID 可以访问彼此文件；mock 明确验证宿主测试路径可见。
+- 独立内核、硬件断电与磁盘缓存耐久性。node-power-loss 只证明完整进程崩溃、租约失效和持久库重开；证据使用 `processesExited` / `closedDescendantSet`，不伪造 `containerRemoved`。
+- 容器 CPU/内存上限、网络隔离、跨架构与跨机网络。
+- 独立新容器复核降为新进程冻结副本复核。它仍使用内存中的原始 oracle、CAS hash、独立 cwd、最小环境和实际 TAP/退出码，并在复核后检查 oracle、snapshot 和 CAS hash；同 UID 的运行时与 oracle 防篡改隔离未覆盖。
+
+正常、超时、中断均停止本轮协调端与节点后代，再只读查询会话库，执行最终凭据扫描。收尾删除 `local-runtime/`，确认进程无残留并记录临时目录移除；`--keep` 或失败保留的 proof 证据不算运行目录。专用自测将每次保留的 proof 移至 `.acceptance-proof/local-process-<时间戳>/`，同时保存各场景状态与耗时，TMPDIR 下不保留这些 proof。Linux 首次验收需确认 ps 格式、信号权限、回环端口、SQLite 锁与 Node 版本，并记录实际 OS/架构、CPU 配额及耗时；macOS 通过不能代替 Linux 实机验证。

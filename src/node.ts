@@ -72,6 +72,8 @@ export class CoordinatorUnavailable extends Error {
   }
 }
 
+export class CoordinatorShuttingDown extends Error {}
+
 class CoordinatorSessionExpired extends Error {}
 
 export function nodeReconnectDelay(attempt: number, random = Math.random()): number {
@@ -493,18 +495,20 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
       body: JSON.stringify(body)
     });
     const length = Number(response.headers.get("content-length") ?? "0");
-    if ([502, 503, 504].includes(response.status)) {
+    const mailboxShutdown = response.status === 503 &&
+      ["/api/nodes/mailbox/poll", "/api/nodes/mailbox/upload", "/api/nodes/mailbox/ack"].includes(path);
+    if ([502, 503, 504].includes(response.status) && !mailboxShutdown) {
       controller.abort();
       await response.body?.cancel().catch(() => undefined);
       throw new CoordinatorUnavailable();
     }
-    if ((!response.ok && response.status !== 409) || (Number.isFinite(length) && length > BODY_LIMIT)) {
+    if ((!response.ok && response.status !== 409 && !mailboxShutdown) || (Number.isFinite(length) && length > BODY_LIMIT)) {
       controller.abort();
       await response.body?.cancel().catch(() => undefined);
-      throw genericError();
+      throw mailboxShutdown ? new CoordinatorUnavailable() : genericError();
     }
     reader = response.body?.getReader();
-    if (!reader) throw genericError();
+    if (!reader) throw mailboxShutdown ? new CoordinatorUnavailable() : genericError();
     const chunks: Uint8Array[] = [];
     let size = 0;
     while (true) {
@@ -514,13 +518,19 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
       if (size > BODY_LIMIT) {
         controller.abort();
         await reader.cancel().catch(() => undefined);
-        throw genericError();
+        throw mailboxShutdown ? new CoordinatorUnavailable() : genericError();
       }
       chunks.push(next.value);
     }
     bodyComplete = true;
     let parsed: unknown;
-    try { parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")); } catch { throw genericError(); }
+    try { parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")); }
+    catch { throw mailboxShutdown ? new CoordinatorUnavailable() : genericError(); }
+    if (mailboxShutdown) {
+      if (object(parsed) && exactKeys(parsed, ["error", "code"]) && typeof parsed.error === "string" &&
+          parsed.code === "coordinator_shutting_down") throw new CoordinatorShuttingDown();
+      throw new CoordinatorUnavailable();
+    }
     if (response.status === 409) {
       if (!object(parsed) || !exactKeys(parsed, ["error"]) || typeof parsed.error !== "string") throw genericError();
       if (["Node session is fenced; stop local work and isolate this node",
@@ -531,7 +541,7 @@ export async function fetchJson(base: URL, path: string, token: string, body: un
     }
     return parsed;
   } catch (error) {
-    if (error instanceof CoordinatorConflict || error instanceof CoordinatorSessionExpired || error instanceof CoordinatorUnavailable) throw error;
+    if (error instanceof CoordinatorConflict || error instanceof CoordinatorSessionExpired || error instanceof CoordinatorUnavailable || error instanceof CoordinatorShuttingDown) throw error;
     controller.abort();
     if (reader && !bodyComplete) await reader.cancel().catch(() => undefined);
     if (!signal?.aborted && (timedOut || transportFailure(error))) throw new CoordinatorUnavailable();
@@ -958,10 +968,10 @@ export async function runNode(options: NodeOptions): Promise<void> {
           try {
             progress = await exchangeWorkerMailbox(options.coordinator, token, supervisor.mailbox, binding, cycleSignal) || progress;
           } catch (error) {
-            if (!(error instanceof CoordinatorConflict) && !(error instanceof LocalMailboxFence)) throw error;
+            if (!(error instanceof CoordinatorConflict) && !(error instanceof LocalMailboxFence) && !(error instanceof CoordinatorShuttingDown)) throw error;
             mailboxFencedBindings.add(binding.runtimeId);
             let stopReason: RuntimeStopReason = "unexpected";
-            if (error instanceof CoordinatorConflict) {
+            if (error instanceof CoordinatorConflict || error instanceof CoordinatorShuttingDown) {
               // A mailbox fence can precede the regular stop-directive poll.
               // A session fence ends this cycle; other protocol failures remain fatal.
               const response = await fetchJson(coordinator, "/api/nodes/runtimes/poll", token, {

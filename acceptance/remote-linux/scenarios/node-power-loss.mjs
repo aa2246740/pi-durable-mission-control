@@ -92,7 +92,10 @@ export function assertRestartedNode(machine, node, before) {
 export function assertNodePowerLoss(evidence, records) {
   const { detail, runtimes, transport, machine, node } = evidence.final;
   assert.equal(evidence.kill.signal, "SIGKILL");
-  assert.equal(evidence.kill.containerRemoved, true, "Whole node container did not exit");
+  if (evidence.kill.backend === "local-process") {
+    assert.equal(evidence.kill.processesExited, true, "Whole node process set did not exit");
+    assert.equal(evidence.kill.closedDescendantSet, true, "Descendant set was not closed before kill");
+  } else assert.equal(evidence.kill.containerRemoved, true, "Whole node container did not exit");
   assert.ok(Number.isFinite(evidence.lossObservedMs) && evidence.lossObservedMs >= 0);
   assertLostOwnership(evidence.lost.detail, evidence.lost.runtimes, evidence.lost.machine, evidence.before);
   assertRestartedNode(evidence.restarted.machine, evidence.restarted.node, evidence.before);
@@ -120,7 +123,7 @@ export function createNodePowerLossScenario(home) {
   const evidence = { humanActions: [], nodeHome: join(home, "state"), leaseMs: 20000, leaseOverride: false };
   let context, killedHandle;
   const save = () => context.save("node-power-loss.json", evidence);
-  const guest = async () => JSON.parse(await context.exec(["exec", context.containerName, "node", "-e", nodeEvidenceSource()]));
+  const guest = async () => context.local ? context.local.nodeEvidence() : JSON.parse(await context.exec(["exec", context.containerName, "node", "-e", nodeEvidenceSource()]));
   const state = async (read = context.api) => ({
     detail: await read(`/api/missions/${context.missionId}`),
     runtimes: await read(`/api/missions/${context.missionId}/runtimes`),
@@ -143,7 +146,7 @@ export function createNodePowerLossScenario(home) {
   return {
     evidence,
     mountArgs() { mkdirSync(home, { recursive: true, mode: 0o700 }); return ["-v", `${home}:/node-home`, "--env", "MC_ACCEPTANCE_NODE_HOME=/node-home/state"]; },
-    configure(value) { context = value; save(); },
+    configure(value) { context = value; if (context.local) evidence.nodeHome = context.local.home; save(); },
     expectsExit(handle) { return handle === killedHandle; },
     async execute() {
       let readyAt;
@@ -155,6 +158,16 @@ export function createNodePowerLossScenario(home) {
         readyAt ??= Date.now();
         return Date.now() - readyAt >= 500;
       });
+      if (context.local) {
+        await context.local.freezeNode();
+        // Requests already in transit can reach the fake provider after the node
+        // is stopped. Include those records in the fault-boundary snapshot.
+        let count = context.records.length, stableAt = Date.now();
+        await context.wait(() => {
+          if (context.records.length !== count) { count = context.records.length; stableAt = Date.now(); }
+          return Date.now() - stableAt >= 500;
+        });
+      }
       const before = await state();
       assert.equal(before.runtimes.length, 1);
       assert.equal(before.runtimes[0].state, "running");
@@ -163,14 +176,18 @@ export function createNodePowerLossScenario(home) {
       assert.equal(evidence.before.activity.effectIds.length, 2);
       killedHandle = context.getNode();
       const killedAt = Date.now();
-      evidence.kill = { containerName: context.containerName, signal: "SIGKILL", attemptedAt: new Date(killedAt).toISOString(), command: ["kill", "--signal", "KILL", context.containerName] };
+      evidence.kill = { signal: "SIGKILL", attemptedAt: new Date(killedAt).toISOString(),
+        ...(context.local ? { backend: "local-process", command: ["freeze-and-kill-owned-descendants"] } : { containerName: context.containerName, command: ["kill", "--signal", "KILL", context.containerName] }) };
       save();
-      await context.exec(evidence.kill.command);
-      await context.wait(async () => {
-        const names = (await context.exec(["list", "--all", "--quiet"])).trim().split(/\s+/);
-        return !names.includes(context.containerName) && (killedHandle.child.exitCode !== null || killedHandle.child.signalCode !== null);
-      });
-      evidence.kill.containerRemoved = true;
+      if (context.local) Object.assign(evidence.kill, await context.local.killNode());
+      else {
+        await context.exec(evidence.kill.command);
+        await context.wait(async () => {
+          const names = (await context.exec(["list", "--all", "--quiet"])).trim().split(/\s+/);
+          return !names.includes(context.containerName) && (killedHandle.child.exitCode !== null || killedHandle.child.signalCode !== null);
+        });
+        evidence.kill.containerRemoved = true;
+      }
       evidence.kill.completedAt = new Date().toISOString();
       evidence.kill.exitCode = killedHandle.child.exitCode;
       evidence.kill.output = killedHandle.output();
@@ -184,9 +201,9 @@ export function createNodePowerLossScenario(home) {
       });
       evidence.lossObservedMs = Date.now() - killedAt;
       evidence.lossObservedAt = new Date().toISOString();
-      evidence.journalAfterKill = readNodeJournal(join(home, "state"));
+      evidence.journalAfterKill = readNodeJournal(context.local?.home ?? join(home, "state"));
       save();
-      evidence.restart = { attemptedAt: new Date().toISOString(), machineId: context.machineId, nodeHome: join(home, "state"), sameTokenViaStdin: true };
+      evidence.restart = { attemptedAt: new Date().toISOString(), machineId: context.machineId, nodeHome: context.local?.home ?? join(home, "state"), sameTokenViaStdin: true };
       save();
       context.startNode();
       const first = await context.wait(async () => {
@@ -234,7 +251,7 @@ export function createNodePowerLossScenario(home) {
         try { evidence.final.node = await guest(); }
         catch (error) {
           evidence.nodeReadError = error.message;
-          try { evidence.persistedJournal = readNodeJournal(join(home, "state")); }
+          try { evidence.persistedJournal = readNodeJournal(context.local?.home ?? join(home, "state")); }
           catch (journalError) { evidence.journalReadError = journalError.message; }
         }
         context.save("mission.json", evidence.final.detail);

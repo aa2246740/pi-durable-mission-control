@@ -217,3 +217,16 @@ test("power-loss driver kills the node once, restarts with the same home and rec
   assert.equal(saved["node-power-loss.json"].humanActions[1].status, 409);
   assert.equal(saved["node-power-loss.json"].restart.nodeHome, home);
 });
+
+
+test("local node loss requires a closed, exited process set without pretending a container was removed", () => {
+  const { evidence, records } = fixture();
+  evidence.kill = { backend: "local-process", signal: "SIGKILL", processesExited: true, closedDescendantSet: true };
+  assert.equal(assertNodePowerLoss(evidence, records).recoverable, false);
+  for (const key of ["processesExited", "closedDescendantSet"]) {
+    const bad = structuredClone(evidence); bad.kill[key] = false;
+    assert.throws(() => assertNodePowerLoss(bad, records));
+  }
+  const container = structuredClone(evidence); delete container.kill.backend;
+  assert.throws(() => assertNodePowerLoss(container, records), /Whole node container/);
+});
