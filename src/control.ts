@@ -331,6 +331,20 @@ export function tryAcquireDaemonOwnership(home: string): DatabaseSync | undefine
   }
 }
 
+function parityExecutableDownlink(payload: WorkerEnvelope["payload"]): boolean {
+  if (payload.kind === "deliver" || payload.kind === "approved-effect") return true;
+  if (payload.kind === "abort" || payload.kind === "shutdown" || payload.kind === "notice" || payload.kind === "rpc") return false;
+  if (payload.kind !== "reply" || !payload.ok) return payload.kind === "reply" ? false : true;
+  const result = payload.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return true;
+  const record = result as { [key: string]: unknown };
+  if (Object.hasOwn(record, "effectPermit")) return true;
+  const keys = Object.keys(record);
+  if (record.status === "pending" && typeof record.approvalId === "string" && keys.length === 2) return false;
+  if (record.recorded === true && keys.every((key) => key === "recorded" || key === "late")) return false;
+  return true;
+}
+
 export class ControlPlane {
   readonly mcpRuntime = new McpRuntimeManager();
   readonly home: string;
@@ -884,7 +898,11 @@ export class ControlPlane {
 
   nodeRuntimePoll(machineId: string, token: string, sessionId: string, sessionEpoch: number, stopRuntimeId?: string): { directives: RemoteRuntimeDirective[] } {
     this.machineRegistry.requireSession(machineId, token, sessionId, sessionEpoch);
-    return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch, stopRuntimeId) };
+    return { directives: this.remoteRuntimes.poll(machineId, sessionId, sessionEpoch, stopRuntimeId, (row) => {
+      if (row.desired !== "run") return true;
+      const agent = this.getAgent(row.agent_id);
+      return !agent || !this.missionParityExecutionBlocked(agent.missionId);
+    }) };
   }
 
   nodeEffectReceipt(machineId: string, token: string, sessionId: string, sessionEpoch: number, value: unknown): NodeEffectAck {
@@ -1416,7 +1434,9 @@ export class ControlPlane {
 
   nodeWorkerPoll(machineId: string, token: string, sessionId: string, sessionEpoch: number, rawBinding: unknown): { envelopes: readonly WorkerEnvelope[] } {
     const binding = this.authorizeWorkerMailbox(machineId, token, sessionId, sessionEpoch, rawBinding);
-    return { envelopes: this.workerMailbox.pending(binding, 1) };
+    const agent = this.getAgent(binding.agentId);
+    const parity = Boolean(agent && this.missionParityExecutionBlocked(agent.missionId));
+    return { envelopes: this.workerMailbox.pending(binding, 1, parity ? (envelope) => !parityExecutableDownlink(envelope.payload) : undefined) };
   }
 
   /**
@@ -3092,6 +3112,7 @@ export class ControlPlane {
   }
 
   dispatchRemoteOutbox(row: OutboxRow, message: Message, agent: Agent): boolean {
+    if (this.missionParityExecutionBlocked(row.mission_id)) return false;
     return this.transaction(() => {
       const freshAgent = this.getAgent(agent.id);
       const freshMessage = this.message(message.id);
@@ -4213,6 +4234,9 @@ export class ControlPlane {
     if (!row) throw new HttpError(404, "Approval not found");
     const previous = decode<Approval>(row.data);
     if (previous.remoteEffectBinding) {
+      if (this.missionParityExecutionBlocked(previous.missionId) && (previous.status === "pending" || previous.status === "approved")) {
+        throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
+      }
       this.reconcileRemoteEffectApprovals();
       const current = this.db.prepare("SELECT data FROM approvals WHERE id=?").get(id) as Row | undefined;
       if (!current) throw new HttpError(404, "Approval not found");
@@ -5302,6 +5326,7 @@ export class ControlPlane {
             `Remote approval ${approval.id} became stale before dispatch; no effect was sent.`);
         });
       } else if (approval.status === "approved") {
+        if (this.missionParityExecutionBlocked(approval.missionId)) continue;
         try {
           this.dispatchRemoteEffectApproval(approval);
         } catch (error) {
@@ -5328,6 +5353,7 @@ export class ControlPlane {
   }
 
   private dispatchRemoteEffectApproval(approval: Approval): void {
+    if (this.missionParityExecutionBlocked(approval.missionId)) return;
     const remote = approval.remoteEffectBinding;
     if (!remote || !this.remoteEffectApprovalCurrent(approval)) return;
     const binding = remote.spec.binding;

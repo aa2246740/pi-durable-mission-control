@@ -737,21 +737,26 @@ export class DurableWorkerMailbox {
     return freeze(this.atomic(() => this.enqueueWithinTransaction(binding, payload, messageId)));
   }
 
-  pending(value: WorkerBinding, limit = 32): readonly WorkerEnvelope[] {
+  pending(value: WorkerBinding, limit = 32, include?: (envelope: WorkerEnvelope) => boolean): readonly WorkerEnvelope[] {
     checkLimit(limit);
     const binding = this.checkedBinding(value);
     return freeze(this.atomic(() => {
       this.openRow(binding);
       const rows = this.db.prepare(
-        "SELECT message_id,runtime_id,sequence,sha256,envelope_json,status,source_inbox_id FROM worker_mailbox_outbox WHERE runtime_id=? AND status IN ('queued','offered') ORDER BY sequence LIMIT ?"
-      ).all(binding.runtimeId, limit) as OutboxRow[];
+        "SELECT message_id,runtime_id,sequence,sha256,envelope_json,status,source_inbox_id FROM worker_mailbox_outbox WHERE runtime_id=? AND status IN ('queued','offered') ORDER BY sequence"
+      ).all(binding.runtimeId) as OutboxRow[];
+      const selected: OutboxRow[] = [];
       for (const row of rows) {
+        const parsed = this.outboxRow(row);
+        if (include && !include(parsed.envelope)) break;
+        if (selected.length >= limit) break;
         if (row.status === "queued") {
           this.db.prepare("UPDATE worker_mailbox_outbox SET status='offered' WHERE message_id=? AND status='queued'")
             .run(row.message_id);
         }
+        selected.push({ ...row, status: row.status === "queued" ? "offered" : row.status });
       }
-      return rows.map((row) => this.outboxRow({ ...row, status: row.status === "queued" ? "offered" : row.status }));
+      return selected.map((row) => this.outboxRow(row));
     }).map((row) => row.envelope));
   }
 

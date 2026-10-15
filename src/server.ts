@@ -190,6 +190,11 @@ export async function startServer(options: ServerOptions) {
     try {
       response.setHeader("x-content-type-options", "nosniff");
       response.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'");
+      try {
+        nodeRoute = new URL(request.url ?? "/", "http://127.0.0.1").pathname.startsWith("/api/nodes/");
+      } catch {
+        nodeRoute = false;
+      }
       if (!isLocalHost(request.headers.host)) throw new HttpError(403, "Host is not a loopback host");
       const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
       const origin = request.headers.origin;
