@@ -153,8 +153,8 @@ test("rehearsal worker starts its attempt, reads a denied publication, and retri
 });
 
 
-test("rehearsal validator executes a quote-equivalent frozen command", () => {
-  const acceptanceCommand = frozenAcceptanceCommand({ path: "/host/totals.acceptance.test.mjs", sha256: "a".repeat(64) });
+test("rehearsal validator executes a shell-equivalent frozen command", () => {
+  const acceptanceCommand = frozenAcceptanceCommand({ entry: { path: "/host/run-frozen-acceptance.mjs" } });
   const body = { tools: [{ function: { name: "RunValidation" } }], messages: [
     { role: "assistant", tool_calls: [{ id: "state", function: { name: "GetMissionState", arguments: "{}" } }] },
     { role: "tool", tool_call_id: "state", content: JSON.stringify({ mission: {}, tasks: [{ id: "t", status: "review" }], artifacts: [{ id: "a", taskId: "t" }] }) }
@@ -167,9 +167,9 @@ test("rehearsal validator executes a quote-equivalent frozen command", () => {
   assert.equal(acceptanceCommandMatch(acceptanceCommand, call.args.command), "shell-equivalent");
 });
 
-test("rehearsal orchestrator recognizes failure of a quote-equivalent frozen command", () => {
-  const acceptanceCommand = frozenAcceptanceCommand({ path: "/host/totals.acceptance.test.mjs", sha256: "a".repeat(64) });
-  const command = acceptanceCommand.replaceAll("'\\''", "'\"'\"'");
+test("rehearsal orchestrator recognizes failure of a shell-equivalent frozen command", () => {
+  const acceptanceCommand = frozenAcceptanceCommand({ entry: { path: "/host/run-frozen-acceptance.mjs" } });
+  const command = ` ${acceptanceCommand} `;
   const body = { messages: [
     { role: "assistant", tool_calls: [{ id: "state", function: { name: "GetMissionState", arguments: "{}" } }] },
     { role: "tool", tool_call_id: "state", content: JSON.stringify({ tasks: [{ status: "blocked" }], validationReceipts: [{ command, exitCode: 1 }] }) }
