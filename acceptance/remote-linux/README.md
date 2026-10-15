@@ -333,7 +333,7 @@ runner 默认在 TMPDIR 下创建权限 0700 的独占 proof，拒绝复用已�
 
 上述场景均可在两个平台运行；`--real` 仍只接受 default。真正模型调用需要另外提供凭据和授权，彩排不验证模型能力、真实计费和生产网络。
 
-本机 graceful restart 会等全部 agent 空闲、mailbox 静止，再把 SIGTERM 对齐到下一次真实 runtime poll 到达 relay 的时刻。relay 暂存该请求，等待协调端实际持久化 `coordinator_stopping`，随后转发原请求取得停止指令；不生成停止回报或修改持久化状态。`node-relay.json` 只记录请求路径、状态码和时刻。这个同步针对本次发现的产品时序问题：关闭时 mailbox poll 返回 503，可让节点进入重试并错过默认 5 秒停止期限。任意时刻 SIGTERM 的恢复能力仍需产品另行修复与验收；本场景证明上述受控边界。本机恢复完成等待为 30 秒，容器仍为 10 秒；最终恢复、epoch 和禁止重放断言不变。容器场景不使用该同步。
+本机 graceful restart 会等全部 agent 空闲、mailbox 静止，再经过独立于 runtime poll 的偏移发送 SIGTERM。默认偏移为 0..250ms；专用关闭回归在两个后端各使用 0、37、131ms 三个偏移，并加入一次 SIGKILL 对照。relay 立即转发请求，`node-relay.json` 只记录请求路径、状态码和时刻。关闭期间经过认证的 mailbox 503 携带 `coordinator_shutting_down`，节点据此查询匹配的停止指令，并在同一会话上继续上报停止结果。产品默认停止期限仍为 5 秒；本机完整恢复窗口为 30 秒，容器为 10 秒。验收继续核对新 runtime 的 epoch 增长、旧 mailbox/effect 保持不变和投递不重放。
 
 故障控制通过 `ps` 递归跟踪本轮进程身份与进程组，Linux 额外核对 `/proc/<pid>/stat` 的启动 tick；macOS 使用 `ps` 的启动时间、命令与进程组。整节点故障先暂停 supervisor/祖先进程，再反复发现并暂停后代，直到连续核对全部为停止态，随后重读身份并分别 SIGKILL，包括自行 detached 的 worker、shell 和后代。进程组中存在非本轮进程、身份变化或无法封闭后代集合都会失败。这里只控制正常产品进程的派生关系，不提供针对恶意双重 fork/逃逸程序的安全沙箱。
 
