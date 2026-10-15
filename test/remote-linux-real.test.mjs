@@ -4,8 +4,9 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assertCoordinatorExit, finalInterruption, missionOutcomeReady, stoppedRealRuntimes, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
-import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
+import { assertCoordinatorExit, finalInterruption, missionOutcomeReady, realAgentLocations, assertRealPublication, stoppedRealRuntimes, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
+import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, classifyOracleCommand, auditOracle, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
+import { rehearsalCall } from "../acceptance/remote-linux/fake-provider.mjs";
 import { sessionFailure, readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
 import { ControlPlane } from "../dist/control.js";
 import { shellQuote } from "../acceptance/remote-linux/mock.mjs";
@@ -242,6 +243,7 @@ test("real success gate rejects absent injection, changed CAS, wrong receipts an
     validationReceipts:[{id:"receipt-1",taskId:"task",validatorId:"v",command:"unit-command",artifactIds:["a"],artifactDigests:{a:digest},exitCode:0,snapshotIntegrity:true,workspaceKind:"remote-snapshot",stdout:"# tests 4\n# pass 4\n# fail 0",createdAt:"2026-10-14T00:00:02Z"}]};
   const evidence = {tools:[],oracleTouches:[],hostRuntime:{beforeSha256:digest,afterSha256:digest},independentReview:{artifactId:"a",artifactSha256:digest,casSha256:digest,acceptanceSha256:digest,tests:4,receiptId:"receipt-1",receiptPassed:true,agreesWithReceipt:true,passed:true},acceptance:{sha256:digest,tests:4,checks:[{phase:"publication",intact:true},{phase:"receipt",receiptId:"receipt-1",intact:true}]},mutation:{artifactId:"a",beforeSha256:digest,afterSha256:"b".repeat(64),casBeforeSha256:digest,casAfterSha256:digest,casFinalSha256:digest,completedAt:"2026-10-14T00:00:01Z"}};
   assert.doesNotThrow(()=>assertRealSuccess(detail,evidence,"unit-command","linux"));
+  assert.doesNotThrow(()=>assertRealSuccess(detail,{...evidence,oracleReads:[{agentId:"o",source:"shell_evidence",seq:1,command:"cat totals.acceptance.test.mjs"}]},"unit-command","linux"));
   const extra = [{id:"idle",status:"ready",attempt:0},{id:"cancelled",status:"cancelled",attempt:1}];
   assert.doesNotThrow(()=>assertRealSuccess({...detail,tasks:[...detail.tasks,...extra]},evidence,"unit-command","linux"));
   assert.doesNotThrow(()=>assertRealSuccess({...detail,artifacts:[{id:"wrong",path:"/work/wrong.mjs"},...detail.artifacts]},evidence,"unit-command","linux"));
@@ -309,12 +311,94 @@ test("frozen command checks its embedded digest before tests, including paths wi
 
 test("oracle audit detects all local shell records and proof-directory mutations", () => {
   const path = "/host/proof/totals.acceptance.test.mjs";
-  for (const command of [`cat '${path}'`,"cat totals.acceptance.test.mjs", "chmod -R u+w /host/proof", "chflags nouchg '/host/proof'", "cd /host/proof && printf bad > other", "chmod -R u+w $HOME", "chflags nouchg ${TMPDIR}", "echo x > ~/other"]) assert.equal(touchedOracle(command,path),true,command);
+  for (const command of ["chmod -R u+w /host/proof", "chflags nouchg '/host/proof'", "cd /host/proof && printf bad > other", "chmod -R u+w $HOME", "chflags nouchg ${TMPDIR}", "echo x > ~/other"]) assert.equal(touchedOracle(command,path),true,command);
   for (const command of ["node --test totals.unit.test.mjs", "chmod 600 /work/totals.mjs", "ls /host/proof"]) assert.equal(touchedOracle(command,path),false,command);
   const exported = {agents:[{id:"o",machineId:"local"},{id:"v",machineId:"local"},{id:"w",machineId:"linux"}],
     events:[{type:"shell_evidence",agentId:"o",seq:1,data:{command:`chflags nouchg '${path}'`}},{type:"shell_evidence",agentId:"w",seq:2,data:{command:`cat ${path}`}}],
     transcripts:[{agentId:"v",entries:[{id:"t",role:"tool",text:JSON.stringify({command:"chmod -R u+w /host/proof",exitCode:0})},{role:"tool",text:"plain tool result"},{role:"assistant",text:JSON.stringify({command:`cat ${path}`})}]}]};
   assert.deepEqual(oracleTouches(exported,path).map((record)=>record.agentId),["o","v"]);
+});
+
+test("oracle audit allows only explicit read commands and read-only pipelines", () => {
+  const path = "/host/proof/totals.acceptance.test.mjs";
+  const commands = [
+    `cat '${path}'`, 'cat "totals.acceptance.test.mjs"', `head -n 20 ${path}`, `tail -n 10 ${path}`,
+    `less -N ${path}`, `more ${path}`, `wc -l ${path}`, `grep -n total ${path}`, `rg --line-number total ${path}`,
+    `sha256sum ${path}`, `shasum -a 256 ${path}`, `stat -f %Sp ${path}`, `ls -l ${path}`, `file ${path}`,
+    `sed -n '1,20p' ${path}`, `cat ${path} | grep total | wc -l`, `cat ${path} | sed -n '1p'`,
+    `node --test ${path}`, `${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(path)}`,
+    'cat "$HOME/totals.acceptance.test.mjs"', 'head "${TMPDIR}/totals.acceptance.test.mjs"',
+    'cat ~/totals.acceptance.test.mjs', 'cat ./totals.acceptance.test.mjs', 'cat ../proof/totals.acceptance.test.mjs',
+    `c"at" /host/proof/totals.acceptance."test".mjs`, `/bin/cat ${path}`
+  ];
+  for (const command of commands) {
+    assert.equal(classifyOracleCommand(command,path),"read",command);
+    assert.equal(touchedOracle(command,path),false,command);
+  }
+});
+
+test("oracle audit refuses mutations, executable options and uncertain shell syntax", () => {
+  const path = "/host/proof/totals.acceptance.test.mjs";
+  const commands = [
+    ...["chmod 600", "chflags nouchg", "chown nobody", "rm", "mv", "cp", "ln", "install", "truncate -s 0", "touch", "tee", "perl -i -pe 1", "python3 -c pass", "node -e 0", "eval cat"].map((prefix) => `${prefix} ${path}`),
+    `cat ${path} | tee /tmp/copy`, `cat ${path} && rm ${path}`, `cat ${path} && wc -l ${path}`,
+    `cat ${path} > /tmp/copy`, `cat ${path} >> /tmp/copy`, `cat ${path} 2>/tmp/log`, `cat ${path} <> /tmp/file`,
+    `cat $(cat ${path})`, `cat \`cat ${path}\``, `cat ${path}; touch /tmp/file`, `cat ${path}\nrm ${path}`,
+    `cat ${path} |`, `cat ${path} || wc -l`, `cat '${path}`, `cat ${path} # comment`,
+    `sed -i '' 1p ${path}`, `sed 'w /tmp/copy' ${path}`, `sed 'e touch /tmp/copy' ${path}`, `sed 's/a/b/e' ${path}`,
+    `sed -f /tmp/script ${path}`, `sed -n '1p' --in-place ${path}`, `rg --pre /tmp/program total ${path}`,
+    `rg --hostname-bin=/tmp/program total ${path}`, `file -C ${path}`, `less -o/tmp/copy ${path}`, `less +s/tmp/copy ${path}`,
+    `node --test --require /tmp/script ${path}`, `node --test --test-reporter-destination=/tmp/copy ${path}`,
+    `node --test /tmp/script.mjs ${path}`, `/tmp/cat ${path}`, `env cat ${path}`,
+    "node --test /untrusted/totals.acceptance.test.mjs", `constructor ${path}`, `__proto__ ${path}`,
+    'chmod 600 "$HOME/totals.acceptance.test.mjs"', 'rm "${HOME}/totals.acceptance.test.mjs"',
+    'cp ../proof/totals.acceptance.test.mjs ./copy', 'cat ./totals.acceptance.test.mjs | python3 -c pass',
+    'cat totals.acceptance.test.mjs > "$HOME/other"', 'rm totals.acceptance."test".mjs',
+    String.raw`rm totals.acceptance.test.\mjs`, 'cat "$UNKNOWN/totals.acceptance.test.mjs"'
+  ];
+  for (const command of commands) assert.equal(classifyOracleCommand(command,path),"touch",command);
+});
+
+test("oracle evidence separates local shell and tool reads from writes with source identifiers", () => {
+  const path = "/host/proof/totals.acceptance.test.mjs";
+  const entry = (id, data, role = "tool") => ({id,role,text:JSON.stringify(data)});
+  const exported = {mission:{},artifacts:[],validationReceipts:[],blockers:[],agents:[{id:"o",kind:"orchestrator",machineId:"local"},{id:"w",kind:"worker",machineId:"linux"}],
+    events:[{type:"shell_evidence",agentId:"o",seq:1,data:{command:`cat ${path}`}},{type:"shell_evidence",agentId:"o",seq:2,data:{command:`cat ${path} > /tmp/copy`}},{type:"shell_evidence",agentId:"w",seq:3,data:{command:`rm ${path}`}}],
+    transcripts:[{agentId:"o",entries:[
+      entry("read",{name:"read_file",args:{path}}), entry("write",{name:"write_file",args:{path,content:"new test",command:`cat ${path}`}}),
+      entry("bash-read",{command:`sha256sum ${path}`,exitCode:0}), entry("bash-write",{name:"bash",args:{command:`sed -i '' 1p ${path}`}}),
+      entry("unknown",{path,content:"ambiguous"}), entry("proof-write",{toolName:"write_file",input:{path:"/host/proof/summary.json",content:"forged"}}),
+      entry("relative-read",{method:"read_file",args:{path:"./totals.acceptance.test.mjs"}}),
+      entry("unrelated",{name:"write_file",args:{path:"/work/totals.mjs",content:path}}), entry("quoted",{command:`rm ${path}`},"assistant"),
+      entry("null",null), entry("invalid-args",{name:"read_file",args:null}), {id:"plain",role:"tool",text:"plain result"}
+    ]},{agentId:"w",entries:[entry("remote-write",{name:"write_file",args:{path,content:"remote"}})]}]};
+  const audit = auditOracle(exported,path);
+  assert.deepEqual(audit.oracleReads.map((record)=>record.seq ?? record.entryId),[1,"read","bash-read","relative-read"]);
+  assert.deepEqual(audit.oracleTouches.map((record)=>record.seq ?? record.entryId),[2,"write","bash-write","unknown","proof-write"]);
+  assert.deepEqual(audit.oracleReads[0],{agentId:"o",source:"shell_evidence",seq:1,command:`cat ${path}`});
+  assert.deepEqual(audit.oracleReads[1],{agentId:"o",source:"tool transcript",entryId:"read",tool:"read_file",path,command:`read_file ${shellQuote(path)}`});
+  assert.deepEqual(oracleTouches(exported,path),audit.oracleTouches);
+  const evidence = collectRealEvidence(exported,undefined,{path});
+  assert.deepEqual(evidence.oracleReads,audit.oracleReads);
+  assert.deepEqual(evidence.oracleTouches,audit.oracleTouches);
+});
+
+test("rehearsal orchestrator reads the frozen test once before creating work", () => {
+  const path = "/host/proof/totals.acceptance.test.mjs";
+  const acceptanceCommand = frozenAcceptanceCommand({path,sha256:"a".repeat(64)});
+  const body = {tools:["SpawnAgent","bash","CreateTask"].map((name)=>({function:{name}})),messages:[
+    {role:"system",content:"You coordinate a persistent Mission"},
+    {role:"assistant",tool_calls:[{id:"state",function:{name:"GetMissionState",arguments:"{}"}}]},
+    {role:"tool",tool_call_id:"state",content:JSON.stringify({mission:{acceptance:acceptanceCommand},roles:[],tasks:[],validationContract:{assertions:[]}})}
+  ]};
+  const read = rehearsalCall(body,{role:"orchestrator",acceptanceCommand});
+  assert.deepEqual(read,{role:"orchestrator",name:"bash",args:{command:`shasum -a 256 ${shellQuote(path)}`}});
+  assert.equal(classifyOracleCommand(read.args.command,path),"read");
+  body.messages.push({role:"assistant",tool_calls:[{id:"read",function:{name:read.name,arguments:JSON.stringify(read.args)}}]},
+    {role:"tool",tool_call_id:"read",content:JSON.stringify({exitCode:0})});
+  assert.equal(rehearsalCall(body,{role:"orchestrator",acceptanceCommand}).name,"CreateTask");
+  body.messages.at(-1).content = JSON.stringify({exitCode:1});
+  assert.throws(()=>rehearsalCall(body,{role:"orchestrator",acceptanceCommand}),/Frozen test read failed/);
 });
 
 test("final evidence scan runs after summary and every late file and fails the run on leakage", (t) => {
@@ -345,6 +429,9 @@ test("stopped export reads the product's actual late shell events and tool trans
     control.missionAction(mission.id,"start");
     const [agent] = control.listAgents(mission.id);
     before = control.exportMission(mission.id);
+    const read = await control.workerCommand({id:"oracle-read",token:"internal",agentId:agent.id,epoch:agent.epoch,method:"bash",args:{command:`cat ${shellQuote(acceptance.path)}`},taskId:"oracle-read"});
+    assert.equal(read.exitCode,0);
+    assert.equal(read.stdout,readFileSync(acceptance.path,"utf8"));
     const command = `chmod 600 ${shellQuote(acceptance.path)}; chmod 400 ${shellQuote(acceptance.path)}`;
     const receipt = await control.workerCommand({id:"oracle-unit",token:"internal",agentId:agent.id,epoch:agent.epoch,method:"bash",args:{command},taskId:"oracle-unit"});
     assert.equal(receipt.exitCode,0);
@@ -353,6 +440,7 @@ test("stopped export reads the product's actual late shell events and tool trans
   } finally { control.close(); }
   const refreshed = refreshStoppedExport(join(state,"control.sqlite"),before);
   assert.deepEqual(oracleTouches(refreshed,acceptance.path).map((record)=>record.source),["shell_evidence","tool transcript"]);
+  assert.deepEqual(auditOracle(refreshed,acceptance.path).oracleReads.map((record)=>record.source),["shell_evidence","tool transcript"]);
 });
 
 
@@ -510,6 +598,28 @@ test("acceptance waits for the last admitted turn and observes its eventual prod
     assert.equal(missionOutcomeReady({...denied,mission:{...denied.mission,status:"active",maxTurns:96},agents:[{status:"idle"}]}),false,"raising the budget makes old denial evidence stale");
     assert.equal(missionOutcomeReady({...admitted,mission:{...admitted.mission,status:"failed"}}),true);
   } finally { control.close(); }
+});
+
+test("real publication gate explains local-only completion and preserves agent locations", () => {
+  const detail = {mission:{status:"completed"},agents:[
+    {id:"o",kind:"orchestrator",machineId:"local",workspaceId:"host"},
+    {id:"w",kind:"worker",machineId:"local",workspaceId:"host"},
+    {id:"v",kind:"validator",machineId:"local",workspaceId:"host"}
+  ],artifacts:[{id:"local-artifact",agentId:"w"}]};
+  assert.deepEqual(realAgentLocations(detail),[
+    {agentId:"o",kind:"orchestrator",machineId:"local",workspaceId:"host"},
+    {agentId:"w",kind:"worker",machineId:"local",workspaceId:"host"},
+    {agentId:"v",kind:"validator",machineId:"local",workspaceId:"host"}
+  ]);
+  for (const id of [undefined,"local-artifact"]) assert.throws(()=>assertRealPublication(detail,id,"linux"),
+    {message:"No publication observed from a remote Linux worker on linux; worker locations: w: machineId=local, workspaceId=host"});
+  const remote = {...detail,agents:[...detail.agents,{id:"remote",kind:"worker",machineId:"linux",workspaceId:"guest"}],
+    artifacts:[...detail.artifacts,{id:"remote-artifact",agentId:"remote",remoteProvenance:{machineId:"linux"}}]};
+  assert.doesNotThrow(()=>assertRealPublication(remote,"remote-artifact","linux"));
+  assert.throws(()=>assertRealPublication(remote,undefined,"linux"),/w: machineId=local, workspaceId=host; remote: machineId=linux, workspaceId=guest/);
+  assert.throws(()=>assertRealPublication(remote,"remote-artifact","another-linux"),/No publication observed/);
+  assert.throws(()=>assertRealPublication({...detail,agents:[]},undefined,"linux"),/worker locations: none/);
+  assert.deepEqual(realAgentLocations(undefined),[]);
 });
 
 test("real runtime stop gate accepts multiple workers and binds delivery to its exact runtime", () => {

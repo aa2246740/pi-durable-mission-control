@@ -57,6 +57,14 @@ export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementati
     if (state?.tasks.some((task) => task.status === "blocked") && state.validationReceipts?.some((receipt) => receipt.command === acceptanceCommand && receipt.exitCode !== 0)) {
       return { role, name: "RequestUserInput", args: { question: "Frozen business tests rejected the totals implementation; a correction is required." } };
     }
+    const history = transcript(body);
+    if (state && !history.some((result) => result.name === "bash")) {
+      const path = acceptanceCommand.match(/--test-reporter=tap (.+)$/)?.[1];
+      assert.ok(path, "Frozen test path missing from acceptance command");
+      assert.ok(body.tools.some((tool) => tool.function.name === "bash"), "Orchestrator is missing bash");
+      return { role, name: "bash", args: { command: `shasum -a 256 ${path}` } };
+    }
+    if (history.at(-1)?.name === "bash") assert.equal(history.at(-1).value.exitCode, 0, "Frozen test read failed");
     return nextCall(body, { acceptanceCommand });
   }
   const names = new Set(body.tools.map((tool) => tool.function.name));

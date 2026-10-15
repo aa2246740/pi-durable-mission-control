@@ -179,20 +179,90 @@ export function checkFrozenAcceptance(acceptance, phase, receiptId) {
   return check;
 }
 
-export function touchedOracle(command, acceptancePath) {
-  // Shell evidence is audited conservatively, including relative file references.
+function oracleReference(command, acceptancePath) {
+  // Keep the existing proof-directory audit even when a command only reads it.
   const directory = dirname(acceptancePath);
   const unquoted = command.replace(/["']/g, "").replace(/\$\{(?:HOME|TMPDIR)\}|\$(?:HOME|TMPDIR)\b|~(?=\/|\s|$)/g, directory);
-  return unquoted.includes(acceptancePath) || unquoted.includes("totals.acceptance.test.mjs") ||
-    (unquoted.includes(directory) && /\b(?:chmod|chflags|chown|rm|mv|cp|tee|touch|mkdir|rmdir|install|truncate|ln|sed|perl|python\d*|node)\b|>|write(?:File)?/i.test(unquoted));
+  const file = unquoted.replace(/\\/g, "").includes("totals.acceptance.test.mjs") || unquoted.includes(acceptancePath);
+  const directoryTouch = unquoted.includes(directory) && /\b(?:chmod|chflags|chown|rm|mv|cp|tee|touch|mkdir|rmdir|install|truncate|ln|sed|perl|python\d*|node)\b|>|write(?:File)?/i.test(unquoted);
+  return { file, directoryTouch };
 }
 
-export function oracleTouches(exported, acceptancePath) {
+function readOnlyPipeline(command, acceptancePath) {
+  // This is a deliberately small shell grammar, not a general shell parser.
+  // Unknown expansions, control operators and escapes never earn read permission.
+  const literal = command.replace(/\$\{(?:HOME|TMPDIR)\}|\$(?:HOME|TMPDIR)\b/g, dirname(acceptancePath));
+  if (/[\n\r\x00-\x08\x0b-\x1f\x7f$`\\;&<>(){}*?!#]/.test(literal)) return false;
+  const pipeline = [[]];
+  let word = "", quote = "", started = false;
+  const flush = () => { if (started) pipeline.at(-1).push(word); word = ""; started = false; };
+  for (const char of literal) {
+    if (quote) {
+      if (char === quote) quote = "";
+      else word += char;
+      started = true;
+    } else if (char === "'" || char === '"') { quote = char; started = true; }
+    else if (char === "|") { flush(); pipeline.push([]); }
+    else if (/\s/.test(char)) flush();
+    else { word += char; started = true; }
+  }
+  if (quote) return false;
+  flush();
+  return pipeline.every((words) => readOnlyCommand(words, acceptancePath));
+}
+
+const readOptions = {
+  cat: /^-(?:[benstuvAET]+|-show-all|-number|-squeeze-blank)$/, head: /^-(?:[nclqv]|\d+)$/, tail: /^-(?:[ncqv]|\d+)$/,
+  less: /^-[FNSXn]+$/, more: /^-(?:[dflpcsu]+|\d+)$/, wc: /^-[clmwL]+$/,
+  grep: /^-(?:[EFGivwnclhHosrq]+|[emABC]|-color=(?:never|always|auto))$/,
+  rg: /^-(?:[ivwnclHsoqUF]+|[emABC]|-no-heading|-fixed-strings|-line-number|-count|-files-with-matches|-color=(?:never|always|auto))$/,
+  sha256sum: /^-(?:[bctwz]+|-check|-status|-strict)$/, shasum: /^-(?:[abctw]+|-check|-status|-strict)$/,
+  stat: /^-[fctLx]+$/, ls: /^-[aAbBcCdDfFgGhHiklLmMnNopqQrRsStTuUvwx1]+$/, file: /^-(?:[bhiLNz]+|-mime|-mime-type|-brief)$/
+};
+
+function readOnlyCommand([executable, ...args], acceptancePath) {
+  if (!executable) return false;
+  const name = executable.replace(/^\/(?:usr\/)?bin\//, "");
+  if (name === "node" || executable === process.execPath) {
+    const operands = args.filter((arg) => !["--test", "--test-reporter=tap"].includes(arg));
+    return args.includes("--test") && operands.length === 1 && [acceptancePath, "totals.acceptance.test.mjs", "./totals.acceptance.test.mjs"].includes(operands[0]);
+  }
+  if (name === "sed") {
+    // sed can execute or write even without -i (e, w and s///e). Admit print only.
+    if (args[0] === "-n") args.shift();
+    if (args[0] === "-e") args.shift();
+    return /^(?:\d+(?:,\d+)?)?p$/.test(args[0] ?? "") && args.length >= 1 && args.slice(1).every((arg) => !arg.startsWith("-"));
+  }
+  if (["less", "more"].includes(name) && args.some((arg) => arg.startsWith("+"))) return false;
+  const options = Object.hasOwn(readOptions, name) ? readOptions[name] : undefined;
+  if (!options || args.length === 0) return false;
+  let operandsOnly = false;
+  return args.every((arg) => {
+    if (arg === "--") { operandsOnly = true; return true; }
+    return operandsOnly || !arg.startsWith("-") || arg === "-" || options.test(arg);
+  });
+}
+
+export function classifyOracleCommand(command, acceptancePath) {
+  const { file, directoryTouch } = oracleReference(command, acceptancePath);
+  if (file) return readOnlyPipeline(command, acceptancePath) ? "read" : "touch";
+  return directoryTouch ? "touch" : null;
+}
+
+export function touchedOracle(command, acceptancePath) {
+  return classifyOracleCommand(command, acceptancePath) === "touch";
+}
+
+export function auditOracle(exported, acceptancePath) {
   const local = new Set(exported.agents.filter((agent) => agent.machineId === "local").map((agent) => agent.id));
-  const commands = [];
+  const oracleReads = [], oracleTouches = [];
+  const recordCommand = (record) => {
+    const kind = classifyOracleCommand(record.command, acceptancePath);
+    if (kind) (kind === "read" ? oracleReads : oracleTouches).push(record);
+  };
   for (const event of exported.events ?? []) {
     if (event.type === "shell_evidence" && local.has(event.agentId) && typeof event.data?.command === "string") {
-      commands.push({ agentId: event.agentId, source: "shell_evidence", seq: event.seq, command: event.data.command });
+      recordCommand({ agentId: event.agentId, source: "shell_evidence", seq: event.seq, command: event.data.command });
     }
   }
   for (const transcript of exported.transcripts ?? []) {
@@ -201,10 +271,26 @@ export function oracleTouches(exported, acceptancePath) {
       if (entry.role !== "tool") continue;
       let data;
       try { data = JSON.parse(entry.text); } catch { continue; }
-      if (typeof data.command === "string") commands.push({ agentId: transcript.agentId, source: "tool transcript", entryId: entry.id, command: data.command });
+      if (!object(data)) continue;
+      const record = { agentId: transcript.agentId, source: "tool transcript", entryId: entry.id };
+      const tool = data.name ?? data.toolName ?? data.tool ?? data.method;
+      const args = data.args ?? data.arguments ?? data.input ?? data;
+      if (!object(args)) continue;
+      if (typeof args.command === "string" && !["read_file", "write_file"].includes(tool)) recordCommand({ ...record, command: args.command });
+      else if (typeof args.path === "string") {
+        const { file, directoryTouch } = oracleReference(args.path, acceptancePath);
+        const read = tool === "read_file";
+        if (file || directoryTouch || (!read && args.path.includes(dirname(acceptancePath)))) {
+          (read ? oracleReads : oracleTouches).push({ ...record, tool: tool ?? "unknown", path: args.path, command: `${tool ?? "unknown"} ${shellQuote(args.path)}` });
+        }
+      }
     }
   }
-  return commands.filter((record) => touchedOracle(record.command, acceptancePath));
+  return { oracleReads, oracleTouches };
+}
+
+export function oracleTouches(exported, acceptancePath) {
+  return auditOracle(exported, acceptancePath).oracleTouches;
 }
 
 export function realMission({ acceptanceCommand, localWorkspaceId, remoteWorkspaceId, roleIds }) {
@@ -244,7 +330,7 @@ export function collectRealEvidence(exported, mutation, acceptance, casHashes = 
     cost: exported.mission.costKnown ? exported.mission.cost : null, costKnown: exported.mission.costKnown,
     roles, agents, evidenceComplete: agents.every((agent) => agent.complete), tools,
     toolSequenceOrdering: "per-agent durable commit_seq, entry id and tool position; no cross-agent clock ordering", acceptance, mutation,
-    oracleTouches: oracleTouches(exported, acceptance.path),
+    ...auditOracle(exported, acceptance.path),
     artifacts: exported.artifacts.map((artifact) => ({ id: artifact.id, sha256: artifact.sha256, casSha256: casHashes[artifact.id] ?? null, snapshotPath: artifact.snapshotPath, remoteProvenance: artifact.remoteProvenance })),
     validationReceipts: exported.validationReceipts, blockers: exported.blockers };
 }
@@ -295,7 +381,7 @@ export function assertRealSuccess(detail, evidence, acceptanceCommand, machineId
   assert.match(receipt.stdout, /^# fail 0$/m);
   assertHostRuntime(evidence.hostRuntime);
   assertIndependentReview(evidence.independentReview, evidence.acceptance, artifact, receipt);
-  assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle was touched by a local shell command");
+  assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle modification or unverified access by a local tool");
   assert.ok(evidence.acceptance.checks.some((check) => check.phase === "publication"), "Publication hash check missing");
   assert.ok(evidence.acceptance.checks.some((check) => check.phase === "receipt" && check.receiptId === receipt.id), "Receipt hash check missing");
   assert.ok(evidence.acceptance.checks.every((check) => check.intact), "Frozen acceptance hash or permissions changed");
