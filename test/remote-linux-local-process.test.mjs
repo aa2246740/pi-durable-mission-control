@@ -48,6 +48,60 @@ test("process census distinguishes start identity and process group", () => {
   assert.equal(sameProcess(entry, { ...entry, pgid: entry.pgid + 1 }), false);
 });
 
+test("background process census leaves the relay event loop responsive while ps is pending", { timeout: 15000 }, async (t) => {
+  const proof = mkdtempSync(join(tmpdir(), "mc-census-")), bin = join(proof, "bin");
+  mkdirSync(bin);
+  const count = join(proof, "count"), pending = join(proof, "pending"), released = join(proof, "released"), finished = join(proof, "finished");
+  // A relay response releases the second ps. A synchronous observer can only
+  // serve that response after ps times out, making the failure deterministic.
+  writeFileSync(join(bin, "ps"), `#!${process.execPath}
+import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+const count = ${JSON.stringify(count)}, pending = ${JSON.stringify(pending)}, released = ${JSON.stringify(released)}, finished = ${JSON.stringify(finished)};
+const n = fs.existsSync(count) ? Number(fs.readFileSync(count, 'utf8')) + 1 : 1;
+fs.writeFileSync(count, String(n));
+if (n === 2) {
+  fs.writeFileSync(pending, 'pending');
+  const deadline = Date.now() + 2000;
+  while (!fs.existsSync(released) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  fs.writeFileSync(finished, 'finished');
+}
+process.stdout.write(execFileSync('/bin/ps', process.argv.slice(2)));
+`, { mode: 0o700 });
+  const runner = join(proof, "runner.mjs");
+  writeFileSync(runner, `
+import { createServer } from 'node:http';
+import { existsSync, writeFileSync } from 'node:fs';
+import { ProcessTree } from ${JSON.stringify(new URL("../acceptance/remote-linux/local-process.mjs", import.meta.url).href)};
+const tree = new ProcessTree(process.pid);
+const server = createServer((_request, response) => {
+  const censusFinished = existsSync(${JSON.stringify(finished)});
+  writeFileSync(${JSON.stringify(released)}, 'released');
+  clearInterval(tree.timer);
+  response.end(JSON.stringify({ censusFinished }));
+  server.close();
+});
+server.listen(0, '127.0.0.1', () => console.log(server.address().port));
+`);
+  const handle = childProcess(process.execPath, [runner], { PATH: `${bin}:${process.env.PATH}`, TMPDIR: proof });
+  t.after(async () => {
+    writeFileSync(released, "released");
+    handle.child.kill("SIGTERM");
+    await handle.done;
+    rmSync(proof, { recursive: true, force: true });
+  });
+  await wait(() => {
+    assert.equal(handle.child.exitCode, null, handle.output());
+    return existsSync(pending) && /^\d+/.test(handle.stdout());
+  });
+  const port = Number(handle.stdout().trim());
+  const response = await fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(5000) });
+  assert.deepEqual(await response.json(), { censusFinished: false }, "Relay was blocked until the process census finished");
+  await handle.done;
+  assert.equal(handle.child.exitCode, 0, handle.output());
+  assert.equal(readFileSync(count, "utf8"), "2", "Background process censuses overlapped");
+});
+
 test("whole-node kill closes descendants across detached process groups and preserves unrelated process", { timeout: 20000 }, async (t) => {
   const proof = temporary(t), ready = join(proof, "ready.json");
   const grandchild = `setInterval(()=>{},1000)`;

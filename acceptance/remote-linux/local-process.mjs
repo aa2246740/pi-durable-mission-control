@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { availableParallelism, totalmem } from "node:os";
 import { join } from "node:path";
@@ -28,8 +28,13 @@ const active = (entry) => entry && !/[ZX]/.test(entry.state);
 export const sameProcess = (a, b) => Boolean(a && b && a.pid === b.pid && a.identity === b.identity && a.pgid === b.pgid && a.command.join("\0") === b.command.join("\0"));
 
 // ps is available on both platforms. Linux adds the kernel start tick to avoid PID reuse.
+const censusArgs = ["-axo", "pid=,ppid=,pgid=,stat=,lstart=,args="];
+const censusOptions = () => ({ env: { PATH: process.env.PATH, LC_ALL: "C" }, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 export function readProcesses() {
-  const output = execFileSync("ps", ["-axo", "pid=,ppid=,pgid=,stat=,lstart=,args="], { env: { PATH: process.env.PATH, LC_ALL: "C" }, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  return parseProcesses(execFileSync("ps", censusArgs, censusOptions()));
+}
+
+function parseProcesses(output) {
   return output.split("\n").flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+((?:\S+\s+){4}\S+)\s+(.*)$/);
     if (!match) return [];
@@ -51,11 +56,26 @@ export class ProcessTree {
     this.owned = new Map();
     this.capture();
     assert.ok(this.owned.has(pid), "Started process identity missing");
-    this.timer = setInterval(() => { try { this.capture(); } catch (error) { this.error ??= error; } }, 50);
+    this.scanning = false;
+    // The relay and mock share this event loop. Background observation must not
+    // block their HTTP exchanges; fault injection still uses fresh sync captures.
+    this.timer = setInterval(() => {
+      if (this.scanning) return;
+      this.scanning = true;
+      execFile("ps", censusArgs, censusOptions(), (error, output) => {
+        this.scanning = false;
+        if (error) { this.error ??= error; return; }
+        try {
+          if (!this.observe(parseProcesses(output)).length) clearInterval(this.timer);
+        } catch (error) { this.error ??= error; }
+      });
+    }, 50);
     this.timer.unref();
   }
   capture() {
-    const entries = readProcesses();
+    return this.observe(readProcesses());
+  }
+  observe(entries) {
     const root = entries.find((entry) => entry.pid === this.pid);
     if (!this.owned.size && root) this.owned.set(root.pid, root);
     let changed;
