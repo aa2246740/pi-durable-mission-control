@@ -136,6 +136,8 @@ test("real protocol-3 node publishes a frozen artifact through authenticated HTT
   const detail = control.detail(mission.id);
   const artifact = detail.artifacts.find(item => item.taskId === task.id);
   assert.ok(artifact, nodeOutput);
+  assert.equal(artifact.path, "artifact.bin");
+  assert.equal(artifact.relativePath, "artifact.bin");
   assert.equal(artifact.remoteProvenance.taskAttempt, runningTask.attempt);
   assert.equal(artifact.sha256, createHash("sha256").update(original).digest("hex"));
   assert.equal(detail.events.filter(event => event.type === "artifact_published").length, 1);

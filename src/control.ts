@@ -42,6 +42,7 @@ import { MachineRegistry, type NodeCommand, type RemoteMachine } from "./machine
 import { DurableWorkerMailbox, parseWorkerBinding, parseWorkerReceipt, type MailboxSettlementAnswer, type MailboxSettlementQuery, type WorkerBinding, type WorkerEnvelope, type WorkerReceipt } from "./worker-mailbox.js";
 import { parseWorkerStartSpec, workerStartSpecHash } from "./node-worker-spec.js";
 import { RemoteRuntimeRegistry, type RemoteRuntimeDirective, type RemoteRuntimeRow } from "./remote-runtimes.js";
+import { normalizeRemoteArtifactPath, REMOTE_ARTIFACT_PATH_ERROR } from "./remote-artifact-path.js";
 import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 import { nodeEffectUpload, parseNodeEffectReceipt, parseNodeEffectUpload, parseNodeEffectSpec, type NodeEffectUpload, type NodeEffectAck } from "./node-effects.js";
 import { RemoteArtifactStore, parseRemoteArtifactManifest, remoteArtifactTransferId, type RemoteArtifactManifest } from "./remote-artifacts.js";
@@ -102,6 +103,14 @@ export class HttpError extends Error {
   constructor(status: number, message: string) {
     super(message);
     this.status = status;
+  }
+}
+
+// Only static, corrective admission messages may cross the remote worker boundary.
+export class RemoteEffectRejection extends HttpError {
+  constructor(status: 400 | 403 | 409, message: string) {
+    super(status, message);
+    this.name = "RemoteEffectRejection";
   }
 }
 
@@ -966,7 +975,7 @@ export class ControlPlane {
     }, () => {
       const artifact = this.remoteArtifacts.complete(auth.spec, auth.manifest, (snapshotPath, identity) => ({
         id: randomUUID(), missionId: auth.mission.id, agentId: auth.agent.id,
-        name: String(auth.spec.args.name), path: auth.manifest.sourcePath,
+        name: String(auth.spec.args.name), path: auth.manifest.relativePath,
         sha256: auth.manifest.sha256, size: auth.manifest.size, createdAt: now(),
         snapshotPath, taskId: auth.task.id, relativePath: auth.manifest.relativePath,
         remoteProvenance: {
@@ -3565,12 +3574,17 @@ export class ControlPlane {
       if (artifactPublication) {
         if (descriptor.artifactTransfers !== true || machine.capabilities?.artifactTransfers !== true ||
             machine.capabilities.protocol !== 3) throw new HttpError(409, "Remote artifact transfers were not negotiated for this worker");
-        if (role.kind !== "worker") throw new HttpError(403, "Only a task worker may publish a remote artifact");
-        if (typeof args.taskId !== "string" || !args.taskId.trim()) throw new HttpError(400, "Remote PublishArtifact requires taskId");
+        if (role.kind !== "worker") throw new RemoteEffectRejection(403, "Only a task worker may publish an artifact. Ask the owning worker to publish it.");
+        if (typeof args.taskId !== "string" || !args.taskId.trim()) throw new RemoteEffectRejection(400, "PublishArtifact requires taskId. Use GetMissionState to find your owned task ID.");
         const task = this.task(args.taskId);
-        if (!task || task.missionId !== mission.id || task.ownerId !== agent.id ||
-            !["ready", "assigned", "running", "review", "blocked"].includes(task.status)) {
-          throw new HttpError(409, "Remote artifact task is not owned by this worker");
+        if (!task || task.missionId !== mission.id || task.ownerId !== agent.id) {
+          throw new RemoteEffectRejection(409, "PublishArtifact taskId must identify a task owned by this worker. Use GetMissionState to find your assigned task.");
+        }
+        if (!["ready", "assigned", "running", "review", "blocked"].includes(task.status)) {
+          throw new RemoteEffectRejection(409, "PublishArtifact taskId must identify an active task. Check GetMissionState before publishing.");
+        }
+        if (!Number.isSafeInteger(task.attempt) || task.attempt <= 0) {
+          throw new RemoteEffectRejection(409, "Before PublishArtifact, use UpdateTask with your taskId and status=running to start the task attempt.");
         }
         taskAttempt = task.attempt;
       }
@@ -3580,13 +3594,25 @@ export class ControlPlane {
       if (Reflect.ownKeys(args).length !== keys.length || keys.some((key) => typeof args[key] !== "string") ||
           required.some((key) => !String(args[key]).trim()) ||
           keys.some((key) => Buffer.byteLength(String(args[key])) > (key === "command" ? 32000 : key === "content" ? 256 * 1024 : 4096))) {
-        throw new HttpError(400, "Invalid remote workspace effect arguments");
+        throw new RemoteEffectRejection(400, artifactPublication
+          ? "PublishArtifact requires non-empty string name, path, and taskId only; each must be at most 4096 bytes."
+          : request.method === "bash"
+            ? "bash requires a non-empty string command only, at most 32000 bytes."
+            : "File operations require a non-empty string path; write_file also requires string content, at most 256 KiB. Do not add other arguments.");
       }
-      if (artifactPublication && (String(args.name).length > 200 || String(args.taskId).length > 240 ||
-          String(args.path).startsWith("/") || String(args.path).includes("\\") ||
-          /\p{Cc}/u.test(String(args.name)) || /\p{Cc}/u.test(String(args.path)) ||
-          String(args.path).split("/").some((part) => !part || part === "." || part === ".."))) {
-        throw new HttpError(400, "Remote artifact requires a safe relative path, name, and task ID");
+      if (artifactPublication) {
+        if (String(args.name).length > 200 || /\p{Cc}/u.test(String(args.name))) {
+          throw new RemoteEffectRejection(400, "PublishArtifact name must be at most 200 characters and contain no control characters.");
+        }
+        if (String(args.taskId).length > 240) {
+          throw new RemoteEffectRejection(400, "PublishArtifact taskId must be at most 240 characters. Use your owned task ID from GetMissionState.");
+        }
+        let relative: string;
+        try { relative = normalizeRemoteArtifactPath(String(args.path), descriptor.workspacePath); }
+        catch { throw new RemoteEffectRejection(400, REMOTE_ARTIFACT_PATH_ERROR); }
+        if (relative !== args.path) {
+          throw new RemoteEffectRejection(400, "PublishArtifact RPC path must be workspace-relative. Retry with a path such as totals.mjs.");
+        }
       }
       const binding = {
         runtimeId: runtime.runtime_id, machineId: runtime.machine_id, sessionId: runtime.session_id,

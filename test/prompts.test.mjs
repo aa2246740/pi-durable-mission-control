@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ORCHESTRATOR_INSTRUCTIONS, remoteWorkspacePromptFlags, workerSystemInstructions } from "../dist/prompts.js";
+import { ORCHESTRATOR_INSTRUCTIONS, SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION, remoteWorkspacePromptFlags, workerSystemInstructions } from "../dist/prompts.js";
 
 const worker = { kind: "worker", instructions: "Implement the assigned task." };
 const validator = { kind: "validator", instructions: "Validate independently." };
@@ -111,10 +111,22 @@ test("local validators on a remote mission accept the frozen snapshot, not their
   assert.match(metadataValidator, /takes priority over any earlier instruction to run self-checks or call PublishArtifact/);
 });
 
-test("remote workspace prompt flags follow a non-empty mission allowlist and validator kind", () => {
+test("remote workspace prompt flags follow a non-empty mission allowlist for orchestrators and validators", () => {
   assert.deepEqual(remoteWorkspacePromptFlags("validator", ["remote-workspace"]), { remoteWorkspacesAuthorized: true });
   assert.deepEqual(remoteWorkspacePromptFlags("validator", undefined), {});
   assert.deepEqual(remoteWorkspacePromptFlags("validator", []), {});
   assert.deepEqual(remoteWorkspacePromptFlags("worker", ["remote-workspace"]), {});
-  assert.deepEqual(remoteWorkspacePromptFlags("orchestrator", ["remote-workspace"]), {});
+  assert.deepEqual(remoteWorkspacePromptFlags("orchestrator", ["remote-workspace"]), { remoteWorkspacesAuthorized: true });
+  assert.deepEqual(remoteWorkspacePromptFlags("orchestrator", []), {});
+});
+
+test("remote-authorized orchestrators select explicit remote workspace IDs and workers start task attempts", () => {
+  const remote = workerSystemInstructions({ role: orchestratorRole, ...remoteWorkspacePromptFlags("orchestrator", ["remote-workspace"]) });
+  assert.match(remote, /Omitting SpawnAgent targetWorkspaceId runs the agent in the coordinator's local workspace/);
+  assert.match(remote, /GetMissionState remoteWorkspaces.*id.*targetWorkspaceId/);
+  assert.match(SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION, /Omitting targetWorkspaceId.*coordinator's local workspace/);
+  assert.match(SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION, /GetMissionState remoteWorkspaces.*id as targetWorkspaceId/);
+  assert.equal(SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION.includes("/work"), false);
+  assert.equal(workerSystemInstructions({ role: orchestratorRole }).includes("Omitting SpawnAgent targetWorkspaceId"), false);
+  assert.match(workerSystemInstructions({ role: worker }), /before starting work, use UpdateTask.*status=running/);
 });

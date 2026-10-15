@@ -1029,6 +1029,15 @@ export class NodeWorkerSupervisor {
     effect: { taskId: string; method: "read_file" | "write_file" | "bash" | "PublishArtifact"; args: { [key: string]: JsonValue } }
   ): Promise<void> {
     const binding = handle.binding;
+    if (!payload.ok) {
+      // The applied inbox is durable evidence of a refusal, with no effect entry.
+      if (!this.mailbox.finish(binding, envelope.messageId)) throw new Error("Rejected effect reply was not processing");
+      handle.pendingRpc.delete(payload.rpcId);
+      handle.pendingEffects.delete(payload.rpcId);
+      this.options.onMailboxActivity?.();
+      await this.send(handle, { id: payload.rpcId, error: payload.error });
+      return;
+    }
     const pendingResult = payload.ok && payload.result && typeof payload.result === "object"
       ? payload.result as Record<string, unknown> : undefined;
     if (pendingResult?.status === "pending") {
@@ -1084,13 +1093,13 @@ export class NodeWorkerSupervisor {
     const hasAttempt = Object.hasOwn(permitRecord ?? {}, "taskAttempt");
     const exactPermit = Boolean(permitRecord && permitKeys?.length === (hasAttempt ? 7 : 6) &&
       ["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(permitRecord, key)));
-    if (!payload.ok || !exactPermit || !bindingMatches || !descriptorMatches || !taskMatches ||
+    if (!exactPermit || !bindingMatches || !descriptorMatches || !taskMatches ||
         typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) ||
         method !== effect.method || canonicalJson(args) !== canonicalJson(effect.args) ||
         (effect.method === "PublishArtifact" && (typeof permitRecord?.taskAttempt !== "number" || !Number.isSafeInteger(permitRecord.taskAttempt) || permitRecord.taskAttempt <= 0)) ||
         (effect.method !== "PublishArtifact" && hasAttempt)) {
-      await this.send(handle, { id: payload.rpcId, error: payload.ok ? "Coordinator effect permit did not match the requested operation" : payload.error });
-      await this.stopHandle(handle, "A workspace effect permit was rejected or mismatched");
+      await this.send(handle, { id: payload.rpcId, error: "Coordinator effect permit did not match the requested operation" });
+      await this.stopHandle(handle, "A workspace effect permit was mismatched");
       return;
     }
     const spec: NodeEffectSpec = {
@@ -1273,6 +1282,12 @@ export class NodeWorkerSupervisor {
     rpcId: string,
     payload: Extract<WorkerEnvelope["payload"], { kind: "reply" }>
   ): boolean {
+    if (!payload.ok) {
+      const issued = this.mailbox.inspectOutbox(handle.binding).some(({ envelope }) =>
+        envelope.payload.kind === "rpc" && envelope.payload.rpcId === rpcId && REMOTE_EFFECT_METHODS.has(envelope.payload.method));
+      return issued && this.mailbox.inspectInbox(handle.binding).some(({ envelope, status }) =>
+        status === "applied" && envelope.payload.kind === "reply" && canonicalJson(envelope.payload) === canonicalJson(payload));
+    }
     const cached = handle.completedEffects.get(rpcId);
     if (!cached || !payload.ok || !payload.result || typeof payload.result !== "object") return false;
     const permit = (payload.result as Record<string, unknown>).effectPermit;
@@ -1280,15 +1295,19 @@ export class NodeWorkerSupervisor {
     const record = permit as Record<string, unknown>;
     const keys = Reflect.ownKeys(record);
     const binding = parseWorkerBinding(record.binding);
-    if (keys.length !== 6 || !["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(record, key)) ||
+    const publication = record.method === "PublishArtifact";
+    if (keys.length !== (publication ? 7 : 6) || (publication &&
+        (typeof record.taskAttempt !== "number" || !Number.isSafeInteger(record.taskAttempt) || record.taskAttempt <= 0)) ||
+        !["binding", "descriptorHash", "taskId", "method", "args", "expiresAt"].every(key => Object.hasOwn(record, key)) ||
         !binding || ["runtimeId", "machineId", "sessionId", "sessionEpoch", "agentId", "epoch"].some(key =>
           binding[key as keyof WorkerBinding] !== handle.binding[key as keyof WorkerBinding]) ||
         record.descriptorHash !== handle.descriptorHash || typeof record.taskId !== "string" ||
-        (record.method !== "read_file" && record.method !== "write_file" && record.method !== "bash") ||
+        (record.method !== "read_file" && record.method !== "write_file" && record.method !== "bash" && record.method !== "PublishArtifact") ||
         !Number.isSafeInteger(record.expiresAt) || record.expiresAt !== cached.expiresAt) return false;
     const spec: NodeEffectSpec = {
       binding, descriptorHash: record.descriptorHash as string, taskId: record.taskId,
-      method: record.method, args: record.args as { [key: string]: JsonValue }
+      method: record.method, args: record.args as { [key: string]: JsonValue },
+      ...(publication ? { taskAttempt: record.taskAttempt as number } : {})
     };
     if (canonicalJson(spec) !== cached.identity) return false;
     const entry = this.effects.inspect().find(item => canonicalJson(item.spec) === cached.identity);

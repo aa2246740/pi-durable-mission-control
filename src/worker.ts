@@ -12,7 +12,8 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { AssistantEntry, createRegistry, defineExtension, defineTool, GenerationTask, Harness, hook, watchEvents } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ModelProfile, RoleProfile } from "./contracts.js";
-import { workerSystemInstructions } from "./prompts.js";
+import { workerSystemInstructions, SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION } from "./prompts.js";
+import { normalizeRemoteArtifactPath } from "./remote-artifact-path.js";
 import type { WorkerNotice, WorkerNoticeBody } from "./worker-events.js";
 import { REMOTE_RPC_METHODS, REMOTE_ORCHESTRATOR_RPC_METHODS, REMOTE_EFFECT_METHODS } from "./remote-rpc-methods.js";
 
@@ -135,6 +136,10 @@ function acquireStoreLease(path: string): () => void {
 }
 
 export function rpcRequest(config: WorkerConfig, method: string, args: unknown, taskId: string): Promise<unknown> {
+  if (config.runtimeMode === "remote-workspace-effects" && method === "PublishArtifact" &&
+      args && typeof args === "object" && "path" in args && typeof args.path === "string") {
+    args = { ...args, path: normalizeRemoteArtifactPath(args.path, config.workspacePath) };
+  }
   const id = randomUUID();
   const message: RpcMessage = { type: "rpc", id, token: config.token, agentId: config.agentId, epoch: config.epoch, method, args, taskId: `${config.agentId}:${taskId}` };
   return new Promise((resolve, reject) => {
@@ -185,7 +190,13 @@ function tools(config: WorkerConfig) {
       parameters: Type.Object(properties, { additionalProperties: false }),
       replay: "unsafe" as const,
       execute: async (args, api) => {
-        const result = await call(name, args, api);
+        let result: unknown;
+        try { result = await call(name, args, api); }
+        catch (error) {
+          if (config.runtimeMode !== "remote-workspace-effects" || !REMOTE_EFFECT_METHODS.has(name)) throw error;
+          return { isError: true, content: [{ type: "text" as const,
+            text: JSON.stringify({ error: error instanceof Error ? error.message : "Remote operation failed" }) }] };
+        }
         const approvalPending = Boolean(result && typeof result === "object" && "status" in result && result.status === "pending");
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
@@ -215,7 +226,7 @@ function tools(config: WorkerConfig) {
     tool("Report", "Submit one idempotent handoff to the orchestrator and end this run. Call alone after finishing the work; new messages wake you. Use WaitForMessage instead of repeated waiting reports.", { summary: Type.String(), evidence: Type.String() }),
     tool("RunValidation", "Run a real validation command and record its output and artifact digests.", { taskId: Type.String(), command: Type.String(), artifactIds: Type.Array(Type.String()) }),
     tool("ValidateTask", "Decide task acceptance using a genuine validation receipt.", { taskId: Type.String(), receiptId: Type.String(), passed: Type.Boolean(), evidence: Type.String(), assertionResults: Type.Optional(Type.Array(Type.Object({ assertionId: Type.String(), status: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("untested")]), evidence: Type.String() }, { additionalProperties: false }))) }),
-    tool("PublishArtifact", "Publish a workspace file as an immutable snapshot. Remote workers must provide the ID of their current owned task.", { name: Type.String(), path: Type.String(), taskId: Type.Optional(Type.String()) }),
+    tool("PublishArtifact", "Publish a workspace file as an immutable snapshot. Remote workers must first set their owned task to running with UpdateTask, then provide its taskId. Use a safe workspace-relative path such as totals.mjs, or an absolute path inside the assigned workspace such as /work/totals.mjs. Do not use .., backslashes, or control characters.", { name: Type.String(), path: Type.String(), taskId: Type.Optional(Type.String()) }),
     tool("RequestUserInput", "Ask the user for a decision.", { question: Type.String() }),
     tool("CompleteMission", "Request mission completion after domain gates pass.", {}),
     tool("read_file", "Read a file inside the mission workspace.", { path: Type.String() }),
@@ -225,7 +236,7 @@ function tools(config: WorkerConfig) {
   const selected = config.role.kind === "orchestrator"
     ? [...common, tool("SpawnAgent", "Create a worker or validator agent in this mission.", {
       title: Type.String(), roleId: Type.String(), prompt: Type.String(),
-      targetWorkspaceId: Type.Optional(Type.String({ description: "Remote targets require an execution-enabled node." }))
+      targetWorkspaceId: Type.Optional(Type.String({ description: SPAWN_AGENT_TARGET_WORKSPACE_DESCRIPTION }))
     })]
     : config.role.kind === "validator"
       ? common.filter((item) => !["CompleteMission", "RequestUserInput", "write_file", "bash"].includes(item.name))
@@ -267,7 +278,7 @@ export async function openWorkerRuntime(
     faux!.setResponses(config.testOnlyArtifactTransferLoop
       ? [
         fauxAssistantMessage(fauxToolCall("PublishArtifact", {
-            name: "frozen-evidence", path: "artifact.bin",
+            name: "frozen-evidence", path: `${config.workspacePath}/artifact.bin`,
             taskId: config.testOnlyArtifactTaskId ?? "__test_only_current_owned_task__"
           }), { stopReason: "toolUse" }),
           fauxAssistantMessage([

@@ -63,21 +63,28 @@ export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementati
   const call = (name, args = {}) => { assert.ok(names.has(name), `${role} is missing ${name}`); return { role, name, args }; };
   if (body.messages.at(-1)?.role !== "tool") return call("GetMissionState");
   const history = transcript(body), last = history.at(-1);
-  assert.ok(!last?.value?.error && !last?.value?.isError, `Tool ${last?.name} failed`);
+  const rejectedPublication = role === "worker" && last?.name === "PublishArtifact" &&
+    last.args.taskId === "not-an-owned-task";
+  if (rejectedPublication) {
+    assert.equal(typeof last.value.error, "string", "Invalid publication must return a tool error");
+    assert.match(last.value.error, /taskId.*owned by this worker/, "Publication denial must explain how to correct taskId");
+  } else assert.ok(!last?.value?.error && !last?.value?.isError, `Tool ${last?.name} failed`);
   const state = history.findLast((result) => result.name === "GetMissionState")?.value;
   assert.ok(state?.mission && state.tasks, "Missing mission state");
   const task = state.tasks[0];
-  if (!task || task.status !== (role === "worker" ? "running" : "review")) return call("WaitForMessage");
+  if (!task || (role === "worker" ? !["ready", "assigned", "running"].includes(task.status) : task.status !== "review")) return call("WaitForMessage");
   if (role === "worker") {
     assert.equal(state.executionEnvironment?.platform, "linux");
-    if (last.name === "GetMissionState") return call("write_file", { path: "totals.mjs", content: wrongImplementation ? wrongSource : totalsSource });
+    if (last.name === "GetMissionState") return call("UpdateTask", { taskId: task.id, status: "running" });
+    if (last.name === "UpdateTask" && last.args.status === "running") return call("write_file", { path: "totals.mjs", content: wrongImplementation ? wrongSource : totalsSource });
     if (last.name === "write_file") return call("bash", { command: `command -v node && node --input-type=module -e ${shellQuote("import assert from 'node:assert/strict'; import {totalCents} from './totals.mjs'; assert.equal(process.platform,'linux'); assert.equal(totalCents([{quantity:2,unitPriceCents:125},{quantity:3,unitPriceCents:70}]),460); console.log('LINUX-SELF-CHECK-OK');")}` });
     if (last.name === "bash") {
       assert.equal(last.value.status, "succeeded");
       assert.equal(last.value.result?.exitCode, 0, "Linux self-check failed");
-      return call("PublishArtifact", { name: "Order totals", path: "totals.mjs", taskId: task.id });
+      return call("PublishArtifact", { name: "Order totals", path: "/work/totals.mjs", taskId: "not-an-owned-task" });
     }
     if (last.name === "PublishArtifact") {
+      if (rejectedPublication) return call("PublishArtifact", { name: "Order totals", path: "/work/totals.mjs", taskId: task.id });
       assert.equal(last.value.status, "succeeded");
       assert.ok(last.value.result?.id, "Publication did not return an artifact ID");
       return call("UpdateTask", { taskId: task.id, status: "review", evidence: "Linux self-check passed; totals.mjs published." });

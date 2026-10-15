@@ -1210,6 +1210,11 @@ test("replayed PublishArtifact omits the stored task handoff without rewriting t
     rpcId: "rpc-publish-plain-replay", taskId: plainTaskId, method: "PublishArtifact", args: plainArgs,
     taskAttempt: 1, messageId: "permit-publish-plain-replay", sequence: 4
   });
+  const originalPermit = supervisor.mailbox.inspectInbox(binding).find(item => item.envelope.messageId === "permit-publish-handoff").envelope;
+  supervisor.mailbox.receive(binding, { ...originalPermit, messageId: "duplicate-publish-permit", sequence: 5 });
+  await supervisor.pump(binding);
+  assert.equal(supervisor.inspect()[0].state, "running");
+  assert.equal(sent.filter(message => message.id === "rpc-publish-handoff").length, 1);
   const byId = (rpcId) => sent.find((message) => message.id === rpcId)?.result;
   const firstHandoff = byId("rpc-publish-handoff");
   const replayHandoff = byId("rpc-publish-handoff-replay");
@@ -1302,4 +1307,96 @@ test("replayed write_file, bash, and read_file receipts stay identical to the fi
   assert.equal(readFileSync(join(workspace, "source.txt"), "utf8"), "changed after journal");
   assert.match(sent.find((message) => message.id === "rpc-read_file").result.result.content, /^original$/);
   assert.equal(supervisor.inspect().find((row) => row.runtimeId === binding.runtimeId).state, "running");
+});
+
+test("coordinator effect rejection settles without stopping and survives duplicate replay after restart", async t => {
+  const home = mkdtempSync(join(tmpdir(), "mission-control-effect-rejection-"));
+  const root = join(home, "root"), workspace = join(root, "workspace"), nodeHome = join(home, "node-home");
+  mkdirSync(workspace, { recursive: true });
+  let supervisor;
+  const binding = bindingFor("rejection");
+  t.after(async () => { await closeQuietly(supervisor); rmSync(home, { recursive: true, force: true }); });
+  const options = { ...supervisorOptions(nodeHome, root), executionMode: "workspace-effects" };
+  supervisor = new NodeWorkerSupervisor(options);
+  const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true });
+  const handle = supervisor.handles.get(binding.runtimeId);
+  const sent = [];
+  const send = handle.child.send.bind(handle.child);
+  handle.child.send = (message, callback) => { sent.push(message); return send(message, callback); };
+  const rpcId = "rejected-publication";
+  handle.child.emit("message", {
+    type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId, epoch: binding.epoch,
+    method: "PublishArtifact", args: { name: "Totals", path: "totals.mjs", taskId: "not-owned" },
+    taskId: `${binding.agentId}:rejected`
+  });
+  await waitFor(() => handle.pendingEffects.has(rpcId));
+  const payload = { kind: "reply", rpcId, ok: false, error: "PublishArtifact taskId must identify a task owned by this worker." };
+  const envelope = { binding, messageId: "rejected-reply", sequence: 1, payload };
+  supervisor.mailbox.receive(binding, envelope);
+  await supervisor.pump(binding);
+  assert.deepEqual(sent.find(message => message.id === rpcId), { id: rpcId, error: payload.error });
+  assert.equal(supervisor.inspect()[0].state, "running");
+  assert.equal(supervisor.mailbox.inspectBinding(binding).status, "open");
+  assert.equal(handle.pendingRpc.has(rpcId), false);
+  assert.equal(handle.pendingEffects.has(rpcId), false);
+  assert.equal(supervisor.mailbox.inspectInbox(binding).find(item => item.envelope.messageId === envelope.messageId).status, "applied");
+  assert.deepEqual(supervisor.effects.inspect(), []);
+  supervisor.mailbox.receive(binding, { ...envelope, messageId: "rejected-reply-duplicate", sequence: 2 });
+  await supervisor.pump(binding);
+  assert.equal(supervisor.inspect()[0].state, "running");
+  assert.equal(sent.filter(message => message.id === rpcId).length, 1);
+  await permitEffect(supervisor, handle, binding, started.descriptorHash, {
+    rpcId: "valid-after-rejection", taskId: `${binding.agentId}:valid`, method: "write_file",
+    args: { path: "after.txt", content: "still running" }, messageId: "valid-permit", sequence: 3
+  });
+  assert.equal(readFileSync(join(workspace, "after.txt"), "utf8"), "still running");
+  assert.equal(supervisor.inspect()[0].state, "running");
+  await supervisor.stop(binding, "requested");
+  await supervisor.close();
+  supervisor = new NodeWorkerSupervisor(options);
+  // Restart does not resume historical processes. Exercise dispatch with the saved
+  // binding and empty volatile RPC state, using the actual persisted mailbox.
+  let stops = 0;
+  supervisor.stopHandle = async () => { stops++; };
+  await supervisor.apply({ ...handle, pendingRpc: new Set(), pendingEffects: new Map() }, envelope);
+  assert.equal(stops, 0);
+  assert.equal(supervisor.inspect()[0].stopReason, "requested");
+  await supervisor.apply({ ...handle, pendingRpc: new Set() }, { ...envelope, payload: { ...payload, error: "changed rejection" } });
+  assert.equal(stops, 1, "a changed reply is still a protocol violation");
+});
+
+test("successful malformed or mismatched effect permits still stop the runtime", async () => {
+  const changes = {
+    missing: () => undefined,
+    binding: permit => ({ ...permit, binding: { ...permit.binding, epoch: 2 } }),
+    descriptor: permit => ({ ...permit, descriptorHash: "f".repeat(64) }),
+    task: permit => ({ ...permit, taskId: "another-task" }),
+    method: permit => ({ ...permit, method: "bash" }),
+    args: permit => ({ ...permit, args: { path: "other.txt", content: "changed" } }),
+    attempt: permit => ({ ...permit, taskAttempt: 0 }),
+    incomplete: permit => { const changed = { ...permit }; delete changed.expiresAt; return changed; }
+  };
+  for (const [kind, change] of Object.entries(changes)) {
+    const home = mkdtempSync(join(tmpdir(), `node-permit-${kind}-`));
+    const workspace = join(home, "workspace");
+    mkdirSync(workspace);
+    const binding = bindingFor(`malformed-${kind}`);
+    const supervisor = new NodeWorkerSupervisor({ ...supervisorOptions(join(home, "node"), home), executionMode: "workspace-effects" });
+    try {
+      const started = await supervisor.start({ ...specFor(binding, workspace, ""), effects: true });
+      const handle = supervisor.handles.get(binding.runtimeId);
+      const rpcId = "invalid-permit", taskId = `${binding.agentId}:write`, args = { path: "never.txt", content: "never" };
+      handle.child.emit("message", { type: "rpc", id: rpcId, token: handle.token, agentId: binding.agentId,
+        epoch: binding.epoch, method: "write_file", args, taskId });
+      await waitFor(() => handle.pendingEffects.has(rpcId));
+      const permit = change({ binding, descriptorHash: started.descriptorHash, taskId, method: "write_file", args, expiresAt: Date.now() + 20000 });
+      supervisor.mailbox.receive(binding, { binding, messageId: `invalid-${kind}`, sequence: 1,
+        payload: { kind: "reply", rpcId, ok: true, result: permit ? { effectPermit: permit } : {} } });
+      await supervisor.pump(binding);
+      assert.equal(supervisor.inspect()[0].state, "closed", kind);
+      assert.equal(supervisor.inspect()[0].stopReason, "unexpected", kind);
+      assert.deepEqual(supervisor.effects.inspect(), [], kind);
+      assert.equal(existsSync(join(workspace, "never.txt")), false, kind);
+    } finally { await supervisor.close(); rmSync(home, { recursive: true, force: true }); }
+  }
 });

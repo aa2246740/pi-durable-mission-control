@@ -124,3 +124,30 @@ test("failed frozen validation produces a model request for correction, not a pr
     { role: "tool", tool_call_id: "state-result", content: JSON.stringify({ tasks: [{ status: "blocked" }], validationReceipts: [{ command: "frozen", exitCode: 1 }] }) }] };
   assert.equal(rehearsalCall(body, { role: "orchestrator", acceptanceCommand: "frozen" }).name, "RequestUserInput");
 });
+
+test("rehearsal worker starts its attempt, reads a denied publication, and retries an absolute workspace path", () => {
+  const messages = [];
+  const tools = ["GetMissionState", "UpdateTask", "write_file", "bash", "PublishArtifact", "Report", "WaitForMessage"].map(name => ({ function: { name } }));
+  const add = (name, args, value) => {
+    const id = `call-${messages.length}`;
+    messages.push({ role: "assistant", tool_calls: [{ id, function: { name, arguments: JSON.stringify(args) } }] });
+    messages.push({ role: "tool", tool_call_id: id, content: JSON.stringify(value) });
+  };
+  const next = () => rehearsalCall({ messages, tools }, { role: "worker" });
+  add("GetMissionState", {}, { mission: { id: "mission" }, tasks: [{ id: "task", status: "ready", attempt: 0 }], executionEnvironment: { platform: "linux" } });
+  assert.deepEqual(next(), { role: "worker", name: "UpdateTask", args: { taskId: "task", status: "running" } });
+  add("UpdateTask", next().args, { id: "task", status: "running", attempt: 1 });
+  const write = next();
+  assert.equal(write.name, "write_file");
+  add(write.name, write.args, { status: "succeeded" });
+  const bash = next();
+  assert.equal(bash.name, "bash");
+  add(bash.name, bash.args, { status: "succeeded", result: { exitCode: 0 } });
+  const denied = next();
+  assert.deepEqual(denied.args, { name: "Order totals", path: "/work/totals.mjs", taskId: "not-an-owned-task" });
+  add(denied.name, denied.args, { error: "PublishArtifact taskId must identify a task owned by this worker. Use GetMissionState to find your assigned task." });
+  const retry = next();
+  assert.deepEqual(retry.args, { name: "Order totals", path: "/work/totals.mjs", taskId: "task" });
+  add(retry.name, retry.args, { status: "succeeded", result: { id: "artifact" } });
+  assert.deepEqual(next().args, { taskId: "task", status: "review", evidence: "Linux self-check passed; totals.mjs published." });
+});
