@@ -40,7 +40,7 @@ The home directory contains the control database, one database per agent, export
 
 ## Profiles and permissions
 
-Profiles store provider names and environment-variable references, never credential values. The built-in GLM-4.7 Coding and MiniMax-M2.5 entries are configurable presets, not verified inference claims. Add a profile for any supported pi-ai API family (`openai-completions`, `openai-responses`, or `anthropic-messages`), including a keyless local endpoint. Select explicit cost rates to enable cost-limit enforcement; unknown rates remain `costKnown: false`.
+Profiles store provider names and environment-variable references, never credential values. The built-in GLM-5.3 Flash Coding and MiniMax-M2.5 entries are configurable presets, not verified inference claims. Presets are seeded only when missing, so an existing home keeps its earlier GLM-4.7 Coding preset until the operator edits it. Add a profile for any supported pi-ai API family (`openai-completions`, `openai-responses`, or `anthropic-messages`), including a keyless local endpoint. Select explicit cost rates to enable cost-limit enforcement; unknown rates remain `costKnown: false`.
 
 Missions require an orchestrator role. Profile changes are allowed only while an agent is idle or offline. In `approve` autonomy, shell commands and file writes are persisted as exact-argument approvals and consumed once. `trusted` autonomy is an explicit mission setting; it bypasses that approval gate.
 

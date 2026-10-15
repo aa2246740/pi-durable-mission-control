@@ -40,7 +40,7 @@ test("real config examples retain unknown prices and specified role APIs", () =>
   assert.equal(mini.worker.api, "openai-completions");
   const glm = readConfig(new URL("../acceptance/remote-linux/real-glm.json", import.meta.url));
   for (const profile of Object.values(glm)) {
-    assert.equal(profile.modelId, "glm-5.3");
+    assert.equal(profile.modelId, "glm-5.3-flash");
     assert.equal(profile.baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
     assert.equal(profile.credentialEnv, "ZHIPU_API_KEY");
   }

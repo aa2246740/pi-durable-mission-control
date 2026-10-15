@@ -213,7 +213,7 @@ MC_ACCEPTANCE_CONTAINER_PREFIX=mc-acc-g-gpt- node --test acceptance/remote-linux
 此模式由真实模型自行选择工具，不启动脚本化 mock。配置文件为 JSON，顶层固定包含 `orchestrator`、`worker`、`validator` 三个产品 profile，字段为 `name`、`api`、`modelId`、`baseUrl`、`credentialEnv`、`contextWindow`、`maxTokens`、`reasoning`、`toolCalling`、`vision`，可选完整的 `cost`。不支持把密钥写入配置。未知价格必须省略 `cost`，产品会保留 `costKnown: false`；不能把未知价格填成 0。示例的 token 上限沿用产品 preset，可按服务实际限制调整，不代表已验证服务能力。
 
 - `real-minimax.json`：本地 orchestrator/validator 用 MiniMax-M2.5，Anthropic Messages API，`https://api.minimaxi.com/anthropic`；远端 worker 用 MiniMax-M2.7，OpenAI Completions API，`https://api.minimaxi.com/v1`。凭据引用均为 `MINIMAX_CN`。
-- `real-glm.json`：三个角色均配置 glm-5.3，OpenAI Completions API，`https://open.bigmodel.cn/api/coding/paas/v4`，凭据引用为 `ZHIPU_API_KEY`。Coding Plan 会映射旧模型名（2026-10-15 预检观察到 glm-4.7 被映射为 glm-5.3-flash，glm-5.3 返回 glm-5.3），实际响应名从会话库的 `responseModel` 读取；与配置不同会在 summary 的 `modelMismatches` 中标注，配置名不作为实际模型的证明。
+- `real-glm.json`：三个角色均配置 glm-5.3-flash（与产品内置 GLM 预设一致），OpenAI Completions API，`https://open.bigmodel.cn/api/coding/paas/v4`，凭据引用为 `ZHIPU_API_KEY`。Coding Plan 会映射旧模型名（2026-10-15 预检观察到 glm-4.7 被映射为 glm-5.3-flash，glm-5.3 返回 glm-5.3），实际响应名从会话库的 `responseModel` 读取；与配置不同会在 summary 的 `modelMismatches` 中标注，配置名不作为实际模型的证明。
 
 智谱 Coding Plan 的专用端点为 `https://open.bigmodel.cn/api/coding/paas/v4`，通用按量 API 端点为 `https://open.bigmodel.cn/api/paas/v4`。Coding Plan key 须有可用的编程套餐权限，通用 API key 须有开放平台资源包或充值余额；运行者须核对 key 的发行渠道与权限，不能假定可互换。同名 `ZHIPU_API_KEY` 仅是引用名称。示例保留 Coding Plan 端点，脚本不替换端点、不试探 key。两种端点及 key 要求见[智谱官方端点说明](https://zcode.z.ai/cn/docs/qa)；通用 API 使用平台余额或资源包，Coding Plan 使用套餐权益。
 

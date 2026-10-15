@@ -135,7 +135,7 @@ test("start is detached and idempotent; status, export, and stop use the selecte
         name: `CLI ${kind}`,
         kind,
         instructions: "Isolated CLI parser test",
-        profileId: "glm-4.7-coding"
+        profileId: "glm-5.3-flash-coding"
       });
     }
     const mission = await postJson(port, token, "/api/missions", {

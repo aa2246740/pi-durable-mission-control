@@ -595,10 +595,10 @@ export class ControlPlane {
   private seedProfiles(): void {
     const presets: ModelProfile[] = [
       {
-        id: "glm-4.7-coding",
-        name: "GLM-4.7 Coding",
+        id: "glm-5.3-flash-coding",
+        name: "GLM-5.3 Flash Coding",
         api: "openai-completions",
-        modelId: "glm-4.7",
+        modelId: "glm-5.3-flash",
         baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
         credentialEnv: "ZHIPU_API_KEY",
         contextWindow: 128000,
