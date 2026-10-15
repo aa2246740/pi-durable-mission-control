@@ -130,3 +130,30 @@ test("remote-authorized orchestrators select explicit remote workspace IDs and w
   assert.equal(workerSystemInstructions({ role: orchestratorRole }).includes("Omitting SpawnAgent targetWorkspaceId"), false);
   assert.match(workerSystemInstructions({ role: worker }), /before starting work, use UpdateTask.*status=running/);
 });
+
+test("verification instructions distinguish command execution errors from failed acceptance checks", () => {
+  for (const config of [{}, { workspaceStrategy: "worktree" }, { remoteWorkspacesAuthorized: true }]) {
+    const text = workerSystemInstructions({ role: validator, ...config });
+    const verification = text.split("For verification:")[1].split("For a mission with a validationContract")[0];
+    assert.match(verification, /shell or syntax error or command not found, with no acceptance check results/);
+    assert.match(verification, /compare it character for character with the Mission or task command/);
+    assert.match(verification, /correct the transcription, and rerun RunValidation without substituting a different or weaker command/);
+    assert.match(verification, /Do not use that receipt for ValidateTask passed=false or request rework/);
+    assert.match(verification, /if the given command still cannot execute, Report the blocker to the orchestrator/);
+    assert.match(verification, /Record failed checks as failures and return the task for rework/);
+    assert.match(verification, /do not edit product source, weaken assertions, loosen timeouts, or skip cases to manufacture a pass/);
+  }
+
+  const text = workerSystemInstructions({ role: worker });
+  const implementation = text.split("For implementation,")[1].split("For verification:")[0];
+  assert.match(implementation, /UpdateTask.*status=running/);
+  assert.doesNotMatch(implementation, /correct the transcription|rerun RunValidation|ValidateTask passed=false|command still cannot execute/);
+});
+
+test("orchestrators distinguish failed checks from command execution blockers before rework", () => {
+  const text = workerSystemInstructions({ role: orchestratorRole });
+  assert.match(text, /Before requesting rework from a failed receipt, confirm whether acceptance checks failed or the supplied command did not execute as given/);
+  assert.match(text, /have the validator correct and rerun the given command, or report an execution blocker, in the latter case/);
+  assert.match(text, /Failed acceptance checks must remain visible and cause a new, explicit work attempt/);
+  assert.match(text, /Never weaken a test, skip a case, or alter an assertion merely to make it pass/);
+});
