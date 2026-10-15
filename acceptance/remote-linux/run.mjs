@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertRealOutcome, assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
+import { acceptanceCommandMatch, assertRealOutcome, assertRealSuccess, collectRealEvidence, kinds, readConfig, readSecrets, redact as redactSecrets, scanEvidence, sha256, realMission, writeFrozenAcceptance, faultInjectionScript, nodeCredentialShell, frozenAcceptanceCommand, checkFrozenAcceptance, findRealPublication, checkHostRuntime, assertHostRuntime, independentReview, assertIndependentReview } from "./real.mjs";
 import { readSessionEvidence, refreshStoppedExport, remoteRuntimeHome, remoteSessionScript, stopNodeForEvidenceScript } from "./session-evidence.mjs";
 import { delivery, deliveryName, shellQuote, startMock, pauseQuestion } from "./mock.mjs";
 import { rehearsalConfig, rehearsalSecrets, startFakeProvider } from "./fake-provider.mjs";
@@ -744,8 +744,10 @@ export async function run(options) {
       assert.ok(artifact, "No frozen artifact for independent review");
       const accepted = detail.tasks.find((task) => task.status === "accepted");
       const decision = detail.validations?.filter((value) => value.taskId === accepted?.id).at(-1);
-      const receipt = detail.validationReceipts.find((value) => value.command === acceptanceCommand && value.artifactIds.includes(artifact.id) &&
+      const receipt = detail.validationReceipts.find((value) => acceptanceCommandMatch(acceptanceCommand, value.command) && value.artifactIds.includes(artifact.id) &&
         (!config || value.id === decision?.receiptId));
+      assert.ok(receipt, "No matching frozen acceptance receipt for independent review");
+      summary.acceptanceReceipt = { id: receipt.id, commandMatch: acceptanceCommandMatch(acceptanceCommand, receipt.command) };
       review = await independentReview({ proof, acceptance, artifact, receipt, casPath: join(home, "artifacts", artifact.sha256),
         name: reviewName, image: "node:22-bookworm-slim", execute: async (args) => {
           const handle = childProcess(containerCLI, args, { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });

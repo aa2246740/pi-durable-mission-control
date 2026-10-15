@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
-import { readSecrets, kinds } from "./real.mjs";
+import { acceptanceCommandMatch, readSecrets, kinds } from "./real.mjs";
 import { nextCall, shellQuote, transcript } from "./mock.mjs";
 
 export function rehearsalSecrets(proof, config) {
@@ -54,7 +54,7 @@ const wrongSource = "export const totalCents = lines => lines.reduce((sum, line)
 export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementation = false }) {
   if (role === "orchestrator") {
     const state = transcript(body).findLast((result) => result.name === "GetMissionState")?.value;
-    if (state?.tasks.some((task) => task.status === "blocked") && state.validationReceipts?.some((receipt) => receipt.command === acceptanceCommand && receipt.exitCode !== 0)) {
+    if (state?.tasks.some((task) => task.status === "blocked") && state.validationReceipts?.some((receipt) => acceptanceCommandMatch(acceptanceCommand, receipt.command) && receipt.exitCode !== 0)) {
       return { role, name: "RequestUserInput", args: { question: "Frozen business tests rejected the totals implementation; a correction is required." } };
     }
     const history = transcript(body);
@@ -102,7 +102,9 @@ export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementati
     if (last.name === "GetMissionState") {
       const artifactIds = state.artifacts.filter((artifact) => artifact.taskId === task.id).map((artifact) => artifact.id);
       assert.equal(artifactIds.length, 1);
-      return call("RunValidation", { taskId: task.id, command: acceptanceCommand, artifactIds });
+      // Exercise quote-equivalent execution through the real validation boundary.
+      const command = acceptanceCommand.replaceAll("'\\''", "'\"'\"'");
+      return call("RunValidation", { taskId: task.id, command, artifactIds });
     }
     if (last.name === "RunValidation") {
       const receipt = last.value;

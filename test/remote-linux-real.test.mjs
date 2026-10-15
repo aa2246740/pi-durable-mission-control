@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { assertCoordinatorExit, finalInterruption, missionOutcomeReady, realAgentLocations, assertRealPublication, stoppedRealRuntimes, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
-import { assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, classifyOracleCommand, auditOracle, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
+import { acceptanceCommandMatch, realAcceptanceSelection, assertRealOutcome, assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, classifyOracleCommand, auditOracle, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
 import { rehearsalCall } from "../acceptance/remote-linux/fake-provider.mjs";
 import { sessionFailure, readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
 import { ControlPlane } from "../dist/control.js";
@@ -300,6 +300,11 @@ test("frozen command checks its embedded digest before tests, including paths wi
   const intact = checkFrozenAcceptance(acceptance,"publication");
   assert.equal(intact.intact,true);
   assert.equal(invoke().status,0);
+  const equivalent = command.replaceAll("'\\''", "'\"'\"'");
+  assert.equal(acceptanceCommandMatch(command,equivalent),"shell-equivalent");
+  const equivalentResult = spawnSync("/bin/sh",["-c",equivalent],{cwd:workspace,encoding:"utf8",env:{PATH:process.env.PATH}});
+  assert.equal(equivalentResult.status,0,equivalentResult.stderr);
+  assert.match(equivalentResult.stdout,/^# pass 4$/m);
   chmodSync(acceptance.path,0o600);
   writeFileSync(acceptance.path,"console.log('TAMPERED-TEST-RAN');\n");
   const tampered = invoke();
@@ -718,4 +723,108 @@ test("late interruptions fail the saved summary and return the CLI failure", (t)
   }
   const failure=new Error("existing");
   assert.equal(finalInterruption({status:"failed"},failure,undefined),failure);
+});
+
+// Literal command pairs copied from the two 2026-10-15 mission exports.
+const recordedCommands = [
+  {
+    "name": "minimax-20261015-083650",
+    "expected": "'/opt/homebrew/Cellar/node/26.7.0/bin/node' -e 'const fs=require('\\''node:fs'\\''),crypto=require('\\''node:crypto'\\'');if(crypto.createHash('\\''sha256'\\'').update(fs.readFileSync(\"/Users/wu/.mc-orch/real/minimax-20261015-083650/totals.acceptance.test.mjs\")).digest('\\''hex'\\'')!==\"0097d807b2e0b2c977a6951c72e056dd5ff3064794035b298d03a8822ca1c12b\"){console.error('\\''Frozen acceptance hash mismatch'\\'');process.exit(1)}' && '/opt/homebrew/Cellar/node/26.7.0/bin/node' --test --test-reporter=tap '/Users/wu/.mc-orch/real/minimax-20261015-083650/totals.acceptance.test.mjs'",
+    "actual": "'/opt/homebrew/Cellar/node/26.7.0/bin/node' -e 'const fs=require('\"'\"'node:fs'\"'\"'),crypto=require('\"'\"'node:crypto'\"'\"');if(crypto.createHash('\"'\"'sha256'\"'\"').update(fs.readFileSync(\"/Users/wu/.mc-orch/real/minimax-20261015-083650/totals.acceptance.test.mjs\")).digest('\"'\"'hex'\"'\"')!==\"0097d807b2e0b2c977a6951c72e056dd5ff3064794035b298d03a8822ca1c12b\"){console.error('\"'\"'Frozen acceptance hash mismatch'\"'\"');process.exit(1)}' && '/opt/homebrew/Cellar/node/26.7.0/bin/node' --test --test-reporter=tap '/Users/wu/.mc-orch/real/minimax-20261015-083650/totals.acceptance.test.mjs'"
+  },
+  {
+    "name": "glm-20261015-083913",
+    "expected": "'/opt/homebrew/Cellar/node/26.7.0/bin/node' -e 'const fs=require('\\''node:fs'\\''),crypto=require('\\''node:crypto'\\'');if(crypto.createHash('\\''sha256'\\'').update(fs.readFileSync(\"/Users/wu/.mc-orch/real/glm-20261015-083913/totals.acceptance.test.mjs\")).digest('\\''hex'\\'')!==\"0097d807b2e0b2c977a6951c72e056dd5ff3064794035b298d03a8822ca1c12b\"){console.error('\\''Frozen acceptance hash mismatch'\\'');process.exit(1)}' && '/opt/homebrew/Cellar/node/26.7.0/bin/node' --test --test-reporter=tap '/Users/wu/.mc-orch/real/glm-20261015-083913/totals.acceptance.test.mjs'",
+    "actual": "'/opt/homebrew/Cellar/node/26.7.0/bin/node' -e 'const fs=require('\\''node:fs'\\''),crypto=require('\\''node:crypto'\\'');if(crypto.createHash('\\''sha256'\\'').update(fs.readFileSync(\"/Users/wu/.mc-orch/real/glm-20261015-083913/totals.acceptance.test.mjs\")).digest('\\''hex'\\'')!==\"0097d807b2e0b2c977a6951c72e056dd5ff3064794035b298d03a8822ca1c12b\"){console.error('\\''Frozen acceptance hash mismatch'\\'');process.exit(1)}' && '/opt/homebrew/Cellar/node/26.7.0/bin/node' --test --test-reporter=tap /Users/wu/.mc-orch/real/glm-20261015-083913/totals.acceptance.test.mjs"
+  }
+];
+
+for (const { name, expected, actual } of recordedCommands) {
+  test(`${name} frozen command matches the recorded validator quote spelling`, () => {
+    assert.notEqual(expected, actual);
+    assert.equal(acceptanceCommandMatch(expected, actual), "shell-equivalent");
+    assert.equal(acceptanceCommandMatch(actual, expected), "shell-equivalent");
+    assert.equal(acceptanceCommandMatch(expected, expected), "exact");
+  });
+}
+
+test("frozen command matching rejects weakened checks and changed shell execution", () => {
+  const command = recordedCommands[0].expected;
+  const changed = [
+    command.replace("0097d807", "1097d807"),
+    command.replaceAll("totals.acceptance.test.mjs", "other.acceptance.test.mjs"),
+    command.split(" && ")[1], command.replace(" && ", "; "), command.replace(" && ", " || "),
+    `${command} && true`, `${command}; true`, `${command} $(true)`, `${command} \`true\``,
+    `${command} $EXTRA`, `${command} > /tmp/report`, `${command} 2>/dev/null`,
+    command.replace("--test-reporter=tap", "--test-reporter=spec"),
+    command.replace("hash mismatch", "hashmismatch"),
+    command.replace("--test --test-reporter=tap", "'--test --test-reporter=tap'")
+  ];
+  for (const actual of changed) assert.equal(acceptanceCommandMatch(command, actual), null, actual);
+  assert.equal(acceptanceCommandMatch("node 'two words'", "node two words"), null);
+  assert.equal(acceptanceCommandMatch("node two words", "node 'two words'"), null);
+  assert.equal(acceptanceCommandMatch("node 'two words'", "node 'twowords'"), null);
+  assert.equal(acceptanceCommandMatch("node ''", "node"), null);
+  assert.equal(acceptanceCommandMatch("node '&&' true", "node && true"), null);
+});
+
+test("literal shell matching preserves empty words, escaped bytes and quoted operators", () => {
+  const pairs = [
+    ["'node' --test 'file.mjs'", 'node\t--test "file.mjs"'],
+    ["node 'a b'", String.raw`node a\ b`],
+    ["node '' x", 'node "" x'],
+    ["node 'ab'cd", 'node a"bc"d'],
+    ["node 'a\\b'", String.raw`node "a\\b"`],
+    ["node 'a\"b'", String.raw`node "a\"b"`],
+    ["node 'a;b|c<d>e'", String.raw`node a\;b\|c\<d\>e`],
+    ["node '*?['", String.raw`node \*\?\[`],
+    ["node '#literal'", String.raw`node \#literal`],
+    ["node 'one'&&node 'two'", "node one && node two"]
+  ];
+  for (const [expected, actual] of pairs) assert.equal(acceptanceCommandMatch(expected, actual), "shell-equivalent", actual);
+});
+
+test("unsupported shell syntax only earns byte-exact matching", () => {
+  const unsupported = [
+    'node "$VALUE"', "node '$VALUE'", 'node "$(true)"', "node `true`",
+    "node *", "node ?", "node [ab]", "node; true", "node | cat", "node || true",
+    "node > report", "node < input", "node 2>&1", "node &", "node # comment",
+    "node\ntrue", "node\rtrue", "node '\n'", "node\0", "node\u000b", "node\u00a0x",
+    "node (true)", "node {a,b}", "node ~", "X=value node", "if true", "time node", "! node",
+    "node &&", "&& node", "node && && true", "node 'unfinished", 'node "unfinished',
+    "node \\", String.raw`node "a\q"`
+  ];
+  for (const command of unsupported) {
+    assert.equal(acceptanceCommandMatch(command, command), "exact", command);
+    assert.equal(acceptanceCommandMatch(command, ` ${command}`), null, command);
+  }
+  for (const [expected, actual] of [["time node", "'time' node"], ["if true", "'if' true"], ["X=value node", "'X=value' node"], ["node ~", "node '~'"]]) {
+    assert.equal(acceptanceCommandMatch(expected, actual), null);
+  }
+  assert.equal(acceptanceCommandMatch(undefined, undefined), null);
+});
+
+test("accepted task selection and failure diagnostics recognize equivalent frozen receipts", () => {
+  const { expected, actual } = recordedCommands[0];
+  const receipt = { id: "r", taskId: "t", validatorId: "v", command: actual, artifactIds: ["a"], exitCode: 1 };
+  const detail = { mission: { status: "blocked" }, tasks: [{ id: "t", status: "accepted", ownerId: "w", validatorId: "v" }],
+    artifacts: [{ id: "a", taskId: "t", agentId: "w", path: "/work/totals.mjs", remoteProvenance: { machineId: "linux" } }],
+    validations: [{ taskId: "t", passed: true, receiptId: "r" }], validationReceipts: [receipt] };
+  assert.equal(realAcceptanceSelection(detail, expected, "linux", "a").receipt, receipt);
+  assert.equal(realAcceptanceSelection(detail, expected, "linux", "a").commandMatch, "shell-equivalent");
+  assert.throws(() => assertRealOutcome(detail, expected), /Frozen acceptance failed.*failedReceipts=1/);
+  for (const patch of [{ command: `${actual} && true` }, { id: "other" }, { taskId: "other" }, { validatorId: "w" }, { artifactIds: [] }]) {
+    assert.throws(() => realAcceptanceSelection({ ...detail, validationReceipts: [{ ...receipt, ...patch }] }, expected, "linux", "a"), /No matching frozen acceptance receipt/);
+  }
+});
+
+test("real evidence records exact, shell-equivalent and unmatched receipt commands without rewriting them", () => {
+  const acceptance = { path: "/host/totals.acceptance.test.mjs", sha256: "a".repeat(64) };
+  const command = frozenAcceptanceCommand(acceptance);
+  const equivalent = command.replaceAll("'\\''", "'\"'\"'");
+  const exported = { mission: {}, agents: [], artifacts: [], events: [], transcripts: [], blockers: [],
+    validationReceipts: [command, equivalent, `${command} && true`].map((command, index) => ({ id: String(index), command })) };
+  const evidence = collectRealEvidence(exported, undefined, acceptance);
+  assert.deepEqual(evidence.validationReceipts.map((receipt) => receipt.commandMatch), ["exact", "shell-equivalent", null]);
+  assert.deepEqual(evidence.validationReceipts.map((receipt) => ({ id: receipt.id, command: receipt.command })), exported.validationReceipts);
 });
