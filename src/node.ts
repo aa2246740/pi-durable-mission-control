@@ -72,7 +72,7 @@ export class CoordinatorUnavailable extends Error {
   }
 }
 
-class CoordinatorSessionExpired extends Error {}
+export class CoordinatorSessionExpired extends Error {}
 
 export function nodeReconnectDelay(attempt: number, random = Math.random()): number {
   const ceiling = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.min(attempt, 5));

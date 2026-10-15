@@ -186,6 +186,7 @@ export async function startServer(options: ServerOptions) {
     "/api/nodes/runtimes/events", "/api/nodes/effects/receipts", "/api/nodes/mailbox/settlement"
   ]);
   const handleRequest = (nodeOnly: boolean) => async (request: IncomingMessage, response: ServerResponse) => {
+    let nodeRoute = false;
     try {
       response.setHeader("x-content-type-options", "nosniff");
       response.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'");
@@ -201,7 +202,7 @@ export async function startServer(options: ServerOptions) {
       const method = request.method ?? "GET";
       const mutation = ["POST", "PATCH", "PUT", "DELETE"].includes(method);
       if (request.headers["sec-fetch-site"] === "cross-site") throw new HttpError(403, "Cross-site request rejected");
-      const nodeRoute = url.pathname.startsWith("/api/nodes/");
+      nodeRoute = url.pathname.startsWith("/api/nodes/");
       const readRequestBody = async (): Promise<Record<string, unknown>> => {
         const body = await readBody(request);
         if (closing && (!nodeRoute || !shutdownNodeRoutes.has(url.pathname))) throw new HttpError(503, "Coordinator is shutting down");
@@ -726,7 +727,7 @@ export async function startServer(options: ServerOptions) {
       const status = error instanceof HttpError || error instanceof MachineError ? error.status : error instanceof McpConfigurationError ? 400 : 500;
       const message = error instanceof MachineError && error.status === 401 ? "Node authentication failed" :
         error instanceof HttpError || error instanceof MachineError || error instanceof McpConfigurationError ? error.message : "Internal server error";
-      if (nodeOnly) {
+      if (nodeOnly || nodeRoute) {
         jsonResponse(response, status, { error: message });
         return;
       }

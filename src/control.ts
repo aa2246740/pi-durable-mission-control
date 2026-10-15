@@ -1712,7 +1712,7 @@ export class ControlPlane {
   missionAction(id: string, action: "start" | "pause" | "resume" | "cancel"): Mission {
     const mission = this.getMission(id);
     if (!mission) throw new HttpError(404, "Mission not found");
-    if ((action === "start" || action === "resume") && this.parityWorkflow(id)) {
+    if ((action === "start" || action === "resume") && this.missionParityExecutionBlocked(id)) {
       throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
     }
     if (action === "start") {
@@ -1871,12 +1871,17 @@ export class ControlPlane {
           recipientId: agent.id,
           content: prompt,
           mode: "followUp",
-          status: mission.status === "paused" ? "aborted" : "queued",
-          attempt: 1,
-          createdAt: now()
-        };
-        this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, missionId, message.status, json(message));
-        if (message.status === "queued") this.enqueue(message);
+        status: mission.status === "paused" || this.missionParityExecutionBlocked(missionId) ? "aborted" : "queued",
+        attempt: 1,
+        createdAt: now(),
+        ...(mission.status === "paused" || this.missionParityExecutionBlocked(missionId)
+          ? { error: mission.status === "paused"
+            ? "Held while mission is paused; delivery will start after explicit resume"
+            : "Held because mission parity execution is not available in this build." }
+          : {})
+      };
+      this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, missionId, message.status, json(message));
+      if (message.status === "queued") this.enqueue(message);
       }
       return agent;
     });
@@ -2206,6 +2211,7 @@ export class ControlPlane {
       const recipient = this.getAgent(recipientId);
       if (!mission || !recipient || recipient.missionId !== missionId) throw new HttpError(404, "Recipient not found in this mission");
       if (["cancelled", "completed", "failed"].includes(mission.status)) throw new HttpError(409, "Mission is not accepting messages");
+      const held = mission.status === "paused" || this.missionParityExecutionBlocked(missionId);
       const message: Message = {
         id: randomUUID(),
         missionId,
@@ -2213,13 +2219,15 @@ export class ControlPlane {
         recipientId,
         content,
         mode,
-        status: mission.status === "paused" ? "aborted" : "queued",
+        status: held ? "aborted" : "queued",
         attempt: 1,
         createdAt: now(),
-        ...(mission.status === "paused" ? { error: "Held while mission is paused; delivery will start after explicit resume" } : {})
+        ...(held ? { error: mission.status === "paused"
+          ? "Held while mission is paused; delivery will start after explicit resume"
+          : "Held because mission parity execution is not available in this build." } : {})
       };
       this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, missionId, message.status, json(message));
-      if (mission.status !== "paused") this.enqueue(message);
+      if (!held) this.enqueue(message);
       this.event(missionId, "message_created", `User message queued for ${recipient.title}.`, recipient.id, { messageId: message.id });
       return message;
     });
@@ -2601,6 +2609,7 @@ export class ControlPlane {
         const gate = this.scheduleGate(mission);
         reason = gate.reason;
         recipientId = gate.recipientId;
+        if (!reason && this.missionParityExecutionBlocked(mission.id)) reason = "capability_unavailable";
         if (!reason) outcome = "queued";
       }
       let nextRunAt: string | null = null;
@@ -2939,8 +2948,9 @@ export class ControlPlane {
               ? "delivery_pending"
               : "needs_attention";
           } else if (elapsed >= watchdogIdleThresholdMs) {
-            diagnosis = state.autoWake ? "wake_queued" : "stalled";
-            if (state.autoWake && activeGate.recipientId) {
+            const wakeAllowed = state.autoWake && !this.missionParityExecutionBlocked(missionId);
+            diagnosis = wakeAllowed ? "wake_queued" : "stalled";
+            if (wakeAllowed && activeGate.recipientId) {
               const wakeId = `watchdog-wake:${missionId}:${fingerprint}`;
               const messageId = `watchdog-message:${missionId}:${fingerprint}`;
               const requestId = `${messageId}:1`;
@@ -3338,7 +3348,7 @@ export class ControlPlane {
       if (!agent || agent.epoch !== epoch) throw new HttpError(409, "Worker epoch is fenced");
       const mission = this.getMission(agent.missionId);
       if (!mission) throw new HttpError(404, "Mission not found");
-      if (this.parityWorkflow(mission.id)) {
+      if (this.missionParityExecutionBlocked(mission.id)) {
         throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity admission is not available in this build");
       }
       const prior = this.db.prepare("SELECT 1 FROM generation_admissions WHERE agent_id=? AND generation_id=?").get(agentId, generationId);
@@ -3454,6 +3464,18 @@ export class ControlPlane {
       const remaining = this.blockers(blocker.missionId).some((item) => item.status === "open");
       if (mission?.status === "blocked" && !remaining && blocker.kind !== "user_input") {
         this.putMission({ ...mission, status: "paused", updatedAt: now() });
+      } else if (mission && blocker.kind === "user_input" && blocker.agentId && this.missionParityExecutionBlocked(mission.id)) {
+        const recipient = this.getAgent(blocker.agentId);
+        if (recipient) {
+          const message: Message = {
+            id: `blocker-resolution:${id}`, missionId: mission.id, senderId: "user", recipientId: recipient.id,
+            content: resolution, mode: "followUp", status: "aborted", attempt: 1, createdAt: now(),
+            error: "Held because mission parity execution is not available in this build."
+          };
+          this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, mission.id, message.status, json(message));
+          this.event(mission.id, "message_created", "Human blocker resolution recorded without releasing delivery.", recipient.id, { messageId: message.id, blockerId: id });
+        }
+        if (!remaining && mission.status === "blocked") this.putMission({ ...mission, status: "paused", updatedAt: now() });
       } else if (mission && !remaining && blocker.kind === "user_input" && blocker.agentId &&
         ["blocked", "paused"].includes(mission.status)) {
         const explicitResume = this.hasLocalWorkerStopHold(mission.id);
@@ -3576,6 +3598,9 @@ export class ControlPlane {
     const { agent, mission, role } = this.authorizeAgent(request.agentId, request.epoch, this.getAgent(request.agentId)?.missionId ?? "");
     if (!["Transcript", "Report", "Usage", "AdmitTurn"].includes(request.method) && mission.status !== "active" && !(request.method === "ValidateTask" && mission.status === "validating")) {
       throw new HttpError(409, "Mission is not accepting worker commands");
+    }
+    if (this.missionParityExecutionBlocked(mission.id) && !["Transcript", "Usage", "GetMissionState", "ListAgents", "ListMcpTools", "read_file", "RecordEffectReceipt", "AdmitTurn"].includes(request.method)) {
+      throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
     }
     const args = request.args && typeof request.args === "object" ? request.args as Record<string, unknown> : {};
     if (current && current.machineId !== "local" && REMOTE_EFFECT_METHODS.has(request.method)) {
@@ -3886,11 +3911,14 @@ export class ControlPlane {
 
   private enqueueAgentMessage(sender: Agent, recipient: Agent, content: string, mode: "steer" | "followUp"): Message {
     const mission = this.getMission(sender.missionId);
-    const held = mission?.status === "paused";
+    const parityHeld = mission ? this.missionParityExecutionBlocked(mission.id) : false;
+    const held = mission?.status === "paused" || parityHeld;
     const message: Message = {
       id: randomUUID(), missionId: sender.missionId, senderId: sender.id, recipientId: recipient.id, content, mode,
       status: held ? "aborted" : "queued", attempt: 1, createdAt: now(),
-      ...(held ? { error: "Held while mission is paused; delivery will start after explicit resume" } : {})
+      ...(held ? { error: parityHeld && mission?.status !== "paused"
+        ? "Held because mission parity execution is not available in this build."
+        : "Held while mission is paused; delivery will start after explicit resume" } : {})
     };
     this.db.prepare("INSERT INTO messages(id,mission_id,status,data) VALUES(?,?,?,?)").run(message.id, message.missionId, message.status, json(message));
     if (!held) this.enqueue(message);
@@ -4196,6 +4224,7 @@ export class ControlPlane {
     if (previous.status !== "approved") throw new HttpError(409, "Approval must be approved before execution");
     if (previous.remoteEffectBinding) return previous;
     if (!agent || !mission || mission.status !== "active") throw new HttpError(409, "Approved operation cannot run outside an active mission");
+    this.rejectParityExecution(mission.id);
     if (agent.machineId !== "local") throw new HttpError(409, REMOTE_OPERATION_UNAVAILABLE);
     if (previous.tool === "run_validation") {
       const binding = previous as Approval & Partial<ValidationApprovalBinding>;
@@ -5600,6 +5629,16 @@ export class ControlPlane {
   private parityWorkflow(missionId: string): MissionWorkflowRecord | null {
     const workflow = this.storedWorkflow(missionId);
     return workflow?.mode === "parity-v1" ? workflow : null;
+  }
+
+  missionParityExecutionBlocked(missionId: string): boolean {
+    return this.parityWorkflow(missionId) !== null;
+  }
+
+  private rejectParityExecution(missionId: string): void {
+    if (this.missionParityExecutionBlocked(missionId)) {
+      throw new WorkflowOperationError(409, "CAPABILITY_UNAVAILABLE", "Mission parity execution is not available in this build");
+    }
   }
 
   reconcileInFlightOperations(): void {

@@ -101,12 +101,13 @@ export class WorkerManager {
   }
 
   async startMission(missionId: string): Promise<void> {
+    if (this.control.missionParityExecutionBlocked(missionId)) return;
     for (const agent of this.control.listAgents(missionId)) await this.startAgent(agent);
     await this.dispatchPending();
   }
 
   async recoverActiveMissions(): Promise<void> {
-    const missions = this.control.state().missions.filter((mission) => mission.status === "active");
+    const missions = this.control.state().missions.filter((mission) => mission.status === "active" && !this.control.missionParityExecutionBlocked(mission.id));
     for (const mission of missions) {
       for (const agent of this.control.listAgents(mission.id)) {
         const runtime = agent.machineId !== "local" ? this.control.remoteRuntimeForAgent(agent.id) : undefined;
@@ -122,7 +123,7 @@ export class WorkerManager {
   }
 
   async startAgent(agent: Agent): Promise<void> {
-    if (this.closing || this.quiescenceFlights.has(agent.missionId) || this.control.missionById(agent.missionId)?.status !== "active") return;
+    if (this.closing || this.quiescenceFlights.has(agent.missionId) || this.control.missionById(agent.missionId)?.status !== "active" || this.control.missionParityExecutionBlocked(agent.missionId)) return;
     const pending = this.starting.get(agent.id);
     if (pending) return pending;
     const starting = this.startAgentOnce(agent).then(() => this.clearRemoteStopWait(agent.id)).catch(async (error: unknown) => {
@@ -419,7 +420,7 @@ export class WorkerManager {
     if (this.closing) return;
     for (const row of this.control.pendingOutbox()) {
       const message = this.control.message(row.message_id);
-      if (this.closing || this.quiescenceFlights.has(row.mission_id) || this.control.missionById(row.mission_id)?.status !== "active") continue;
+      if (this.closing || this.quiescenceFlights.has(row.mission_id) || this.control.missionById(row.mission_id)?.status !== "active" || this.control.missionParityExecutionBlocked(row.mission_id)) continue;
       const agent = message ? this.control.getAgentPublic(message.recipientId) : undefined;
       if (!message || !agent || this.dispatching.has(row.id) || this.recoveringAgents.has(agent.id)) continue;
       this.dispatching.add(row.id);

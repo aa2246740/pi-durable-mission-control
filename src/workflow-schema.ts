@@ -396,20 +396,27 @@ export function parseJsonText(text: string): unknown {
   function parseObject(depth: number): Record<string, unknown> {
     index += 1;
     skip();
-    const result: Record<string, unknown> = {};
+    const stored = Object.create(null) as Record<string, unknown>;
+    const finish = (): Record<string, unknown> => {
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(stored)) {
+        Object.defineProperty(result, key, { value: stored[key], enumerable: true, writable: true, configurable: true });
+      }
+      return result;
+    };
     if (text[index] === "}") {
       index += 1;
-      return result;
+      return finish();
     }
     while (index < text.length) {
       skip();
       if (text[index] !== "\"") throw rejected("Workflow JSON object keys must be strings");
       const key = parseString();
-      if (Object.hasOwn(result, key)) throw rejected("Workflow JSON objects cannot contain duplicate keys");
+      if (Object.hasOwn(stored, key)) throw rejected("Workflow JSON objects cannot contain duplicate keys");
       skip();
       if (text[index] !== ":") throw rejected("Workflow JSON object is missing a colon");
       index += 1;
-      result[key] = parseValue(depth + 1);
+      Object.defineProperty(stored, key, { value: parseValue(depth + 1), enumerable: true, writable: true, configurable: true });
       skip();
       if (text[index] === ",") {
         index += 1;
@@ -417,7 +424,7 @@ export function parseJsonText(text: string): unknown {
       }
       if (text[index] === "}") {
         index += 1;
-        return result;
+        return finish();
       }
       throw rejected("Workflow JSON object is invalid");
     }
@@ -615,6 +622,9 @@ export function parseRoleBindings(input: unknown): RoleBinding[] {
     }
     if (resolved.profileSnapshot.reasoning === false && item.reasoningEffort !== undefined && item.reasoningEffort !== "off") {
       throw rejected("Requested reasoning effort must be off or omitted when the model profile does not support reasoning");
+    }
+    if (item.reasoningEffort !== undefined && item.reasoningEffort !== resolved.reasoningEffort) {
+      throw rejected("Requested reasoning effort must match the frozen resolved effort");
     }
     const binding: RoleBinding = {
       slot: item.slot,

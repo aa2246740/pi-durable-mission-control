@@ -24,7 +24,7 @@ import {
 
 const POLICY_CANONICAL = '{"autoAcceptPlan":true,"autoAcceptRepairs":false,"defaultAttemptLimit":7,"maxParallelTasks":1,"skipScrutiny":true,"skipUserTesting":false}';
 const POLICY_DIGEST = "6ffb356c129d47b5679ea07072007ede00d6f4b8045ffd8b8376c9ca5898672a";
-const ROLES_DIGEST = "55c0a51aea219843f53d51329d05a8a58e8b9032f901dd3da9fca9cd60c188dd";
+const ROLES_DIGEST = "799271ae03ad3a4c4fe6608cda4a5a3ba9fffea66cecd68fd87d636d5e2db71c";
 const SET_CANONICAL = '[{"n":1,"slot":"orchestrator"},{"n":1,"slot":"worker"}]';
 
 function homeFixture(t) {
@@ -71,7 +71,7 @@ function oldProfile() {
 function foundationBindings() {
   const slots = [
     ["worker", "role-worker", "worker", undefined],
-    ["orchestrator", "role-orchestrator", "orchestrator", "low"],
+    ["orchestrator", "role-orchestrator", "orchestrator", "high"],
     ["user-testing", "role-user-testing", "validator", undefined],
     ["task-validator", "role-task-validator", "validator", "high"],
     ["scrutiny", "role-scrutiny", "validator", undefined]
@@ -228,7 +228,12 @@ test("foundation snapshots survive reopen, profile changes, backup, and restore 
     assert.deepEqual(read.workflow.roleBindings, workflow.roleBindings);
     assert.equal(read.workflow.roleBindings[0].resolved.profileSnapshot.modelId, "synthetic-old-model");
     assert.equal(read.workflow.roleBindings.find((binding) => binding.slot === "orchestrator").resolved.reasoningEffort, "high");
+    assert.equal(read.workflow.roleBindings.find((binding) => binding.slot === "orchestrator").reasoningEffort, "high");
     assert.equal(read.workflow.roleBindings.find((binding) => binding.slot === "orchestrator").resolved.roleSnapshot.instructions, "Synthetic instructions for orchestrator");
+    const exported = reopened.exportMission(mission.id);
+    assert.equal(exported.workflowFormat, "mission-workflow-v1");
+    assert.equal(exported.workflow.roleBindings.find((binding) => binding.slot === "orchestrator").reasoningEffort, "high");
+    assert.equal(exported.workflow.roleBindings.find((binding) => binding.slot === "orchestrator").resolved.reasoningEffort, "high");
     assert.equal(reopened.profile("profile-old").modelId, "synthetic-new-model");
     assert.equal(workflowDigest("policy", read.workflow.policy), POLICY_DIGEST);
     assert.equal(workflowDigest("roles", read.workflow.roleBindings), ROLES_DIGEST);
