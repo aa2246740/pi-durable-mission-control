@@ -203,3 +203,24 @@ test("running restart rejects a paused dead end after resume and preserves its H
   assert.equal(scenario.evidence.snapshots.at(-1).label, "recovery-dead-end");
   assert.equal(scenario.summary().humanActions[0].response.format, "mission-control-replay-v1");
 });
+
+test("local restart waits for idle agents and unchanged transport before signalling", async (t) => {
+  let now = 1000;
+  t.mock.method(Date, "now", () => now);
+  const snapshot = fixture(); snapshot.detail.agents = [{ status: "running" }];
+  const scenario = createCoordinatorRestartScenario("coordinator-restart", { quiescenceMs: 1000 });
+  scenario.evidence.settlePolls = 4;
+  scenario.configure({ records: snapshot.records, snapshot: async () => snapshot, save() {},
+    restart: async () => { throw new Error("ready-to-restart"); } });
+  assert.equal(await scenario.observe(snapshot.detail), false);
+  now += 2000;
+  assert.equal(await scenario.observe(snapshot.detail), false, "A busy agent cannot satisfy the quiet interval");
+  snapshot.detail.agents[0].status = "idle";
+  assert.equal(await scenario.observe(snapshot.detail), false);
+  now += 800;
+  assert.equal(await scenario.observe(snapshot.detail), false);
+  snapshot.transport.outbox.push({ status: "acknowledged" });
+  assert.equal(await scenario.observe(snapshot.detail), false, "Transport change restarts the quiet interval");
+  now += 1001;
+  await assert.rejects(scenario.observe(snapshot.detail), /ready-to-restart/);
+});

@@ -14,6 +14,8 @@ import { rehearsalConfig, rehearsalSecrets, startFakeProvider } from "./fake-pro
 import { assertWorkerCrash, observeWorkerCrash } from "./scenarios/worker-crash.mjs";
 import { createCoordinatorRestartScenario, restartScenarios, configureCoordinatorRestartRun } from "./scenarios/coordinator-restart.mjs";
 import { createNodePowerLossScenario } from "./scenarios/node-power-loss.mjs";
+import { localRelay } from "./local-relay.mjs";
+import { createLocalBackend, localUncovered, localEnvironment, ProcessTree } from "./local-process.mjs";
 import { createTurnLimitScenario, turnLimitMaxTurns } from "./scenarios/turn-limit.mjs";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
@@ -26,7 +28,10 @@ export function parseOptions(args) {
   const options = { keep: false, timeoutMs: 180000 };
   let explicitTimeout = false;
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--keep") options.keep = true;
+    if (args[i] === "--backend" && args[i + 1]) {
+      options.backend = args[++i];
+      assert.ok(["container", "local-process"].includes(options.backend), "--backend must be container or local-process");
+    } else if (args[i] === "--keep") options.keep = true;
     else if (args[i] === "--real" && args[i + 1]) options.real = resolve(args[++i]);
     else if (args[i] === "--secrets-file" && args[i + 1]) options.secretsFile = resolve(args[++i]);
     else if (args[i] === "--rehearsal") options.rehearsal = true;
@@ -98,7 +103,7 @@ export function assertCoordinatorExit(signalCode, ready) {
   assert.ok(signalCode === null || (!ready && signalCode === "SIGTERM"), "Coordinator required forced shutdown");
 }
 
-async function relay(targetPort) {
+async function relay(targetPort, host = "192.168.64.1") {
   const sockets = new Set();
   const server = createServer((socket) => {
     const upstream = connect(targetPort, "127.0.0.1");
@@ -109,7 +114,7 @@ async function relay(targetPort) {
     }
     socket.pipe(upstream).pipe(socket);
   });
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "192.168.64.1", resolve); });
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, host, resolve); });
   return { port: server.address().port, retarget(port) {
     targetPort = port;
     for (const socket of sockets) socket.destroy();
@@ -119,8 +124,8 @@ async function relay(targetPort) {
   } };
 }
 
-export function childProcess(command, args, env = process.env) {
-  const child = spawn(command, args, { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
+export function childProcess(command, args, env = process.env, settings = {}) {
+  const child = spawn(command, args, { cwd: root, env, stdio: ["pipe", "pipe", "pipe"], ...settings });
   let stdout = "", stderr = "";
   let error;
   child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString()).slice(-2 * 1024 * 1024); });
@@ -231,6 +236,10 @@ export function assertRemoteResume(detail, runtimes, evidence, records, transpor
 }
 
 export async function run(options) {
+  const backend = options.backend ?? "container";
+  assert.ok(["container", "local-process"].includes(backend), "--backend must be container or local-process");
+  const isLocal = backend === "local-process";
+  const relayHost = isLocal ? "127.0.0.1" : "192.168.64.1";
   let config = options.real ? readConfig(options.real) : undefined;
   assert.ok(!(options.rehearsal && options.secretsFile), "--rehearsal conflicts with --secrets-file");
   let credentials = config && !options.rehearsal ? readSecrets(options.secretsFile, kinds.map((kind) => config[kind].credentialEnv)) : undefined;
@@ -254,11 +263,19 @@ export async function run(options) {
   const home = join(proof, "home");
   const credential = randomUUID();
   secrets.push(credential);
-  let daemon, node, mock, nodeRelay, modelRelay, detail, summary;
+  let daemon, node, mock, nodeRelay, modelRelay, detail, summary, local, image;
+  const coordinatorTrees = [];
+  const spawnCoordinator = (env) => {
+    const handle = childProcess(process.execPath, [join(root, "dist/cli.js"), "serve", "--home", home, "--port", "0", "--node-port", "0"], env, { detached: isLocal });
+    if (isLocal) coordinatorTrees.push({ tree: new ProcessTree(handle.child.pid), handle });
+    return handle;
+  };
+  let remotePath = "/work";
+  let nodePlatform = "linux";
   const pause = options.scenario === "pause-resume" ? { humanActions: [] } : undefined;
   const crash = options.scenario === "worker-crash" ? { humanActions: [] } : undefined;
   const turnLimit = options.scenario === "turn-limit" ? createTurnLimitScenario() : undefined;
-  const restart = createCoordinatorRestartScenario(options.scenario);
+  const restart = createCoordinatorRestartScenario(options.scenario, { quiescenceMs: isLocal ? 1000 : 0, recoveryTimeoutMs: isLocal ? 30000 : 10000 });
   const powerLoss = options.scenario === "node-power-loss" ? createNodePowerLossScenario(join(proof, "node-home")) : undefined;
   let captureRestart;
   const recovery = pause ?? turnLimit?.evidence;
@@ -303,10 +320,16 @@ export async function run(options) {
   };
   const records = [];
   try {
-    assert.deepEqual(await containerNames(), [], `Existing ${prefix} containers require their owner's cleanup`);
-    const images = JSON.parse(await command(["image", "list", "--format", "json"]));
-    const image = images.find((i) => /^(docker\.io\/library\/)?node:22-bookworm-slim$/.test(i.configuration.name));
-    assert.ok(image?.variants.some((v) => v.platform.architecture === "arm64" && v.platform.os === "linux"), "Required cached node:22-bookworm-slim arm64 image missing; pulling is forbidden");
+    if (isLocal) {
+      local = createLocalBackend({ root, proof, childProcess, commandOutput });
+      remotePath = local.workspace;
+      nodePlatform = local.platform;
+    } else {
+      assert.deepEqual(await containerNames(), [], `Existing ${prefix} containers require their owner's cleanup`);
+      const images = JSON.parse(await command(["image", "list", "--format", "json"]));
+      image = images.find((i) => /^(docker\.io\/library\/)?node:22-bookworm-slim$/.test(i.configuration.name));
+      assert.ok(image?.variants.some((v) => v.platform.architecture === "arm64" && v.platform.os === "linux"), "Required cached node:22-bookworm-slim arm64 image missing; pulling is forbidden");
+    }
 
     hostRuntime = { path: process.execPath, beforeSha256: sha256(readFileSync(process.execPath)) };
     save("host-runtime.json", hostRuntime);
@@ -325,10 +348,10 @@ export async function run(options) {
       }
       acceptanceCommand = frozenAcceptanceCommand(acceptance);
       if (options.rehearsal) {
-        mock = await startFakeProvider({ config, credentials, acceptanceCommand, wrongImplementation: options.rehearsalWrongImplementation,
+        mock = await startFakeProvider({ config, credentials, acceptanceCommand, wrongImplementation: options.rehearsalWrongImplementation, platform: nodePlatform, remotePath,
           record: (record) => { records.push(record); save("rehearsal-tools.json", records); }, fail: (error) => { mockFailure = error; } });
-        modelRelay = await relay(mock.address().port);
-        config = rehearsalConfig(config, mock.address().port, modelRelay.port);
+        modelRelay = await relay(mock.address().port, relayHost);
+        config = rehearsalConfig(config, mock.address().port, modelRelay.port, relayHost);
       }
       save("real-config.json", config);
       save("frozen-acceptance.json", acceptance);
@@ -339,12 +362,12 @@ export async function run(options) {
       writeFileSync(testPath, source, { mode: 0o400 });
       acceptance = Object.defineProperty({ path: testPath, sha256: sha256(source), tests: 4 }, "source", { value: source });
       acceptanceCommand = `${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(testPath)}`;
-      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario, hooks: turnLimit ?? restart,
+      mock = await startMock({ credential, acceptanceCommand, hostTestPath: testPath, scenario: options.scenario, hooks: turnLimit ?? restart, platform: nodePlatform, hostPathVisible: isLocal,
         record: (record) => { records.push(record); save("mock-tools.json", records); }, fail: (error) => { mockFailure = error; } });
-      modelRelay = await relay(mock.address().port);
+      modelRelay = await relay(mock.address().port, relayHost);
       env.MC_ACCEPTANCE_MODEL_CREDENTIAL = credential;
     }
-    daemon = childProcess(process.execPath, [join(root, "dist/cli.js"), "serve", "--home", home, "--port", "0", "--node-port", "0"], env);
+    daemon = spawnCoordinator(env);
     let daemonInfo = await wait(() => existsSync(join(home, "daemon.json")) && JSON.parse(readFileSync(join(home, "daemon.json"), "utf8")));
     const adminToken = readFileSync(join(home, "admin.token"), "utf8").trim();
     secrets.push(adminToken);
@@ -368,11 +391,12 @@ export async function run(options) {
     };
     const enrolled = await api("/api/machines", { id: machineId, name: config ? "Real model Linux acceptance" : "Deterministic Linux acceptance" });
     secrets.push(enrolled.token);
-    nodeRelay = await relay(daemonInfo.nodePort);
+    nodeRelay = isLocal ? await localRelay(daemonInfo.nodePort) : await relay(daemonInfo.nodePort, relayHost);
     const credentialRefs = config ? [config.worker.credentialEnv] : ["MC_ACCEPTANCE_MODEL_CREDENTIAL"];
     // Values travel only over stdin; the shell reads one value for each explicitly allowed name.
     const nodeInput = [enrolled.token, ...credentialRefs.map((ref) => config ? credentials[ref] : credential)].join("\n") + "\n";
     const startNode = () => {
+      if (local) return (node = local.start({ port: nodeRelay.port, machineId, credentialRefs, input: nodeInput }));
       node = childProcess(containerCLI, ["run", "--rm", "-i", ...((config || restart) ? ["--env", "MC_ACCEPTANCE_RETAIN_CONTAINER=1"] : []), "--name", name, "--arch", "arm64", "--cpus", "2", "--memory", "512M",
         ...(powerLoss ? powerLoss.mountArgs() : []),
         "-v", `${join(root, "dist")}:/app/dist:ro`, "-v", `${join(root, "package.json")}:/app/package.json:ro`,
@@ -385,10 +409,11 @@ export async function run(options) {
     };
     startNode();
     const machine = await wait(async () => (await api("/api/state")).machines.find((m) => m.id === machineId && m.status === "online"));
-    assert.equal(machine.capabilities.platform, "linux");
+    assert.equal(machine.capabilities.platform, nodePlatform);
+    assert.notEqual(machine.id, "local");
     assert.equal(machine.capabilities.executionMode, "workspace-effects");
     assert.ok(credentialRefs.every((ref) => machine.capabilities.credentialRefs.includes(ref)));
-    const probe = await api(`/api/machines/${machineId}/probe`, { requestId: randomUUID(), path: "/work" });
+    const probe = await api(`/api/machines/${machineId}/probe`, { requestId: randomUUID(), path: remotePath });
     await wait(async () => {
       const result = await api(`/api/machines/${machineId}/commands/${probe.id}`);
       if (result.status === "failed") throw new Error("Workspace probe failed");
@@ -404,7 +429,7 @@ export async function run(options) {
         await api("/api/roles", { id: `acceptance-${kind}`, name: kind, kind, profileId: `acceptance-${kind}`,
           instructions: `You are the ${kind} for this mission.`, mcpPermissions: [] });
       }
-      mission = await api("/api/missions", realMission({ acceptanceCommand, localWorkspaceId: localWorkspace.id, remoteWorkspaceId: remoteWorkspace.id, roleIds: kinds.map((kind) => `acceptance-${kind}`) }));
+      mission = await api("/api/missions", realMission({ remotePath, acceptanceCommand, localWorkspaceId: localWorkspace.id, remoteWorkspaceId: remoteWorkspace.id, roleIds: kinds.map((kind) => `acceptance-${kind}`) }));
       // Evidence reads remain possible after timeout; they never mutate mission state.
       captureReal = async () => {
         const response = await fetch(`${base}/api/missions/${mission.id}/export`, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
@@ -431,7 +456,7 @@ export async function run(options) {
     } else {
       const profile = { name: "Deterministic acceptance mock", api: "openai-completions", modelId: "acceptance-mock", credentialEnv: "MC_ACCEPTANCE_MODEL_CREDENTIAL",
         contextWindow: 128000, maxTokens: 2048, reasoning: false, toolCalling: true, vision: false, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
-      for (const [id, baseUrl] of [["acceptance-local", `http://127.0.0.1:${mock.address().port}/v1`], ["acceptance-remote", `http://192.168.64.1:${modelRelay.port}/v1`]]) {
+      for (const [id, baseUrl] of [["acceptance-local", `http://127.0.0.1:${mock.address().port}/v1`], ["acceptance-remote", `http://${relayHost}:${modelRelay.port}/v1`]]) {
         await api("/api/profiles", { ...profile, id, baseUrl });
       }
       const roles = ["orchestrator", "worker", "validator"].map((kind) => ({ id: `acceptance-${kind}`, name: kind, kind,
@@ -444,6 +469,11 @@ export async function run(options) {
     }
     if (restart) captureRestart = configureCoordinatorRestartRun(restart, {
       missionId: mission.id, home, proof, records, api, post, wait, command, save, redact, assertCoordinatorExit,
+      local, remotePath,
+      gracefulStop: local ? (signal) => nodeRelay.atRuntimePoll(async () => {
+        daemon.child.kill(signal);
+        await wait(async () => (await api(`/api/missions/${mission.id}`)).events.some((event) => event.type === "coordinator_stopping"));
+      }) : undefined,
       readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id),
       readRequest: async (path) => {
         const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
@@ -452,12 +482,12 @@ export async function run(options) {
       downloadContent: (id) => fetch(`${base}/api/artifacts/${id}/content`, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) }),
       setDetail: (value) => { detail = value; },
       daemonState: () => ({ handle: daemon, info: daemonInfo }),
-      spawnDaemon: () => (daemon = childProcess(process.execPath, [join(root, "dist/cli.js"), "serve", "--home", home, "--port", "0", "--node-port", "0"], env)),
+      spawnDaemon: () => (daemon = spawnCoordinator(env)),
       activateDaemon: (info) => { daemonInfo = info; base = `http://127.0.0.1:${info.port}`; nodeRelay.retarget(info.nodePort); },
       containerName: name, machineId,
       assertRecovered: (final, evidence) => assertRemoteResume(final.detail, final.runtimes, evidence, records, final.transport)
     });
-    if (turnLimit) turnLimit.configure({ api, wait, save, missionId: mission.id, modelUrl: `http://192.168.64.1:${modelRelay.port}`,
+    if (turnLimit) turnLimit.configure({ api, wait, save, missionId: mission.id, modelUrl: `http://${relayHost}:${modelRelay.port}`,
       readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id) });
     if (recovery) captureMock = async () => {
       const read = async (path) => {
@@ -493,7 +523,7 @@ export async function run(options) {
       save("worker-crash.json", crash);
     };
     if (powerLoss) powerLoss.configure({ api, post, wait, save, machineId, missionId: mission.id, containerName: name,
-      exec: command, startNode, getNode: () => node, records,
+      exec: command, local, startNode, getNode: () => node, records,
       readTransport: () => readPauseTransport(join(home, "control.sqlite"), mission.id),
       readEvidence: async (path) => {
         const response = await fetch(base + path, { headers: { authorization: `Bearer ${adminToken}` }, signal: AbortSignal.timeout(5000) });
@@ -511,7 +541,7 @@ export async function run(options) {
         save("frozen-acceptance.json", acceptance);
       }
       if (config && !mutation) {
-        const publication = findRealPublication(current, machineId, seenPublications, rejectedPublications);
+        const publication = findRealPublication(current, machineId, seenPublications, rejectedPublications, remotePath);
         save("rejected-publications.json", rejectedPublications);
         if (publication) {
           const { event: published, artifact } = publication;
@@ -521,7 +551,7 @@ export async function run(options) {
           const casBeforeSha256 = sha256(readFileSync(casPath));
           assert.equal(casBeforeSha256, artifact.sha256);
           // container exec --help: container exec [options] <container-id> <arguments> ...
-          const guest = JSON.parse(await command(["exec", name, "node", "-e", faultInjectionScript, artifact.path]));
+          const guest = JSON.parse(await (local ? local.eval(faultInjectionScript, [artifact.path]) : command(["exec", name, "node", "-e", faultInjectionScript, artifact.path])));
           mutation = { artifactId: artifact.id, eventSeq: published.seq, publishedSha256: artifact.sha256, ...guest,
             casBeforeSha256, casAfterSha256: sha256(readFileSync(casPath)), completedAt: new Date().toISOString() };
           save("fault-injection.json", mutation);
@@ -537,7 +567,7 @@ export async function run(options) {
       }
       if (crash) {
         const finished = await observeWorkerCrash({
-          crash, current, missionId: mission.id, containerName: name, records, api, post, exec: command,
+          crash, current, missionId: mission.id, containerName: name, records, api, post, exec: command, killWorker: local ? () => local.killWorker() : undefined,
           transport: () => readPauseTransport(join(home, "control.sqlite"), mission.id),
           save: () => save("worker-crash.json", crash)
         });
@@ -619,7 +649,7 @@ export async function run(options) {
       if (powerLoss) {
         await powerLoss.capture();
         summary = { status: "passed", scenario: "node-power-loss", missionStatus: detail.mission.status,
-          ...powerLoss.assertCompleted(), mockCost: 0, image: { name: image.configuration.name, digest: image.id } };
+          ...powerLoss.assertCompleted(), mockCost: 0, image: image ? { name: image.configuration.name, digest: image.id } : null };
       } else if (crash) {
         await captureCrash();
         crash.assertions = assertWorkerCrash(detail, crash.runtimes, crash, records, crash.transport);
@@ -628,13 +658,13 @@ export async function run(options) {
           taskStatus: detail.tasks[0]?.status ?? null, artifacts: detail.artifacts.length, stopProvenance: crash.assertions.stopProvenance,
           remoteRuntimeState: crash.runtimes[0].state, diagnostic: crash.assertions.diagnostic, humanActions: crash.humanActions,
           effectReceipts: crash.assertions.effectReceipts, blockers: detail.blockers.length, mockCost: 0,
-          image: { name: image.configuration.name, digest: image.id }, tools: records.map(({ role, name }) => ({ role, name })) };
+          image: image ? { name: image.configuration.name, digest: image.id } : null, tools: records.map(({ role, name }) => ({ role, name })) };
       } else if (config) {
         const evidence = await captureReal();
         summary = { status: "passed", mode: "real", durationMs: Date.now() - startedAt, missionStatus: detail.mission.status,
           turns: evidence.turns, maxTurns: evidence.maxTurns, roles: evidence.roles, costKnown: evidence.costKnown,
           acceptance, mutation, tools: evidence.tools, blockers: detail.blockers, remoteRuntimeState: deliveryRuntime.state, remoteRuntimeId: deliveryRuntime.binding.runtimeId, remoteRuntimeCount: runtimes.length,
-          image: { name: image.configuration.name, digest: image.id } };
+          image: image ? { name: image.configuration.name, digest: image.id } : null };
       } else {
         assert.equal(detail.mission.status, "completed");
         assert.equal(detail.tasks.length, 1);
@@ -655,7 +685,7 @@ export async function run(options) {
         assert.notEqual(worker.id, validator.id);
         assert.equal(receipt.validatorId, validator.id);
         const effects = detail.events.filter((e) => e.type === "remote_effect_receipt" && e.agentId === worker.id).map((e) => e.data.receipt).filter((r) => r.status === "succeeded").map((r) => r.result);
-        assert.ok(effects.some((r) => r.exitCode === 0 && r.stdout?.includes("/usr/local/bin/node") && r.stdout.includes("LINUX-SELF-CHECK-OK")), "No successful Linux PATH/self-check receipt");
+        assert.ok(effects.some((r) => r.exitCode === 0 && r.stdout?.includes(local ? process.execPath : "/usr/local/bin/node") && r.stdout.includes("LINUX-SELF-CHECK-OK")), "No successful Linux PATH/self-check receipt");
         assert.ok(effects.some((r) => r.exitCode === 0 && r.stdout?.includes("LIVE-SOURCE-CHANGED")), "No live source mutation receipt");
         assert.ok(records.some((r) => r.role === "validator" && r.name === "RunValidation"));
         assert.equal(records.some((r) => r.role === "validator" && r.name === "RequestUserInput"), false);
@@ -682,8 +712,8 @@ export async function run(options) {
         summary = { status: "passed", scenario: options.scenario ?? "default", ...(restart ? { coordinatorRestart: restart.evidence.assertions } : {}), ...(recovery ? { [pause ? "pauseResume" : "turnLimit"]: recovery.assertions, humanActions: recovery.humanActions } : {}), durationMs: Date.now() - startedAt, missionStatus: detail.mission.status, taskStatus: detail.tasks[0].status,
           exitCode: receipt.exitCode, snapshotIntegrity: receipt.snapshotIntegrity, workspaceKind: receipt.workspaceKind,
           machineId, platform: machine.capabilities.platform, node: machine.capabilities.node, remoteProvenance: artifact.remoteProvenance,
-          contentDisposition: disposition, linuxNodePath: "/usr/local/bin/node", liveSourceChanged: true, blockers: detail.blockers.filter((blocker) => blocker.status === "open").length,
-          validatorRequestedUserInput: false, remoteRuntimeState: runtimes[0].state, mockCost: 0, image: { name: image.configuration.name, digest: image.id },
+          contentDisposition: disposition, linuxNodePath: local ? process.execPath : "/usr/local/bin/node", liveSourceChanged: true, blockers: detail.blockers.filter((blocker) => blocker.status === "open").length,
+          validatorRequestedUserInput: false, remoteRuntimeState: runtimes[0].state, mockCost: 0, image: image ? { name: image.configuration.name, digest: image.id } : null,
           tools: records.map(({ role, name }) => ({ role, name })) };
       }
     }
@@ -732,6 +762,9 @@ export async function run(options) {
       clearTimeout(timer);
       assertCoordinatorExit(daemon.child.signalCode, ready);
     });
+    if (isLocal) await cleanup("coordinator descendants", async () => {
+      for (const owned of coordinatorTrees) await owned.tree.stop(owned.handle);
+    });
     if (config && acceptance) {
       acceptance.checks.push(checkFrozenAcceptance(acceptance, "end"));
       save("frozen-acceptance.json", acceptance);
@@ -741,7 +774,7 @@ export async function run(options) {
       save("host-runtime.json", hostRuntime);
       await cleanup("host node integrity", async () => assertHostRuntime(hostRuntime));
     }
-    if (detail?.mission.status === "completed" && acceptance && (!config || mutation)) await cleanup("independent container review", async () => {
+    if (detail?.mission.status === "completed" && acceptance && (!config || mutation)) await cleanup("independent frozen review", async () => {
       const artifact = config ? detail.artifacts.find((value) => value.id === mutation?.artifactId) : detail.artifacts[0];
       assert.ok(artifact, "No frozen artifact for independent review");
       const accepted = detail.tasks.find((task) => task.status === "accepted");
@@ -751,7 +784,20 @@ export async function run(options) {
       assert.ok(receipt, "No matching frozen acceptance receipt for independent review");
       summary.acceptanceReceipt = { id: receipt.id, commandMatch: acceptanceCommandMatch(acceptanceCommand, receipt.command) };
       review = await independentReview({ proof, acceptance, artifact, receipt, casPath: join(home, "artifacts", artifact.sha256),
-        name: reviewName, image: "node:22-bookworm-slim", execute: async (args) => {
+        name: reviewName, image: "node:22-bookworm-slim", backend, executeLocal: local ? async (file, cwd) => {
+          const handle = childProcess(process.execPath, ["--test", "--test-reporter=tap", file], { PATH: process.env.PATH, HOME: cwd, TMPDIR: cwd }, { cwd, detached: true });
+          const tree = new ProcessTree(handle.child.pid);
+          let killFlight, killError;
+          const timer = setTimeout(() => {
+            killFlight = tree.kill().catch((error) => { killError = error; handle.child.kill("SIGKILL"); });
+          }, 60000);
+          await handle.done;
+          clearTimeout(timer);
+          await killFlight;
+          await tree.stop(handle);
+          if (killError) throw killError;
+          return { exitCode: handle.child.exitCode, signalCode: handle.child.signalCode, stdout: handle.stdout(), stderr: handle.stderr() };
+        } : undefined, execute: async (args) => {
           const handle = childProcess(containerCLI, args, { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: proof });
           const timer = setTimeout(() => handle.child.kill("SIGKILL"), 60000);
           await handle.done;
@@ -771,7 +817,7 @@ export async function run(options) {
       let remoteStopped = false;
       if (node) {
         try {
-          const stopped = JSON.parse(await command(["exec", name, "node", "-e", stopNodeForEvidenceScript]));
+          const stopped = local ? (await local.stop(), { stopped: true, backend }) : JSON.parse(await command(["exec", name, "node", "-e", stopNodeForEvidenceScript]));
           remoteStopped = stopped.stopped === true;
           save("node-evidence-stop.json", stopped);
         } catch { save("node-evidence-stop.json", { stopped: false, error: "Node shutdown not confirmed; remote session evidence incomplete" }); }
@@ -782,7 +828,7 @@ export async function run(options) {
           session = readSessionEvidence(join(home, "agents", `${agent.id}.sqlite`));
         } else if (agent.machineId === machineId && remoteStopped) {
           try {
-            session = JSON.parse(await command(["exec", name, "node", "-e", remoteSessionScript, `${remoteRuntimeHome}/agents/${sha256(agent.id)}.sqlite`]));
+            session = local ? readSessionEvidence(join(local.home, "worker-runtime", "agents", `${sha256(agent.id)}.sqlite`)) : JSON.parse(await command(["exec", name, "node", "-e", remoteSessionScript, `${remoteRuntimeHome}/agents/${sha256(agent.id)}.sqlite`]));
           } catch { session = { complete: false, error: "Remote session query failed" }; }
         } else session = { complete: false, error: "Related process stop not confirmed" };
         sessions.push({ agentId: agent.id, ...session });
@@ -803,7 +849,7 @@ export async function run(options) {
         assert.deepEqual(evidence.oracleTouches, [], "Acceptance oracle modification or unverified access by a local tool");
         assert.ok(acceptance.checks.every((check) => check.intact), "Frozen acceptance hash or permissions changed");
       });
-      if (summary.status === "passed") await cleanup("final acceptance", async () => assertRealSuccess(exportedReal, evidence, acceptanceCommand, machineId));
+      if (summary.status === "passed") await cleanup("final acceptance", async () => assertRealSuccess(exportedReal, evidence, acceptanceCommand, machineId, remotePath));
       Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches, oracleReads: evidence.oracleReads, agentLocations: realAgentLocations(exportedReal),
         modelMismatches: Object.entries(evidence.roles).filter(([, role]) => role.modelMismatch).map(([kind, role]) => ({ kind, configuredModelId: role.configuredModelId, responseModels: role.responseModels })) });
     }
@@ -812,7 +858,11 @@ export async function run(options) {
       await flags.done;
       assert.ok(!flags.error() && flags.child.exitCode === 0, "chflags nouchg failed");
     });
-    await cleanup("container", async () => {
+    await cleanup("node backend", async () => {
+      if (isLocal) {
+        if (local) { await local.stop(); summary.localCleanup = await local.cleanup(); }
+        return;
+      }
       for (const ownedName of [name, reviewName]) {
         if ((await containerNames()).includes(ownedName)) {
           try { await command(["stop", ownedName]); }
@@ -831,13 +881,19 @@ export async function run(options) {
     for (const [label, server] of [["node relay", nodeRelay], ["model relay", modelRelay]]) if (server) await cleanup(label, () => server.close());
     if (mock) await cleanup("mock", async () => { mock.closeAllConnections(); await new Promise((resolve) => mock.close(resolve)); });
     if (daemon) writeFileSync(join(proof, "coordinator.log"), redact(daemon.output()), { mode: 0o600 });
+    if (isLocal && nodeRelay) save("node-relay.json", nodeRelay.observations);
     if (node) writeFileSync(join(proof, "container.log"), redact(node.output()), { mode: 0o600 });
     rmSync(join(home, "admin.token"), { force: true });
-    await cleanup("container residue", async () => assert.deepEqual(await containerNames(), []));
+    if (!isLocal) await cleanup("container residue", async () => assert.deepEqual(await containerNames(), []));
     process.removeListener("SIGINT", onInt);
     process.removeListener("SIGTERM", onTerm);
     if (rehearsalSecretPath) await cleanup("rehearsal secrets", async () => rmSync(rehearsalSecretPath, { force: true }));
     summary ??= { status: "failed" };
+    summary.backend = backend;
+    summary.uncovered = isLocal ? [...localUncovered] : [];
+    summary.nodePlatform = nodePlatform;
+    summary.nodeArchitecture = process.arch;
+    if (isLocal) summary.localEnvironment = localEnvironment();
     summary.cleanupVerified = cleanupErrors.length === 0;
     if (cleanupErrors.length) {
       summary.status = "failed";
