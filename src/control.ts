@@ -975,7 +975,7 @@ export class ControlPlane {
     }, () => {
       const artifact = this.remoteArtifacts.complete(auth.spec, auth.manifest, (snapshotPath, identity) => ({
         id: randomUUID(), missionId: auth.mission.id, agentId: auth.agent.id,
-        name: String(auth.spec.args.name), path: auth.manifest.relativePath,
+        name: String(auth.spec.args.name), path: auth.manifest.sourcePath,
         sha256: auth.manifest.sha256, size: auth.manifest.size, createdAt: now(),
         snapshotPath, taskId: auth.task.id, relativePath: auth.manifest.relativePath,
         remoteProvenance: {
