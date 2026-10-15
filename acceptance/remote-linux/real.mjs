@@ -169,6 +169,56 @@ export function frozenAcceptanceCommand(acceptance) {
   return `${shellQuote(process.execPath)} -e ${shellQuote(check)} && ${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(acceptance.path)}`;
 }
 
+// Quote removal is safe only in this literal subset; unknown shell syntax fails closed.
+function literalShellTokens(command) {
+  if (typeof command !== "string" || /[\x00-\x08\x0a-\x1f\x7f$`]/.test(command)) return null;
+  const tokens = [];
+  let word = "", quote = "", started = false;
+  const flush = () => {
+    if (started) tokens.push({ kind: "word", value: word });
+    word = ""; started = false;
+  };
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (quote === "'") {
+      if (char === "'") quote = "";
+      else word += char;
+    } else if (quote === '"') {
+      if (char === '"') quote = "";
+      else if (char === "\\") {
+        const next = command[++index];
+        if (next !== '"' && next !== "\\") return null;
+        word += next;
+      } else word += char;
+    } else if (char === "'" || char === '"') { quote = char; started = true; }
+    else if (char === "\\") {
+      if (++index === command.length) return null;
+      word += command[index]; started = true;
+    } else if (char === " " || char === "\t") flush();
+    else if (char === "&" && command[index + 1] === "&") {
+      flush();
+      if (tokens.at(-1)?.kind !== "word") return null;
+      tokens.push({ kind: "operator", value: "&&" }); index++;
+    } else if ("&;|<>()*?[#{}!~".includes(char) || /\s/.test(char)) return null;
+    else { word += char; started = true; }
+  }
+  if (quote) return null;
+  flush();
+  if (tokens.at(-1)?.kind !== "word") return null;
+  // Assignments and reserved words can change shell parsing despite identical word values.
+  if (tokens.some((token) => token.kind === "word" &&
+    (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.value) || /^(?:if|then|else|elif|fi|do|done|case|esac|while|until|for|in|time|function|select|coproc|!|\{|\})$/.test(token.value)))) return null;
+  return tokens;
+}
+
+export function acceptanceCommandMatch(expected, actual) {
+  if (typeof expected !== "string" || typeof actual !== "string") return null;
+  if (expected === actual) return "exact";
+  const left = literalShellTokens(expected), right = literalShellTokens(actual);
+  return left && right && left.length === right.length && left.every((token, index) =>
+    token.kind === right[index].kind && token.value === right[index].value) ? "shell-equivalent" : null;
+}
+
 export function checkFrozenAcceptance(acceptance, phase, receiptId) {
   const check = { phase, checkedAt: new Date().toISOString(), ...(receiptId ? { receiptId } : {}) };
   try {
@@ -332,7 +382,7 @@ export function collectRealEvidence(exported, mutation, acceptance, casHashes = 
     toolSequenceOrdering: "per-agent durable commit_seq, entry id and tool position; no cross-agent clock ordering", acceptance, mutation,
     ...auditOracle(exported, acceptance.path),
     artifacts: exported.artifacts.map((artifact) => ({ id: artifact.id, sha256: artifact.sha256, casSha256: casHashes[artifact.id] ?? null, snapshotPath: artifact.snapshotPath, remoteProvenance: artifact.remoteProvenance })),
-    validationReceipts: exported.validationReceipts, blockers: exported.blockers };
+    validationReceipts: exported.validationReceipts.map((receipt) => ({ ...receipt, commandMatch: acceptanceCommandMatch(frozenAcceptanceCommand(acceptance), receipt.command) })), blockers: exported.blockers };
 }
 
 export function realAcceptanceSelection(detail, acceptanceCommand, machineId, artifactId) {
@@ -350,13 +400,13 @@ export function realAcceptanceSelection(detail, acceptanceCommand, machineId, ar
   const validation = detail.validations.filter((value) => value.taskId === task.id).at(-1);
   assert.ok(validation?.passed, "Accepted task has no successful validator decision");
   const receipt = detail.validationReceipts.find((value) => value.id === validation.receiptId && value.taskId === task.id &&
-    value.validatorId === task.validatorId && value.command === acceptanceCommand && value.artifactIds.includes(artifact.id));
-  assert.ok(receipt, "No exact frozen acceptance receipt for the accepted task");
-  return { task, artifact, receipt };
+    value.validatorId === task.validatorId && acceptanceCommandMatch(acceptanceCommand, value.command) && value.artifactIds.includes(artifact.id));
+  assert.ok(receipt, "No matching frozen acceptance receipt for the accepted task");
+  return { task, artifact, receipt, commandMatch: acceptanceCommandMatch(acceptanceCommand, receipt.command) };
 }
 
 export function assertRealOutcome(detail, acceptanceCommand) {
-  const failed = detail.validationReceipts.filter((receipt) => receipt.command === acceptanceCommand && receipt.exitCode !== 0);
+  const failed = detail.validationReceipts.filter((receipt) => acceptanceCommandMatch(acceptanceCommand, receipt.command) && receipt.exitCode !== 0);
   const reason = failed.length ? "Frozen acceptance failed for the published snapshot" : "Real Mission did not complete";
   assert.equal(detail.mission.status, "completed", `${reason}; status=${detail.mission.status}; failedReceipts=${failed.length}`);
 }

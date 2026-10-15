@@ -8,7 +8,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { createRuntimeProvider } from "../dist/worker.js";
 import { parseOptions } from "../acceptance/remote-linux/run.mjs";
-import { assertRealOutcome, readConfig, scanEvidence } from "../acceptance/remote-linux/real.mjs";
+import { acceptanceCommandMatch, frozenAcceptanceCommand, assertRealOutcome, readConfig, scanEvidence } from "../acceptance/remote-linux/real.mjs";
 import { encodeReply, normalizeMessages, rehearsalCall, rehearsalConfig, rehearsalSecrets, startFakeProvider, totalsSource, validateRequest } from "../acceptance/remote-linux/fake-provider.mjs";
 
 const config = () => readConfig(new URL("../acceptance/remote-linux/real-minimax.json", import.meta.url));
@@ -150,4 +150,31 @@ test("rehearsal worker starts its attempt, reads a denied publication, and retri
   assert.deepEqual(retry.args, { name: "Order totals", path: "/work/totals.mjs", taskId: "task" });
   add(retry.name, retry.args, { status: "succeeded", result: { id: "artifact" } });
   assert.deepEqual(next().args, { taskId: "task", status: "review", evidence: "Linux self-check passed; totals.mjs published." });
+});
+
+
+test("rehearsal validator executes a quote-equivalent frozen command", () => {
+  const acceptanceCommand = frozenAcceptanceCommand({ path: "/host/totals.acceptance.test.mjs", sha256: "a".repeat(64) });
+  const body = { tools: [{ function: { name: "RunValidation" } }], messages: [
+    { role: "assistant", tool_calls: [{ id: "state", function: { name: "GetMissionState", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "state", content: JSON.stringify({ mission: {}, tasks: [{ id: "t", status: "review" }], artifacts: [{ id: "a", taskId: "t" }] }) }
+  ] };
+  const call = rehearsalCall(body, { role: "validator", acceptanceCommand });
+  assert.equal(call.name, "RunValidation");
+  assert.equal(call.args.taskId, "t");
+  assert.deepEqual(call.args.artifactIds, ["a"]);
+  assert.notEqual(call.args.command, acceptanceCommand);
+  assert.equal(acceptanceCommandMatch(acceptanceCommand, call.args.command), "shell-equivalent");
+});
+
+test("rehearsal orchestrator recognizes failure of a quote-equivalent frozen command", () => {
+  const acceptanceCommand = frozenAcceptanceCommand({ path: "/host/totals.acceptance.test.mjs", sha256: "a".repeat(64) });
+  const command = acceptanceCommand.replaceAll("'\\''", "'\"'\"'");
+  const body = { messages: [
+    { role: "assistant", tool_calls: [{ id: "state", function: { name: "GetMissionState", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "state", content: JSON.stringify({ tasks: [{ status: "blocked" }], validationReceipts: [{ command, exitCode: 1 }] }) }
+  ] };
+  const call = rehearsalCall(body, { role: "orchestrator", acceptanceCommand });
+  assert.equal(call.name, "RequestUserInput");
+  assert.match(call.args.question, /Frozen business tests rejected/);
 });
