@@ -314,12 +314,14 @@ export async function run(options) {
     if (config) {
       acceptance = writeFrozenAcceptance(proof);
       acceptance.checks = [];
-      acceptance.immutable = { attempted: process.platform === "darwin", applied: false };
-      if (acceptance.immutable.attempted) {
-        const flags = childProcess("/bin/chflags", ["uchg", acceptance.path], frozenFlagEnvironment());
-        await flags.done;
-        acceptance.immutable.applied = !flags.error() && flags.child.exitCode === 0;
-        if (!acceptance.immutable.applied) acceptance.immutable.error = "chflags uchg failed";
+      for (const file of [acceptance, acceptance.entry]) {
+        file.immutable = { attempted: process.platform === "darwin", applied: false };
+        if (file.immutable.attempted) {
+          const flags = childProcess("/bin/chflags", ["uchg", file.path], frozenFlagEnvironment());
+          await flags.done;
+          file.immutable.applied = !flags.error() && flags.child.exitCode === 0;
+          if (!file.immutable.applied) file.immutable.error = "chflags uchg failed";
+        }
       }
       acceptanceCommand = frozenAcceptanceCommand(acceptance);
       if (options.rehearsal) {
@@ -805,8 +807,8 @@ export async function run(options) {
       Object.assign(summary, { missionStatus: evidence.status, blockers: evidence.blockers, roles: evidence.roles, tools: evidence.tools, evidenceComplete: evidence.evidenceComplete, oracleTouches: evidence.oracleTouches, oracleReads: evidence.oracleReads, agentLocations: realAgentLocations(exportedReal),
         modelMismatches: Object.entries(evidence.roles).filter(([, role]) => role.modelMismatch).map(([kind, role]) => ({ kind, configuredModelId: role.configuredModelId, responseModels: role.responseModels })) });
     }
-    if (acceptance?.immutable?.applied) await cleanup("frozen acceptance flags", async () => {
-      const flags = childProcess("/bin/chflags", ["nouchg", acceptance.path], frozenFlagEnvironment());
+    for (const file of config && acceptance ? [acceptance, acceptance.entry] : []) if (file.immutable?.applied) await cleanup("frozen acceptance flags", async () => {
+      const flags = childProcess("/bin/chflags", ["nouchg", file.path], frozenFlagEnvironment());
       await flags.done;
       assert.ok(!flags.error() && flags.child.exitCode === 0, "chflags nouchg failed");
     });

@@ -59,12 +59,12 @@ export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementati
     }
     const history = transcript(body);
     if (state && !history.some((result) => result.name === "bash")) {
-      const path = acceptanceCommand.match(/--test-reporter=tap (.+)$/)?.[1];
-      assert.ok(path, "Frozen test path missing from acceptance command");
+      const path = acceptanceCommand.match(/^'[^']+' (.+)$/)?.[1];
+      assert.ok(path, "Frozen entry path missing from acceptance command");
       assert.ok(body.tools.some((tool) => tool.function.name === "bash"), "Orchestrator is missing bash");
       return { role, name: "bash", args: { command: `shasum -a 256 ${path}` } };
     }
-    if (history.at(-1)?.name === "bash") assert.equal(history.at(-1).value.exitCode, 0, "Frozen test read failed");
+    if (history.at(-1)?.name === "bash") assert.equal(history.at(-1).value.exitCode, 0, "Frozen entry read failed");
     return nextCall(body, { acceptanceCommand });
   }
   const names = new Set(body.tools.map((tool) => tool.function.name));
@@ -102,8 +102,8 @@ export function rehearsalCall(body, { role, acceptanceCommand, wrongImplementati
     if (last.name === "GetMissionState") {
       const artifactIds = state.artifacts.filter((artifact) => artifact.taskId === task.id).map((artifact) => artifact.id);
       assert.equal(artifactIds.length, 1);
-      // Exercise quote-equivalent execution through the real validation boundary.
-      const command = acceptanceCommand.replaceAll("'\\''", "'\"'\"'");
+      // Exercise shell-equivalent execution through the real validation boundary.
+      const command = ` ${acceptanceCommand} `;
       return call("RunValidation", { taskId: task.id, command, artifactIds });
     }
     if (last.name === "RunValidation") {

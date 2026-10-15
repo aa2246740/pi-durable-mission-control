@@ -160,13 +160,36 @@ test('reject invalid fields and unsafe amounts', () => {
 });
 `;
   writeFileSync(path, source, { mode: 0o400, flag: "wx" });
-  return Object.defineProperty({ path, sha256: sha256(readFileSync(path)), tests: 4 }, "source", { value: source });
+  const acceptance = { path, sha256: sha256(readFileSync(path)), tests: 4 };
+  acceptance.entry = writeFrozenAcceptanceEntry(acceptance);
+  return Object.defineProperty(acceptance, "source", { value: source });
 }
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
+export function writeFrozenAcceptanceEntry(acceptance) {
+  const path = join(dirname(acceptance.path), "run-frozen-acceptance.mjs");
+  const source = `import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
+const path = ${JSON.stringify(acceptance.path)};
+if (createHash('sha256').update(readFileSync(path)).digest('hex') !== ${JSON.stringify(acceptance.sha256)}) {
+  console.error('Frozen acceptance hash mismatch');
+  process.exit(1);
+}
+const child = spawn(process.execPath, ['--test', '--test-reporter=tap', path], { cwd: process.cwd(), stdio: 'inherit' });
+child.on('error', (error) => { console.error(error); process.exit(1); });
+child.on('exit', (code, signal) => {
+  if (signal) process.kill(process.pid, signal);
+  else process.exit(code ?? 1);
+});
+`;
+  writeFileSync(path, source, { mode: 0o400, flag: "wx" });
+  return { path, sha256: sha256(readFileSync(path)) };
+}
+
 export function frozenAcceptanceCommand(acceptance) {
-  const check = `const fs=require('node:fs'),crypto=require('node:crypto');if(crypto.createHash('sha256').update(fs.readFileSync(${JSON.stringify(acceptance.path)})).digest('hex')!==${JSON.stringify(acceptance.sha256)}){console.error('Frozen acceptance hash mismatch');process.exit(1)}`;
-  return `${shellQuote(process.execPath)} -e ${shellQuote(check)} && ${shellQuote(process.execPath)} --test --test-reporter=tap ${shellQuote(acceptance.path)}`;
+  const quote = (path) => path.includes("'") ? '"' + path.replace(/[\\"$`]/g, "\\$&") + '"' : shellQuote(path);
+  return `${quote(process.execPath)} ${quote(acceptance.entry.path)}`;
 }
 
 // Quote removal is safe only in this literal subset; unknown shell syntax fails closed.
@@ -221,11 +244,18 @@ export function acceptanceCommandMatch(expected, actual) {
 
 export function checkFrozenAcceptance(acceptance, phase, receiptId) {
   const check = { phase, checkedAt: new Date().toISOString(), ...(receiptId ? { receiptId } : {}) };
-  try {
-    check.sha256 = sha256(readFileSync(acceptance.path));
-    check.mode = statSync(acceptance.path).mode & 0o7777;
-    check.intact = check.sha256 === acceptance.sha256 && check.mode === 0o400;
-  } catch { check.intact = false; check.error = "Frozen acceptance file unreadable"; }
+  check.files = [acceptance, acceptance.entry].map((file) => {
+    const result = { path: file.path };
+    try {
+      result.sha256 = sha256(readFileSync(file.path));
+      result.mode = statSync(file.path).mode & 0o7777;
+      result.intact = result.sha256 === file.sha256 && result.mode === 0o400;
+    } catch { result.intact = false; result.error = "Frozen acceptance file unreadable"; }
+    return result;
+  });
+  check.sha256 = check.files[0].sha256;
+  check.mode = check.files[0].mode;
+  check.intact = check.files.every((file) => file.intact);
   return check;
 }
 
@@ -233,7 +263,7 @@ function oracleReference(command, acceptancePath) {
   // Keep the existing proof-directory audit even when a command only reads it.
   const directory = dirname(acceptancePath);
   const unquoted = command.replace(/["']/g, "").replace(/\$\{(?:HOME|TMPDIR)\}|\$(?:HOME|TMPDIR)\b|~(?=\/|\s|$)/g, directory);
-  const file = unquoted.replace(/\\/g, "").includes("totals.acceptance.test.mjs") || unquoted.includes(acceptancePath);
+  const file = unquoted.replace(/\\/g, "").includes("totals.acceptance.test.mjs") || unquoted.replace(/\\/g, "").includes("run-frozen-acceptance.mjs") || unquoted.includes(acceptancePath);
   const directoryTouch = unquoted.includes(directory) && /\b(?:chmod|chflags|chown|rm|mv|cp|tee|touch|mkdir|rmdir|install|truncate|ln|sed|perl|python\d*|node)\b|>|write(?:File)?/i.test(unquoted);
   return { file, directoryTouch };
 }
@@ -293,7 +323,8 @@ function readOnlyCommand([executable, ...args], acceptancePath) {
   });
 }
 
-export function classifyOracleCommand(command, acceptancePath) {
+export function classifyOracleCommand(command, acceptancePath, acceptanceCommand = frozenAcceptanceCommand({ entry: { path: join(dirname(acceptancePath), "run-frozen-acceptance.mjs") } })) {
+  if (acceptanceCommandMatch(acceptanceCommand, command)) return "read";
   const { file, directoryTouch } = oracleReference(command, acceptancePath);
   if (file) return readOnlyPipeline(command, acceptancePath) ? "read" : "touch";
   return directoryTouch ? "touch" : null;
@@ -303,11 +334,11 @@ export function touchedOracle(command, acceptancePath) {
   return classifyOracleCommand(command, acceptancePath) === "touch";
 }
 
-export function auditOracle(exported, acceptancePath) {
+export function auditOracle(exported, acceptancePath, acceptanceCommand) {
   const local = new Set(exported.agents.filter((agent) => agent.machineId === "local").map((agent) => agent.id));
   const oracleReads = [], oracleTouches = [];
   const recordCommand = (record) => {
-    const kind = classifyOracleCommand(record.command, acceptancePath);
+    const kind = classifyOracleCommand(record.command, acceptancePath, acceptanceCommand);
     if (kind) (kind === "read" ? oracleReads : oracleTouches).push(record);
   };
   for (const event of exported.events ?? []) {
@@ -345,7 +376,7 @@ export function oracleTouches(exported, acceptancePath) {
 
 export function realMission({ acceptanceCommand, localWorkspaceId, remoteWorkspaceId, roleIds }) {
   return { title: "Remote Linux order totals", goal: `${businessRules} Deliver totals.mjs at /work/totals.mjs in the assigned Linux workspace.`,
-    acceptance: `${businessRules} Deliver one totals.mjs file. An independent validator on the coordinator verifies the published snapshot using this read-only host command: ${acceptanceCommand}. The host test file is available only on the coordinator.`,
+    acceptance: `${businessRules} Deliver one totals.mjs file. An independent validator on the coordinator verifies the published snapshot using this read-only host command: ${acceptanceCommand}. The frozen host entry script and test file are available only on the coordinator.`,
     workspaceId: localWorkspaceId, remoteWorkspaceIds: [remoteWorkspaceId], roleIds, maxTurns: 60, maxCost: 0, autonomy: "trusted", workspaceStrategy: "shared",
     assertions: [{ id: "TOTALS-FROZEN", description: `${businessRules} Independent validation of the published Linux snapshot passes all four host tests.` }] };
 }
@@ -380,7 +411,7 @@ export function collectRealEvidence(exported, mutation, acceptance, casHashes = 
     cost: exported.mission.costKnown ? exported.mission.cost : null, costKnown: exported.mission.costKnown,
     roles, agents, evidenceComplete: agents.every((agent) => agent.complete), tools,
     toolSequenceOrdering: "per-agent durable commit_seq, entry id and tool position; no cross-agent clock ordering", acceptance, mutation,
-    ...auditOracle(exported, acceptance.path),
+    ...auditOracle(exported, acceptance.path, frozenAcceptanceCommand(acceptance)),
     artifacts: exported.artifacts.map((artifact) => ({ id: artifact.id, sha256: artifact.sha256, casSha256: casHashes[artifact.id] ?? null, snapshotPath: artifact.snapshotPath, remoteProvenance: artifact.remoteProvenance })),
     validationReceipts: exported.validationReceipts.map((receipt) => ({ ...receipt, commandMatch: acceptanceCommandMatch(frozenAcceptanceCommand(acceptance), receipt.command) })), blockers: exported.blockers };
 }

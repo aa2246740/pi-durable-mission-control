@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { assertCoordinatorExit, finalInterruption, missionOutcomeReady, realAgentLocations, assertRealPublication, stoppedRealRuntimes, commandOutput, frozenFlagEnvironment, finalizeEvidence, normalizeFailure, parseOptions } from "../acceptance/remote-linux/run.mjs";
-import { acceptanceCommandMatch, realAcceptanceSelection, assertRealOutcome, assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, frozenAcceptanceCommand, checkFrozenAcceptance, classifyOracleCommand, auditOracle, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
+import { acceptanceCommandMatch, realAcceptanceSelection, assertRealOutcome, assertRealSuccess, collectRealEvidence, faultInjectionScript, nodeCredentialShell, parseSecrets, readConfig, readSecrets, realMission, redact, scanEvidence, sha256, validateConfig, writeFrozenAcceptance, writeFrozenAcceptanceEntry, frozenAcceptanceCommand, checkFrozenAcceptance, classifyOracleCommand, auditOracle, touchedOracle, oracleTouches, findRealPublication, independentReview, assertIndependentReview, checkHostRuntime, assertHostRuntime } from "../acceptance/remote-linux/real.mjs";
 import { rehearsalCall } from "../acceptance/remote-linux/fake-provider.mjs";
 import { sessionFailure, readSessionEvidence, refreshStoppedExport, remoteSessionScript } from "../acceptance/remote-linux/session-evidence.mjs";
 import { ControlPlane } from "../dist/control.js";
@@ -217,7 +217,7 @@ test("stopped pi-durable SQLite evidence retains assistant tool order and cumula
   assert.equal(sha256(readFileSync(path)),before,"the read-only query must leave the actual database unchanged");
   const exported = {mission:{status:"blocked",turns:3,maxTurns:60,costKnown:false,cost:0},agents:[{id:"o",kind:"orchestrator",machineId:"local"},{id:"w",kind:"worker",machineId:"linux"}],
     generationAdmissions:[{agent_id:"o"},{agent_id:"o",generation_id:"auxiliary:unit"},{agent_id:"w"}],transcripts:[],artifacts:[],validationReceipts:[],blockers:[{kind:"user_input"}],events:[]};
-  const evidence = collectRealEvidence(exported,undefined,{path:"/host/totals.acceptance.test.mjs"},{},[{agentId:"o",...session},{agentId:"w",...readSessionEvidence(join(directory,"missing.sqlite"))}],{orchestrator:{modelId:"configured-model"}});
+  const evidence = collectRealEvidence(exported,undefined,{path:"/host/totals.acceptance.test.mjs",entry:{path:"/host/run-frozen-acceptance.mjs"}},{},[{agentId:"o",...session},{agentId:"w",...readSessionEvidence(join(directory,"missing.sqlite"))}],{orchestrator:{modelId:"configured-model"}});
   assert.equal(evidence.roles.orchestrator.modelCalls,2);
   assert.deepEqual(evidence.roles.orchestrator.responseModels,["unit-actual-model"]);
   assert.equal(evidence.roles.orchestrator.modelMismatch,true);
@@ -300,7 +300,8 @@ test("frozen command checks its embedded digest before tests, including paths wi
   const intact = checkFrozenAcceptance(acceptance,"publication");
   assert.equal(intact.intact,true);
   assert.equal(invoke().status,0);
-  const equivalent = command.replaceAll("'\\''", "'\"'\"'");
+  assert.equal(command.includes("'\\''"),false);
+  const equivalent = ` ${command} `;
   assert.equal(acceptanceCommandMatch(command,equivalent),"shell-equivalent");
   const equivalentResult = spawnSync("/bin/sh",["-c",equivalent],{cwd:workspace,encoding:"utf8",env:{PATH:process.env.PATH}});
   assert.equal(equivalentResult.status,0,equivalentResult.stderr);
@@ -383,27 +384,27 @@ test("oracle evidence separates local shell and tool reads from writes with sour
   assert.deepEqual(audit.oracleReads[0],{agentId:"o",source:"shell_evidence",seq:1,command:`cat ${path}`});
   assert.deepEqual(audit.oracleReads[1],{agentId:"o",source:"tool transcript",entryId:"read",tool:"read_file",path,command:`read_file ${shellQuote(path)}`});
   assert.deepEqual(oracleTouches(exported,path),audit.oracleTouches);
-  const evidence = collectRealEvidence(exported,undefined,{path});
+  const evidence = collectRealEvidence(exported,undefined,{path,entry:{path:"/host/proof/run-frozen-acceptance.mjs"}});
   assert.deepEqual(evidence.oracleReads,audit.oracleReads);
   assert.deepEqual(evidence.oracleTouches,audit.oracleTouches);
 });
 
-test("rehearsal orchestrator reads the frozen test once before creating work", () => {
+test("rehearsal orchestrator reads the frozen entry once before creating work", () => {
   const path = "/host/proof/totals.acceptance.test.mjs";
-  const acceptanceCommand = frozenAcceptanceCommand({path,sha256:"a".repeat(64)});
+  const acceptanceCommand = frozenAcceptanceCommand({entry:{path:"/host/proof/run-frozen-acceptance.mjs"}});
   const body = {tools:["SpawnAgent","bash","CreateTask"].map((name)=>({function:{name}})),messages:[
     {role:"system",content:"You coordinate a persistent Mission"},
     {role:"assistant",tool_calls:[{id:"state",function:{name:"GetMissionState",arguments:"{}"}}]},
     {role:"tool",tool_call_id:"state",content:JSON.stringify({mission:{acceptance:acceptanceCommand},roles:[],tasks:[],validationContract:{assertions:[]}})}
   ]};
   const read = rehearsalCall(body,{role:"orchestrator",acceptanceCommand});
-  assert.deepEqual(read,{role:"orchestrator",name:"bash",args:{command:`shasum -a 256 ${shellQuote(path)}`}});
+  assert.deepEqual(read,{role:"orchestrator",name:"bash",args:{command:`shasum -a 256 ${shellQuote("/host/proof/run-frozen-acceptance.mjs")}`}});
   assert.equal(classifyOracleCommand(read.args.command,path),"read");
   body.messages.push({role:"assistant",tool_calls:[{id:"read",function:{name:read.name,arguments:JSON.stringify(read.args)}}]},
     {role:"tool",tool_call_id:"read",content:JSON.stringify({exitCode:0})});
   assert.equal(rehearsalCall(body,{role:"orchestrator",acceptanceCommand}).name,"CreateTask");
   body.messages.at(-1).content = JSON.stringify({exitCode:1});
-  assert.throws(()=>rehearsalCall(body,{role:"orchestrator",acceptanceCommand}),/Frozen test read failed/);
+  assert.throws(()=>rehearsalCall(body,{role:"orchestrator",acceptanceCommand}),/Frozen entry read failed/);
 });
 
 test("final evidence scan runs after summary and every late file and fails the run on leakage", (t) => {
@@ -425,6 +426,7 @@ test("stopped export reads the product's actual late shell events and tool trans
   const directory = temporary(t);
   const acceptance = writeFrozenAcceptance(directory);
   const state = join(directory,"state"), workspace = join(directory,"workspace"); mkdirSync(workspace);
+  writeFileSync(join(workspace,"totals.mjs"),goodTotals);
   const control = new ControlPlane(state);
   let before;
   try {
@@ -437,7 +439,13 @@ test("stopped export reads the product's actual late shell events and tool trans
     const read = await control.workerCommand({id:"oracle-read",token:"internal",agentId:agent.id,epoch:agent.epoch,method:"bash",args:{command:`cat ${shellQuote(acceptance.path)}`},taskId:"oracle-read"});
     assert.equal(read.exitCode,0);
     assert.equal(read.stdout,readFileSync(acceptance.path,"utf8"));
-    const command = `chmod 600 ${shellQuote(acceptance.path)}; chmod 400 ${shellQuote(acceptance.path)}`;
+    const frozen = frozenAcceptanceCommand(acceptance);
+    for (const [index, command] of [frozen, `${JSON.stringify(process.execPath)} ${JSON.stringify(acceptance.entry.path)}`].entries()) {
+      const executed = await control.workerCommand({id:`oracle-execute-${index}`,token:"internal",agentId:agent.id,epoch:agent.epoch,method:"bash",args:{command},taskId:`oracle-execute-${index}`});
+      assert.equal(executed.exitCode,0,executed.stderr);
+      assert.match(executed.stdout,/^# pass 4$/m);
+    }
+    const command = [acceptance.path, acceptance.entry.path].map((path) => `chmod 600 ${shellQuote(path)}; chmod 400 ${shellQuote(path)}`).join("; ");
     const receipt = await control.workerCommand({id:"oracle-unit",token:"internal",agentId:agent.id,epoch:agent.epoch,method:"bash",args:{command},taskId:"oracle-unit"});
     assert.equal(receipt.exitCode,0);
     assert.equal(checkFrozenAcceptance(acceptance,"end").intact,true,"restore hides the touch from a final hash check");
@@ -445,7 +453,9 @@ test("stopped export reads the product's actual late shell events and tool trans
   } finally { control.close(); }
   const refreshed = refreshStoppedExport(join(state,"control.sqlite"),before);
   assert.deepEqual(oracleTouches(refreshed,acceptance.path).map((record)=>record.source),["shell_evidence","tool transcript"]);
-  assert.deepEqual(auditOracle(refreshed,acceptance.path).oracleReads.map((record)=>record.source),["shell_evidence","tool transcript"]);
+  const reads = auditOracle(refreshed,acceptance.path).oracleReads;
+  assert.deepEqual(reads.map((record)=>record.source),["shell_evidence","shell_evidence","shell_evidence","tool transcript","tool transcript","tool transcript"]);
+  assert.equal(reads.filter((record) => acceptanceCommandMatch(frozenAcceptanceCommand(acceptance), record.command)).length,4);
 });
 
 
@@ -819,12 +829,107 @@ test("accepted task selection and failure diagnostics recognize equivalent froze
 });
 
 test("real evidence records exact, shell-equivalent and unmatched receipt commands without rewriting them", () => {
-  const acceptance = { path: "/host/totals.acceptance.test.mjs", sha256: "a".repeat(64) };
+  const acceptance = { path: "/host/totals.acceptance.test.mjs", sha256: "a".repeat(64), entry: { path: "/host/run-frozen-acceptance.mjs" } };
   const command = frozenAcceptanceCommand(acceptance);
-  const equivalent = command.replaceAll("'\\''", "'\"'\"'");
+  const equivalent = ` ${command} `;
   const exported = { mission: {}, agents: [], artifacts: [], events: [], transcripts: [], blockers: [],
     validationReceipts: [command, equivalent, `${command} && true`].map((command, index) => ({ id: String(index), command })) };
   const evidence = collectRealEvidence(exported, undefined, acceptance);
   assert.deepEqual(evidence.validationReceipts.map((receipt) => receipt.commandMatch), ["exact", "shell-equivalent", null]);
   assert.deepEqual(evidence.validationReceipts.map((receipt) => ({ id: receipt.id, command: receipt.command })), exported.validationReceipts);
+});
+
+
+test("frozen entry command has two literal paths and its mission contains no embedded shell program", (t) => {
+  const proof = join(temporary(t), "proof with spaces"); mkdirSync(proof);
+  const acceptance = writeFrozenAcceptance(proof);
+  const command = frozenAcceptanceCommand(acceptance);
+  assert.equal(command, `${shellQuote(process.execPath)} ${shellQuote(acceptance.entry.path)}`);
+  assert.equal(command.includes("'\\''"), false);
+  const mission = realMission({ acceptanceCommand: command, localWorkspaceId: "local", remoteWorkspaceId: "linux", roleIds: ["o", "w", "v"] });
+  assert.ok(mission.acceptance.includes(command));
+  assert.equal(JSON.stringify(mission).includes("-e "), false);
+  assert.equal(acceptanceCommandMatch(command, command), "exact");
+  assert.equal(acceptanceCommandMatch(command, `${JSON.stringify(process.execPath)} ${JSON.stringify(acceptance.entry.path)}`), "shell-equivalent");
+  for (const changed of [`${command} && true`, `${command} --test`, command.replace("run-frozen-acceptance", "other")]) {
+    assert.equal(acceptanceCommandMatch(command, changed), null);
+  }
+});
+
+test("frozen entry forwards test output, failure exit code and termination signal", (t) => {
+  const directory = temporary(t);
+  const run = (name, source) => {
+    const proof = join(directory, name); mkdirSync(proof);
+    const path = join(proof, "unit.test.mjs"); writeFileSync(path, source);
+    const entry = writeFrozenAcceptanceEntry({ path, sha256: sha256(readFileSync(path)) });
+    const options = { cwd: proof, encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 10000 };
+    return { entry, result: spawnSync(process.execPath, [entry.path], options), direct: name === "signal" ? undefined : spawnSync(process.execPath, ["--test", "--test-reporter=tap", path], options) };
+  };
+  for (const [name, source, code] of [
+    ["pass", "import { test } from 'node:test'; test('forwarded output', () => console.log(process.cwd()));", 0],
+    ["fail", "import { test } from 'node:test'; test('forwarded failure', () => { console.error('failure output'); throw new Error('expected failure'); });", 1]
+  ]) {
+    const { entry, result, direct } = run(name, source);
+    assert.equal(statSync(entry.path).mode & 0o7777, 0o400);
+    assert.equal(sha256(readFileSync(entry.path)), entry.sha256);
+    assert.equal(result.status, direct.status);
+    assert.equal(result.status, code);
+    assert.equal(result.signal, null);
+    assert.match(result.stdout, name === "pass" ? /# pass 1/ : /# fail 1/);
+    assert.ok(result.stdout.includes(name === "pass" ? join(directory, name) : "failure output"));
+  }
+  const { result } = run("signal", "process.kill(process.ppid, 'SIGKILL'); process.exit(0);");
+  assert.equal(result.status, null, result.stderr);
+  assert.equal(result.signal, "SIGKILL");
+});
+
+test("publication, receipt and end checks cover hash and permissions of both frozen files", (t) => {
+  const acceptance = writeFrozenAcceptance(temporary(t));
+  for (const phase of ["publication", "receipt", "end"]) {
+    const intact = checkFrozenAcceptance(acceptance, phase, phase === "receipt" ? "r" : undefined);
+    assert.equal(intact.intact, true);
+    assert.deepEqual(intact.files.map(({path, sha256, mode, intact}) => ({path, sha256, mode, intact})),
+      [acceptance, acceptance.entry].map(({path, sha256}) => ({path, sha256, mode: 0o400, intact: true})));
+    if (phase === "receipt") assert.equal(intact.receiptId, "r");
+    for (const file of [acceptance, acceptance.entry]) {
+      const source = readFileSync(file.path);
+      chmodSync(file.path, 0o600);
+      let check = checkFrozenAcceptance(acceptance, phase);
+      assert.equal(check.intact, false);
+      assert.equal(check.files.find((value) => value.path === file.path).mode, 0o600);
+      writeFileSync(file.path, "tampered"); chmodSync(file.path, 0o400);
+      check = checkFrozenAcceptance(acceptance, phase);
+      assert.equal(check.intact, false);
+      assert.notEqual(check.files.find((value) => value.path === file.path).sha256, file.sha256);
+      chmodSync(file.path, 0o600); writeFileSync(file.path, source); chmodSync(file.path, 0o400);
+    }
+  }
+});
+
+test("oracle audit admits exact and equivalent frozen execution and entry reads, while rejecting entry writes", (t) => {
+  const acceptance = writeFrozenAcceptance(temporary(t));
+  const command = frozenAcceptanceCommand(acceptance);
+  const equivalent = `${JSON.stringify(process.execPath)} ${JSON.stringify(acceptance.entry.path)}`;
+  const reads = [command, equivalent, `cat ${shellQuote(acceptance.entry.path)}`, `shasum -a 256 ${shellQuote(acceptance.entry.path)}`];
+  const touches = [
+    ...["chmod 600", "chflags nouchg", "rm", "node -e 0"].map((prefix) => `${prefix} ${shellQuote(acceptance.entry.path)}`),
+    `echo changed > ${shellQuote(acceptance.entry.path)}`, `${command} && true`
+  ];
+  for (const value of reads) assert.equal(classifyOracleCommand(value, acceptance.path), "read", value);
+  for (const value of touches) assert.equal(classifyOracleCommand(value, acceptance.path), "touch", value);
+  const exported = { mission: {}, agents: [{id:"o", machineId:"local"}, {id:"w", machineId:"linux"}], artifacts: [], blockers: [], validationReceipts: [],
+    events: [...reads, ...touches].map((command, seq) => ({type:"shell_evidence", agentId:"o", seq, data:{command}})),
+    transcripts: [{agentId:"o", entries: [
+      {id:"read", role:"tool", text:JSON.stringify({name:"read_file", args:{path:acceptance.entry.path}})},
+      {id:"write", role:"tool", text:JSON.stringify({name:"write_file", args:{path:"run-frozen-acceptance.mjs", content:"changed"}})},
+      {id:"execute", role:"tool", text:JSON.stringify({name:"bash", args:{command:equivalent}})}
+    ]}] };
+  const audit = auditOracle(exported, acceptance.path);
+  assert.equal(audit.oracleReads.length, reads.length + 2);
+  assert.equal(audit.oracleTouches.length, touches.length + 1);
+  assert.deepEqual(audit.oracleReads.slice(0, reads.length).map((record) => record.command), reads);
+  assert.equal(audit.oracleReads.at(-2).entryId, "read");
+  assert.equal(audit.oracleReads.at(-1).entryId, "execute");
+  assert.equal(audit.oracleTouches.at(-1).entryId, "write");
+  assert.deepEqual(collectRealEvidence(exported, undefined, acceptance).oracleReads, audit.oracleReads);
 });
