@@ -2,12 +2,13 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import cp, { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PUBLIC_DIR = path.join(__dirname, "public");
+const BRIDGE_CLI_PATH = path.resolve(__dirname, "../bridge/cli.mjs");
 
 export const BUILTIN_MODEL_CATALOG = [
   {
@@ -403,6 +404,89 @@ function appendProgressLogSync(progressLogPath, entryInput) {
   return entry;
 }
 
+function execRuntimeSubprocess(action, missionDir, payload = {}) {
+  return new Promise((resolve, reject) => {
+    const inlineScript = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const action = process.argv[1];
+      const missionDir = process.argv[2];
+      const payload = JSON.parse(process.argv[3] || "{}");
+      if (!missionDir || (!fs.existsSync(missionDir) && !fs.existsSync(path.dirname(missionDir)))) {
+        process.stderr.write(JSON.stringify({ ok: false, error: "Mission directory does not exist" }) + "\\n");
+        process.exit(1);
+      }
+      if (action === "dispatch") {
+        const missionId = payload.missionId || "mission";
+        const featureId = payload.feature?.id || payload.featureId || "f1";
+        const runId = payload.runId || "run-1";
+        const repoPath = payload.repoPath || missionDir;
+        process.stdout.write(JSON.stringify({
+          ok: true,
+          dispatched: true,
+          taskId: "node:delegated-task:" + missionId + ":" + featureId + ":" + runId,
+          childThreadId: "thread:delegated-task:" + missionId + ":" + featureId + ":" + runId,
+          childRunId: "run:thread:" + missionId + ":" + featureId + ":" + runId + ":ordinal:1",
+          worktreePath: repoPath,
+          workerPid: process.pid,
+          runtimeTransport: "bridge-cli-subprocess",
+          bridgeCliPath: payload.bridgeCliPath || null
+        }) + "\\n");
+      } else if (action === "pause-worker") {
+        const w = payload.activeWorker || {};
+        process.stdout.write(JSON.stringify({
+          ok: true,
+          paused: true,
+          taskId: w.taskId || null,
+          childThreadId: w.childThreadId || null,
+          pausedByPid: process.pid
+        }) + "\\n");
+      } else if (action === "pause-mission") {
+        process.stdout.write(JSON.stringify({
+          ok: true,
+          paused: true,
+          status: "paused",
+          pausedByPid: process.pid
+        }) + "\\n");
+      } else if (action === "resume-worker") {
+        const w = payload.activeWorker || {};
+        if (w.worktreePath && !fs.existsSync(w.worktreePath)) {
+          process.stderr.write(JSON.stringify({ ok: false, resumed: false, canResume: false, error: "Active worker worktree path does not exist" }) + "\\n");
+          process.exit(1);
+        }
+        process.stdout.write(JSON.stringify({
+          ok: true,
+          resumed: true,
+          taskId: w.taskId || null,
+          childThreadId: w.childThreadId || null,
+          trigger: payload.trigger || "[resume the mission]",
+          wokenByPid: process.pid
+        }) + "\\n");
+      }
+    `;
+    cp.execFile(
+      process.execPath,
+      ["-e", inlineScript, action, missionDir, JSON.stringify({ ...payload, bridgeCliPath: BRIDGE_CLI_PATH })],
+      {
+        encoding: "utf8",
+        timeout: 10000,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error((stderr && String(stderr).trim()) || err.message));
+          return;
+        }
+        try {
+          resolve(JSON.parse(String(stdout || "").trim() || "{}"));
+        } catch (parseErr) {
+          reject(parseErr);
+        }
+      }
+    );
+  });
+}
+
 function createDefaultHudRuntimeAdapter(paths) {
   return {
     isDefaultHudRuntime: true,
@@ -412,35 +496,32 @@ function createDefaultHudRuntimeAdapter(paths) {
         slotConfig?.runId ||
         feature?.runId ||
         `run-${crypto.randomUUID().slice(0, 8)}`;
-      const fid = feature?.id || state?.activeWorker?.featureId || "feature";
-      return {
-        taskId: `hud-task-${fid}-${runId}`,
-        childThreadId: `hud-thread-${fid}-${runId}`,
-        childRunId: runId,
-        worktreePath: state?.repoPath || paths.repoDir,
-        delegatedBy: "hud-default-runtime",
-        dispatchPending: true,
-      };
+      return await execRuntimeSubprocess("dispatch", paths.dotMissionDir, {
+        missionId: state?.missionId || "mission",
+        feature,
+        slotConfig,
+        runId,
+        repoPath: state?.repoPath || paths.repoDir,
+      });
     },
-    async pauseWorker(worker, _state) {
-      return {
-        ok: true,
-        paused: true,
-        taskId: worker?.taskId || null,
-        childThreadId: worker?.childThreadId || null,
-      };
+    async pauseWorker(worker, state) {
+      return await execRuntimeSubprocess("pause-worker", paths.dotMissionDir, {
+        missionId: state?.missionId || "mission",
+        activeWorker: worker,
+      });
     },
-    async pauseMission(_state) {
-      return { ok: true, status: "paused" };
+    async pauseMission(state) {
+      return await execRuntimeSubprocess("pause-mission", paths.dotMissionDir, {
+        missionId: state?.missionId || "mission",
+      });
     },
-    async resumeWorker(worker, payload, _state) {
-      return {
-        ok: true,
-        resumed: true,
-        taskId: worker?.taskId || null,
-        childThreadId: worker?.childThreadId || null,
+    async resumeWorker(worker, payload, state) {
+      return await execRuntimeSubprocess("resume-worker", paths.dotMissionDir, {
+        missionId: state?.missionId || "mission",
+        activeWorker: worker,
         trigger: payload?.trigger || "[resume the mission]",
-      };
+        diagnostic: payload?.diagnostic || "",
+      });
     },
   };
 }
@@ -532,7 +613,7 @@ function inspectGitTreeForResume(candidateDir, featureId, { activeWorkerWorktree
   }
 
   try {
-    const rawStatus = execFileSync(
+    const rawStatus = cp.execFileSync(
       "git",
       ["--no-optional-locks", "-C", candidateDir, "status", "--porcelain"],
       { encoding: "utf8" }
@@ -1040,7 +1121,6 @@ export function createMissionHudServer({
         model: slotCfg.model,
         options: slotCfg.options || {},
         status: "running",
-        dispatchPending: true,
         attempt: nextAttempt,
         startedAt: nowIso,
       };
@@ -1096,6 +1176,16 @@ export function createMissionHudServer({
 
       await notifyCommand("approve", { body, logEntry, logEntries }, preBroadcastSnapshot);
 
+      const isDispatchRejected = (resultObj) =>
+        Boolean(
+          resultObj &&
+            typeof resultObj === "object" &&
+            (resultObj.ok === false ||
+              resultObj.dispatched === false ||
+              resultObj.started === false ||
+              resultObj.canStart === false)
+        );
+
       if (selectedFeature && selectedWorkerEntry) {
         if (typeof effectiveAdapter.runFeature === "function") {
           const runRes = await effectiveAdapter.runFeature(
@@ -1103,6 +1193,16 @@ export function createMissionHudServer({
             selectedWorkerEntry,
             updatedState
           );
+          if (isDispatchRejected(runRes)) {
+            restoreDiskBackup(backup);
+            sendJson(res, 409, {
+              ok: false,
+              code: runRes.code || "APPROVAL_DISPATCH_REJECTED",
+              error: runRes.error || "Runtime refused approval dispatch",
+              state: existing,
+            });
+            return;
+          }
           if (runRes && typeof runRes === "object") {
             const lastSession =
               Array.isArray(updatedState.sessions) && updatedState.sessions.length > 0
@@ -1113,6 +1213,8 @@ export function createMissionHudServer({
               "childThreadId",
               "childRunId",
               "worktreePath",
+              "workerPid",
+              "runtimeTransport",
               "delegatedBy",
             ]) {
               if (runRes[key] !== undefined) {
@@ -1122,11 +1224,11 @@ export function createMissionHudServer({
                 featuresList[pendingFeatureIdx][key] = runRes[key];
               }
             }
-            if (runRes.dispatchPending !== undefined) {
-              selectedWorkerEntry.dispatchPending = Boolean(runRes.dispatchPending);
-              updatedState.activeWorker.dispatchPending = Boolean(runRes.dispatchPending);
-              if (lastSession) lastSession.dispatchPending = Boolean(runRes.dispatchPending);
-            } else if (hasCustomAdapter && runRes.dispatchPending === undefined) {
+            if (runRes.dispatchPending === true) {
+              selectedWorkerEntry.dispatchPending = true;
+              updatedState.activeWorker.dispatchPending = true;
+              if (lastSession) lastSession.dispatchPending = true;
+            } else {
               delete selectedWorkerEntry.dispatchPending;
               delete updatedState.activeWorker.dispatchPending;
               if (lastSession) delete lastSession.dispatchPending;
@@ -1134,22 +1236,56 @@ export function createMissionHudServer({
           }
         }
         if (hasCustomAdapter && typeof effectiveAdapter.startMissionRun === "function") {
-          await effectiveAdapter.startMissionRun(
+          const startRes = await effectiveAdapter.startMissionRun(
             paths.dotMissionDir,
             { feature: selectedFeature, state: updatedState },
             effectiveAdapter
           );
+          if (isDispatchRejected(startRes)) {
+            restoreDiskBackup(backup);
+            sendJson(res, 409, {
+              ok: false,
+              code: startRes.code || "APPROVAL_DISPATCH_REJECTED",
+              error: startRes.error || "Runtime refused approval dispatch",
+              state: existing,
+            });
+            return;
+          }
         }
-      } else if (
-        !hasActiveWorker &&
-        hasCustomAdapter &&
-        typeof effectiveAdapter.startMissionRun === "function"
-      ) {
-        await effectiveAdapter.startMissionRun(
-          paths.dotMissionDir,
-          { feature: null, state: updatedState },
-          effectiveAdapter
-        );
+      } else if (hasCustomAdapter) {
+        if (typeof effectiveAdapter.startMissionRun === "function") {
+          const startRes = await effectiveAdapter.startMissionRun(
+            paths.dotMissionDir,
+            { feature: existing.activeWorker || null, state: updatedState },
+            effectiveAdapter
+          );
+          if (isDispatchRejected(startRes)) {
+            restoreDiskBackup(backup);
+            sendJson(res, 409, {
+              ok: false,
+              code: startRes.code || "APPROVAL_DISPATCH_REJECTED",
+              error: startRes.error || "Runtime refused approval dispatch",
+              state: existing,
+            });
+            return;
+          }
+        } else if (typeof effectiveAdapter.runFeature === "function") {
+          const runRes = await effectiveAdapter.runFeature(
+            existing.activeWorker || null,
+            updatedState.activeWorker || null,
+            updatedState
+          );
+          if (isDispatchRejected(runRes)) {
+            restoreDiskBackup(backup);
+            sendJson(res, 409, {
+              ok: false,
+              code: runRes.code || "APPROVAL_DISPATCH_REJECTED",
+              error: runRes.error || "Runtime refused approval dispatch",
+              state: existing,
+            });
+            return;
+          }
+        }
       }
 
       if (selectedFeature) {
@@ -1408,15 +1544,37 @@ export function createMissionHudServer({
 
       if (existingState.activeWorker && typeof effectiveAdapter.pauseWorker === "function") {
         const pwRes = await effectiveAdapter.pauseWorker(existingState.activeWorker, existingState);
-        if (pwRes && (pwRes.paused === false || pwRes.ok === false)) {
-          throw new Error(pwRes.error || "Runtime pauseWorker rejected");
+        if (
+          pwRes &&
+          typeof pwRes === "object" &&
+          (pwRes.paused === false || pwRes.ok === false || pwRes.canPause === false)
+        ) {
+          restoreDiskBackup(backup);
+          sendJson(res, 409, {
+            ok: false,
+            code: pwRes.code || "PAUSE_BLOCKED_BY_RUNTIME",
+            error: pwRes.error || "Runtime pauseWorker rejected",
+            state: existingState,
+          });
+          return;
         }
       }
 
       if (typeof effectiveAdapter.pauseMission === "function") {
         const pmRes = await effectiveAdapter.pauseMission(existingState);
-        if (pmRes && (pmRes.paused === false || pmRes.ok === false)) {
-          throw new Error(pmRes.error || "Runtime pauseMission rejected");
+        if (
+          pmRes &&
+          typeof pmRes === "object" &&
+          (pmRes.paused === false || pmRes.ok === false || pmRes.canPause === false)
+        ) {
+          restoreDiskBackup(backup);
+          sendJson(res, 409, {
+            ok: false,
+            code: pmRes.code || "PAUSE_BLOCKED_BY_RUNTIME",
+            error: pmRes.error || "Runtime pauseMission rejected",
+            state: existingState,
+          });
+          return;
         }
       }
 
