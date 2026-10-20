@@ -1422,3 +1422,97 @@ test("F03-end-feature-daemon-leak: calling endFeatureRun directly terminates act
   assert.equal(finalState.sessions[0].daemonStatus, "stopped");
   assert.equal(loadFeaturesDoc(projectDir).features[0].daemonStatus, "stopped");
 });
+
+test("COMPLETION-REQUIRES-START: endFeatureRun on final validator immediately transitions state.status to completed, and subsequent startMissionRun is a clean idempotent no-op", async (t) => {
+  const projectDir = makeTempProjectDir(t);
+
+  proposeMission(projectDir, {
+    title: "Immediate Completion in EndFeatureRun",
+    repoPath: projectDir,
+    milestones: [{ id: "m1", title: "Milestone 1", ordinal: 1 }],
+    assertions: [{ id: "VAL-M1-001", description: "M1 passes", milestoneId: "m1" }],
+    features: [
+      {
+        id: "m1-f1",
+        milestoneId: "m1",
+        title: "M1 Feature 1",
+        kind: "implementation",
+        fulfills: ["VAL-M1-001"],
+      },
+    ],
+  });
+  approveMissionPlan(projectDir);
+
+  // Step 1: Dispatch m1-f1 asynchronously (simulating CLI/MCP step-by-step execution)
+  await startMissionRun(projectDir);
+  const st1 = loadState(projectDir);
+  assert.equal(st1.status, "running");
+  assert.equal(st1.activeWorker.featureId, "m1-f1");
+
+  // Complete m1-f1 via endFeatureRun -> injects scrutiny-validator-m1 and user-testing-validator-m1
+  const endF1 = endFeatureRun(projectDir, {
+    runId: st1.activeWorker.runId,
+    featureId: "m1-f1",
+    successState: "success",
+    validatorsPassed: true,
+    handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+  });
+  assert.equal(endF1.state.status, "running");
+
+  // Step 2: Dispatch scrutiny-validator-m1
+  await startMissionRun(projectDir);
+  const st2 = loadState(projectDir);
+  assert.equal(st2.activeWorker.featureId, "scrutiny-validator-m1");
+
+  const endScrutiny = endFeatureRun(projectDir, {
+    runId: st2.activeWorker.runId,
+    featureId: "scrutiny-validator-m1",
+    successState: "success",
+    validatorsPassed: true,
+    assertionResults: { "VAL-M1-001": "passed" },
+    handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+  });
+  assert.equal(endScrutiny.state.status, "running");
+
+  // Step 3: Dispatch user-testing-validator-m1 (final validator)
+  await startMissionRun(projectDir);
+  const st3 = loadState(projectDir);
+  assert.equal(st3.activeWorker.featureId, "user-testing-validator-m1");
+
+  // Complete final validator via endFeatureRun WITHOUT calling startMissionRun again
+  const endFinal = endFeatureRun(projectDir, {
+    runId: st3.activeWorker.runId,
+    featureId: "user-testing-validator-m1",
+    successState: "success",
+    validatorsPassed: true,
+    assertionResults: { "VAL-M1-001": "passed" },
+    handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+  });
+
+  // Immediately completed!
+  assert.equal(endFinal.state.status, "completed");
+  assert.equal(endFinal.state.activeWorker, null);
+  assert.equal(endFinal.state.lastStartedAt, null);
+
+  const stateAfterEnd = loadState(projectDir);
+  assert.equal(stateAfterEnd.status, "completed");
+  const revisionAfterEnd = stateAfterEnd.revision;
+
+  const logsAfterEnd = readProgressLog(projectDir);
+  const completedLogsAfterEnd = logsAfterEnd.filter(
+    (l) => l.type === "mission_completed"
+  );
+  assert.equal(completedLogsAfterEnd.length, 1);
+
+  // Subsequent startMissionRun call must be a clean idempotent no-op
+  const noopState = await startMissionRun(projectDir);
+  assert.equal(noopState.status, "completed");
+  assert.equal(noopState.revision, revisionAfterEnd);
+
+  const logsAfterNoop = readProgressLog(projectDir);
+  const completedLogsAfterNoop = logsAfterNoop.filter(
+    (l) => l.type === "mission_completed"
+  );
+  assert.equal(completedLogsAfterNoop.length, 1);
+  assert.equal(logsAfterNoop.length, logsAfterEnd.length);
+});

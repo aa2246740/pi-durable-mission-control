@@ -425,6 +425,7 @@ export async function startMissionRun(
       if (
         state.status === "orchestrator_turn" ||
         state.status === "paused" ||
+        state.status === "completed" ||
         state.lastHandoffNeedsAttention ||
         (state.activeWorker && state.activeWorker.status === "running") ||
         state.activeWorker
@@ -587,6 +588,7 @@ export async function startMissionRun(
     if (
       postResumeState.status === "orchestrator_turn" ||
       postResumeState.status === "paused" ||
+      postResumeState.status === "completed" ||
       postResumeState.lastHandoffNeedsAttention
     ) {
       return postResumeState;
@@ -608,6 +610,14 @@ export async function startMissionRun(
       saveFeaturesDoc(missionDir, featuresDoc);
     }
   } else if (state.status !== "running") {
+    const featuresDocBeforeStart = loadFeaturesDoc(missionDir);
+    const hasPendingOrRunning =
+      featuresDocBeforeStart.features.some(
+        (f) => f.status === "pending" || f.status === "running"
+      ) || Boolean(state.activeWorker);
+    if (state.status === "completed" && !hasPendingOrRunning) {
+      return loadState(missionDir);
+    }
     const nowIso = new Date().toISOString();
     state.status = "running";
     state.lastStartedAt = nowIso;
@@ -642,6 +652,10 @@ export async function startMissionRun(
         Boolean(state.activeWorker && state.activeWorker.status === "running");
 
       if (!anyRunning) {
+        if (state.status === "completed") {
+          return loadState(missionDir);
+        }
+
         const hasValidatorFeatures = featuresDoc.features.some((f) =>
           isValidatorFeature(f)
         );

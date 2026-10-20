@@ -955,6 +955,58 @@ export function endFeatureRun(missionDir, input = {}) {
     checkMilestoneCompletionAndInjectValidation(missionDir);
   }
 
+  if (!shouldReturnToOrchestrator) {
+    const postState = loadState(missionDir);
+    const postFeaturesDoc = loadFeaturesDoc(missionDir);
+    if (
+      postFeaturesDoc.features.length > 0 &&
+      postFeaturesDoc.features.every(
+        (f) => f.status === "completed" || f.status === "cancelled"
+      ) &&
+      !postState.activeWorker &&
+      !postState.lastHandoffNeedsAttention
+    ) {
+      const hasValidatorFeatures = postFeaturesDoc.features.some((f) =>
+        isValidatorFeature(f)
+      );
+      const hasFailedValidator = postFeaturesDoc.features.some(
+        (f) => isValidatorFeature(f) && f.status === "failed"
+      );
+      const hasFailedAssertion = (postState.assertions || []).some(
+        (a) =>
+          a.status === "failed" ||
+          (hasValidatorFeatures && a.status !== "passed")
+      );
+      if (
+        !hasFailedAssertion &&
+        !hasFailedValidator &&
+        postState.status !== "completed"
+      ) {
+        const finishIso = new Date().toISOString();
+        if (postState.lastStartedAt) {
+          const startedMs = Date.parse(postState.lastStartedAt);
+          const endMs = Date.parse(finishIso);
+          if (!Number.isNaN(startedMs) && endMs > startedMs) {
+            postState.elapsedMs =
+              (postState.elapsedMs || 0) + (endMs - startedMs);
+          }
+        }
+        postState.lastStartedAt = null;
+        postState.status = "completed";
+        postState.revision = (postState.revision || 1) + 1;
+        saveState(missionDir, postState);
+
+        appendProgressLog(missionDir, {
+          timestamp: finishIso,
+          type: "mission_completed",
+          message: "Mission completed",
+          featureId: null,
+          workerNumber: null,
+        });
+      }
+    }
+  }
+
   return {
     shouldReturnToOrchestrator,
     feature: featuresDoc.features[featureIdx],
