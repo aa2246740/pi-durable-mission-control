@@ -85,6 +85,7 @@ export async function dispatchFeatureToWorker(
       ? "Explorer"
       : "Worker";
   const { slotName, slotConfig } = resolveFeatureSlot(candidate, modelSettings);
+  const hasRunFeature = typeof dispatchAdapter?.runFeature === "function";
 
   candidate.status = "running";
   candidate.attempts = nextAttempt;
@@ -110,6 +111,8 @@ export async function dispatchFeatureToWorker(
     status: "running",
     attempt: nextAttempt,
     startedAt: startIso,
+    handoff: null,
+    ...(!hasRunFeature ? { dispatchPending: true } : {}),
   };
 
   state.activeWorker = workerEntry;
@@ -129,7 +132,7 @@ export async function dispatchFeatureToWorker(
     workerNumber,
   });
 
-  if (typeof dispatchAdapter?.runFeature !== "function") {
+  if (!hasRunFeature) {
     return loadState(missionDir);
   }
 
@@ -220,14 +223,129 @@ export async function startMissionRun(
     state.activeWorker?.status === "paused" ||
     state.activeWorker?.resumePending === true;
 
-  // Already-running guard (F02 serialStart)
+  // Already-running guard (F02 serialStart) + F03 dispatchPending handoff
   if (
     !needsResume &&
     state.status === "running" &&
     state.activeWorker &&
     state.activeWorker.status === "running"
   ) {
-    return state;
+    if (
+      state.activeWorker.dispatchPending === true &&
+      typeof dispatchAdapter?.runFeature === "function"
+    ) {
+      const pendingRunId = state.activeWorker.runId;
+      const pendingFeatureId = state.activeWorker.featureId;
+      delete state.activeWorker.dispatchPending;
+      if (Array.isArray(state.sessions)) {
+        state.sessions = state.sessions.map((s) => {
+          if (s.runId === pendingRunId) {
+            const copy = { ...s };
+            delete copy.dispatchPending;
+            return copy;
+          }
+          return s;
+        });
+      }
+      saveState(missionDir, state);
+
+      const featuresDoc = loadFeaturesDoc(missionDir);
+      const modelSettings = loadModelSettings(missionDir);
+      const fIdx = featuresDoc.features.findIndex(
+        (f) => f.id === pendingFeatureId
+      );
+      const feature =
+        fIdx !== -1
+          ? featuresDoc.features[fIdx]
+          : {
+              id: pendingFeatureId,
+              title: state.activeWorker.featureTitle || pendingFeatureId,
+              milestoneId: state.activeWorker.milestoneId || "m1",
+              kind: state.activeWorker.kind || "implementation",
+              skillName:
+                state.activeWorker.skillName || "worker-implementation",
+            };
+      const { slotConfig } = resolveFeatureSlot(feature, modelSettings);
+
+      const result = await dispatchAdapter.runFeature(
+        feature,
+        slotConfig,
+        loadState(missionDir)
+      );
+
+      const identity = extractDelegationIdentity(result);
+      state = loadState(missionDir);
+      const updatedFeaturesDoc = loadFeaturesDoc(missionDir);
+
+      if (Object.keys(identity).length > 0) {
+        if (state.activeWorker && state.activeWorker.runId === pendingRunId) {
+          state.activeWorker = {
+            ...state.activeWorker,
+            ...identity,
+          };
+          delete state.activeWorker.dispatchPending;
+        }
+        if (Array.isArray(state.sessions)) {
+          state.sessions = state.sessions.map((s) => {
+            if (s.runId === pendingRunId) {
+              const copy = { ...s, ...identity };
+              delete copy.dispatchPending;
+              return copy;
+            }
+            return s;
+          });
+        }
+        const idx = updatedFeaturesDoc.features.findIndex(
+          (f) => f.id === pendingFeatureId
+        );
+        if (idx !== -1) {
+          const featureIdentity = {};
+          if (identity.taskId) featureIdentity.taskId = identity.taskId;
+          if (identity.childThreadId)
+            featureIdentity.childThreadId = identity.childThreadId;
+          if (identity.worktreePath)
+            featureIdentity.worktreePath = identity.worktreePath;
+          if (identity.childRunId)
+            featureIdentity.childRunId = identity.childRunId;
+          updatedFeaturesDoc.features[idx] = {
+            ...updatedFeaturesDoc.features[idx],
+            ...featureIdentity,
+          };
+        }
+        saveState(missionDir, state);
+        saveFeaturesDoc(missionDir, {
+          ...updatedFeaturesDoc,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
+      if (
+        state.activeWorker &&
+        state.activeWorker.runId === pendingRunId &&
+        result &&
+        typeof result === "object" &&
+        result.handoff
+      ) {
+        endFeatureRun(missionDir, {
+          runId: pendingRunId,
+          featureId: pendingFeatureId,
+          ...result,
+        });
+      }
+
+      state = loadState(missionDir);
+      if (
+        state.status === "orchestrator_turn" ||
+        state.status === "paused" ||
+        state.lastHandoffNeedsAttention ||
+        (state.activeWorker && state.activeWorker.status === "running") ||
+        state.activeWorker
+      ) {
+        return state;
+      }
+    } else {
+      return state;
+    }
   }
 
   // Resume interrupted worker first if recovering from paused state
@@ -399,7 +517,7 @@ export async function startMissionRun(
       featuresDoc.features[fIdx].status = "pending";
       saveFeaturesDoc(missionDir, featuresDoc);
     }
-  } else {
+  } else if (state.status !== "running") {
     const nowIso = new Date().toISOString();
     state.status = "running";
     state.lastStartedAt = nowIso;
@@ -434,10 +552,18 @@ export async function startMissionRun(
         Boolean(state.activeWorker && state.activeWorker.status === "running");
 
       if (!anyRunning) {
-        const hasFailedAssertion = (state.assertions || []).some(
-          (a) => a.status === "failed"
+        const hasValidatorFeatures = featuresDoc.features.some((f) =>
+          isValidatorFeature(f)
         );
-        if (hasFailedAssertion) {
+        const hasFailedValidator = featuresDoc.features.some(
+          (f) => isValidatorFeature(f) && f.status === "failed"
+        );
+        const hasFailedAssertion = (state.assertions || []).some(
+          (a) =>
+            a.status === "failed" ||
+            (hasValidatorFeatures && a.status !== "passed")
+        );
+        if (hasFailedAssertion || hasFailedValidator) {
           state.status = "orchestrator_turn";
           state.lastHandoffNeedsAttention = true;
           if (

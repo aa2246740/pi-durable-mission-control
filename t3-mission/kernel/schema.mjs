@@ -14,6 +14,7 @@ export const FEATURE_STATUSES = [
   "pending",
   "running",
   "completed",
+  "failed",
   "cancelled",
 ];
 
@@ -322,6 +323,10 @@ export function normalizeAssertion(assertion, index = 0) {
   const status = ASSERTION_STATUSES.includes(assertion.status)
     ? assertion.status
     : "pending";
+  const stageResults =
+    assertion.stageResults && typeof assertion.stageResults === "object"
+      ? { ...assertion.stageResults }
+      : undefined;
 
   return {
     ...assertion,
@@ -329,6 +334,7 @@ export function normalizeAssertion(assertion, index = 0) {
     description,
     milestoneId,
     status,
+    ...(stageResults ? { stageResults } : {}),
   };
 }
 

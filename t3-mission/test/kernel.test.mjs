@@ -21,6 +21,7 @@ import {
   readProgressLog,
   saveState,
   getMissionPaths,
+  isValidatorFeature,
 } from "../kernel/index.mjs";
 
 function makeTempProjectDir(t) {
@@ -340,11 +341,19 @@ test("VAL-KERNEL-004: Milestone completion automatically injects scrutiny-valida
           slot: slotConfig.slot,
           model: slotConfig.model,
         });
+        const assertionResults = isValidatorFeature(feature)
+          ? Object.fromEntries(
+              currentState.assertions
+                .filter((a) => a.milestoneId === feature.milestoneId)
+                .map((a) => [a.id, "passed"])
+            )
+          : undefined;
         endFeatureRun(projectDir, {
           runId: currentState.activeWorker.runId,
           featureId: feature.id,
           successState: "success",
           validatorsPassed: true,
+          ...(assertionResults ? { assertionResults } : {}),
           handoff: {
             whatWasImplemented: VALID_SUMMARY_50,
           },
@@ -811,7 +820,7 @@ test("F01 & F02: async delegation identity persistence, role assignment, serial 
   assert.equal(loadFeaturesDoc(projectDir).features[1].status, "pending");
 });
 
-test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update validation, failed assertion gate, effort normalization, bare-array features, and run identity fencing", async (t) => {
+test("F03, F07, F08, F09, F10, F11, F12: handoff attention ledger, strict dismissal/update validation, validator stageResults & missing assertionResults gate, runId attribution, and dispatchPending", async (t) => {
   const projectDir = makeTempProjectDir(t);
 
   proposeMission(projectDir, {
@@ -819,7 +828,10 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
     repoPath: projectDir,
     milestones: [{ id: "m1", title: "Milestone 1", ordinal: 1 }],
     assertions: [{ id: "VAL-1", description: "Must pass validation", milestoneId: "m1" }],
-    features: [{ id: "f1", milestoneId: "m1", title: "Feature 1", fulfills: ["VAL-1"] }],
+    features: [
+      { id: "f1", milestoneId: "m1", title: "Feature 1", fulfills: ["VAL-1"] },
+      { id: "f2", milestoneId: "m1", title: "Second", fulfills: ["VAL-1"] },
+    ],
     modelSettings: {
       skipUserTesting: false,
     },
@@ -842,11 +854,26 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
   assert.equal(normalizedMinimal.options.effort, 1);
   assert.equal(normalizedMinimal.options.reasoningEffort, "minimal");
 
-  // Start f1 asynchronously
-  await startMissionRun(projectDir, {}, { async runFeature() { return { taskId: "t1", childThreadId: "c1" }; } });
-  const active = loadState(projectDir).activeWorker;
+  // F03 (P14): Starting without runFeature sets dispatchPending=true, and subsequent startMissionRun with runFeature dispatches that worker
+  await startMissionRun(projectDir);
+  assert.equal(loadState(projectDir).activeWorker.dispatchPending, true);
 
-  // F12: EndFeatureRun requires featureId or runId, and fences against stale featureId or runId
+  await startMissionRun(
+    projectDir,
+    {},
+    {
+      async runFeature() {
+        return { taskId: "t1", childThreadId: "c1" };
+      },
+    }
+  );
+  const active = loadState(projectDir).activeWorker;
+  assert.equal(active.dispatchPending, undefined);
+  assert.equal(active.taskId, "t1");
+  assert.equal(active.childThreadId, "c1");
+  assert.equal(active.handoff, null);
+
+  // F12 (P12): EndFeatureRun requires BOTH runId and featureId, and fences against stale featureId or runId
   assert.throws(
     () =>
       endFeatureRun(projectDir, {
@@ -860,6 +887,29 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
   assert.throws(
     () =>
       endFeatureRun(projectDir, {
+        featureId: "f1",
+        successState: "success",
+        validatorsPassed: true,
+        handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+      }),
+    (err) => err.code === "MISSING_RUN_IDENTITY"
+  );
+
+  assert.throws(
+    () =>
+      endFeatureRun(projectDir, {
+        runId: active.runId,
+        successState: "success",
+        validatorsPassed: true,
+        handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+      }),
+    (err) => err.code === "MISSING_RUN_IDENTITY"
+  );
+
+  assert.throws(
+    () =>
+      endFeatureRun(projectDir, {
+        runId: active.runId,
         featureId: "wrong-feature",
         successState: "success",
         validatorsPassed: true,
@@ -872,6 +922,7 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
     () =>
       endFeatureRun(projectDir, {
         runId: "wrong-run",
+        featureId: "f1",
         successState: "success",
         validatorsPassed: true,
         handoff: { whatWasImplemented: VALID_SUMMARY_50 },
@@ -891,6 +942,10 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
       nonInteractiveChecks: [{ id: "chk-1", summary: "Verify CLI exit code" }],
     },
   });
+
+  // F11 (P18): feature.lastHandoff includes runId
+  const f1AfterEnd = loadFeaturesDoc(projectDir).features.find((f) => f.id === "f1");
+  assert.equal(f1AfterEnd.lastHandoff.runId, active.runId);
 
   const stateWithPending = loadState(projectDir);
   assert.equal(stateWithPending.lastHandoffNeedsAttention, true);
@@ -941,6 +996,13 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
   assert.equal(loadState(projectDir).pendingHandoffItems.length, 1);
   assert.equal(loadState(projectDir).lastHandoffNeedsAttention, true);
 
+  // F07 (P03): Patching an unchanged or unrelated existing feature (f2 title already "Second") MUST NOT clear f1's pendingHandoffItems
+  updateMissionFeatures(projectDir, {
+    updateFeatures: [{ id: "f2", title: "Second" }],
+  });
+  assert.equal(loadState(projectDir).pendingHandoffItems.length, 1);
+  assert.equal(loadState(projectDir).lastHandoffNeedsAttention, true);
+
   // Dismissing the second item clears pendingHandoffItems and sets lastHandoffNeedsAttention = false
   dismissHandoffItems(projectDir, {
     dismissals: [
@@ -956,7 +1018,37 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
   assert.equal(loadState(projectDir).pendingHandoffItems.length, 0);
   assert.equal(loadState(projectDir).lastHandoffNeedsAttention, false);
 
-  // F08: Run scrutiny-validator-m1 which reports VAL-1: 'failed'
+  // Complete f2, then test F08 (P07): scrutiny-validator-m1 omitting assertionResults must NOT auto-pass VAL-1
+  const stateAfterMissingValidatorResults = await startMissionRun(
+    projectDir,
+    {},
+    {
+      async runFeature(feature, _slot, currentState) {
+        endFeatureRun(projectDir, {
+          runId: currentState.activeWorker.runId,
+          featureId: feature.id,
+          successState: "success",
+          validatorsPassed: true,
+          handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+        });
+      },
+    }
+  );
+  assert.equal(stateAfterMissingValidatorResults.status, "orchestrator_turn");
+  assert.equal(stateAfterMissingValidatorResults.lastHandoffNeedsAttention, true);
+  assert.equal(stateAfterMissingValidatorResults.assertions[0].status, "pending");
+  assert.equal(
+    stateAfterMissingValidatorResults.pendingHandoffItems.some(
+      (i) => i.id === "scrutiny-validator-m1:missing_assertion_results"
+    ),
+    true
+  );
+
+  // Reset scrutiny-validator-m1 to pending via updateMissionFeatures to test F08 (P08): explicit scrutiny failure followed by user-testing pass
+  updateMissionFeatures(projectDir, {
+    updateFeatures: [{ id: "scrutiny-validator-m1", status: "pending" }],
+  });
+
   const stateAtValidators = await startMissionRun(
     projectDir,
     {},
@@ -981,13 +1073,14 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
   assert.equal(stateAtValidators.status, "orchestrator_turn");
   assert.equal(stateAtValidators.lastHandoffNeedsAttention, true);
   assert.equal(stateAtValidators.assertions[0].status, "failed");
+  assert.equal(stateAtValidators.assertions[0].stageResults.scrutiny, "failed");
   assert.equal(
     stateAtValidators.pendingHandoffItems.some((i) => i.type === "validator_failure"),
     true
   );
 
-  // Dismiss the validator_failure to run user-testing-validator-m1 WITHOUT explicit assertionResults:
-  // VAL-1 must remain 'failed' (not overwritten by automatic pass fallback) and mission must NOT complete
+  // F08 (P08): Dismiss the validator_failure and run user-testing-validator-m1 WITH VAL-1: 'passed':
+  // VAL-1 must remain 'failed' (cannot overwrite failed scrutiny stage) and mission must NOT complete
   dismissHandoffItems(projectDir, {
     dismissals: [
       {
@@ -1009,6 +1102,7 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
           featureId: feature.id,
           successState: "success",
           validatorsPassed: true,
+          assertionResults: { "VAL-1": "passed" },
           handoff: { whatWasImplemented: VALID_SUMMARY_50 },
         });
       },
@@ -1016,6 +1110,8 @@ test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update
   );
 
   assert.equal(stateAfterUserTesting.assertions[0].status, "failed");
+  assert.equal(stateAfterUserTesting.assertions[0].stageResults.scrutiny, "failed");
+  assert.equal(stateAfterUserTesting.assertions[0].stageResults.user_testing, "passed");
   assert.equal(stateAfterUserTesting.status, "orchestrator_turn");
   assert.equal(stateAfterUserTesting.lastHandoffNeedsAttention, true);
 
