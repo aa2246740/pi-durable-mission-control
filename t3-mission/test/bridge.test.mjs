@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { DISMISSAL_TYPES } from "../kernel/schema.mjs";
 import {
   buildMissionTaskTitle,
   buildStableClientRequestId,
@@ -30,16 +31,22 @@ import {
   createBridgeDispatchAdapter,
   createMissionMcpServer,
   handleJsonRpcMessage,
+  isExecutedAsMain as isMcpExecutedAsMain,
   MISSION_TOOL_NAMES,
   MISSION_TOOLS,
   startStdioMcpServer
 } from "../bridge/mcp-server.mjs";
 
-import { parseCliArgs, runCli } from "../bridge/cli.mjs";
+import {
+  isExecutedAsMain as isCliExecutedAsMain,
+  parseCliArgs,
+  runCli
+} from "../bridge/cli.mjs";
 
 const execFileAsync = promisify(execFileCallback);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = path.resolve(__dirname, "../bridge/cli.mjs");
+const MCP_SERVER_PATH = path.resolve(__dirname, "../bridge/mcp-server.mjs");
 const SKILL_PATH = path.resolve(__dirname, "../skill/SKILL.md");
 
 function createTempDir(prefix = "t3-mission-bridge-test-") {
@@ -402,7 +409,10 @@ test("F01 & I-01: runFeature and StartMissionRun propagate and persist taskId, c
     const directRes = await runFeature(
       { id: "f-direct", title: "Direct Feature", milestoneId: "m1" },
       { providerInstanceId: "antigravity", model: "gemini-4-argon-high" },
-      { missionId: "m-direct", activeWorker: { workerNumber: 1, attempt: 1 } },
+      {
+        missionId: "m-direct",
+        activeWorker: { runId: "run-direct-0", workerNumber: 1, attempt: 1 }
+      },
       {
         transportClient: async () => ({
           taskId: "task-direct-1",
@@ -416,6 +426,8 @@ test("F01 & I-01: runFeature and StartMissionRun propagate and persist taskId, c
     assert.equal(directRes.childThreadId, "thread-direct-1");
     assert.equal(directRes.childRunId, "run-direct-1");
     assert.equal(directRes.worktreePath, "/tmp/worktree-direct-1");
+    assert.match(directRes.request.task, /runId="run-direct-0"/);
+    assert.match(directRes.request.task, /featureId="f-direct"/);
 
     await callMissionTool("ProposeMission", {
       missionDir: tempMissionDir,
@@ -691,7 +703,7 @@ test("VAL-BRIDGE-002: resumeWorker blocks resume when Git tree has unresolved me
 // VAL-BRIDGE-003: MCP Server JSON-RPC 2.0 & CLI Entrypoint
 // ============================================================================
 
-test("F05, F06, F12: MCP schemas and Bridge boundary normalize dismissals, forward feature/milestone/assertion updates, and enforce EndFeatureRun identity", async () => {
+test("F05, F06, F12: MCP schemas and Bridge boundary normalize dismissals, forward feature/milestone/assertion updates, and enforce both runId and featureId on EndFeatureRun", async () => {
   const dismissTool = MISSION_TOOLS.find((t) => t.name === "DismissHandoffItems");
   const itemSchema = dismissTool.inputSchema.properties.dismissals.items;
   assert.deepEqual(itemSchema.required, [
@@ -700,18 +712,29 @@ test("F05, F06, F12: MCP schemas and Bridge boundary normalize dismissals, forwa
     "summary",
     "justification"
   ]);
-  assert.deepEqual(itemSchema.properties.type.enum, [
-    "discovered_issue",
-    "non_interactive_check",
-    "validator_failure",
-    "handoff_attention"
-  ]);
+  assert.deepEqual(itemSchema.properties.type.enum, DISMISSAL_TYPES);
+  assert.deepEqual(
+    new Set(itemSchema.properties.type.enum),
+    new Set([
+      "discovered_issue",
+      "non_interactive_check",
+      "incomplete_work",
+      "validator_failure",
+      "critical_context"
+    ])
+  );
+  assert.equal(itemSchema.properties.type.enum.includes("handoff_attention"), false);
   assert.equal(itemSchema.properties.justification.minLength, 20);
   assert.ok(itemSchema.properties.itemId);
   assert.ok(itemSchema.properties.reason);
 
   const endTool = MISSION_TOOLS.find((t) => t.name === "EndFeatureRun");
-  assert.deepEqual(endTool.inputSchema.required, ["missionDir", "featureId", "handoff"]);
+  assert.deepEqual(endTool.inputSchema.required, [
+    "missionDir",
+    "runId",
+    "featureId",
+    "handoff"
+  ]);
   assert.ok(endTool.inputSchema.properties.runId);
 
   const updateTool = MISSION_TOOLS.find((t) => t.name === "UpdateMissionFeatures");
@@ -731,15 +754,40 @@ test("F05, F06, F12: MCP schemas and Bridge boundary normalize dismissals, forwa
     );
   }
 
-  // F12: EndFeatureRun without featureId or runId throws MISSING_RUN_IDENTITY
+  // F12: EndFeatureRun requires BOTH runId and featureId; missing either throws MISSING_RUN_IDENTITY
+  const validHandoff = {
+    whatWasImplemented:
+      "Implemented feature with more than fifty characters of detailed summary text."
+  };
   await assert.rejects(
     () =>
       callMissionTool("EndFeatureRun", {
         missionDir: "/tmp/no-identity",
-        handoff: {
-          whatWasImplemented:
-            "Implemented feature with more than fifty characters of detailed summary text."
-        }
+        handoff: validHandoff
+      }),
+    (err) => {
+      assert.equal(err.code, "MISSING_RUN_IDENTITY");
+      return true;
+    }
+  );
+  await assert.rejects(
+    () =>
+      callMissionTool("EndFeatureRun", {
+        missionDir: "/tmp/no-run-id",
+        featureId: "f1",
+        handoff: validHandoff
+      }),
+    (err) => {
+      assert.equal(err.code, "MISSING_RUN_IDENTITY");
+      return true;
+    }
+  );
+  await assert.rejects(
+    () =>
+      callMissionTool("EndFeatureRun", {
+        missionDir: "/tmp/no-feature-id",
+        runId: "run-1",
+        handoff: validHandoff
       }),
     (err) => {
       assert.equal(err.code, "MISSING_RUN_IDENTITY");
@@ -761,6 +809,54 @@ test("F05, F06, F12: MCP schemas and Bridge boundary normalize dismissals, forwa
       assertions: [{ id: "VAL-1", milestoneId: "m1", description: "Initial assertion" }]
     });
     await callMissionTool("ApproveMissionPlan", { missionDir: tempMissionDir });
+
+    // Start run and complete f1 with whatWasLeftUndone -> emits incomplete_work pending item
+    const started = await callMissionTool("StartMissionRun", { missionDir: tempMissionDir });
+    const activeRunId = started.activeWorker.runId;
+    await callMissionTool("EndFeatureRun", {
+      missionDir: tempMissionDir,
+      runId: activeRunId,
+      featureId: "f1",
+      successState: "success",
+      validatorsPassed: true,
+      handoff: {
+        ...validHandoff,
+        whatWasLeftUndone: "Remaining edge case deferred to follow-up"
+      }
+    });
+
+    // F05: Dismissing incomplete_work succeeds, while handoff_attention is rejected with INVALID_DISMISSAL_TYPE
+    const dismissIncomplete = await callMissionTool("DismissHandoffItems", {
+      missionDir: tempMissionDir,
+      dismissals: [
+        {
+          type: "incomplete_work",
+          sourceFeatureId: "f1",
+          summary: "Remaining edge case deferred to follow-up",
+          justification: "Explicitly deferred with more than twenty characters of justification."
+        }
+      ]
+    });
+    assert.equal(dismissIncomplete.state.lastHandoffNeedsAttention, false);
+
+    await assert.rejects(
+      () =>
+        callMissionTool("DismissHandoffItems", {
+          missionDir: tempMissionDir,
+          dismissals: [
+            {
+              type: "handoff_attention",
+              sourceFeatureId: "f1",
+              summary: "Anything",
+              justification: "A justification string that is longer than twenty characters."
+            }
+          ]
+        }),
+      (err) => {
+        assert.equal(err.code, "INVALID_DISMISSAL_TYPE");
+        return true;
+      }
+    );
 
     // Legacy aliases (itemId -> summary, reason -> justification) normalize at Bridge boundary
     let capturedDismissals = null;
@@ -1013,8 +1109,9 @@ test("VAL-BRIDGE-003: stdio MCP Server communicates over NDJSON streams", async 
   assert.equal(lines[1].result.structuredContent.planAccepted, true);
 });
 
-test("VAL-BRIDGE-003: CLI entrypoint executes commands via node t3-mission/bridge/cli.mjs <command> --mission-dir <dir> [--json <payload>]", async () => {
+test("VAL-BRIDGE-003 & O01: CLI and MCP Server entrypoints execute main via both physical and symlinked paths", async () => {
   const tempMissionDir = createTempDir("t3-cli-e2e-");
+  const tempSymlinkDir = createTempDir("t3-symlink-entrypoint-");
   try {
     await execFileAsync("git", ["init"], { cwd: tempMissionDir });
     await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: tempMissionDir });
@@ -1023,7 +1120,21 @@ test("VAL-BRIDGE-003: CLI entrypoint executes commands via node t3-mission/bridg
     await execFileAsync("git", ["add", ".gitignore"], { cwd: tempMissionDir });
     await execFileAsync("git", ["commit", "-m", "initial commit"], { cwd: tempMissionDir });
 
-    // 1. ProposeMission via CLI subprocess
+    const symlinkBridgeDir = path.join(tempSymlinkDir, "bridge-link");
+    fs.symlinkSync(path.dirname(CLI_PATH), symlinkBridgeDir);
+    const symlinkCliPath = path.join(symlinkBridgeDir, "cli.mjs");
+    const symlinkMcpPath = path.join(symlinkBridgeDir, "mcp-server.mjs");
+
+    assert.equal(
+      isCliExecutedAsMain(new URL(`file://${CLI_PATH}`).href, symlinkCliPath),
+      true
+    );
+    assert.equal(
+      isMcpExecutedAsMain(new URL(`file://${MCP_SERVER_PATH}`).href, symlinkMcpPath),
+      true
+    );
+
+    // 1. ProposeMission via symlinked CLI subprocess
     const proposePayload = JSON.stringify({
       title: "CLI E2E Mission",
       repoPath: tempMissionDir,
@@ -1046,7 +1157,7 @@ test("VAL-BRIDGE-003: CLI entrypoint executes commands via node t3-mission/bridg
     });
 
     const { stdout: proposeStdout } = await execFileAsync("node", [
-      CLI_PATH,
+      symlinkCliPath,
       "ProposeMission",
       "--mission-dir",
       tempMissionDir,
@@ -1093,6 +1204,7 @@ test("VAL-BRIDGE-003: CLI entrypoint executes commands via node t3-mission/bridg
     assert.match(checkResult.summary, /The mission was paused/);
   } finally {
     fs.rmSync(tempMissionDir, { recursive: true, force: true });
+    fs.rmSync(tempSymlinkDir, { recursive: true, force: true });
   }
 });
 

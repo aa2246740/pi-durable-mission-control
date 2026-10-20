@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -84,6 +85,15 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     }
     if (token.startsWith("--feature-id=")) {
       extraFlags.featureId = token.slice("--feature-id=".length).trim();
+      continue;
+    }
+
+    if (token === "--run-id") {
+      extraFlags.runId = String(args[++i] ?? "").trim();
+      continue;
+    }
+    if (token.startsWith("--run-id=")) {
+      extraFlags.runId = token.slice("--run-id=".length).trim();
       continue;
     }
 
@@ -191,9 +201,21 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
   }
 }
 
-const isMainModule =
-  process.argv[1] &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+function resolveRealOrAbs(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+export function isExecutedAsMain(metaUrl, argv1 = process.argv[1]) {
+  return Boolean(
+    argv1 && resolveRealOrAbs(argv1) === resolveRealOrAbs(fileURLToPath(metaUrl))
+  );
+}
+
+const isMainModule = isExecutedAsMain(import.meta.url);
 
 if (isMainModule) {
   runCli(process.argv.slice(2)).then(({ exitCode }) => {
@@ -205,5 +227,6 @@ if (isMainModule) {
 
 export default {
   parseCliArgs,
-  runCli
+  runCli,
+  isExecutedAsMain
 };
