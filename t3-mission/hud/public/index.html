@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>T3 Mission Control HUD · Factory Droid</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="hud-shell" id="hud-shell">
+      <!-- Top Bar -->
+      <header class="hud-topbar" id="hud-topbar">
+        <div class="topbar-left">
+          <div class="breadcrumb-row">
+            <span class="back-chip" id="back-to-app">&lt; Back to App</span>
+            <span class="mission-badge">MISSION</span>
+            <span class="mission-repo-path" id="mission-repo-path">/Volumes/Workspace/openslide-studio-agentready</span>
+          </div>
+          <h1 class="mission-title" id="mission-title">
+            Open SlideStudio 参考材料附件：图片 / PPTX 模板 / 数据表 / PDF / Word
+          </h1>
+        </div>
+
+        <div class="topbar-metrics">
+          <div class="metric-box">
+            <span class="metric-label">TIME</span>
+            <span class="metric-value mono" id="metric-time">00:00:00</span>
+            <div class="metric-bar"><div class="metric-bar-fill time-fill" id="metric-time-bar"></div></div>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">PROGRESS</span>
+            <span class="metric-value mono" id="metric-progress">0/0</span>
+            <div class="metric-bar"><div class="metric-bar-fill progress-fill" id="metric-progress-bar"></div></div>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">USAGE</span>
+            <span class="metric-value mono" id="metric-usage">0%</span>
+            <div class="metric-bar"><div class="metric-bar-fill usage-fill" id="metric-usage-bar"></div></div>
+          </div>
+        </div>
+      </header>
+
+      <!-- Orange Status / Turn Strip -->
+      <section class="status-strip" id="status-strip" data-status="awaiting_input">
+        <div class="status-strip-left">
+          <span class="status-dot" id="status-strip-dot"></span>
+          <span class="status-text" id="status-strip-label">AWAITING APPROVAL</span>
+          <span class="status-subtext" id="status-strip-subtext">Revision #1 · Live SSE Connected</span>
+        </div>
+        <div class="status-strip-actions">
+          <button
+            type="button"
+            class="strip-btn strip-btn-approve"
+            id="strip-approve-btn"
+            data-action="approve"
+            title="Approve & Start Mission"
+          >
+            ✓ Approve &amp; Start Mission
+          </button>
+          <button
+            type="button"
+            class="strip-btn strip-btn-pause"
+            id="btn-pause"
+            data-action="pause"
+            title="Pause Mission"
+          >
+            || Pause
+          </button>
+          <button
+            type="button"
+            class="strip-btn strip-btn-resume"
+            id="btn-resume"
+            data-action="resume"
+            title="Resume Mission"
+          >
+            ▶ Resume Mission
+          </button>
+        </div>
+      </section>
+
+      <!-- Three-Column Main Workspace -->
+      <main class="hud-workspace" id="hud-workspace">
+        <!-- Left Column: Sessions -->
+        <aside class="hud-col hud-col-left" id="sessions-panel" aria-label="Sessions">
+          <div class="panel-header">
+            <span class="panel-title">Sessions</span>
+            <span class="panel-count mono" id="sessions-count">1</span>
+          </div>
+          <div class="sessions-list" id="sessions-list">
+            <!-- Populated by app.js -->
+          </div>
+          <div class="sidebar-footer">
+            <div class="user-chip">
+              <span class="user-avatar">WD</span>
+              <span class="user-name">Wu David</span>
+            </div>
+            <span class="sse-indicator" id="sse-indicator" title="SSE Stream Status">● Live</span>
+          </div>
+        </aside>
+
+        <!-- Center Column: Orchestrator Turn / Plan Approval / Session Handoff Detail -->
+        <section class="hud-col hud-col-center" id="center-panel" aria-label="Orchestrator Turn and Handoff">
+          <!-- Uninitialized Banner (hidden when initialized) -->
+          <div class="onboarding-card hidden" id="onboarding-card"></div>
+
+          <!-- Plan Approval Card (shown prominently when status === 'awaiting_input' && !planAccepted) -->
+          <div class="approval-card hidden" id="plan-approval-card"></div>
+
+          <!-- Session Handoff Inspector (shown when a Worker/Explorer/Validator session is clicked) -->
+          <div class="session-handoff-view hidden" id="session-handoff-view"></div>
+
+          <!-- Orchestrator Action Stream (Droid timeline flow) -->
+          <div class="orchestrator-stream" id="orchestrator-stream"></div>
+
+          <!-- Bottom Droid Composer & Milestone Capsule -->
+          <footer class="center-composer" id="center-composer">
+            <div class="milestone-pipeline-bar" id="milestone-pipeline-bar">
+              <span class="pipeline-dot">●</span>
+              <span class="pipeline-text" id="pipeline-text">
+                执行并处理交接：M1 已通过验收 → M2（资料进入生成）→ M3（模板）
+              </span>
+            </div>
+            <div class="composer-box">
+              <div class="composer-status-msg" id="composer-status-msg">
+                Mission is running. Pause to send messages.
+              </div>
+              <div class="composer-toolbar">
+                <span class="toolbar-chip model-active-chip" id="toolbar-orchestrator-model">
+                  Claude Code · Opus 5.5 (claude-opus-5-5)
+                </span>
+                <span class="toolbar-chip">Autonomy <strong class="mono">||</strong></span>
+                <span class="toolbar-chip mission-mode-chip">Mission Mode</span>
+                <span class="toolbar-chip connectors-chip">● Connectors (1)</span>
+              </div>
+            </div>
+          </footer>
+        </section>
+
+        <!-- Right Column: Model Slots + Features + Progress Log -->
+        <aside class="hud-col hud-col-right" id="right-panel" aria-label="Model, Features, and Progress Log">
+          <!-- Model 3-Slot Selector -->
+          <section class="right-section model-section" id="model-section">
+            <div class="section-header">
+              <span class="section-title">Model</span>
+              <span class="section-meta" id="model-save-status">Synced</span>
+            </div>
+            <div class="model-slots-list" id="model-slots-list">
+              <!-- Orchestrator Slot -->
+              <div class="model-slot-row" data-slot-row="orchestrator">
+                <label class="slot-label" for="model-select-orchestrator">Orchestrator</label>
+                <div class="slot-controls">
+                  <select
+                    id="model-select-orchestrator"
+                    class="slot-select"
+                    data-slot="orchestrator"
+                    aria-label="Orchestrator Model"
+                  ></select>
+                  <div
+                    class="effort-bars"
+                    id="effort-bars-orchestrator"
+                    data-slot="orchestrator"
+                    role="group"
+                    aria-label="Orchestrator Reasoning Effort"
+                  ></div>
+                </div>
+              </div>
+
+              <!-- Worker Slot -->
+              <div class="model-slot-row" data-slot-row="worker">
+                <label class="slot-label" for="model-select-worker">Worker</label>
+                <div class="slot-controls">
+                  <select
+                    id="model-select-worker"
+                    class="slot-select"
+                    data-slot="worker"
+                    aria-label="Worker Model"
+                  ></select>
+                  <div
+                    class="effort-bars"
+                    id="effort-bars-worker"
+                    data-slot="worker"
+                    role="group"
+                    aria-label="Worker Reasoning Effort"
+                  ></div>
+                </div>
+              </div>
+
+              <!-- Validator Slot -->
+              <div class="model-slot-row" data-slot-row="validator">
+                <label class="slot-label" for="model-select-validator">Validator</label>
+                <div class="slot-controls">
+                  <select
+                    id="model-select-validator"
+                    class="slot-select"
+                    data-slot="validator"
+                    aria-label="Validator Model"
+                  ></select>
+                  <div
+                    class="effort-bars"
+                    id="effort-bars-validator"
+                    data-slot="validator"
+                    role="group"
+                    aria-label="Validator Reasoning Effort"
+                  ></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Features Checklist -->
+          <section class="right-section features-section" id="features-section">
+            <div class="section-header">
+              <span class="section-title">Features</span>
+              <span class="section-count mono" id="features-count">0/0</span>
+            </div>
+            <div class="features-list" id="features-list">
+              <!-- Populated by app.js -->
+            </div>
+          </section>
+
+          <!-- Progress Log -->
+          <section class="right-section progress-log-section" id="progress-log-section">
+            <div class="section-header">
+              <span class="section-title">Progress Log</span>
+              <span class="section-count mono" id="progress-log-count">0</span>
+            </div>
+            <div class="progress-log-list" id="progress-log-list">
+              <!-- Populated by app.js -->
+            </div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
