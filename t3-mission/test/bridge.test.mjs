@@ -1208,8 +1208,9 @@ test("VAL-BRIDGE-003 & O01: CLI and MCP Server entrypoints execute main via both
   }
 });
 
-test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRuntime, PauseMissionRuntime, and ResumeWorkerRuntime execute via subprocess while preserving 7 MCP tools", () => {
+test("CLI runtime execution subcommands: DispatchWorkerRuntime spawns controllable LocalWorkerDaemon, transitions on PauseWorkerRuntime/ResumeWorkerRuntime, and self-terminates when missionDir is removed", async () => {
   const tempMissionDir = createTempDir("t3-runtime-cli-");
+  let spawnedPid = null;
   try {
     const cleanEnv = { ...process.env, T3_ACP_MCP_NODE: "" };
 
@@ -1222,7 +1223,7 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
     assert.equal(listParsed.tools.length, 7);
     assert.equal(MISSION_TOOLS.length, 7);
 
-    // 1. DispatchWorkerRuntime
+    // 1. DispatchWorkerRuntime spawns a live detached LocalWorkerDaemon
     const dispatchStdout = execFileSync(
       process.execPath,
       [
@@ -1242,6 +1243,7 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
       { env: cleanEnv, encoding: "utf8" }
     );
     const dispatchRes = JSON.parse(dispatchStdout);
+    spawnedPid = dispatchRes.workerPid;
     assert.equal(dispatchRes.ok, true);
     assert.equal(dispatchRes.dispatched, true);
     assert.equal(dispatchRes.taskId, "node:delegated-task:m-runtime-1:f-rt-1:run-rt-1");
@@ -1249,10 +1251,22 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
     assert.equal(dispatchRes.childRunId, "run:thread:m-runtime-1:f-rt-1:run-rt-1:ordinal:1");
     assert.equal(dispatchRes.worktreePath, tempMissionDir);
     assert.equal(typeof dispatchRes.workerPid, "number");
+    assert.equal(dispatchRes.daemonStatus, "running");
     assert.equal(dispatchRes.runtimeTransport, "bridge-cli-subprocess");
+    assert.ok(dispatchRes.daemonStateFile.startsWith(os.tmpdir()));
+    assert.equal(fs.existsSync(dispatchRes.daemonStateFile), true);
     assert.equal(fs.existsSync(path.join(tempMissionDir, ".mission")), false);
 
-    // 2. PauseWorkerRuntime
+    // Verify workerPid is alive and visible in ps with tempMissionDir
+    assert.doesNotThrow(() => process.kill(dispatchRes.workerPid, 0));
+    const psOut = execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" });
+    assert.equal(psOut.includes(tempMissionDir), true);
+
+    const initialDaemonState = JSON.parse(fs.readFileSync(dispatchRes.daemonStateFile, "utf8"));
+    assert.equal(initialDaemonState.status, "running");
+    assert.equal(initialDaemonState.pid, dispatchRes.workerPid);
+
+    // 2. PauseWorkerRuntime signals SIGUSR1 and transitions daemon to paused
     const pauseWorkerStdout = execFileSync(
       process.execPath,
       [
@@ -1264,7 +1278,9 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
         JSON.stringify({
           activeWorker: {
             taskId: dispatchRes.taskId,
-            childThreadId: dispatchRes.childThreadId
+            childThreadId: dispatchRes.childThreadId,
+            workerPid: dispatchRes.workerPid,
+            daemonStateFile: dispatchRes.daemonStateFile
           }
         })
       ],
@@ -1275,7 +1291,13 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
     assert.equal(pauseWorkerRes.paused, true);
     assert.equal(pauseWorkerRes.taskId, dispatchRes.taskId);
     assert.equal(pauseWorkerRes.childThreadId, dispatchRes.childThreadId);
+    assert.equal(pauseWorkerRes.workerPid, dispatchRes.workerPid);
+    assert.equal(pauseWorkerRes.daemonStatus, "paused");
     assert.equal(typeof pauseWorkerRes.pausedByPid, "number");
+
+    const pausedDaemonState = JSON.parse(fs.readFileSync(dispatchRes.daemonStateFile, "utf8"));
+    assert.equal(pausedDaemonState.status, "paused");
+    assert.equal(pausedDaemonState.pauseCount, 1);
 
     // 3. PauseMissionRuntime
     const pauseMissionStdout = execFileSync(
@@ -1289,7 +1311,7 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
     assert.equal(pauseMissionRes.status, "paused");
     assert.equal(typeof pauseMissionRes.pausedByPid, "number");
 
-    // 4. ResumeWorkerRuntime (valid worktreePath)
+    // 4. ResumeWorkerRuntime (valid worktreePath) signals SIGUSR2 and transitions daemon back to running
     const resumeStdout = execFileSync(
       process.execPath,
       [
@@ -1302,6 +1324,8 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
           activeWorker: {
             taskId: dispatchRes.taskId,
             childThreadId: dispatchRes.childThreadId,
+            workerPid: dispatchRes.workerPid,
+            daemonStateFile: dispatchRes.daemonStateFile,
             worktreePath: tempMissionDir
           },
           trigger: "[resume the mission]",
@@ -1315,8 +1339,14 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
     assert.equal(resumeRes.resumed, true);
     assert.equal(resumeRes.taskId, dispatchRes.taskId);
     assert.equal(resumeRes.childThreadId, dispatchRes.childThreadId);
+    assert.equal(resumeRes.workerPid, dispatchRes.workerPid);
+    assert.equal(resumeRes.daemonStatus, "running");
     assert.equal(resumeRes.trigger, "[resume the mission]");
     assert.equal(typeof resumeRes.wokenByPid, "number");
+
+    const resumedDaemonState = JSON.parse(fs.readFileSync(dispatchRes.daemonStateFile, "utf8"));
+    assert.equal(resumedDaemonState.status, "running");
+    assert.equal(resumedDaemonState.resumeCount, 1);
 
     // 5. ResumeWorkerRuntime fails with exit code 1 when worktreePath does not exist
     assert.throws(
@@ -1350,7 +1380,27 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRunti
         return true;
       }
     );
+
+    // 6. Removing tempMissionDir causes LocalWorkerDaemon to self-terminate
+    fs.rmSync(tempMissionDir, { recursive: true, force: true });
+    let exited = false;
+    for (let i = 0; i < 40; i++) {
+      try {
+        process.kill(dispatchRes.workerPid, 0);
+        await new Promise((r) => setTimeout(r, 25));
+      } catch {
+        exited = true;
+        break;
+      }
+    }
+    assert.equal(exited, true);
+    assert.equal(fs.existsSync(dispatchRes.daemonStateFile), false);
   } finally {
+    if (spawnedPid) {
+      try {
+        process.kill(spawnedPid, "SIGTERM");
+      } catch {}
+    }
     fs.rmSync(tempMissionDir, { recursive: true, force: true });
   }
 });

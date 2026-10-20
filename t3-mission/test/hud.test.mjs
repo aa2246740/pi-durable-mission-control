@@ -1033,7 +1033,7 @@ test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature 
   assert.equal(p20Res.status, 200);
 });
 
-test("Round 3 & Round 4 Scrutiny Fixes (P22, P23, R4-approval-explicit-runtime-rejection, R4-default-runtime-lifecycle): Runtime adapter wiring, explicit rejection on approve, and default runtime subprocess execution", async (t) => {
+test("Round 3, Round 4 & Round 5 Scrutiny Fixes (P22, P23, R4-approval-explicit-runtime-rejection, R4-default-runtime-lifecycle, F03-accepted-false): Runtime adapter wiring, explicit rejection on approve, and default runtime subprocess execution", async (t) => {
   // --- P22: dispatchAdapter pauseWorker / pauseMission / resumeWorker wired and rollback on error ---
   const p22Dir = createTempMissionWorkspace();
   execFileSync("git", ["init", "-q", p22Dir]);
@@ -1482,5 +1482,186 @@ test("Round 3 & Round 4 Scrutiny Fixes (P22, P23, R4-approval-explicit-runtime-r
     cp.execFile = origExecFile;
     await srvDefault.close();
     fs.rmSync(r4DefaultDir, { recursive: true, force: true });
+  }
+
+  // --- F03-accepted-false: { accepted: false, error: "Rejected" } from runFeature or startMissionRun rejects with 409 ---
+  for (const methodKey of ["runFeature", "startMissionRun"]) {
+    const r5ApproveDir = createTempMissionWorkspace();
+    const r5DotM = path.join(r5ApproveDir, ".mission");
+    fs.mkdirSync(r5DotM, { recursive: true });
+    fs.writeFileSync(
+      path.join(r5DotM, "state.json"),
+      JSON.stringify(
+        {
+          missionId: `mission-r5-accepted-false-${methodKey}`,
+          title: "R5 Accepted False Rejection",
+          repoPath: r5ApproveDir,
+          status: "awaiting_input",
+          planAccepted: false,
+          revision: 1,
+          elapsedMs: 0,
+          lastStartedAt: null,
+          milestones: [{ id: "m1", title: "M1", ordinal: 1 }],
+          assertions: [],
+          activeWorker: null,
+          sessions: [],
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(r5DotM, "features.json"),
+      JSON.stringify(
+        {
+          features: [
+            { id: "f1", title: "First", milestoneId: "m1", status: "pending", attempts: 0 },
+          ],
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(r5DotM, "model-settings.json"),
+      JSON.stringify({ validator: { model: "grok-4.7", effort: 3 } }, null, 2) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(r5DotM, "progress_log.jsonl"),
+      JSON.stringify({ seq: 1, timestamp: new Date().toISOString(), type: "init", message: "init" }) +
+        "\n"
+    );
+
+    const snapFiles = () => ({
+      state: fs.readFileSync(path.join(r5DotM, "state.json"), "utf8"),
+      features: fs.readFileSync(path.join(r5DotM, "features.json"), "utf8"),
+      modelSettings: fs.readFileSync(path.join(r5DotM, "model-settings.json"), "utf8"),
+      progressLog: fs.readFileSync(path.join(r5DotM, "progress_log.jsonl"), "utf8"),
+    });
+    const beforeFiles = snapFiles();
+
+    const customAdapter = {
+      [methodKey]: async () => ({
+        accepted: false,
+        error: "Rejected",
+      }),
+    };
+
+    const srvReject = await createMissionHudServer({
+      missionDir: r5ApproveDir,
+      port: 0,
+      runtimeAdapter: customAdapter,
+    });
+    const rejectRes = await fetch(`${srvReject.url}/api/mission/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(rejectRes.status, 409, `Expected 409 when ${methodKey} returns accepted:false`);
+    const rejectBody = await rejectRes.json();
+    assert.equal(rejectBody.ok, false);
+    assert.equal(rejectBody.code, "APPROVAL_DISPATCH_REJECTED");
+    assert.equal(rejectBody.error, "Rejected");
+    assert.deepEqual(snapFiles(), beforeFiles, `Expected disk unchanged when ${methodKey} returns accepted:false`);
+
+    const stateOnDisk = JSON.parse(fs.readFileSync(path.join(r5DotM, "state.json"), "utf8"));
+    assert.equal(stateOnDisk.planAccepted, false);
+    assert.equal(stateOnDisk.status, "awaiting_input");
+
+    await srvReject.close();
+    fs.rmSync(r5ApproveDir, { recursive: true, force: true });
+  }
+
+  // --- R5-daemon-metadata-persistence: daemonStateFile and daemonStatus persisted across approve, pause, and resume ---
+  const r5DaemonDir = createTempMissionWorkspace();
+  execFileSync("git", ["init", "-q", r5DaemonDir]);
+  execFileSync("git", ["-C", r5DaemonDir, "config", "user.name", "Test"]);
+  execFileSync("git", ["-C", r5DaemonDir, "config", "user.email", "test@example.invalid"]);
+  fs.writeFileSync(path.join(r5DaemonDir, ".gitignore"), ".mission/\n");
+  fs.writeFileSync(path.join(r5DaemonDir, "file.txt"), "baseline\n");
+  execFileSync("git", ["-C", r5DaemonDir, "add", "."]);
+  execFileSync("git", ["-C", r5DaemonDir, "commit", "-qm", "fixture"]);
+
+  const r5DaemonDotM = path.join(r5DaemonDir, ".mission");
+  fs.mkdirSync(r5DaemonDotM, { recursive: true });
+  fs.writeFileSync(
+    path.join(r5DaemonDotM, "state.json"),
+    JSON.stringify(
+      {
+        missionId: "mission-r5-daemon",
+        title: "R5 Daemon Metadata",
+        repoPath: r5DaemonDir,
+        status: "awaiting_input",
+        planAccepted: false,
+        revision: 1,
+        elapsedMs: 0,
+        lastStartedAt: null,
+        milestones: [{ id: "m1", title: "M1", ordinal: 1 }],
+        assertions: [],
+        activeWorker: null,
+        sessions: [],
+      },
+      null,
+      2
+    ) + "\n"
+  );
+  fs.writeFileSync(
+    path.join(r5DaemonDotM, "features.json"),
+    JSON.stringify(
+      {
+        features: [
+          { id: "f1", title: "First", milestoneId: "m1", status: "pending", attempts: 0 },
+        ],
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  const daemonStateFilePath = path.join(r5DaemonDotM, "worker-daemon-state.json");
+  const srvDaemon = await createMissionHudServer({
+    missionDir: r5DaemonDir,
+    port: 0,
+    runtimeAdapter: {
+      runFeature: async () => ({
+        ok: true,
+        dispatched: true,
+        daemonStateFile: daemonStateFilePath,
+        daemonStatus: "running",
+      }),
+      pauseWorker: async () => ({
+        ok: true,
+        paused: true,
+        daemonStatus: "paused",
+      }),
+      resumeWorker: async () => ({
+        ok: true,
+        resumed: true,
+        daemonStatus: "resumed",
+      }),
+    },
+  });
+
+  try {
+    const appRes = await fetch(`${srvDaemon.url}/api/mission/approve`, { method: "POST" });
+    assert.equal(appRes.status, 200);
+    const appState = JSON.parse(fs.readFileSync(path.join(r5DaemonDotM, "state.json"), "utf8"));
+    assert.equal(appState.activeWorker.daemonStateFile, daemonStateFilePath);
+    assert.equal(appState.activeWorker.daemonStatus, "running");
+
+    const pauseRes = await fetch(`${srvDaemon.url}/api/mission/pause`, { method: "POST" });
+    assert.equal(pauseRes.status, 200);
+    const pausedState = JSON.parse(fs.readFileSync(path.join(r5DaemonDotM, "state.json"), "utf8"));
+    assert.equal(pausedState.activeWorker.daemonStatus, "paused");
+
+    const resumeRes = await fetch(`${srvDaemon.url}/api/mission/resume`, { method: "POST" });
+    assert.equal(resumeRes.status, 200);
+    const resumedState = JSON.parse(fs.readFileSync(path.join(r5DaemonDotM, "state.json"), "utf8"));
+    assert.equal(resumedState.activeWorker.daemonStatus, "resumed");
+  } finally {
+    await srvDaemon.close();
+    fs.rmSync(r5DaemonDir, { recursive: true, force: true });
   }
 });

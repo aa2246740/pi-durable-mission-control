@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import cp from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -9,6 +11,22 @@ import {
   startStdioMcpServer
 } from "./mcp-server.mjs";
 import { callT3McpTool, runFeature } from "./t3-adapter.mjs";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isPidAlive(pid) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Parse command-line arguments for `t3-mission/bridge/cli.mjs`.
@@ -98,6 +116,15 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       continue;
     }
 
+    if (token === "--state-file") {
+      extraFlags.stateFile = String(args[++i] ?? "").trim();
+      continue;
+    }
+    if (token.startsWith("--state-file=")) {
+      extraFlags.stateFile = token.slice("--state-file=".length).trim();
+      continue;
+    }
+
     if (!token.startsWith("-") && !command) {
       command = token.trim();
       continue;
@@ -178,6 +205,84 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
     }
 
     if (
+      normalizedCmd === "localworkerdaemon" ||
+      normalizedCmd === "local-worker-daemon"
+    ) {
+      const repoPath = String(payload.repoPath || missionDir);
+      const runId = String(payload.runId || "run-1");
+      const featureId = String(payload.featureId || "f1");
+      const stateFile = payload.stateFile ? String(payload.stateFile) : "";
+
+      const daemonState = {
+        pid: process.pid,
+        missionDir,
+        repoPath,
+        runId,
+        featureId,
+        status: "running",
+        pauseCount: 0,
+        resumeCount: 0,
+        lastTrigger: null,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      const writeDaemonState = () => {
+        if (!stateFile) return;
+        try {
+          const tmpFile = `${stateFile}.${process.pid}.${Date.now()}.tmp`;
+          fs.writeFileSync(tmpFile, JSON.stringify(daemonState), "utf8");
+          fs.renameSync(tmpFile, stateFile);
+        } catch {
+          // Ignore transient write errors during teardown
+        }
+      };
+
+      writeDaemonState();
+
+      process.on("SIGUSR1", () => {
+        daemonState.status = "paused";
+        daemonState.pauseCount += 1;
+        daemonState.updatedAt = new Date().toISOString();
+        writeDaemonState();
+      });
+
+      process.on("SIGUSR2", () => {
+        daemonState.status = "running";
+        daemonState.resumeCount += 1;
+        daemonState.updatedAt = new Date().toISOString();
+        writeDaemonState();
+      });
+
+      const cleanupAndExit = () => {
+        if (stateFile) {
+          try {
+            fs.unlinkSync(stateFile);
+          } catch {}
+        }
+        process.exit(0);
+      };
+
+      process.on("SIGTERM", cleanupAndExit);
+      process.on("SIGINT", cleanupAndExit);
+
+      const startMs = Date.now();
+      setInterval(() => {
+        if (
+          !missionDir ||
+          !fs.existsSync(missionDir) ||
+          (repoPath && !fs.existsSync(repoPath)) ||
+          Date.now() - startMs > 30000
+        ) {
+          cleanupAndExit();
+        }
+      }, 50);
+
+      await new Promise(() => {});
+      return { exitCode: 0 };
+    }
+
+    if (
       normalizedCmd === "dispatchworkerruntime" ||
       normalizedCmd === "dispatch-worker-runtime"
     ) {
@@ -189,10 +294,10 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
         payload.slotConfig && typeof payload.slotConfig === "object"
           ? /** @type {Record<string, any>} */ (payload.slotConfig)
           : {};
-      const missionId = payload.missionId || "mission";
-      const featureId = feature.id || payload.featureId || "f1";
-      const runId = payload.runId || feature.runId || "run-1";
-      const repoPath = payload.repoPath || payload.worktreePath || missionDir;
+      const missionId = String(payload.missionId || "mission");
+      const featureId = String(feature.id || payload.featureId || "f1");
+      const runId = String(payload.runId || feature.runId || "run-1");
+      const repoPath = String(payload.repoPath || payload.worktreePath || missionDir);
 
       if (process.env.T3_ACP_MCP_NODE && String(process.env.T3_ACP_MCP_NODE).trim()) {
         const delegated = await runFeature(feature, slotConfig, {
@@ -209,14 +314,53 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
           dispatched: true,
           ...delegated,
           workerPid: process.pid,
-          runtimeTransport: "bridge-cli-subprocess"
+          runtimeTransport: "t3-acp-mcp"
         };
         stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         return { exitCode: 0, result };
       }
 
-      if (!missionDir || !fs.existsSync(missionDir)) {
+      if (!missionDir || (!fs.existsSync(missionDir) && !fs.existsSync(path.dirname(missionDir)))) {
         throw new Error(`Mission directory does not exist: ${missionDir}`);
+      }
+
+      const safePart = (val) => String(val).replace(/[^A-Za-z0-9_.-]/g, "_");
+      const daemonStateFile = path.join(
+        os.tmpdir(),
+        `t3-mission-local-worker-${safePart(missionId)}-${safePart(featureId)}-${safePart(runId)}-${process.pid}-${Date.now()}.json`
+      );
+
+      const cliPath = fileURLToPath(import.meta.url);
+      const child = cp.spawn(
+        process.execPath,
+        [
+          cliPath,
+          "LocalWorkerDaemon",
+          "--mission-dir",
+          missionDir,
+          "--repo-path",
+          repoPath,
+          "--run-id",
+          runId,
+          "--feature-id",
+          featureId,
+          "--state-file",
+          daemonStateFile
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+          env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }
+        }
+      );
+      child.unref();
+
+      const waitStart = Date.now();
+      while (Date.now() - waitStart < 1500) {
+        if (fs.existsSync(daemonStateFile) && isPidAlive(child.pid)) {
+          break;
+        }
+        await sleep(10);
       }
 
       const result = {
@@ -226,7 +370,9 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
         childThreadId: `thread:delegated-task:${missionId}:${featureId}:${runId}`,
         childRunId: `run:thread:${missionId}:${featureId}:${runId}:ordinal:1`,
         worktreePath: repoPath,
-        workerPid: process.pid,
+        workerPid: child.pid,
+        daemonStateFile,
+        daemonStatus: "running",
         runtimeTransport: "bridge-cli-subprocess"
       };
       stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -249,12 +395,33 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
         await callT3McpTool("t3_thread_interrupt", {
           threadId: activeWorker.childThreadId
         });
+      } else if (
+        typeof activeWorker.workerPid === "number" &&
+        isPidAlive(activeWorker.workerPid)
+      ) {
+        try {
+          process.kill(activeWorker.workerPid, "SIGUSR1");
+        } catch {}
+        if (activeWorker.daemonStateFile && fs.existsSync(activeWorker.daemonStateFile)) {
+          const waitStart = Date.now();
+          while (Date.now() - waitStart < 500) {
+            try {
+              const parsed = JSON.parse(fs.readFileSync(activeWorker.daemonStateFile, "utf8"));
+              if (parsed && parsed.status === "paused") {
+                break;
+              }
+            } catch {}
+            await sleep(10);
+          }
+        }
       }
       const result = {
         ok: true,
         paused: true,
         taskId: activeWorker.taskId || null,
         childThreadId: activeWorker.childThreadId || null,
+        workerPid: activeWorker.workerPid || null,
+        daemonStatus: "paused",
         pausedByPid: process.pid
       };
       stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -308,6 +475,25 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
           threadId: activeWorker.childThreadId,
           message: diagnostic ? `${trigger}\n\n${diagnostic}` : trigger
         });
+      } else if (
+        typeof activeWorker.workerPid === "number" &&
+        isPidAlive(activeWorker.workerPid)
+      ) {
+        try {
+          process.kill(activeWorker.workerPid, "SIGUSR2");
+        } catch {}
+        if (activeWorker.daemonStateFile && fs.existsSync(activeWorker.daemonStateFile)) {
+          const waitStart = Date.now();
+          while (Date.now() - waitStart < 500) {
+            try {
+              const parsed = JSON.parse(fs.readFileSync(activeWorker.daemonStateFile, "utf8"));
+              if (parsed && parsed.status === "running") {
+                break;
+              }
+            } catch {}
+            await sleep(10);
+          }
+        }
       }
 
       const result = {
@@ -315,6 +501,8 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
         resumed: true,
         taskId: activeWorker.taskId || null,
         childThreadId: activeWorker.childThreadId || null,
+        workerPid: activeWorker.workerPid || null,
+        daemonStatus: "running",
         trigger,
         wokenByPid: process.pid
       };
