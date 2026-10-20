@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1205,6 +1205,153 @@ test("VAL-BRIDGE-003 & O01: CLI and MCP Server entrypoints execute main via both
   } finally {
     fs.rmSync(tempMissionDir, { recursive: true, force: true });
     fs.rmSync(tempSymlinkDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI runtime execution subcommands: DispatchWorkerRuntime, PauseWorkerRuntime, PauseMissionRuntime, and ResumeWorkerRuntime execute via subprocess while preserving 7 MCP tools", () => {
+  const tempMissionDir = createTempDir("t3-runtime-cli-");
+  try {
+    const cleanEnv = { ...process.env, T3_ACP_MCP_NODE: "" };
+
+    // Confirm tools/list still returns exactly 7 MCP tools
+    const listStdout = execFileSync(process.execPath, [CLI_PATH, "tools/list"], {
+      env: cleanEnv,
+      encoding: "utf8"
+    });
+    const listParsed = JSON.parse(listStdout);
+    assert.equal(listParsed.tools.length, 7);
+    assert.equal(MISSION_TOOLS.length, 7);
+
+    // 1. DispatchWorkerRuntime
+    const dispatchStdout = execFileSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "DispatchWorkerRuntime",
+        "--mission-dir",
+        tempMissionDir,
+        "--json",
+        JSON.stringify({
+          missionId: "m-runtime-1",
+          runId: "run-rt-1",
+          repoPath: tempMissionDir,
+          feature: { id: "f-rt-1", title: "Runtime Feature" },
+          slotConfig: { providerInstanceId: "codex", model: "gpt-5.4" }
+        })
+      ],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    const dispatchRes = JSON.parse(dispatchStdout);
+    assert.equal(dispatchRes.ok, true);
+    assert.equal(dispatchRes.dispatched, true);
+    assert.equal(dispatchRes.taskId, "node:delegated-task:m-runtime-1:f-rt-1:run-rt-1");
+    assert.equal(dispatchRes.childThreadId, "thread:delegated-task:m-runtime-1:f-rt-1:run-rt-1");
+    assert.equal(dispatchRes.childRunId, "run:thread:m-runtime-1:f-rt-1:run-rt-1:ordinal:1");
+    assert.equal(dispatchRes.worktreePath, tempMissionDir);
+    assert.equal(typeof dispatchRes.workerPid, "number");
+    assert.equal(dispatchRes.runtimeTransport, "bridge-cli-subprocess");
+    assert.equal(fs.existsSync(path.join(tempMissionDir, ".mission")), false);
+
+    // 2. PauseWorkerRuntime
+    const pauseWorkerStdout = execFileSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "PauseWorkerRuntime",
+        "--mission-dir",
+        tempMissionDir,
+        "--json",
+        JSON.stringify({
+          activeWorker: {
+            taskId: dispatchRes.taskId,
+            childThreadId: dispatchRes.childThreadId
+          }
+        })
+      ],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    const pauseWorkerRes = JSON.parse(pauseWorkerStdout);
+    assert.equal(pauseWorkerRes.ok, true);
+    assert.equal(pauseWorkerRes.paused, true);
+    assert.equal(pauseWorkerRes.taskId, dispatchRes.taskId);
+    assert.equal(pauseWorkerRes.childThreadId, dispatchRes.childThreadId);
+    assert.equal(typeof pauseWorkerRes.pausedByPid, "number");
+
+    // 3. PauseMissionRuntime
+    const pauseMissionStdout = execFileSync(
+      process.execPath,
+      [CLI_PATH, "PauseMissionRuntime", "--mission-dir", tempMissionDir],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    const pauseMissionRes = JSON.parse(pauseMissionStdout);
+    assert.equal(pauseMissionRes.ok, true);
+    assert.equal(pauseMissionRes.paused, true);
+    assert.equal(pauseMissionRes.status, "paused");
+    assert.equal(typeof pauseMissionRes.pausedByPid, "number");
+
+    // 4. ResumeWorkerRuntime (valid worktreePath)
+    const resumeStdout = execFileSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "ResumeWorkerRuntime",
+        "--mission-dir",
+        tempMissionDir,
+        "--json",
+        JSON.stringify({
+          activeWorker: {
+            taskId: dispatchRes.taskId,
+            childThreadId: dispatchRes.childThreadId,
+            worktreePath: tempMissionDir
+          },
+          trigger: "[resume the mission]",
+          diagnostic: "Tree is clean."
+        })
+      ],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    const resumeRes = JSON.parse(resumeStdout);
+    assert.equal(resumeRes.ok, true);
+    assert.equal(resumeRes.resumed, true);
+    assert.equal(resumeRes.taskId, dispatchRes.taskId);
+    assert.equal(resumeRes.childThreadId, dispatchRes.childThreadId);
+    assert.equal(resumeRes.trigger, "[resume the mission]");
+    assert.equal(typeof resumeRes.wokenByPid, "number");
+
+    // 5. ResumeWorkerRuntime fails with exit code 1 when worktreePath does not exist
+    assert.throws(
+      () => {
+        execFileSync(
+          process.execPath,
+          [
+            CLI_PATH,
+            "ResumeWorkerRuntime",
+            "--mission-dir",
+            tempMissionDir,
+            "--json",
+            JSON.stringify({
+              activeWorker: {
+                taskId: dispatchRes.taskId,
+                childThreadId: dispatchRes.childThreadId,
+                worktreePath: path.join(tempMissionDir, "non-existent-worktree")
+              }
+            })
+          ],
+          { env: cleanEnv, encoding: "utf8" }
+        );
+      },
+      (err) => {
+        assert.equal(err.status, 1);
+        const parsedErr = JSON.parse(err.stderr);
+        assert.equal(parsedErr.ok, false);
+        assert.equal(parsedErr.resumed, false);
+        assert.equal(parsedErr.canResume, false);
+        assert.equal(parsedErr.error, "Active worker worktree path does not exist");
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(tempMissionDir, { recursive: true, force: true });
   }
 });
 
