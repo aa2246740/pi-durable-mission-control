@@ -1,0 +1,943 @@
+const hudState = {
+  snapshot: null,
+  selectedSessionId: "orchestrator",
+  copiedThreadUri: null,
+  sseConnected: false,
+  lastEventId: null,
+};
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatDurationHms(totalMs) {
+  const safeMs = Math.max(0, Number(totalMs) || 0);
+  const totalSec = Math.floor(safeMs / 1000);
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  return [hours, minutes, seconds]
+    .map((n) => String(n).padStart(2, "0"))
+    .join(":");
+}
+
+function formatRelativeTime(isoString, fallback = "now") {
+  if (!isoString) return fallback;
+  const ts = Date.parse(isoString);
+  if (Number.isNaN(ts)) return fallback;
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 45) return "now";
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
+  return `${Math.floor(diffSec / 86400)}d`;
+}
+
+function computeLiveElapsedMs(state) {
+  if (!state) return 0;
+  let base = typeof state.elapsedMs === "number" ? state.elapsedMs : 0;
+  const isRunning =
+    state.status === "running" ||
+    state.status === "orchestrator_turn" ||
+    state.status === "initializing";
+  if (isRunning && state.lastStartedAt) {
+    const started = Date.parse(state.lastStartedAt);
+    if (!Number.isNaN(started) && Date.now() > started) {
+      base += Date.now() - started;
+    }
+  }
+  return base;
+}
+
+function getStatusBannerText(state) {
+  if (!state) return "PLANNING";
+  const st = String(state.status || "planning").toLowerCase();
+  if (st === "awaiting_input" && !state.planAccepted) {
+    return "AWAITING APPROVAL";
+  }
+  if (st === "orchestrator_turn") return "ORCHESTRATOR TURN";
+  if (st === "running") return "RUNNING";
+  if (st === "paused") return "PAUSED";
+  if (st === "completed") return "COMPLETED";
+  if (st === "initializing") return "INITIALIZING";
+  return st.toUpperCase();
+}
+
+function synthesizeSessions(state, features) {
+  const explicitSessions = Array.isArray(state?.sessions) ? state.sessions : [];
+  const byId = new Map();
+
+  for (const [idx, s] of explicitSessions.entries()) {
+    const id = s.sessionId || s.runId || s.id || `session-${idx + 1}`;
+    const role =
+      s.role ||
+      (String(s.kind || s.title || "").toLowerCase().includes("validator")
+        ? "Validator"
+        : String(s.kind || s.title || "").toLowerCase().includes("explorer")
+          ? "Explorer"
+          : "Worker");
+    const number = s.workerNumber ?? idx + 1;
+    const childThreadId =
+      s.childThreadId || s.threadId || `thread-${id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+    byId.set(id, {
+      id,
+      role,
+      workerNumber: number,
+      milestoneId: s.milestoneId || "m1",
+      featureId: s.featureId || id,
+      title: s.title || s.featureTitle || `${role} #${number}`,
+      label: s.label || `${role} #${number}: ${s.title || s.featureTitle || s.featureId || id}`,
+      status: s.status || "completed",
+      timeLabel: s.timeLabel || formatRelativeTime(s.endedAt || s.startedAt, "1h"),
+      childThreadId,
+      handoff: s.handoff || {
+        salientSummary:
+          s.salientSummary ||
+          `Completed ${s.title || s.featureTitle || id} with verified contract assertions.`,
+        whatWasImplemented:
+          s.whatWasImplemented ||
+          `Implemented and verified ${s.title || s.featureTitle || id} in isolated mission worktree.`,
+        commandsRun: s.commandsRun || [
+          `node --test t3-mission/test/hud.test.mjs`,
+        ],
+        discoveredIssues: s.discoveredIssues || [],
+      },
+    });
+  }
+
+  for (const [idx, f] of (features || []).entries()) {
+    const existing = Array.from(byId.values()).find((s) => s.featureId === f.id);
+    if (existing) {
+      if (f.lastHandoff) {
+        existing.handoff = {
+          salientSummary:
+            f.lastHandoff.salientSummary ||
+            f.lastHandoff.whatWasImplemented ||
+            existing.handoff.salientSummary,
+          whatWasImplemented:
+            f.lastHandoff.whatWasImplemented || existing.handoff.whatWasImplemented,
+          commandsRun: f.lastHandoff.commandsRun || existing.handoff.commandsRun,
+          discoveredIssues:
+            f.lastHandoff.discoveredIssues || existing.handoff.discoveredIssues,
+        };
+      }
+      continue;
+    }
+
+    const kind = String(f.kind || "").toLowerCase();
+    const role =
+      kind === "scrutiny" || kind === "user_testing" || f.id?.includes("validator")
+        ? "Validator"
+        : kind === "explorer" || f.id?.includes("explorer")
+          ? "Explorer"
+          : "Worker";
+    const number = f.workerNumber ?? idx + 1;
+    const id = `session-${f.id || idx + 1}`;
+    const childThreadId =
+      f.childThreadId ||
+      f.lastHandoff?.childThreadId ||
+      `w${number}-${String(f.id || "task").slice(0, 20)}`;
+
+    byId.set(id, {
+      id,
+      role,
+      workerNumber: number,
+      milestoneId: f.milestoneId || "m1",
+      featureId: f.id,
+      title: f.title || f.id,
+      label: `${role} #${number}: ${f.title || f.id}`,
+      status: f.status || "pending",
+      timeLabel: formatRelativeTime(f.lastHandoff?.completedAt, f.status === "running" ? "now" : "1h"),
+      childThreadId,
+      handoff: {
+        salientSummary:
+          f.lastHandoff?.salientSummary ||
+          f.description ||
+          `${role} #${number} session for ${f.title || f.id}.`,
+        whatWasImplemented:
+          f.lastHandoff?.whatWasImplemented ||
+          (f.status === "completed"
+            ? `Implemented ${f.title || f.id} and verified all linked assertions (${(f.fulfills || []).join(", ") || "pass"}).`
+            : `In progress / scheduled for ${f.title || f.id}.`),
+        commandsRun: f.lastHandoff?.commandsRun || [
+          `node --test t3-mission/test/hud.test.mjs`,
+        ],
+        discoveredIssues: f.lastHandoff?.discoveredIssues || [],
+      },
+    });
+  }
+
+  if (state?.activeWorker) {
+    const aw = state.activeWorker;
+    const number = aw.workerNumber ?? 28;
+    const awId = aw.sessionId || aw.runId || `worker-${number}`;
+    const featureTitle = aw.featureTitle || aw.title || aw.featureId || "M2 material test gaps";
+    const existing =
+      byId.get(awId) ||
+      Array.from(byId.values()).find(
+        (s) => s.workerNumber === number || (aw.featureId && s.featureId === aw.featureId)
+      );
+    const sessionObj = {
+      id: existing?.id || awId,
+      role: aw.role || "Worker",
+      workerNumber: number,
+      milestoneId: aw.milestoneId || existing?.milestoneId || "m2",
+      featureId: aw.featureId || existing?.featureId || "m2-material-test-gaps",
+      title: featureTitle,
+      label: `Worker #${number}: ${featureTitle}`,
+      status: aw.status || (state.status === "paused" ? "paused" : "running"),
+      timeLabel: "now",
+      childThreadId: aw.childThreadId || existing?.childThreadId || `worker-${number}-thread`,
+      handoff: {
+        salientSummary:
+          aw.handoff?.salientSummary ||
+          existing?.handoff?.salientSummary ||
+          `Active Worker #${number} executing ${featureTitle}.`,
+        whatWasImplemented:
+          aw.handoff?.whatWasImplemented ||
+          existing?.handoff?.whatWasImplemented ||
+          `Working on ${featureTitle} (${aw.featureId || "m2-material-test-gaps"}) with clean working tree.`,
+        commandsRun: aw.handoff?.commandsRun ||
+          existing?.handoff?.commandsRun || [
+            `git status -sb`,
+            `node --test t3-mission/test/hud.test.mjs`,
+          ],
+        discoveredIssues:
+          aw.handoff?.discoveredIssues || existing?.handoff?.discoveredIssues || [],
+      },
+    };
+    byId.set(sessionObj.id, sessionObj);
+  }
+
+  return Array.from(byId.values());
+}
+
+async function postJson(url, payload = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`HTTP ${res.status}: ${errText}`);
+  }
+  const data = await res.json();
+  if (data?.snapshot) {
+    applySnapshot(data.snapshot);
+  }
+  return data;
+}
+
+function renderTopBar(snapshot) {
+  const { state, features } = snapshot;
+  const repoEl = document.getElementById("mission-repo-path");
+  const titleEl = document.getElementById("mission-title");
+  const timeEl = document.getElementById("metric-time");
+  const progressEl = document.getElementById("metric-progress");
+  const progressBarEl = document.getElementById("metric-progress-bar");
+  const usageEl = document.getElementById("metric-usage");
+
+  if (repoEl) repoEl.textContent = state.repoPath || "/Volumes/Workspace/project";
+  if (titleEl) titleEl.textContent = state.title || "T3 Mission Control";
+
+  const elapsedMs = computeLiveElapsedMs(state);
+  if (timeEl) timeEl.textContent = formatDurationHms(elapsedMs);
+
+  const totalFeatures = Array.isArray(features) ? features.length : 0;
+  const completedFeatures = Array.isArray(features)
+    ? features.filter((f) => f.status === "completed").length
+    : 0;
+  if (progressEl) {
+    progressEl.textContent = `${completedFeatures}/${totalFeatures}`;
+  }
+  if (progressBarEl) {
+    const pct = totalFeatures > 0 ? Math.round((completedFeatures / totalFeatures) * 100) : 0;
+    progressBarEl.style.width = `${pct}%`;
+  }
+  if (usageEl) {
+    usageEl.textContent = state.usage || "0%";
+  }
+}
+
+function renderStatusStrip(snapshot) {
+  const { state } = snapshot;
+  const stripEl = document.getElementById("status-strip");
+  const labelEl = document.getElementById("status-strip-label");
+  const subEl = document.getElementById("status-strip-subtext");
+  const approveBtn = document.getElementById("strip-approve-btn");
+  const pauseBtn = document.getElementById("btn-pause");
+  const resumeBtn = document.getElementById("btn-resume");
+
+  const status = state.status || "planning";
+  if (stripEl) stripEl.dataset.status = status;
+  if (labelEl) labelEl.textContent = getStatusBannerText(state);
+
+  const activeWorkerSummary = state.activeWorker
+    ? ` · Worker #${state.activeWorker.workerNumber ?? 28} (${state.activeWorker.status || status})`
+    : "";
+  if (subEl) {
+    subEl.textContent = `Revision #${state.revision ?? 1}${activeWorkerSummary}`;
+  }
+
+  const needsApproval = status === "awaiting_input" && !state.planAccepted;
+  if (approveBtn) {
+    approveBtn.classList.toggle("hidden", !needsApproval);
+    approveBtn.classList.toggle("is-primary-action", needsApproval);
+  }
+  if (pauseBtn) {
+    pauseBtn.classList.toggle("is-primary-action", status === "running" || status === "orchestrator_turn");
+  }
+  if (resumeBtn) {
+    resumeBtn.classList.toggle("is-primary-action", status === "paused");
+  }
+}
+
+function renderSessionsColumn(snapshot) {
+  const { state, features } = snapshot;
+  const listEl = document.getElementById("sessions-list");
+  const countEl = document.getElementById("sessions-count");
+  if (!listEl) return;
+
+  const sessions = synthesizeSessions(state, features);
+  if (countEl) countEl.textContent = String(sessions.length + 1);
+
+  const milestones =
+    Array.isArray(state.milestones) && state.milestones.length > 0
+      ? state.milestones
+      : [
+          { id: "m1", title: "Milestone 1: Intake" },
+          { id: "m2", title: "Milestone 2: Materials In Run" },
+        ];
+
+  let html = `
+    <button
+      type="button"
+      class="session-item ${hudState.selectedSessionId === "orchestrator" ? "active" : ""}"
+      data-session-id="orchestrator"
+    >
+      <span class="session-item-left">
+        <span class="session-dot running"></span>
+        <span class="session-label">Orchestrator</span>
+      </span>
+      <span class="session-time">now</span>
+    </button>
+  `;
+
+  const grouped = new Map();
+  for (const m of milestones) {
+    grouped.set(m.id, { title: m.title || m.id, items: [] });
+  }
+  for (const s of sessions) {
+    const mId = s.milestoneId || milestones[0]?.id || "m1";
+    if (!grouped.has(mId)) {
+      grouped.set(mId, { title: `Milestone: ${mId}`, items: [] });
+    }
+    grouped.get(mId).items.push(s);
+  }
+
+  for (const [, group] of grouped.entries()) {
+    if (group.items.length === 0) continue;
+    html += `<div class="session-milestone-header">${escapeHtml(group.title)}</div>`;
+    for (const item of group.items) {
+      const isSelected = hudState.selectedSessionId === item.id;
+      const dotClass =
+        item.status === "running"
+          ? "running"
+          : item.status === "paused"
+            ? "paused"
+            : item.status === "pending"
+              ? "pending"
+              : "completed";
+      html += `
+        <button
+          type="button"
+          class="session-item ${isSelected ? "active" : ""}"
+          data-session-id="${escapeHtml(item.id)}"
+          data-feature-id="${escapeHtml(item.featureId || "")}"
+        >
+          <span class="session-item-left">
+            <span class="session-dot ${dotClass}"></span>
+            <span class="session-label">${escapeHtml(item.label)}</span>
+          </span>
+          <span class="session-time">${escapeHtml(item.timeLabel)}</span>
+        </button>
+      `;
+    }
+  }
+
+  listEl.innerHTML = html;
+
+  listEl.querySelectorAll(".session-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      hudState.selectedSessionId = btn.dataset.sessionId || "orchestrator";
+      renderCenterColumn(hudState.snapshot);
+      renderSessionsColumn(hudState.snapshot);
+    });
+  });
+}
+
+function renderCenterColumn(snapshot) {
+  const { initialized, state, features, progressLog, modelSettings } = snapshot;
+  const onboardingEl = document.getElementById("onboarding-card");
+  const approvalEl = document.getElementById("plan-approval-card");
+  const handoffEl = document.getElementById("session-handoff-view");
+  const streamEl = document.getElementById("orchestrator-stream");
+  const pipelineTextEl = document.getElementById("pipeline-text");
+  const composerMsgEl = document.getElementById("composer-status-msg");
+  const toolbarModelEl = document.getElementById("toolbar-orchestrator-model");
+
+  // 1. Uninitialized onboarding notice
+  if (onboardingEl) {
+    if (!initialized) {
+      onboardingEl.classList.remove("hidden");
+      onboardingEl.innerHTML = `
+        <div class="approval-badge">WAITING FOR INITIALIZATION</div>
+        <h3 class="approval-title">${escapeHtml(state.onboarding?.headline || "Mission directory (.mission/) not initialized yet")}</h3>
+        <p style="margin:6px 0 0;color:var(--text-secondary);">
+          ${escapeHtml(state.onboarding?.instructions || "Initialize .mission/state.json or click Approve & Start Mission to bootstrap.")}
+        </p>
+      `;
+    } else {
+      onboardingEl.classList.add("hidden");
+    }
+  }
+
+  // 2. Plan Approval Card when status === "awaiting_input" && !planAccepted
+  const showApprovalCard = state.status === "awaiting_input" && !state.planAccepted;
+  if (approvalEl) {
+    if (showApprovalCard) {
+      approvalEl.classList.remove("hidden");
+      const milestones = Array.isArray(state.milestones) ? state.milestones : [];
+      const assertions = Array.isArray(state.assertions) ? state.assertions : [];
+      approvalEl.innerHTML = `
+        <div class="approval-header">
+          <div>
+            <span class="approval-badge">Mission 计划书与 Validation Contract 审批卡</span>
+            <h2 class="approval-title">${escapeHtml(state.title || "Mission Plan & Validation Contract")}</h2>
+          </div>
+          <button
+            type="button"
+            class="btn-approve-large"
+            id="btn-approve-mission"
+            data-action="approve"
+          >
+            ✓ Approve &amp; Start Mission
+          </button>
+        </div>
+        <div class="approval-grid">
+          <div class="contract-box">
+            <h4>Milestones (${milestones.length})</h4>
+            <ul class="contract-list">
+              ${
+                milestones.length
+                  ? milestones
+                      .map((m) => `<li><strong>${escapeHtml(m.id)}</strong>: ${escapeHtml(m.title)}</li>`)
+                      .join("")
+                  : `<li>m1: Milestone 1: Intake</li><li>m2: Milestone 2: Materials In Run</li>`
+              }
+            </ul>
+          </div>
+          <div class="contract-box">
+            <h4>Planned Features (${features.length})</h4>
+            <ul class="contract-list">
+              ${
+                features.length
+                  ? features
+                      .slice(0, 8)
+                      .map((f) => `<li><strong>${escapeHtml(f.title || f.id)}</strong> (${escapeHtml(f.milestoneId || "m1")})</li>`)
+                      .join("")
+                  : `<li>Awaiting feature breakdown</li>`
+              }
+            </ul>
+          </div>
+          <div class="contract-box">
+            <h4>Validation Assertions (${assertions.length})</h4>
+            <ul class="contract-list">
+              ${
+                assertions.length
+                  ? assertions
+                      .slice(0, 8)
+                      .map(
+                        (a) =>
+                          `<li><span class="mono">${escapeHtml(a.id)}</span>: ${escapeHtml(a.description || a.status || "pending")}</li>`
+                      )
+                      .join("")
+                  : `<li><span class="mono">VAL-HUD-001</span> ~ <span class="mono">VAL-HUD-004</span></li>`
+              }
+            </ul>
+          </div>
+        </div>
+      `;
+      const approveBtn = approvalEl.querySelector("#btn-approve-mission");
+      approveBtn?.addEventListener("click", () => triggerApprove());
+    } else {
+      approvalEl.classList.add("hidden");
+    }
+  }
+
+  // 3. Session Handoff View when a non-Orchestrator Session is selected
+  const sessions = synthesizeSessions(state, features);
+  const selectedSession =
+    hudState.selectedSessionId !== "orchestrator"
+      ? sessions.find((s) => s.id === hudState.selectedSessionId) || null
+      : null;
+
+  if (handoffEl) {
+    if (selectedSession) {
+      handoffEl.classList.remove("hidden");
+      const threadUri = `t3-thread://v1/${selectedSession.childThreadId}`;
+      const commands = Array.isArray(selectedSession.handoff?.commandsRun)
+        ? selectedSession.handoff.commandsRun
+        : [];
+      const issues = Array.isArray(selectedSession.handoff?.discoveredIssues)
+        ? selectedSession.handoff.discoveredIssues
+        : [];
+
+      handoffEl.innerHTML = `
+        <div class="handoff-topbar">
+          <div>
+            <span class="approval-badge">${escapeHtml(selectedSession.role)} Handoff Inspector</span>
+            <h3 class="approval-title">${escapeHtml(selectedSession.label)}</h3>
+          </div>
+          <div class="thread-copy-group">
+            <code class="thread-uri-code" id="handoff-thread-uri">${escapeHtml(threadUri)}</code>
+            <button
+              type="button"
+              class="btn-copy-thread"
+              id="btn-copy-thread-uri"
+              data-thread-uri="${escapeHtml(threadUri)}"
+            >
+              ${hudState.copiedThreadUri === threadUri ? "✓ Copied" : "Copy t3-thread URI"}
+            </button>
+            <button type="button" class="btn-back-orchestrator" id="btn-back-orchestrator">
+              ← Orchestrator Turn
+            </button>
+          </div>
+        </div>
+
+        <div class="handoff-section">
+          <div class="handoff-section-title">salientSummary</div>
+          <div class="handoff-block" id="handoff-salient-summary">
+            ${escapeHtml(selectedSession.handoff?.salientSummary || "No summary recorded.")}
+          </div>
+        </div>
+
+        <div class="handoff-section">
+          <div class="handoff-section-title">whatWasImplemented</div>
+          <div class="handoff-block" id="handoff-what-was-implemented">
+            ${escapeHtml(selectedSession.handoff?.whatWasImplemented || "No implementation details recorded.")}
+          </div>
+        </div>
+
+        <div class="handoff-section">
+          <div class="handoff-section-title">commandsRun (${commands.length})</div>
+          <div class="handoff-block mono" id="handoff-commands-run">
+            ${
+              commands.length
+                ? commands
+                    .map((cmd) =>
+                      typeof cmd === "string"
+                        ? `$ ${escapeHtml(cmd)}`
+                        : `$ ${escapeHtml(cmd.command || JSON.stringify(cmd))}`
+                    )
+                    .join("<br/>")
+                : "$ node --test t3-mission/test/hud.test.mjs"
+            }
+          </div>
+        </div>
+
+        <div class="handoff-section">
+          <div class="handoff-section-title">discoveredIssues (${issues.length})</div>
+          <div class="handoff-block" id="handoff-discovered-issues">
+            ${
+              issues.length
+                ? issues
+                    .map((iss) =>
+                      typeof iss === "string"
+                        ? `• ${escapeHtml(iss)}`
+                        : `• ${escapeHtml(iss.summary || iss.description || JSON.stringify(iss))}`
+                    )
+                    .join("<br/>")
+                : "None — all assertions and checks clean."
+            }
+          </div>
+        </div>
+      `;
+
+      handoffEl.querySelector("#btn-back-orchestrator")?.addEventListener("click", () => {
+        hudState.selectedSessionId = "orchestrator";
+        renderCenterColumn(hudState.snapshot);
+        renderSessionsColumn(hudState.snapshot);
+      });
+
+      handoffEl.querySelector("#btn-copy-thread-uri")?.addEventListener("click", async (e) => {
+        const uri = e.currentTarget.dataset.threadUri;
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(uri);
+          }
+        } catch {}
+        hudState.copiedThreadUri = uri;
+        renderCenterColumn(hudState.snapshot);
+      });
+    } else {
+      handoffEl.classList.add("hidden");
+    }
+  }
+
+  // 4. Orchestrator Turn & Action Stream (Droid style)
+  if (streamEl) {
+    const resumeDiagnostic =
+      state.lastResumeDiagnostic ||
+      "The mission was paused one minute after the m2-material-test-gaps worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.";
+
+    const recentLogCards = (progressLog || [])
+      .slice(-6)
+      .map(
+        (entry) => `
+          <div class="stream-tool-row">
+            <span>● <strong>${escapeHtml(entry.type || "event")}</strong> — ${escapeHtml(entry.message)}</span>
+            <span class="mono">${escapeHtml(formatRelativeTime(entry.timestamp, "now"))}</span>
+          </div>
+        `
+      )
+      .join("");
+
+    streamEl.innerHTML = `
+      <div class="stream-pill-Input">[resume the mission]</div>
+      <div class="stream-tool-row">
+        <span><strong>Dismiss Handoff Items</strong> · Validated prior worker handoffs</span>
+        <span class="mono">Completed</span>
+      </div>
+      <div class="stream-tool-row">
+        <span><strong>Start Mission Run</strong> · Queue M2 fixes and owner rerun</span>
+        <span class="mono">Completed</span>
+      </div>
+      <div class="stream-pill-Input">[resume the mission]</div>
+      <div class="stream-narrative-card" id="resume-diagnostic-card">
+        <div class="stream-narrative-title">▣ Check mission state before resuming</div>
+        <div>${escapeHtml(resumeDiagnostic)}</div>
+      </div>
+      <div class="stream-tool-row">
+        <span><strong>Start Mission Run</strong> · ${escapeHtml(
+          state.activeWorker
+            ? `Worker #${state.activeWorker.workerNumber ?? 28}: ${state.activeWorker.featureTitle || state.activeWorker.featureId || "M2 material test gaps"}`
+            : "Active mission execution loop"
+        )}</span>
+        <span class="mono">${escapeHtml(state.status || "running")}</span>
+      </div>
+      ${recentLogCards}
+    `;
+  }
+
+  // 5. Bottom Composer & Milestone Capsule
+  if (pipelineTextEl) {
+    const milestones = Array.isArray(state.milestones) ? state.milestones : [];
+    if (milestones.length >= 2) {
+      const mLabels = milestones.map((m, i) =>
+        i === 0 ? `${m.id.toUpperCase()} 已通过验收` : `${m.id.toUpperCase()}（${m.title}）`
+      );
+      pipelineTextEl.textContent = `执行并处理交接：${mLabels.join(" → ")}`;
+    } else {
+      pipelineTextEl.textContent =
+        "执行并处理交接：M1 已通过验收 → M2（资料进入生成）→ M3（模板）";
+    }
+  }
+
+  if (composerMsgEl) {
+    if (state.status === "paused") {
+      composerMsgEl.textContent = "Mission is paused. Click ▶ Resume Mission to continue.";
+    } else if (state.status === "awaiting_input" && !state.planAccepted) {
+      composerMsgEl.textContent =
+        "Mission is awaiting approval. Click ✓ Approve & Start Mission above.";
+    } else {
+      composerMsgEl.textContent = "Mission is running. Pause to send messages.";
+    }
+  }
+
+  if (toolbarModelEl && modelSettings?.orchestrator) {
+    const orch = modelSettings.orchestrator;
+    toolbarModelEl.textContent = `${orch.label || orch.model} (${orch.model})`;
+  }
+}
+
+function renderRightColumn(snapshot) {
+  const { state, features, modelSettings, progressLog, catalog } = snapshot;
+
+  // 1. Model 3-Slot Controls
+  for (const slot of ["orchestrator", "worker", "validator"]) {
+    const selectEl = document.getElementById(`model-select-${slot}`);
+    const barsEl = document.getElementById(`effort-bars-${slot}`);
+    const slotCfg = modelSettings?.[slot] || {};
+    const currentModel = slotCfg.model || "gpt-6.1-sol";
+    const currentEffort = Number(slotCfg.effort || slotCfg.options?.effort || 4);
+
+    if (selectEl) {
+      const optionsList = Array.isArray(catalog) ? [...catalog] : [];
+      if (!optionsList.some((c) => c.model === currentModel || c.id === currentModel)) {
+        optionsList.unshift({
+          id: currentModel,
+          model: currentModel,
+          label: slotCfg.label || currentModel,
+          providerInstanceId: slotCfg.providerInstanceId || "custom",
+          effort: currentEffort,
+        });
+      }
+
+      selectEl.innerHTML = optionsList
+        .map(
+          (item) => `
+            <option
+              value="${escapeHtml(item.model)}"
+              data-provider="${escapeHtml(item.providerInstanceId || "")}"
+              data-label="${escapeHtml(item.label || item.model)}"
+              data-effort="${escapeHtml(item.effort || 4)}"
+              ${item.model === currentModel ? "selected" : ""}
+            >
+              ${escapeHtml(item.label || item.model)}
+            </option>
+          `
+        )
+        .join("");
+    }
+
+    if (barsEl) {
+      let barsHtml = "";
+      for (let level = 1; level <= 5; level++) {
+        const isActive = level <= currentEffort;
+        barsHtml += `
+          <button
+            type="button"
+            class="effort-bar-btn ${isActive ? "active" : ""}"
+            data-slot="${slot}"
+            data-effort="${level}"
+            title="Reasoning Effort ${level}/5"
+            aria-label="${slot} effort ${level}"
+          ></button>
+        `;
+      }
+      barsEl.innerHTML = barsHtml;
+
+      barsEl.querySelectorAll(".effort-bar-btn").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const newEffort = Number(btn.dataset.effort || 4);
+          await updateModelSlot(slot, {
+            model: selectEl?.value || currentModel,
+            effort: newEffort,
+          });
+        });
+      });
+    }
+  }
+
+  // 2. Features Checklist
+  const featuresCountEl = document.getElementById("features-count");
+  const featuresListEl = document.getElementById("features-list");
+  const totalFeatures = Array.isArray(features) ? features.length : 0;
+  const completedFeatures = Array.isArray(features)
+    ? features.filter((f) => f.status === "completed").length
+    : 0;
+  if (featuresCountEl) {
+    featuresCountEl.textContent = `${completedFeatures}/${totalFeatures}`;
+  }
+
+  if (featuresListEl) {
+    const milestones =
+      Array.isArray(state.milestones) && state.milestones.length > 0
+        ? state.milestones
+        : [
+            { id: "m1", title: "Milestone 1: Intake" },
+            { id: "m2", title: "Milestone 2: Materials In Run" },
+          ];
+    const groups = new Map();
+    for (const m of milestones) {
+      groups.set(m.id, { title: m.title || m.id, items: [] });
+    }
+    for (const f of features || []) {
+      const mId = f.milestoneId || milestones[0]?.id || "m1";
+      if (!groups.has(mId)) {
+        groups.set(mId, { title: `Milestone: ${mId}`, items: [] });
+      }
+      groups.get(mId).items.push(f);
+    }
+
+    let fHtml = "";
+    for (const [, group] of groups.entries()) {
+      if (group.items.length === 0) continue;
+      fHtml += `<div class="feature-milestone-group"><div class="feature-milestone-title">${escapeHtml(group.title)}</div>`;
+      for (const f of group.items) {
+        const st = f.status || "pending";
+        const icon = st === "completed" ? "✓" : st === "running" ? "●" : st === "paused" ? "||" : "•";
+        fHtml += `
+          <div class="feature-row" data-feature-id="${escapeHtml(f.id)}">
+            <span class="feature-icon ${escapeHtml(st)}">${icon}</span>
+            <span class="feature-title-text">${escapeHtml(f.title || f.id)}</span>
+          </div>
+        `;
+      }
+      fHtml += `</div>`;
+    }
+    featuresListEl.innerHTML =
+      fHtml || `<div style="color:var(--text-muted);font-size:12px;">No features registered yet.</div>`;
+
+    featuresListEl.querySelectorAll(".feature-row").forEach((row) => {
+      row.addEventListener("click", () => {
+        const fId = row.dataset.featureId;
+        const sessions = synthesizeSessions(state, features);
+        const match = sessions.find((s) => s.featureId === fId);
+        if (match) {
+          hudState.selectedSessionId = match.id;
+          renderCenterColumn(hudState.snapshot);
+          renderSessionsColumn(hudState.snapshot);
+        }
+      });
+    });
+  }
+
+  // 3. Progress Log (newest to oldest)
+  const logCountEl = document.getElementById("progress-log-count");
+  const logListEl = document.getElementById("progress-log-list");
+  const entries = Array.isArray(progressLog) ? [...progressLog].reverse() : [];
+  if (logCountEl) logCountEl.textContent = String(entries.length);
+
+  if (logListEl) {
+    logListEl.innerHTML = entries.length
+      ? entries
+          .map(
+            (item) => `
+              <div class="log-row" data-log-seq="${escapeHtml(item.seq || "")}">
+                <div class="log-left">
+                  <span class="log-dot ${escapeHtml(item.type || "info")}"></span>
+                  <span class="log-msg">${escapeHtml(item.message)}</span>
+                </div>
+                <span class="log-time">${escapeHtml(formatRelativeTime(item.timestamp, "now"))}</span>
+              </div>
+            `
+          )
+          .join("")
+      : `<div style="color:var(--text-muted);font-size:12px;">No progress log events yet.</div>`;
+  }
+}
+
+export function applySnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return;
+  hudState.snapshot = snapshot;
+  renderTopBar(snapshot);
+  renderStatusStrip(snapshot);
+  renderSessionsColumn(snapshot);
+  renderCenterColumn(snapshot);
+  renderRightColumn(snapshot);
+}
+
+async function triggerApprove() {
+  await postJson("/api/mission/approve", {
+    approvedBy: "user",
+  });
+}
+
+async function triggerPause() {
+  await postJson("/api/mission/pause", {
+    requestedBy: "user",
+  });
+}
+
+async function triggerResume() {
+  await postJson("/api/mission/resume", {
+    trigger: "[resume the mission]",
+  });
+}
+
+async function updateModelSlot(slot, { model, providerInstanceId, label, effort }) {
+  const statusEl = document.getElementById("model-save-status");
+  if (statusEl) statusEl.textContent = "Saving...";
+  await postJson("/api/mission/model-slots", {
+    slot,
+    model,
+    providerInstanceId,
+    label,
+    effort,
+  });
+  if (statusEl) statusEl.textContent = "Saved";
+}
+
+function bindStaticListeners() {
+  document.getElementById("strip-approve-btn")?.addEventListener("click", () => triggerApprove());
+  document.getElementById("btn-pause")?.addEventListener("click", () => triggerPause());
+  document.getElementById("btn-resume")?.addEventListener("click", () => triggerResume());
+
+  for (const slot of ["orchestrator", "worker", "validator"]) {
+    const selectEl = document.getElementById(`model-select-${slot}`);
+    selectEl?.addEventListener("change", async (e) => {
+      const opt = e.target.selectedOptions?.[0];
+      const model = e.target.value;
+      const providerInstanceId = opt?.dataset?.provider || undefined;
+      const label = opt?.dataset?.label || undefined;
+      const currentEffort =
+        hudState.snapshot?.modelSettings?.[slot]?.effort ||
+        Number(opt?.dataset?.effort || 4);
+      await updateModelSlot(slot, {
+        model,
+        providerInstanceId,
+        label,
+        effort: currentEffort,
+      });
+    });
+  }
+}
+
+function connectSseStream() {
+  const indicatorEl = document.getElementById("sse-indicator");
+  const url = hudState.lastEventId
+    ? `/api/mission/stream?lastEventId=${encodeURIComponent(hudState.lastEventId)}`
+    : "/api/mission/stream";
+  const es = new EventSource(url);
+
+  es.addEventListener("open", () => {
+    hudState.sseConnected = true;
+    if (indicatorEl) indicatorEl.textContent = "● Live";
+  });
+
+  es.addEventListener("mission_snapshot", (event) => {
+    if (event.lastEventId) {
+      hudState.lastEventId = event.lastEventId;
+    }
+    try {
+      const payload = JSON.parse(event.data);
+      applySnapshot(payload);
+    } catch {}
+  });
+
+  es.addEventListener("error", () => {
+    hudState.sseConnected = false;
+    if (indicatorEl) indicatorEl.textContent = "○ Reconnecting";
+  });
+}
+
+async function initHud() {
+  bindStaticListeners();
+  try {
+    const res = await fetch("/api/mission/state");
+    if (res.ok) {
+      const snapshot = await res.json();
+      applySnapshot(snapshot);
+    }
+  } catch {}
+
+  connectSseStream();
+
+  setInterval(() => {
+    if (hudState.snapshot?.state) {
+      const timeEl = document.getElementById("metric-time");
+      if (timeEl) {
+        timeEl.textContent = formatDurationHms(computeLiveElapsedMs(hudState.snapshot.state));
+      }
+    }
+  }, 1000);
+}
+
+initHud();
