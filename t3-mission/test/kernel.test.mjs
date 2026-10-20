@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import cp from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1169,6 +1170,9 @@ test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with
   );
 
   const stUpgraded = loadState(projectDir);
+  assert.equal(stUpgraded.activeWorker.runId, runId);
+  assert.equal(stUpgraded.activeWorker.attempt, 1);
+  assert.equal(loadFeaturesDoc(projectDir).features.find((f) => f.id === "f1").attempts, 1);
   assert.equal(stUpgraded.activeWorker.delegatedBy, undefined);
   assert.equal(stUpgraded.activeWorker.dispatchPending, undefined);
   assert.equal(stUpgraded.activeWorker.taskId, "upgraded-task-1");
@@ -1205,6 +1209,8 @@ test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with
   );
 
   const stCliUpgraded = loadState(projectDir);
+  assert.equal(stCliUpgraded.activeWorker.runId, runId);
+  assert.equal(stCliUpgraded.activeWorker.attempt, 1);
   assert.equal(stCliUpgraded.activeWorker.runtimeTransport, undefined);
   assert.equal(stCliUpgraded.activeWorker.dispatchPending, undefined);
   assert.equal(stCliUpgraded.activeWorker.delegatedBy, undefined);
@@ -1216,10 +1222,80 @@ test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with
   assert.equal(stCliUpgraded.sessions[0].taskId, "upgraded-task-cli");
   assert.equal(stCliUpgraded.sessions[0].childThreadId, "upgraded-thread-cli");
   const upgradedF1 = loadFeaturesDoc(projectDir).features.find((f) => f.id === "f1");
+  assert.equal(upgradedF1.attempts, 1);
   assert.equal(upgradedF1.taskId, "upgraded-task-cli");
   assert.equal(upgradedF1.childThreadId, "upgraded-thread-cli");
   assert.equal(upgradedF1.childRunId, "upgraded-crun-cli");
   assert.equal(upgradedF1.worktreePath, "/tmp/upgraded-wt-cli");
+
+  // Simulate activeWorker marked with runtimeTransport: "hud-default-runtime" and a live placeholder workerPid
+  const placeholderDaemon = cp.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  const placeholderPid = placeholderDaemon.pid;
+  stCliUpgraded.activeWorker.runtimeTransport = "hud-default-runtime";
+  stCliUpgraded.activeWorker.workerPid = placeholderPid;
+  stCliUpgraded.activeWorker.daemonStateFile = path.join(projectDir, "daemon-state.json");
+  stCliUpgraded.activeWorker.daemonStatus = "running";
+  delete stCliUpgraded.activeWorker.dispatchPending;
+  delete stCliUpgraded.activeWorker.delegatedBy;
+  stCliUpgraded.sessions = stCliUpgraded.sessions.map((s) => {
+    if (s.runId === runId) {
+      const copy = {
+        ...s,
+        runtimeTransport: "hud-default-runtime",
+        workerPid: placeholderPid,
+        daemonStateFile: path.join(projectDir, "daemon-state.json"),
+        daemonStatus: "running",
+      };
+      delete copy.dispatchPending;
+      delete copy.delegatedBy;
+      return copy;
+    }
+    return s;
+  });
+  saveState(projectDir, stCliUpgraded);
+
+  await startMissionRun(
+    projectDir,
+    {},
+    {
+      async runFeature() {
+        return {
+          taskId: "upgraded-task-hud-rt",
+          childThreadId: "upgraded-thread-hud-rt",
+          childRunId: "upgraded-crun-hud-rt",
+          worktreePath: "/tmp/upgraded-wt-hud-rt",
+        };
+      },
+    }
+  );
+
+  const stHudRtUpgraded = loadState(projectDir);
+  assert.equal(stHudRtUpgraded.activeWorker.runId, runId);
+  assert.equal(stHudRtUpgraded.activeWorker.attempt, 1);
+  assert.equal(stHudRtUpgraded.activeWorker.runtimeTransport, undefined);
+  assert.equal(stHudRtUpgraded.activeWorker.dispatchPending, undefined);
+  assert.equal(stHudRtUpgraded.activeWorker.delegatedBy, undefined);
+  assert.equal(stHudRtUpgraded.activeWorker.workerPid, undefined);
+  assert.equal(stHudRtUpgraded.activeWorker.daemonStateFile, undefined);
+  assert.equal(stHudRtUpgraded.activeWorker.daemonStatus, undefined);
+  assert.equal(stHudRtUpgraded.activeWorker.taskId, "upgraded-task-hud-rt");
+  assert.equal(stHudRtUpgraded.activeWorker.childThreadId, "upgraded-thread-hud-rt");
+  assert.equal(stHudRtUpgraded.activeWorker.childRunId, "upgraded-crun-hud-rt");
+  assert.equal(stHudRtUpgraded.activeWorker.worktreePath, "/tmp/upgraded-wt-hud-rt");
+  assert.equal(stHudRtUpgraded.sessions[0].runtimeTransport, undefined);
+  assert.equal(stHudRtUpgraded.sessions[0].workerPid, undefined);
+  assert.equal(stHudRtUpgraded.sessions[0].daemonStateFile, undefined);
+  assert.equal(stHudRtUpgraded.sessions[0].daemonStatus, undefined);
+  assert.equal(stHudRtUpgraded.sessions[0].taskId, "upgraded-task-hud-rt");
+  assert.equal(stHudRtUpgraded.sessions[0].childThreadId, "upgraded-thread-hud-rt");
+  const upgradedF1HudRt = loadFeaturesDoc(projectDir).features.find((f) => f.id === "f1");
+  assert.equal(upgradedF1HudRt.attempts, 1);
+  assert.equal(upgradedF1HudRt.taskId, "upgraded-task-hud-rt");
+  assert.equal(upgradedF1HudRt.childThreadId, "upgraded-thread-hud-rt");
+  assert.equal(upgradedF1HudRt.childRunId, "upgraded-crun-hud-rt");
+  assert.equal(upgradedF1HudRt.worktreePath, "/tmp/upgraded-wt-hud-rt");
 
   // Complete f1 with a discoveredIssue ("must-remain")
   endFeatureRun(projectDir, {

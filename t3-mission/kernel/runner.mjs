@@ -187,6 +187,14 @@ export async function dispatchFeatureToWorker(
     typeof result === "object" &&
     result.handoff
   ) {
+    if (
+      state.activeWorker?.workerPid &&
+      typeof state.activeWorker.workerPid === "number"
+    ) {
+      try {
+        process.kill(state.activeWorker.workerPid, "SIGTERM");
+      } catch {}
+    }
     endFeatureRun(missionDir, {
       runId,
       featureId: candidate.id,
@@ -202,6 +210,12 @@ export async function startMissionRun(
   options = {},
   dispatchAdapter = {}
 ) {
+  const effectiveAdapter = {
+    ...(options && typeof options === "object" ? options : {}),
+    ...(dispatchAdapter && typeof dispatchAdapter === "object"
+      ? dispatchAdapter
+      : {}),
+  };
   let state = loadState(missionDir);
 
   if (state.planAccepted !== true) {
@@ -230,17 +244,30 @@ export async function startMissionRun(
     state.activeWorker &&
     state.activeWorker.status === "running"
   ) {
+    const existing = state.activeWorker;
+    const isDefaultRuntimePlaceholder =
+      existing.delegatedBy === "hud-default-runtime" ||
+      existing.runtimeTransport === "bridge-cli-subprocess" ||
+      existing.runtimeTransport === "hud-default-runtime";
     if (
-      (state.activeWorker.dispatchPending === true ||
-        state.activeWorker.delegatedBy === "hud-default-runtime" ||
-        state.activeWorker.runtimeTransport === "bridge-cli-subprocess") &&
-      typeof dispatchAdapter?.runFeature === "function"
+      (existing.dispatchPending === true || isDefaultRuntimePlaceholder) &&
+      typeof effectiveAdapter?.runFeature === "function"
     ) {
-      const pendingRunId = state.activeWorker.runId;
-      const pendingFeatureId = state.activeWorker.featureId;
-      delete state.activeWorker.dispatchPending;
-      delete state.activeWorker.delegatedBy;
-      delete state.activeWorker.runtimeTransport;
+      const pendingRunId = existing.runId;
+      const pendingFeatureId = existing.featureId;
+      if (existing.workerPid && typeof existing.workerPid === "number") {
+        try {
+          process.kill(existing.workerPid, "SIGTERM");
+        } catch {
+          // Ignore if process already exited
+        }
+        delete existing.workerPid;
+        delete existing.daemonStateFile;
+        delete existing.daemonStatus;
+      }
+      delete existing.dispatchPending;
+      delete existing.delegatedBy;
+      delete existing.runtimeTransport;
       if (Array.isArray(state.sessions)) {
         state.sessions = state.sessions.map((s) => {
           if (s.runId === pendingRunId) {
@@ -248,6 +275,9 @@ export async function startMissionRun(
             delete copy.dispatchPending;
             delete copy.delegatedBy;
             delete copy.runtimeTransport;
+            delete copy.workerPid;
+            delete copy.daemonStateFile;
+            delete copy.daemonStatus;
             return copy;
           }
           return s;
@@ -260,20 +290,37 @@ export async function startMissionRun(
       const fIdx = featuresDoc.features.findIndex(
         (f) => f.id === pendingFeatureId
       );
+      if (fIdx !== -1) {
+        delete featuresDoc.features[fIdx].dispatchPending;
+        delete featuresDoc.features[fIdx].delegatedBy;
+        delete featuresDoc.features[fIdx].runtimeTransport;
+        delete featuresDoc.features[fIdx].workerPid;
+        delete featuresDoc.features[fIdx].daemonStateFile;
+        delete featuresDoc.features[fIdx].daemonStatus;
+        if (
+          typeof featuresDoc.features[fIdx].attempts !== "number" ||
+          featuresDoc.features[fIdx].attempts < 1
+        ) {
+          featuresDoc.features[fIdx].attempts = existing.attempt || 1;
+        }
+        saveFeaturesDoc(missionDir, {
+          ...featuresDoc,
+          updatedAt: new Date().toISOString(),
+        });
+      }
       const feature =
         fIdx !== -1
           ? featuresDoc.features[fIdx]
           : {
               id: pendingFeatureId,
-              title: state.activeWorker.featureTitle || pendingFeatureId,
-              milestoneId: state.activeWorker.milestoneId || "m1",
-              kind: state.activeWorker.kind || "implementation",
-              skillName:
-                state.activeWorker.skillName || "worker-implementation",
+              title: existing.featureTitle || pendingFeatureId,
+              milestoneId: existing.milestoneId || "m1",
+              kind: existing.kind || "implementation",
+              skillName: existing.skillName || "worker-implementation",
             };
       const { slotConfig } = resolveFeatureSlot(feature, modelSettings);
 
-      const result = await dispatchAdapter.runFeature(
+      const result = await effectiveAdapter.runFeature(
         feature,
         slotConfig,
         loadState(missionDir)
@@ -285,6 +332,16 @@ export async function startMissionRun(
 
       if (Object.keys(identity).length > 0) {
         if (state.activeWorker && state.activeWorker.runId === pendingRunId) {
+          if (
+            state.activeWorker.workerPid &&
+            typeof state.activeWorker.workerPid === "number"
+          ) {
+            try {
+              process.kill(state.activeWorker.workerPid, "SIGTERM");
+            } catch {
+              // Ignore if process already exited
+            }
+          }
           state.activeWorker = {
             ...state.activeWorker,
             ...identity,
@@ -292,6 +349,9 @@ export async function startMissionRun(
           delete state.activeWorker.dispatchPending;
           delete state.activeWorker.delegatedBy;
           delete state.activeWorker.runtimeTransport;
+          delete state.activeWorker.workerPid;
+          delete state.activeWorker.daemonStateFile;
+          delete state.activeWorker.daemonStatus;
         }
         if (Array.isArray(state.sessions)) {
           state.sessions = state.sessions.map((s) => {
@@ -300,6 +360,9 @@ export async function startMissionRun(
               delete copy.dispatchPending;
               delete copy.delegatedBy;
               delete copy.runtimeTransport;
+              delete copy.workerPid;
+              delete copy.daemonStateFile;
+              delete copy.daemonStatus;
               return copy;
             }
             return s;
@@ -321,6 +384,12 @@ export async function startMissionRun(
             ...updatedFeaturesDoc.features[idx],
             ...featureIdentity,
           };
+          delete updatedFeaturesDoc.features[idx].dispatchPending;
+          delete updatedFeaturesDoc.features[idx].delegatedBy;
+          delete updatedFeaturesDoc.features[idx].runtimeTransport;
+          delete updatedFeaturesDoc.features[idx].workerPid;
+          delete updatedFeaturesDoc.features[idx].daemonStateFile;
+          delete updatedFeaturesDoc.features[idx].daemonStatus;
         }
         saveState(missionDir, state);
         saveFeaturesDoc(missionDir, {
@@ -336,6 +405,14 @@ export async function startMissionRun(
         typeof result === "object" &&
         result.handoff
       ) {
+        if (
+          state.activeWorker?.workerPid &&
+          typeof state.activeWorker.workerPid === "number"
+        ) {
+          try {
+            process.kill(state.activeWorker.workerPid, "SIGTERM");
+          } catch {}
+        }
         endFeatureRun(missionDir, {
           runId: pendingRunId,
           featureId: pendingFeatureId,
@@ -368,8 +445,8 @@ export async function startMissionRun(
       pausedActiveWorker.featureId;
 
     let resumeResult = null;
-    if (typeof dispatchAdapter?.resumeWorker === "function") {
-      resumeResult = await dispatchAdapter.resumeWorker(
+    if (typeof effectiveAdapter?.resumeWorker === "function") {
+      resumeResult = await effectiveAdapter.resumeWorker(
         state.activeWorker,
         options,
         loadState(missionDir)
@@ -486,6 +563,14 @@ export async function startMissionRun(
     if (resumeResult && resumeResult.handoff) {
       const currentAfterResume = loadState(missionDir);
       if (currentAfterResume.activeWorker) {
+        if (
+          currentAfterResume.activeWorker?.workerPid &&
+          typeof currentAfterResume.activeWorker.workerPid === "number"
+        ) {
+          try {
+            process.kill(currentAfterResume.activeWorker.workerPid, "SIGTERM");
+          } catch {}
+        }
         const endOutcome = endFeatureRun(missionDir, {
           runId: pausedActiveWorker.runId,
           featureId: pausedActiveWorker.featureId,
@@ -515,6 +600,14 @@ export async function startMissionRun(
   } else if (needsResume && state.activeWorker && options?.restartFeature === true) {
     const nowIso = new Date().toISOString();
     const oldFeatureId = state.activeWorker.featureId;
+    if (
+      state.activeWorker?.workerPid &&
+      typeof state.activeWorker.workerPid === "number"
+    ) {
+      try {
+        process.kill(state.activeWorker.workerPid, "SIGTERM");
+      } catch {}
+    }
     state.activeWorker = null;
     state.status = "running";
     state.lastStartedAt = nowIso;
@@ -589,6 +682,14 @@ export async function startMissionRun(
               },
             ];
           }
+          if (
+            state.activeWorker?.workerPid &&
+            typeof state.activeWorker.workerPid === "number"
+          ) {
+            try {
+              process.kill(state.activeWorker.workerPid, "SIGTERM");
+            } catch {}
+          }
           state.activeWorker = null;
           state.revision = (state.revision || 1) + 1;
           saveState(missionDir, state);
@@ -605,6 +706,14 @@ export async function startMissionRun(
         }
         state.lastStartedAt = null;
         state.status = "completed";
+        if (
+          state.activeWorker?.workerPid &&
+          typeof state.activeWorker.workerPid === "number"
+        ) {
+          try {
+            process.kill(state.activeWorker.workerPid, "SIGTERM");
+          } catch {}
+        }
         state.activeWorker = null;
         state.revision = (state.revision || 1) + 1;
         saveState(missionDir, state);
@@ -649,7 +758,7 @@ export async function startMissionRun(
       candidate,
       nextIdx,
       modelSettings,
-      dispatchAdapter
+      effectiveAdapter
     );
 
     state = loadState(missionDir);
