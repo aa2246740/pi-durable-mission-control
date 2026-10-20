@@ -406,67 +406,23 @@ function appendProgressLogSync(progressLogPath, entryInput) {
 
 function execRuntimeSubprocess(action, missionDir, payload = {}) {
   return new Promise((resolve, reject) => {
-    const inlineScript = `
-      const fs = require("node:fs");
-      const path = require("node:path");
-      const action = process.argv[1];
-      const missionDir = process.argv[2];
-      const payload = JSON.parse(process.argv[3] || "{}");
-      if (!missionDir || (!fs.existsSync(missionDir) && !fs.existsSync(path.dirname(missionDir)))) {
-        process.stderr.write(JSON.stringify({ ok: false, error: "Mission directory does not exist" }) + "\\n");
-        process.exit(1);
-      }
-      if (action === "dispatch") {
-        const missionId = payload.missionId || "mission";
-        const featureId = payload.feature?.id || payload.featureId || "f1";
-        const runId = payload.runId || "run-1";
-        const repoPath = payload.repoPath || missionDir;
-        process.stdout.write(JSON.stringify({
-          ok: true,
-          dispatched: true,
-          taskId: "node:delegated-task:" + missionId + ":" + featureId + ":" + runId,
-          childThreadId: "thread:delegated-task:" + missionId + ":" + featureId + ":" + runId,
-          childRunId: "run:thread:" + missionId + ":" + featureId + ":" + runId + ":ordinal:1",
-          worktreePath: repoPath,
-          workerPid: process.pid,
-          runtimeTransport: "bridge-cli-subprocess",
-          bridgeCliPath: payload.bridgeCliPath || null
-        }) + "\\n");
-      } else if (action === "pause-worker") {
-        const w = payload.activeWorker || {};
-        process.stdout.write(JSON.stringify({
-          ok: true,
-          paused: true,
-          taskId: w.taskId || null,
-          childThreadId: w.childThreadId || null,
-          pausedByPid: process.pid
-        }) + "\\n");
-      } else if (action === "pause-mission") {
-        process.stdout.write(JSON.stringify({
-          ok: true,
-          paused: true,
-          status: "paused",
-          pausedByPid: process.pid
-        }) + "\\n");
-      } else if (action === "resume-worker") {
-        const w = payload.activeWorker || {};
-        if (w.worktreePath && !fs.existsSync(w.worktreePath)) {
-          process.stderr.write(JSON.stringify({ ok: false, resumed: false, canResume: false, error: "Active worker worktree path does not exist" }) + "\\n");
-          process.exit(1);
-        }
-        process.stdout.write(JSON.stringify({
-          ok: true,
-          resumed: true,
-          taskId: w.taskId || null,
-          childThreadId: w.childThreadId || null,
-          trigger: payload.trigger || "[resume the mission]",
-          wokenByPid: process.pid
-        }) + "\\n");
-      }
-    `;
+    const commandMap = {
+      dispatch: "DispatchWorkerRuntime",
+      "pause-worker": "PauseWorkerRuntime",
+      "pause-mission": "PauseMissionRuntime",
+      "resume-worker": "ResumeWorkerRuntime",
+    };
+    const cliCommand = commandMap[action] || action;
     cp.execFile(
       process.execPath,
-      ["-e", inlineScript, action, missionDir, JSON.stringify({ ...payload, bridgeCliPath: BRIDGE_CLI_PATH })],
+      [
+        BRIDGE_CLI_PATH,
+        cliCommand,
+        "--mission-dir",
+        missionDir,
+        "--json",
+        JSON.stringify({ ...payload, bridgeCliPath: BRIDGE_CLI_PATH }),
+      ],
       {
         encoding: "utf8",
         timeout: 10000,

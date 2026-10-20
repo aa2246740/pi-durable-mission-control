@@ -1461,9 +1461,23 @@ test("Round 3 & Round 4 Scrutiny Fixes (P22, P23, R4-approval-explicit-runtime-r
     assert.equal(resDefRes.status, 200);
 
     assert.ok(
-      nonGitProcessCalls.length >= 3,
+      nonGitProcessCalls.length >= 4,
       `Expected default runtime subprocess calls for approve/pause/resume, got ${nonGitProcessCalls.length}`
     );
+    const cliCommands = nonGitProcessCalls.map((call) => call.argv[1]);
+    assert.deepEqual(cliCommands, [
+      "DispatchWorkerRuntime",
+      "PauseWorkerRuntime",
+      "PauseMissionRuntime",
+      "ResumeWorkerRuntime",
+    ]);
+    for (const call of nonGitProcessCalls) {
+      assert.ok(
+        String(call.argv[0]).endsWith("bridge/cli.mjs"),
+        `Expected bridge/cli.mjs entrypoint, got ${call.argv[0]}`
+      );
+      assert.notEqual(call.argv[0], "-e");
+    }
   } finally {
     cp.execFile = origExecFile;
     await srvDefault.close();
