@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import http from "node:http";
 import vm from "node:vm";
-import { execFileSync } from "node:child_process";
+import cp, { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createMissionHudServer } from "../hud/server.mjs";
 
@@ -739,7 +739,7 @@ test("I-04, I-07, I-03, F11, F04: Startup reconciliation, real Git dirty diagnos
 });
 
 test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature selection, onCommand rollback, missing worktree preflight, retry session handoff isolation, and symlink CLI guard", async (t) => {
-  // --- P14: Default HUD approve selects first pending feature with dispatchPending=true and default runtime metadata ---
+  // --- P14: Default HUD approve selects first pending feature with real runtime subprocess metadata ---
   const p14Dir = createTempMissionWorkspace();
   execFileSync("git", ["init", "-q", p14Dir]);
   execFileSync("git", ["-C", p14Dir, "config", "user.name", "Test"]);
@@ -820,12 +820,13 @@ test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature 
   assert.ok(afterApproveState.activeWorker, "Expected activeWorker to be selected on approve");
   assert.equal(afterApproveState.activeWorker.featureId, "f1");
   assert.equal(afterApproveState.activeWorker.status, "running");
-  assert.equal(afterApproveState.activeWorker.dispatchPending, true);
-  assert.ok(afterApproveState.activeWorker.taskId);
-  assert.ok(afterApproveState.activeWorker.childThreadId);
+  assert.equal(afterApproveState.activeWorker.dispatchPending, undefined);
+  assert.match(afterApproveState.activeWorker.taskId, /^node:delegated-task:/);
+  assert.match(afterApproveState.activeWorker.childThreadId, /^thread:delegated-task:/);
   assert.ok(afterApproveState.activeWorker.childRunId);
   assert.equal(afterApproveState.activeWorker.worktreePath, p14Dir);
-  assert.equal(afterApproveState.activeWorker.delegatedBy, "hud-default-runtime");
+  assert.equal(afterApproveState.activeWorker.runtimeTransport, "bridge-cli-subprocess");
+  assert.equal(typeof afterApproveState.activeWorker.workerPid, "number");
   assert.deepEqual(
     afterApproveFeatures.map((f) => f.status),
     ["running", "pending"]
@@ -1032,7 +1033,7 @@ test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature 
   assert.equal(p20Res.status, 200);
 });
 
-test("Round 3 Scrutiny Fixes (P22, P23): Runtime adapter wiring on pause/resume/approve and pre-commit onCommand hook execution order", async (t) => {
+test("Round 3 & Round 4 Scrutiny Fixes (P22, P23, R4-approval-explicit-runtime-rejection, R4-default-runtime-lifecycle): Runtime adapter wiring, explicit rejection on approve, and default runtime subprocess execution", async (t) => {
   // --- P22: dispatchAdapter pauseWorker / pauseMission / resumeWorker wired and rollback on error ---
   const p22Dir = createTempMissionWorkspace();
   execFileSync("git", ["init", "-q", p22Dir]);
@@ -1303,5 +1304,169 @@ test("Round 3 Scrutiny Fixes (P22, P23): Runtime adapter wiring on pause/resume/
 
     await srv23.close();
     fs.rmSync(p23Dir, { recursive: true, force: true });
+  }
+
+  // --- R4-approval-explicit-runtime-rejection: Explicit ok:false from runFeature or startMissionRun rejects with 409 ---
+  for (const methodKey of ["runFeature", "startMissionRun"]) {
+    const r4ApproveDir = createTempMissionWorkspace();
+    const r4DotM = path.join(r4ApproveDir, ".mission");
+    fs.mkdirSync(r4DotM, { recursive: true });
+    fs.writeFileSync(
+      path.join(r4DotM, "state.json"),
+      JSON.stringify(
+        {
+          missionId: `mission-r4-reject-${methodKey}`,
+          title: "R4 Approval Rejection",
+          repoPath: r4ApproveDir,
+          status: "awaiting_input",
+          planAccepted: false,
+          revision: 1,
+          elapsedMs: 0,
+          lastStartedAt: null,
+          milestones: [{ id: "m1", title: "M1", ordinal: 1 }],
+          assertions: [],
+          activeWorker: null,
+          sessions: [],
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(r4DotM, "features.json"),
+      JSON.stringify(
+        {
+          features: [
+            { id: "f1", title: "First", milestoneId: "m1", status: "pending", attempts: 0 },
+          ],
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(r4DotM, "model-settings.json"),
+      JSON.stringify({ validator: { model: "grok-4.7", effort: 3 } }, null, 2) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(r4DotM, "progress_log.jsonl"),
+      JSON.stringify({ seq: 1, timestamp: new Date().toISOString(), type: "init", message: "init" }) +
+        "\n"
+    );
+
+    const snapFiles = () => ({
+      state: fs.readFileSync(path.join(r4DotM, "state.json"), "utf8"),
+      features: fs.readFileSync(path.join(r4DotM, "features.json"), "utf8"),
+      modelSettings: fs.readFileSync(path.join(r4DotM, "model-settings.json"), "utf8"),
+      progressLog: fs.readFileSync(path.join(r4DotM, "progress_log.jsonl"), "utf8"),
+    });
+    const beforeFiles = snapFiles();
+
+    const customAdapter = {
+      [methodKey]: async () => ({
+        ok: false,
+        error: "Runtime explicitly refused approval dispatch",
+      }),
+    };
+
+    const srvReject = await createMissionHudServer({
+      missionDir: r4ApproveDir,
+      port: 0,
+      dispatchAdapter: customAdapter,
+    });
+    const rejectRes = await fetch(`${srvReject.url}/api/mission/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(rejectRes.status, 409, `Expected 409 when ${methodKey} returns ok:false`);
+    const rejectBody = await rejectRes.json();
+    assert.equal(rejectBody.ok, false);
+    assert.match(rejectBody.error, /Runtime explicitly refused approval dispatch/);
+    assert.deepEqual(snapFiles(), beforeFiles, `Expected disk unchanged when ${methodKey} rejects`);
+
+    const stateOnDisk = JSON.parse(fs.readFileSync(path.join(r4DotM, "state.json"), "utf8"));
+    assert.equal(stateOnDisk.planAccepted, false);
+    assert.equal(stateOnDisk.status, "awaiting_input");
+
+    await srvReject.close();
+    fs.rmSync(r4ApproveDir, { recursive: true, force: true });
+  }
+
+  // --- R4-default-runtime-lifecycle: Default runtime invokes subprocess via cp.execFile across approve/pause/resume ---
+  const r4DefaultDir = createTempMissionWorkspace();
+  execFileSync("git", ["init", "-q", r4DefaultDir]);
+  execFileSync("git", ["-C", r4DefaultDir, "config", "user.name", "Test"]);
+  execFileSync("git", ["-C", r4DefaultDir, "config", "user.email", "test@example.invalid"]);
+  fs.writeFileSync(path.join(r4DefaultDir, ".gitignore"), ".mission/\n");
+  fs.writeFileSync(path.join(r4DefaultDir, "file.txt"), "baseline\n");
+  execFileSync("git", ["-C", r4DefaultDir, "add", "."]);
+  execFileSync("git", ["-C", r4DefaultDir, "commit", "-qm", "fixture"]);
+
+  const r4DefaultDotM = path.join(r4DefaultDir, ".mission");
+  fs.mkdirSync(r4DefaultDotM, { recursive: true });
+  fs.writeFileSync(
+    path.join(r4DefaultDotM, "state.json"),
+    JSON.stringify(
+      {
+        missionId: "mission-r4-default",
+        title: "R4 Default Lifecycle",
+        repoPath: r4DefaultDir,
+        status: "awaiting_input",
+        planAccepted: false,
+        revision: 1,
+        elapsedMs: 0,
+        lastStartedAt: null,
+        milestones: [{ id: "m1", title: "M1", ordinal: 1 }],
+        assertions: [],
+        activeWorker: null,
+        sessions: [],
+      },
+      null,
+      2
+    ) + "\n"
+  );
+  fs.writeFileSync(
+    path.join(r4DefaultDotM, "features.json"),
+    JSON.stringify(
+      {
+        features: [
+          { id: "f1", title: "First", milestoneId: "m1", status: "pending", attempts: 0 },
+        ],
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  const nonGitProcessCalls = [];
+  const origExecFile = cp.execFile;
+  cp.execFile = function (...args) {
+    const file = String(args[0] || "");
+    if (!file.endsWith("git")) {
+      nonGitProcessCalls.push({ file, argv: args[1] });
+    }
+    return origExecFile.apply(this, args);
+  };
+
+  const srvDefault = await createMissionHudServer({ missionDir: r4DefaultDir, port: 0 });
+  try {
+    const appRes = await fetch(`${srvDefault.url}/api/mission/approve`, { method: "POST" });
+    assert.equal(appRes.status, 200);
+    const pauseDefRes = await fetch(`${srvDefault.url}/api/mission/pause`, { method: "POST" });
+    assert.equal(pauseDefRes.status, 200);
+    const resDefRes = await fetch(`${srvDefault.url}/api/mission/resume`, { method: "POST" });
+    assert.equal(resDefRes.status, 200);
+
+    assert.ok(
+      nonGitProcessCalls.length >= 3,
+      `Expected default runtime subprocess calls for approve/pause/resume, got ${nonGitProcessCalls.length}`
+    );
+  } finally {
+    cp.execFile = origExecFile;
+    await srvDefault.close();
+    fs.rmSync(r4DefaultDir, { recursive: true, force: true });
   }
 });

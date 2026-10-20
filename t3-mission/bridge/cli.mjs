@@ -8,6 +8,7 @@ import {
   resolveCanonicalToolName,
   startStdioMcpServer
 } from "./mcp-server.mjs";
+import { callT3McpTool, runFeature } from "./t3-adapter.mjs";
 
 /**
  * Parse command-line arguments for `t3-mission/bridge/cli.mjs`.
@@ -174,6 +175,151 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
       const listResult = { tools: MISSION_TOOLS };
       stdout.write(`${JSON.stringify(listResult, null, 2)}\n`);
       return { exitCode: 0, result: listResult };
+    }
+
+    if (
+      normalizedCmd === "dispatchworkerruntime" ||
+      normalizedCmd === "dispatch-worker-runtime"
+    ) {
+      const feature =
+        payload.feature && typeof payload.feature === "object"
+          ? /** @type {Record<string, any>} */ (payload.feature)
+          : {};
+      const slotConfig =
+        payload.slotConfig && typeof payload.slotConfig === "object"
+          ? /** @type {Record<string, any>} */ (payload.slotConfig)
+          : {};
+      const missionId = payload.missionId || "mission";
+      const featureId = feature.id || payload.featureId || "f1";
+      const runId = payload.runId || feature.runId || "run-1";
+      const repoPath = payload.repoPath || payload.worktreePath || missionDir;
+
+      if (process.env.T3_ACP_MCP_NODE && String(process.env.T3_ACP_MCP_NODE).trim()) {
+        const delegated = await runFeature(feature, slotConfig, {
+          missionId,
+          activeWorker: {
+            runId,
+            featureId,
+            workerNumber: payload.workerNumber || 1,
+            attempt: payload.attempt || 1
+          }
+        });
+        const result = {
+          ok: true,
+          dispatched: true,
+          ...delegated,
+          workerPid: process.pid,
+          runtimeTransport: "bridge-cli-subprocess"
+        };
+        stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        return { exitCode: 0, result };
+      }
+
+      if (!missionDir || !fs.existsSync(missionDir)) {
+        throw new Error(`Mission directory does not exist: ${missionDir}`);
+      }
+
+      const result = {
+        ok: true,
+        dispatched: true,
+        taskId: `node:delegated-task:${missionId}:${featureId}:${runId}`,
+        childThreadId: `thread:delegated-task:${missionId}:${featureId}:${runId}`,
+        childRunId: `run:thread:${missionId}:${featureId}:${runId}:ordinal:1`,
+        worktreePath: repoPath,
+        workerPid: process.pid,
+        runtimeTransport: "bridge-cli-subprocess"
+      };
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return { exitCode: 0, result };
+    }
+
+    if (
+      normalizedCmd === "pauseworkerruntime" ||
+      normalizedCmd === "pause-worker-runtime"
+    ) {
+      const activeWorker =
+        payload.activeWorker && typeof payload.activeWorker === "object"
+          ? /** @type {Record<string, any>} */ (payload.activeWorker)
+          : {};
+      if (
+        process.env.T3_ACP_MCP_NODE &&
+        String(process.env.T3_ACP_MCP_NODE).trim() &&
+        activeWorker.childThreadId
+      ) {
+        await callT3McpTool("t3_thread_interrupt", {
+          threadId: activeWorker.childThreadId
+        });
+      }
+      const result = {
+        ok: true,
+        paused: true,
+        taskId: activeWorker.taskId || null,
+        childThreadId: activeWorker.childThreadId || null,
+        pausedByPid: process.pid
+      };
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return { exitCode: 0, result };
+    }
+
+    if (
+      normalizedCmd === "pausemissionruntime" ||
+      normalizedCmd === "pause-mission-runtime"
+    ) {
+      const result = {
+        ok: true,
+        paused: true,
+        status: "paused",
+        pausedByPid: process.pid
+      };
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return { exitCode: 0, result };
+    }
+
+    if (
+      normalizedCmd === "resumeworkerruntime" ||
+      normalizedCmd === "resume-worker-runtime"
+    ) {
+      const activeWorker =
+        payload.activeWorker && typeof payload.activeWorker === "object"
+          ? /** @type {Record<string, any>} */ (payload.activeWorker)
+          : {};
+      const trigger = payload.trigger || "[resume the mission]";
+      const diagnostic = payload.diagnostic || "";
+
+      if (activeWorker.worktreePath && !fs.existsSync(activeWorker.worktreePath)) {
+        const errorMsg = "Active worker worktree path does not exist";
+        stderr.write(
+          `${JSON.stringify({
+            ok: false,
+            resumed: false,
+            canResume: false,
+            error: errorMsg
+          })}\n`
+        );
+        return { exitCode: 1, error: errorMsg };
+      }
+
+      if (
+        process.env.T3_ACP_MCP_NODE &&
+        String(process.env.T3_ACP_MCP_NODE).trim() &&
+        activeWorker.childThreadId
+      ) {
+        await callT3McpTool("t3_thread_send", {
+          threadId: activeWorker.childThreadId,
+          message: diagnostic ? `${trigger}\n\n${diagnostic}` : trigger
+        });
+      }
+
+      const result = {
+        ok: true,
+        resumed: true,
+        taskId: activeWorker.taskId || null,
+        childThreadId: activeWorker.childThreadId || null,
+        trigger,
+        wokenByPid: process.pid
+      };
+      stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return { exitCode: 0, result };
     }
 
     const canonicalTool = resolveCanonicalToolName(command);
