@@ -281,7 +281,7 @@ test("VAL-KERNEL-002 & VAL-KERNEL-003: endFeatureRun validation, auto-continue v
           validatorsPassed: true,
           handoff: {
             whatWasImplemented: VALID_SUMMARY_50,
-            whatWasLeftUndone: "无",
+            whatWasLeftUndone: "\u65e0",
           },
         });
       },
@@ -1124,4 +1124,99 @@ test("F03, F07, F08, F09, F10, F11, F12: handoff attention ledger, strict dismis
   const loadedBare = loadFeaturesDoc(projectDir);
   assert.equal(loadedBare.features.length, 1);
   assert.equal(loadedBare.features[0].id, "f-bare-array");
+});
+
+test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with unchanged/unrelated features preserves pendingHandoffItems, and startMissionRun upgrades hud-default-runtime workers", async (t) => {
+  const projectDir = makeTempProjectDir(t);
+
+  proposeMission(projectDir, {
+    title: "P26 & HUD Default Runtime Upgrade",
+    repoPath: projectDir,
+    milestones: [{ id: "m1", title: "Milestone 1", ordinal: 1 }],
+    assertions: [{ id: "VAL-1", description: "P26 check", milestoneId: "m1" }],
+    features: [
+      { id: "f1", milestoneId: "m1", title: "Feature 1", fulfills: ["VAL-1"] },
+      { id: "f2", milestoneId: "m1", title: "Feature 2", fulfills: ["VAL-1"] },
+    ],
+  });
+  approveMissionPlan(projectDir);
+
+  await startMissionRun(projectDir);
+  // Simulate HUD default runtime having attached default identity with delegatedBy: "hud-default-runtime"
+  const stRunning = loadState(projectDir);
+  const runId = stRunning.activeWorker.runId;
+  delete stRunning.activeWorker.dispatchPending;
+  stRunning.activeWorker.delegatedBy = "hud-default-runtime";
+  stRunning.sessions = stRunning.sessions.map((s) =>
+    s.runId === runId ? { ...s, delegatedBy: "hud-default-runtime" } : s
+  );
+  saveState(projectDir, stRunning);
+
+  // Upgrading via startMissionRun with a real runFeature adapter replaces default identity and deletes delegatedBy
+  await startMissionRun(
+    projectDir,
+    {},
+    {
+      async runFeature() {
+        return {
+          taskId: "upgraded-task-1",
+          childThreadId: "upgraded-thread-1",
+          childRunId: "upgraded-crun-1",
+          worktreePath: "/tmp/upgraded-wt-1",
+        };
+      },
+    }
+  );
+
+  const stUpgraded = loadState(projectDir);
+  assert.equal(stUpgraded.activeWorker.delegatedBy, undefined);
+  assert.equal(stUpgraded.activeWorker.dispatchPending, undefined);
+  assert.equal(stUpgraded.activeWorker.taskId, "upgraded-task-1");
+  assert.equal(stUpgraded.activeWorker.childThreadId, "upgraded-thread-1");
+  assert.equal(stUpgraded.sessions[0].delegatedBy, undefined);
+  assert.equal(stUpgraded.sessions[0].taskId, "upgraded-task-1");
+
+  // Complete f1 with a discoveredIssue ("must-remain")
+  endFeatureRun(projectDir, {
+    runId,
+    featureId: "f1",
+    successState: "success",
+    validatorsPassed: true,
+    handoff: {
+      whatWasImplemented: VALID_SUMMARY_50,
+      discoveredIssues: [{ id: "must-remain", summary: "Unresolved real defect" }],
+    },
+  });
+
+  assert.equal(loadState(projectDir).pendingHandoffItems.length, 1);
+  assert.equal(loadState(projectDir).lastHandoffNeedsAttention, true);
+
+  // P26: Calling updateMissionFeatures with identical full-feature replacement array preserves pendingHandoffItems
+  const currentFeatures = loadFeaturesDoc(projectDir).features;
+  updateMissionFeatures(projectDir, { features: currentFeatures });
+  const afterNoOpReplace = loadState(projectDir);
+  assert.equal(afterNoOpReplace.pendingHandoffItems.length, 1);
+  assert.equal(afterNoOpReplace.pendingHandoffItems[0].id, "must-remain");
+  assert.equal(afterNoOpReplace.lastHandoffNeedsAttention, true);
+
+  // Calling updateMissionFeatures with full-feature replacement mutating only unrelated f2 also preserves f1's pendingHandoffItems
+  const [f1, f2] = loadFeaturesDoc(projectDir).features;
+  updateMissionFeatures(projectDir, {
+    features: [f1, { ...f2, title: "Unrelated change" }],
+  });
+  const afterUnrelatedReplace = loadState(projectDir);
+  assert.equal(afterUnrelatedReplace.pendingHandoffItems.length, 1);
+  assert.equal(afterUnrelatedReplace.pendingHandoffItems[0].id, "must-remain");
+  assert.equal(afterUnrelatedReplace.lastHandoffNeedsAttention, true);
+
+  // Calling updateMissionFeatures with full-feature replacement appending a new repair feature clears pendingHandoffItems
+  updateMissionFeatures(projectDir, {
+    features: [
+      ...loadFeaturesDoc(projectDir).features,
+      { id: "f-repair", milestoneId: "m1" },
+    ],
+  });
+  const afterAddReplace = loadState(projectDir);
+  assert.equal(afterAddReplace.pendingHandoffItems.length, 0);
+  assert.equal(afterAddReplace.lastHandoffNeedsAttention, false);
 });

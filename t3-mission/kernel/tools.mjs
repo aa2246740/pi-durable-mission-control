@@ -217,15 +217,48 @@ export function updateMissionFeatures(
   let addedCount = 0;
   let updatedCount = 0;
   let replacedCount = 0;
-  let replacedFeatures = false;
   const mutatedFeatureIds = new Set();
   const addedFeatureSourceIds = new Set();
   const resolvedHandoffItemIds = new Set();
 
   if (Array.isArray(replacementFeatures)) {
-    features = replacementFeatures.map((f, i) => normalizeFeature(f, i));
-    replacedCount += replacementFeatures.length || 1;
-    replacedFeatures = true;
+    const prevNormalizedFeatures = featuresDoc.features.map((f, i) =>
+      normalizeFeature(f, i)
+    );
+    const prevById = new Map(prevNormalizedFeatures.map((f) => [f.id, f]));
+
+    const nextNormalizedFeatures = [];
+    const nextIds = new Set();
+    for (let i = 0; i < replacementFeatures.length; i += 1) {
+      const rawF = replacementFeatures[i];
+      const normF = normalizeFeature(rawF, i);
+      nextNormalizedFeatures.push(normF);
+      nextIds.add(normF.id);
+      if (Array.isArray(rawF?.resolvesHandoffItemIds)) {
+        for (const itemId of rawF.resolvesHandoffItemIds) {
+          resolvedHandoffItemIds.add(String(itemId));
+        }
+      }
+      if (!prevById.has(normF.id)) {
+        addedCount += 1;
+        if (rawF?.sourceFeatureId) {
+          addedFeatureSourceIds.add(String(rawF.sourceFeatureId));
+        }
+      } else {
+        const prevF = prevById.get(normF.id);
+        if (JSON.stringify(prevF) !== JSON.stringify(normF)) {
+          updatedCount += 1;
+          mutatedFeatureIds.add(normF.id);
+        }
+      }
+    }
+    for (const prevF of prevNormalizedFeatures) {
+      if (!nextIds.has(prevF.id)) {
+        updatedCount += 1;
+        mutatedFeatureIds.add(prevF.id);
+      }
+    }
+    features = nextNormalizedFeatures;
   }
 
   if (Array.isArray(updateFeatures) && updateFeatures.length > 0) {
@@ -381,7 +414,7 @@ export function updateMissionFeatures(
     Array.isArray(state.pendingHandoffItems) &&
     state.pendingHandoffItems.length > 0
   ) {
-    if (addedCount > 0 || replacedFeatures || replacedCount > 0) {
+    if (addedCount > 0) {
       if (resolvedHandoffItemIds.size > 0 || addedFeatureSourceIds.size > 0) {
         state.pendingHandoffItems = state.pendingHandoffItems.filter(
           (item) =>
@@ -404,7 +437,11 @@ export function updateMissionFeatures(
       );
       state.lastHandoffNeedsAttention = state.pendingHandoffItems.length > 0;
     }
-  } else if (addedCount > 0 || replacedFeatures || replacedCount > 0) {
+  } else if (
+    addedCount > 0 ||
+    mutatedFeatureIds.size > 0 ||
+    resolvedHandoffItemIds.size > 0
+  ) {
     state.lastHandoffNeedsAttention = false;
   }
 

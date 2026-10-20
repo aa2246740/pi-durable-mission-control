@@ -223,7 +223,7 @@ export async function startMissionRun(
     state.activeWorker?.status === "paused" ||
     state.activeWorker?.resumePending === true;
 
-  // Already-running guard (F02 serialStart) + F03 dispatchPending handoff
+  // Already-running guard (F02 serialStart) + F03 dispatchPending / default runtime handoff
   if (
     !needsResume &&
     state.status === "running" &&
@@ -231,17 +231,20 @@ export async function startMissionRun(
     state.activeWorker.status === "running"
   ) {
     if (
-      state.activeWorker.dispatchPending === true &&
+      (state.activeWorker.dispatchPending === true ||
+        state.activeWorker.delegatedBy === "hud-default-runtime") &&
       typeof dispatchAdapter?.runFeature === "function"
     ) {
       const pendingRunId = state.activeWorker.runId;
       const pendingFeatureId = state.activeWorker.featureId;
       delete state.activeWorker.dispatchPending;
+      delete state.activeWorker.delegatedBy;
       if (Array.isArray(state.sessions)) {
         state.sessions = state.sessions.map((s) => {
           if (s.runId === pendingRunId) {
             const copy = { ...s };
             delete copy.dispatchPending;
+            delete copy.delegatedBy;
             return copy;
           }
           return s;
@@ -284,12 +287,14 @@ export async function startMissionRun(
             ...identity,
           };
           delete state.activeWorker.dispatchPending;
+          delete state.activeWorker.delegatedBy;
         }
         if (Array.isArray(state.sessions)) {
           state.sessions = state.sessions.map((s) => {
             if (s.runId === pendingRunId) {
               const copy = { ...s, ...identity };
               delete copy.dispatchPending;
+              delete copy.delegatedBy;
               return copy;
             }
             return s;
