@@ -15,15 +15,19 @@ import {
   checkGitTreeBeforeResume,
   createT3Adapter,
   delegateMissionTask,
+  EFFORT_LEVEL_TO_STRING,
   getOrchestratorCapabilities,
   normalizeTargetFromSlot,
   resolveTargetFromModelSettings,
   resumeWorker,
-  settleCompletedMilestoneThreads
+  runFeature,
+  settleCompletedMilestoneThreads,
+  VALID_CODEX_REASONING_EFFORTS
 } from "../bridge/t3-adapter.mjs";
 
 import {
   callMissionTool,
+  createBridgeDispatchAdapter,
   createMissionMcpServer,
   handleJsonRpcMessage,
   MISSION_TOOL_NAMES,
@@ -47,7 +51,7 @@ function createTempDir(prefix = "t3-mission-bridge-test-") {
 // ============================================================================
 
 test("VAL-BRIDGE-001: normalizeTargetFromSlot maps codex reasoningEffort correctly", () => {
-  for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+  for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
     const target = normalizeTargetFromSlot({
       providerInstanceId: "codex",
       model: "gpt-5.4",
@@ -76,6 +80,82 @@ test("VAL-BRIDGE-001: normalizeTargetFromSlot maps codex reasoningEffort correct
     options: {
       fastMode: true,
       reasoningEffort: "high"
+    }
+  });
+});
+
+test("F09 & I-02: normalizeTargetFromSlot maps numeric effort 1..5 to reasoningEffort even when stale reasoningEffort is present", () => {
+  assert.deepEqual(EFFORT_LEVEL_TO_STRING, {
+    1: "minimal",
+    2: "low",
+    3: "medium",
+    4: "high",
+    5: "max"
+  });
+  assert.ok(VALID_CODEX_REASONING_EFFORTS.has("minimal"));
+
+  const expectedByLevel = [
+    [1, "minimal"],
+    [2, "low"],
+    [3, "medium"],
+    [4, "high"],
+    [5, "max"]
+  ];
+
+  for (const [level, expected] of expectedByLevel) {
+    // Top-level numeric effort overrides stale top-level or nested reasoningEffort
+    const fromTopLevel = normalizeTargetFromSlot({
+      providerInstanceId: "codex",
+      model: "gpt-6.1-sol",
+      effort: level,
+      reasoningEffort: "high",
+      options: {
+        reasoningEffort: "high",
+        effort: level,
+        testMarker: "worker"
+      }
+    });
+    assert.deepEqual(fromTopLevel, {
+      providerInstanceId: "codex",
+      model: "gpt-6.1-sol",
+      options: {
+        testMarker: "worker",
+        reasoningEffort: expected
+      }
+    });
+
+    // Kernel-reloaded slot (where only options survive) still derives from options.effort
+    const fromKernelStore = normalizeTargetFromSlot({
+      providerInstanceId: "codex",
+      model: "gpt-6.1-sol",
+      options: {
+        reasoningEffort: "high",
+        effort: level,
+        testMarker: "worker"
+      }
+    });
+    assert.deepEqual(fromKernelStore, {
+      providerInstanceId: "codex",
+      model: "gpt-6.1-sol",
+      options: {
+        testMarker: "worker",
+        reasoningEffort: expected
+      }
+    });
+  }
+
+  // Effort 5 with explicit xhigh preserves xhigh
+  const xhighSlot = normalizeTargetFromSlot({
+    providerInstanceId: "codex",
+    model: "gpt-5.4",
+    effort: 5,
+    reasoningEffort: "xhigh"
+  });
+  assert.deepEqual(xhighSlot, {
+    providerInstanceId: "codex",
+    model: "gpt-5.4",
+    options: {
+      reasoningEffort: "xhigh"
     }
   });
 });
@@ -316,6 +396,72 @@ test("delegateMissionTask formats standardized titles, roles, worktree isolation
   });
 });
 
+test("F01 & I-01: runFeature and StartMissionRun propagate and persist taskId, childThreadId, childRunId, and worktreePath", async () => {
+  const tempMissionDir = createTempDir("t3-f01-persist-");
+  try {
+    const directRes = await runFeature(
+      { id: "f-direct", title: "Direct Feature", milestoneId: "m1" },
+      { providerInstanceId: "antigravity", model: "gemini-4-argon-high" },
+      { missionId: "m-direct", activeWorker: { workerNumber: 1, attempt: 1 } },
+      {
+        transportClient: async () => ({
+          taskId: "task-direct-1",
+          childThreadId: "thread-direct-1",
+          childRunId: "run-direct-1",
+          worktreePath: "/tmp/worktree-direct-1"
+        })
+      }
+    );
+    assert.equal(directRes.taskId, "task-direct-1");
+    assert.equal(directRes.childThreadId, "thread-direct-1");
+    assert.equal(directRes.childRunId, "run-direct-1");
+    assert.equal(directRes.worktreePath, "/tmp/worktree-direct-1");
+
+    await callMissionTool("ProposeMission", {
+      missionDir: tempMissionDir,
+      title: "F01 Persistence Test",
+      milestones: [{ id: "m1", title: "M1" }],
+      features: [{ id: "f1", milestoneId: "m1", title: "Feature 1" }],
+      assertions: [{ id: "VAL-1", milestoneId: "m1", description: "Check" }]
+    });
+    await callMissionTool("ApproveMissionPlan", { missionDir: tempMissionDir });
+
+    const adapter = createT3Adapter({
+      transportClient: async () => ({
+        taskId: "task-persisted-1",
+        childThreadId: "thread-persisted-1",
+        childRunId: "crun-persisted-1",
+        worktreePath: "/tmp/isolated-worktree-1"
+      })
+    });
+
+    const startRes = await callMissionTool(
+      "StartMissionRun",
+      { missionDir: tempMissionDir },
+      { adapter }
+    );
+
+    assert.equal(startRes.activeWorker.taskId, "task-persisted-1");
+    assert.equal(startRes.activeWorker.childThreadId, "thread-persisted-1");
+    assert.equal(startRes.activeWorker.childRunId, "crun-persisted-1");
+    assert.equal(startRes.activeWorker.worktreePath, "/tmp/isolated-worktree-1");
+
+    const diskState = JSON.parse(
+      fs.readFileSync(path.join(tempMissionDir, ".mission", "state.json"), "utf8")
+    );
+    assert.equal(diskState.activeWorker.taskId, "task-persisted-1");
+    assert.equal(diskState.activeWorker.childThreadId, "thread-persisted-1");
+    assert.equal(diskState.activeWorker.childRunId, "crun-persisted-1");
+    assert.equal(diskState.activeWorker.worktreePath, "/tmp/isolated-worktree-1");
+    assert.equal(diskState.sessions[0].taskId, "task-persisted-1");
+    assert.equal(diskState.sessions[0].childThreadId, "thread-persisted-1");
+    assert.equal(diskState.sessions[0].childRunId, "crun-persisted-1");
+    assert.equal(diskState.sessions[0].worktreePath, "/tmp/isolated-worktree-1");
+  } finally {
+    fs.rmSync(tempMissionDir, { recursive: true, force: true });
+  }
+});
+
 test("getOrchestratorCapabilities and settleCompletedMilestoneThreads invoke expected T3 tools", async () => {
   const calls = [];
   const adapter = createT3Adapter({
@@ -403,6 +549,54 @@ test("VAL-BRIDGE-002: checkGitTreeBeforeResume detects clean, dirty, and conflic
   }
 });
 
+test("F13 & F02: checkGitTreeBeforeResume fails closed on Git errors and resumeWorker blocks without dispatching", async () => {
+  const gitFailure = await checkGitTreeBeforeResume("/missing/repository", {
+    execFileImpl: async () => {
+      throw new Error("permission denied");
+    }
+  });
+
+  assert.equal(gitFailure.isGitRepo, false);
+  assert.equal(gitFailure.clean, false);
+  assert.equal(gitFailure.canResume, false);
+  assert.equal(gitFailure.error, "permission denied");
+  assert.equal(
+    gitFailure.summary,
+    "Cannot resume mission: Git inspection failed (permission denied)."
+  );
+
+  const mcpCalls = [];
+  const blockedByGitError = await resumeWorker(
+    {
+      missionId: "m-git-err",
+      worktreePath: "/missing/repository",
+      activeWorker: {
+        featureId: "f-git-err",
+        childThreadId: "thread-git-err-1"
+      }
+    },
+    {
+      transportClient: async (toolName, args) => {
+        mcpCalls.push({ toolName, args });
+        return {};
+      },
+      execFileImpl: async () => {
+        throw new Error("permission denied");
+      }
+    }
+  );
+
+  assert.equal(blockedByGitError.resumed, false);
+  assert.equal(blockedByGitError.canResume, false);
+  assert.equal(blockedByGitError.status, "blocked_by_git_error");
+  assert.equal(
+    blockedByGitError.reason,
+    "Cannot resume mission: Git inspection failed (permission denied)."
+  );
+  assert.equal(blockedByGitError.preflight.canResume, false);
+  assert.equal(mcpCalls.length, 0);
+});
+
 test("VAL-BRIDGE-002: resumeWorker checks Git tree first and calls t3_thread_send when activeWorker.childThreadId exists", async () => {
   const tempRepo = createTempDir("t3-resume-worker-");
   try {
@@ -436,6 +630,8 @@ test("VAL-BRIDGE-002: resumeWorker checks Git tree first and calls t3_thread_sen
     );
 
     assert.equal(resumeOutcome.resumed, true);
+    assert.equal(resumeOutcome.canResume, true);
+    assert.equal(resumeOutcome.status, "running");
     assert.equal(resumeOutcome.action, "t3_thread_send");
     assert.equal(resumeOutcome.threadId, "thread-existing-worker-2");
     assert.equal(resumeOutcome.gitCheck.clean, true);
@@ -484,6 +680,8 @@ test("VAL-BRIDGE-002: resumeWorker blocks resume when Git tree has unresolved me
   );
 
   assert.equal(outcome.resumed, false);
+  assert.equal(outcome.canResume, false);
+  assert.equal(outcome.status, "blocked_by_conflicts");
   assert.equal(outcome.action, "blocked_by_conflicts");
   assert.equal(outcome.gitCheck.hasConflicts, true);
   assert.equal(mcpCalls.length, 0);
@@ -492,6 +690,132 @@ test("VAL-BRIDGE-002: resumeWorker blocks resume when Git tree has unresolved me
 // ============================================================================
 // VAL-BRIDGE-003: MCP Server JSON-RPC 2.0 & CLI Entrypoint
 // ============================================================================
+
+test("F05, F06, F12: MCP schemas and Bridge boundary normalize dismissals, forward feature/milestone/assertion updates, and enforce EndFeatureRun identity", async () => {
+  const dismissTool = MISSION_TOOLS.find((t) => t.name === "DismissHandoffItems");
+  const itemSchema = dismissTool.inputSchema.properties.dismissals.items;
+  assert.deepEqual(itemSchema.required, [
+    "type",
+    "sourceFeatureId",
+    "summary",
+    "justification"
+  ]);
+  assert.deepEqual(itemSchema.properties.type.enum, [
+    "discovered_issue",
+    "non_interactive_check",
+    "validator_failure",
+    "handoff_attention"
+  ]);
+  assert.equal(itemSchema.properties.justification.minLength, 20);
+  assert.ok(itemSchema.properties.itemId);
+  assert.ok(itemSchema.properties.reason);
+
+  const endTool = MISSION_TOOLS.find((t) => t.name === "EndFeatureRun");
+  assert.deepEqual(endTool.inputSchema.required, ["missionDir", "featureId", "handoff"]);
+  assert.ok(endTool.inputSchema.properties.runId);
+
+  const updateTool = MISSION_TOOLS.find((t) => t.name === "UpdateMissionFeatures");
+  for (const field of [
+    "features",
+    "addFeatures",
+    "updateFeatures",
+    "updateAssertions",
+    "modelSettings",
+    "bonusAttempts",
+    "milestones",
+    "assertions"
+  ]) {
+    assert.ok(
+      updateTool.inputSchema.properties[field],
+      `UpdateMissionFeatures schema should include ${field}`
+    );
+  }
+
+  // F12: EndFeatureRun without featureId or runId throws MISSING_RUN_IDENTITY
+  await assert.rejects(
+    () =>
+      callMissionTool("EndFeatureRun", {
+        missionDir: "/tmp/no-identity",
+        handoff: {
+          whatWasImplemented:
+            "Implemented feature with more than fifty characters of detailed summary text."
+        }
+      }),
+    (err) => {
+      assert.equal(err.code, "MISSING_RUN_IDENTITY");
+      return true;
+    }
+  );
+
+  // F05 & F06 against real kernel in a temporary mission directory
+  const tempMissionDir = createTempDir("t3-f05-f06-");
+  try {
+    await callMissionTool("ProposeMission", {
+      missionDir: tempMissionDir,
+      title: "Schema Alignment Mission",
+      milestones: [{ id: "m1", title: "M1" }],
+      features: [
+        { id: "f1", milestoneId: "m1", title: "F1" },
+        { id: "f2", milestoneId: "m1", title: "F2" }
+      ],
+      assertions: [{ id: "VAL-1", milestoneId: "m1", description: "Initial assertion" }]
+    });
+    await callMissionTool("ApproveMissionPlan", { missionDir: tempMissionDir });
+
+    // Legacy aliases (itemId -> summary, reason -> justification) normalize at Bridge boundary
+    let capturedDismissals = null;
+    await callMissionTool(
+      "DismissHandoffItems",
+      {
+        missionDir: tempMissionDir,
+        dismissals: [
+          {
+            type: "discovered_issue",
+            sourceFeatureId: "f1",
+            itemId: "iss-legacy-1",
+            reason: "This legacy reason string is at least twenty characters."
+          }
+        ]
+      },
+      {
+        kernel: {
+          dismissHandoffItems(_dir, payload) {
+            capturedDismissals = payload.dismissals;
+            return { ok: true, dismissals: payload.dismissals };
+          }
+        }
+      }
+    );
+    assert.equal(capturedDismissals[0].summary, "iss-legacy-1");
+    assert.equal(
+      capturedDismissals[0].justification,
+      "This legacy reason string is at least twenty characters."
+    );
+
+    // F06: Replacement features, milestones, assertions + bonusAttempts/updateAssertions/modelSettings
+    const updateRes = await callMissionTool("UpdateMissionFeatures", {
+      missionDir: tempMissionDir,
+      features: [{ id: "replacement-f1", milestoneId: "m2", title: "Replacement Feature" }],
+      milestones: [{ id: "m2", title: "Milestone 2" }],
+      assertions: [{ id: "VAL-NEW", milestoneId: "m2", description: "New assertion" }]
+    });
+
+    assert.deepEqual(
+      updateRes.features.map((f) => f.id),
+      ["replacement-f1"]
+    );
+    assert.deepEqual(
+      updateRes.state.milestones.map((m) => m.id),
+      ["m2"]
+    );
+    assert.deepEqual(
+      updateRes.state.assertions.map((a) => a.id),
+      ["VAL-NEW"]
+    );
+  } finally {
+    fs.rmSync(tempMissionDir, { recursive: true, force: true });
+  }
+});
 
 test("VAL-BRIDGE-003: MCP Server handles initialize, tools/list, and tools/call for all 7 Mission tools with mock kernel", async () => {
   const invokedTools = [];
@@ -587,13 +911,21 @@ test("VAL-BRIDGE-003: MCP Server handles initialize, tools/list, and tools/call 
       "DismissHandoffItems",
       {
         missionDir: "/tmp/mock-mission",
-        dismissals: [{ itemId: "iss-1", type: "discovered_issue", reason: "Non-blocking" }]
+        dismissals: [
+          {
+            type: "discovered_issue",
+            sourceFeatureId: "f1",
+            summary: "iss-1",
+            justification: "Non-blocking issue with twenty plus characters."
+          }
+        ]
       }
     ],
     [
       "EndFeatureRun",
       {
         missionDir: "/tmp/mock-mission",
+        runId: "run-1",
         featureId: "f1",
         validatorsPassed: true,
         handoff: {
@@ -684,9 +1016,17 @@ test("VAL-BRIDGE-003: stdio MCP Server communicates over NDJSON streams", async 
 test("VAL-BRIDGE-003: CLI entrypoint executes commands via node t3-mission/bridge/cli.mjs <command> --mission-dir <dir> [--json <payload>]", async () => {
   const tempMissionDir = createTempDir("t3-cli-e2e-");
   try {
+    await execFileAsync("git", ["init"], { cwd: tempMissionDir });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: tempMissionDir });
+    await execFileAsync("git", ["config", "user.name", "Test User"], { cwd: tempMissionDir });
+    fs.writeFileSync(path.join(tempMissionDir, ".gitignore"), ".mission/\n", "utf8");
+    await execFileAsync("git", ["add", ".gitignore"], { cwd: tempMissionDir });
+    await execFileAsync("git", ["commit", "-m", "initial commit"], { cwd: tempMissionDir });
+
     // 1. ProposeMission via CLI subprocess
     const proposePayload = JSON.stringify({
       title: "CLI E2E Mission",
+      repoPath: tempMissionDir,
       milestones: [{ id: "M1", title: "Core Bridge" }],
       features: [
         {
