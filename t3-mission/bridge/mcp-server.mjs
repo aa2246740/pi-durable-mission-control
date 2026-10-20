@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { DISMISSAL_TYPES } from "../kernel/schema.mjs";
 import {
   checkGitTreeBeforeResume,
   createT3Adapter,
@@ -88,12 +89,7 @@ export const MISSION_TOOLS = [
             properties: {
               type: {
                 type: "string",
-                enum: [
-                  "discovered_issue",
-                  "non_interactive_check",
-                  "validator_failure",
-                  "handoff_attention"
-                ]
+                enum: [...DISMISSAL_TYPES]
               },
               sourceFeatureId: {
                 type: "string",
@@ -134,7 +130,7 @@ export const MISSION_TOOLS = [
         missionDir: { type: "string", description: "Path to the project or .mission directory" },
         runId: {
           type: "string",
-          description: "Active worker runId (strongly recommended / required when available to fence stale worker runs)"
+          description: "Active worker runId (required to fence stale worker runs)"
         },
         featureId: {
           type: "string",
@@ -146,7 +142,7 @@ export const MISSION_TOOLS = [
         assertionResults: { type: "object" },
         handoff: { type: "object" }
       },
-      required: ["missionDir", "featureId", "handoff"]
+      required: ["missionDir", "runId", "featureId", "handoff"]
     }
   },
   {
@@ -811,6 +807,15 @@ export function createFallbackKernel() {
       const statePath = path.join(baseDir, "state.json");
       const state = readJsonFileSafe(statePath, {});
       const normalized = normalizeDismissalPayloadItems(input.dismissals || []);
+      for (const item of Array.isArray(normalized) ? normalized : []) {
+        if (!item || !DISMISSAL_TYPES.includes(item.type)) {
+          const err = new Error(
+            `INVALID_DISMISSAL_TYPE: Invalid dismissal type "${item?.type}"`
+          );
+          /** @type {any} */ (err).code = "INVALID_DISMISSAL_TYPE";
+          throw err;
+        }
+      }
       state.lastHandoffNeedsAttention = false;
       state.dismissals = [
         ...(Array.isArray(state.dismissals) ? state.dismissals : []),
@@ -822,12 +827,34 @@ export function createFallbackKernel() {
     },
 
     endFeatureRun(missionDir, input = {}) {
+      const hasFeatureId = typeof input.featureId === "string" && input.featureId.trim().length > 0;
+      const hasRunId = typeof input.runId === "string" && input.runId.trim().length > 0;
+      if (!hasFeatureId || !hasRunId) {
+        const err = new Error(
+          "MISSING_RUN_IDENTITY: EndFeatureRun requires both runId and featureId"
+        );
+        /** @type {any} */ (err).code = "MISSING_RUN_IDENTITY";
+        throw err;
+      }
+
       const baseDir = resolveFallbackBaseDir(missionDir);
       const statePath = path.join(baseDir, "state.json");
       const featuresPath = path.join(baseDir, "features.json");
       const state = readJsonFileSafe(statePath, {});
       const featuresDoc = readJsonFileSafe(featuresPath, { features: [] });
-      const targetFeatureId = input.featureId || state.activeWorker?.featureId;
+      if (
+        state.activeWorker &&
+        ((state.activeWorker.runId && state.activeWorker.runId !== input.runId) ||
+          (state.activeWorker.featureId && state.activeWorker.featureId !== input.featureId))
+      ) {
+        const err = new Error(
+          `STALE_WORKER_RUN: Active worker (${state.activeWorker.featureId}/${state.activeWorker.runId}) does not match (${input.featureId}/${input.runId})`
+        );
+        /** @type {any} */ (err).code = "STALE_WORKER_RUN";
+        throw err;
+      }
+
+      const targetFeatureId = input.featureId;
       const nowIso = new Date().toISOString();
       const successState = input.successState || "success";
 
@@ -836,6 +863,7 @@ export function createFallbackKernel() {
         featuresDoc.features[featureIdx].status = successState === "success" ? "completed" : "pending";
         featuresDoc.features[featureIdx].lastHandoff = {
           ...(input.handoff || {}),
+          runId: input.runId,
           successState,
           validatorsPassed: Boolean(input.validatorsPassed ?? true),
           completedAt: nowIso
@@ -1047,9 +1075,9 @@ export async function callMissionTool(toolName, rawArgs = {}, context = {}) {
   if (canonicalName === "EndFeatureRun") {
     const hasFeatureId = typeof args.featureId === "string" && args.featureId.trim().length > 0;
     const hasRunId = typeof args.runId === "string" && args.runId.trim().length > 0;
-    if (!hasFeatureId && !hasRunId) {
+    if (!hasFeatureId || !hasRunId) {
       const err = new Error(
-        "MISSING_RUN_IDENTITY: EndFeatureRun requires featureId and/or runId to fence worker completion"
+        "MISSING_RUN_IDENTITY: EndFeatureRun requires both runId and featureId to fence worker completion"
       );
       /** @type {any} */ (err).code = "MISSING_RUN_IDENTITY";
       throw err;
@@ -1494,9 +1522,21 @@ export function startStdioMcpServer(options = {}) {
   };
 }
 
-const isMainModule =
-  process.argv[1] &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+function resolveRealOrAbs(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+export function isExecutedAsMain(metaUrl, argv1 = process.argv[1]) {
+  return Boolean(
+    argv1 && resolveRealOrAbs(argv1) === resolveRealOrAbs(fileURLToPath(metaUrl))
+  );
+}
+
+const isMainModule = isExecutedAsMain(import.meta.url);
 
 if (isMainModule) {
   startStdioMcpServer();
@@ -1513,6 +1553,7 @@ export default {
   handleJsonRpcMessage,
   createMissionMcpServer,
   startStdioMcpServer,
+  isExecutedAsMain,
   normalizeTargetFromSlot,
   resolveTargetFromModelSettings,
   delegateMissionTask,

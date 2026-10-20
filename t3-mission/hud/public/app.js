@@ -132,20 +132,38 @@ function synthesizeSessions(state, features) {
       s.title || s.featureTitle || matchedFeature?.title || s.featureId || `${role} #${number}`;
     const status = s.status || "completed";
 
-    const matchingFeatureHandoff =
+    const sameFeatureSessionCount = s.featureId
+      ? explicitSessions.filter((item) => item.featureId === s.featureId).length
+      : 1;
+
+    const featureHandoffMatchesRun = Boolean(
       matchedFeature?.lastHandoff &&
-      (!matchedFeature.lastHandoff.runId ||
-        matchedFeature.lastHandoff.runId === s.runId) &&
-      status === "completed"
-        ? matchedFeature.lastHandoff
-        : null;
+        ((s.runId &&
+          matchedFeature.lastHandoff.runId &&
+          matchedFeature.lastHandoff.runId === s.runId) ||
+          (!s.runId &&
+            !matchedFeature.lastHandoff.runId &&
+            status !== "running" &&
+            status !== "paused" &&
+            status !== "pending" &&
+            sameFeatureSessionCount === 1))
+    );
+
+    const matchingFeatureHandoff = featureHandoffMatchesRun
+      ? matchedFeature.lastHandoff
+      : null;
 
     const h = s.handoff || matchingFeatureHandoff || {};
+    const featureThreadMatchesRun = Boolean(
+      matchedFeature?.childThreadId &&
+        ((s.runId && matchedFeature.runId && matchedFeature.runId === s.runId) ||
+          (!s.runId && sameFeatureSessionCount === 1))
+    );
     const childThreadId =
       s.childThreadId ||
       s.threadId ||
       h.childThreadId ||
-      matchedFeature?.childThreadId ||
+      (featureThreadMatchesRun ? matchedFeature.childThreadId : null) ||
       null;
 
     byId.set(id, {
@@ -199,11 +217,10 @@ function synthesizeSessions(state, features) {
       (s) => s.featureId === f.id
     );
     if (matchingSessions.length > 0) {
-      if (f.lastHandoff) {
-        const targetSession =
-          (f.lastHandoff.runId &&
-            matchingSessions.find((s) => s.runId === f.lastHandoff.runId)) ||
-          matchingSessions.at(-1);
+      if (f.lastHandoff && f.lastHandoff.runId) {
+        const targetSession = matchingSessions.find(
+          (s) => s.runId === f.lastHandoff.runId && s.status !== "running"
+        );
         if (targetSession) {
           targetSession.handoff = {
             salientSummary:
@@ -230,7 +247,7 @@ function synthesizeSessions(state, features) {
     const id = `session-${f.id || idx + 1}`;
     const title = f.title || f.id;
     const status = f.status || "pending";
-    const h = f.lastHandoff || {};
+    const h = status === "running" || status === "pending" ? {} : f.lastHandoff || {};
     const childThreadId = f.childThreadId || h.childThreadId || null;
 
     byId.set(id, {
@@ -271,11 +288,11 @@ function synthesizeSessions(state, features) {
       featuresList.find((f) => f.id && f.id === aw.featureId) || null;
     const existing =
       byId.get(awId) ||
-      Array.from(byId.values()).find(
-        (s) =>
-          (aw.runId && s.runId === aw.runId) ||
-          s.workerNumber === number ||
-          (aw.featureId && s.featureId === aw.featureId)
+      Array.from(byId.values()).find((s) =>
+        aw.runId
+          ? s.runId === aw.runId
+          : s.workerNumber === number ||
+            (aw.featureId && s.featureId === aw.featureId && s.status !== "completed")
       );
     const role = inferSessionRole(aw, existing || matchedFeature);
     const featureTitle =

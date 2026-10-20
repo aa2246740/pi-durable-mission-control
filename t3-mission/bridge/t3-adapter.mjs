@@ -652,20 +652,33 @@ export async function runFeature(feature, slotConfig, missionState = {}, envOrOp
   const activeWorker = missionState?.activeWorker || {};
   const workerNumber = activeWorker.workerNumber ?? feature.workerNumber ?? 1;
   const attempt = activeWorker.attempt ?? feature.attempts ?? 1;
+  const runId = activeWorker.runId ?? feature.runId ?? null;
+  const featureId = feature.id ?? activeWorker.featureId ?? null;
+  const baseTask =
+    feature.prompt ||
+    feature.description ||
+    `Implement feature ${feature.id}: ${feature.title}`;
+  const identityParts = [
+    runId ? `runId="${runId}"` : null,
+    featureId ? `featureId="${featureId}"` : null
+  ].filter(Boolean);
+  const task =
+    identityParts.length > 0
+      ? `${baseTask}\n\n[Mission Run Identity: ${identityParts.join(", ")}]`
+      : baseTask;
+
   const delegation = await delegateMissionTask(
     {
       missionId: missionState?.missionId ?? "mission",
       milestoneId: feature.milestoneId ?? activeWorker.milestoneId ?? "M1",
-      featureId: feature.id ?? activeWorker.featureId,
+      runId,
+      featureId,
       featureTitle: feature.title ?? activeWorker.featureTitle,
       kind: feature.kind ?? activeWorker.kind ?? "worker",
       workerNumber,
       attempt,
       slot: slotConfig,
-      task:
-        feature.prompt ||
-        feature.description ||
-        `Implement feature ${feature.id}: ${feature.title}`
+      task
     },
     envOrOptions
   );

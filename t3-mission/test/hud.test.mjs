@@ -711,7 +711,13 @@ test("I-04, I-07, I-03, F11, F04: Startup reconciliation, real Git dirty diagnos
 
   // 3. F04: Standalone CLI execution starts server, creates .mission, outputs listening JSON, and serves HTTP
   const cliTempDir = createTempMissionWorkspace();
+  let cliPid = null;
   t.after(() => {
+    if (cliPid) {
+      try {
+        process.kill(cliPid, "SIGTERM");
+      } catch {}
+    }
     fs.rmSync(cliTempDir, { recursive: true, force: true });
   });
   const cliMissionDir = path.join(cliTempDir, ".mission");
@@ -722,6 +728,7 @@ test("I-04, I-07, I-03, F11, F04: Startup reconciliation, real Git dirty diagnos
   );
   assert.ok(fs.existsSync(cliMissionDir), "CLI should create .mission directory");
   const cliInfo = JSON.parse(cliStdout.trim());
+  cliPid = cliInfo.pid;
   assert.equal(cliInfo.ok, true);
   assert.ok(cliInfo.url.startsWith("http://127.0.0.1:"));
 
@@ -729,4 +736,290 @@ test("I-04, I-07, I-03, F11, F04: Startup reconciliation, real Git dirty diagnos
   assert.equal(cliHttpRes.status, 200);
   const cliSnap = await cliHttpRes.json();
   assert.equal(cliSnap.initialized, false);
+});
+
+test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature selection, onCommand rollback, missing worktree preflight, retry session handoff isolation, and symlink CLI guard", async (t) => {
+  // --- P14: Default HUD approve selects first pending feature with dispatchPending=true ---
+  const p14Dir = createTempMissionWorkspace();
+  execFileSync("git", ["init", "-q", p14Dir]);
+  execFileSync("git", ["-C", p14Dir, "config", "user.name", "Test"]);
+  execFileSync("git", ["-C", p14Dir, "config", "user.email", "test@example.invalid"]);
+  fs.writeFileSync(path.join(p14Dir, ".gitignore"), ".mission/\n");
+  fs.writeFileSync(path.join(p14Dir, "file.txt"), "baseline\n");
+  execFileSync("git", ["-C", p14Dir, "add", "."]);
+  execFileSync("git", ["-C", p14Dir, "commit", "-qm", "fixture"]);
+
+  const p14DotMission = path.join(p14Dir, ".mission");
+  fs.mkdirSync(p14DotMission, { recursive: true });
+  fs.writeFileSync(
+    path.join(p14DotMission, "state.json"),
+    JSON.stringify(
+      {
+        missionId: "mission-p14",
+        title: "P14 Default Approve",
+        repoPath: p14Dir,
+        status: "awaiting_input",
+        planAccepted: false,
+        revision: 1,
+        elapsedMs: 0,
+        lastStartedAt: null,
+        milestones: [{ id: "m1", title: "Milestone one", ordinal: 1 }],
+        assertions: [{ id: "VAL-1", milestoneId: "m1", status: "pending" }],
+        activeWorker: null,
+        sessions: [],
+        pendingHandoffItems: [],
+      },
+      null,
+      2
+    ) + "\n"
+  );
+  fs.writeFileSync(
+    path.join(p14DotMission, "features.json"),
+    JSON.stringify(
+      {
+        features: [
+          { id: "f1", title: "First", milestoneId: "m1", status: "pending", attempts: 0 },
+          { id: "f2", title: "Second", milestoneId: "m1", status: "pending", attempts: 0 },
+        ],
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  const srv14 = await createMissionHudServer({ missionDir: p14Dir, port: 0 });
+  t.after(async () => {
+    await srv14.close();
+    fs.rmSync(p14Dir, { recursive: true, force: true });
+  });
+
+  const approveRes = await fetch(`${srv14.url}/api/mission/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(approveRes.status, 200);
+  const afterApproveState = JSON.parse(
+    fs.readFileSync(path.join(p14DotMission, "state.json"), "utf8")
+  );
+  const afterApproveFeatures = JSON.parse(
+    fs.readFileSync(path.join(p14DotMission, "features.json"), "utf8")
+  ).features;
+  const afterApproveLogs = fs
+    .readFileSync(path.join(p14DotMission, "progress_log.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l));
+
+  assert.equal(afterApproveState.status, "running");
+  assert.equal(afterApproveState.planAccepted, true);
+  assert.ok(afterApproveState.activeWorker, "Expected activeWorker to be selected on approve");
+  assert.equal(afterApproveState.activeWorker.featureId, "f1");
+  assert.equal(afterApproveState.activeWorker.status, "running");
+  assert.equal(afterApproveState.activeWorker.dispatchPending, true);
+  assert.deepEqual(
+    afterApproveFeatures.map((f) => f.status),
+    ["running", "pending"]
+  );
+  assert.equal(afterApproveFeatures[0].attempts, 1);
+  assert.deepEqual(
+    afterApproveLogs.map((l) => l.type),
+    ["plan_approved", "worker_selected", "worker_started"]
+  );
+
+  // --- P15: onCommand throwing error rolls back disk state to paused ---
+  await fetch(`${srv14.url}/api/mission/pause`, { method: "POST" });
+  const srv15 = await createMissionHudServer({
+    missionDir: p14Dir,
+    port: 0,
+    onCommand: async ({ type }) => {
+      if (type === "resume") {
+        throw new Error("Independent runtime wake failure");
+      }
+    },
+  });
+  t.after(async () => {
+    await srv15.close();
+  });
+
+  const failResumeRes = await fetch(`${srv15.url}/api/mission/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(failResumeRes.status, 500);
+  const failResumeBody = await failResumeRes.json();
+  assert.match(failResumeBody.error, /Independent runtime wake failure/);
+
+  const diskStateAfterFail = JSON.parse(
+    fs.readFileSync(path.join(p14DotMission, "state.json"), "utf8")
+  );
+  assert.equal(diskStateAfterFail.status, "paused");
+  assert.equal(diskStateAfterFail.activeWorker.status, "paused");
+  assert.equal(diskStateAfterFail.activeWorker.resumePending, undefined);
+
+  // --- P16: Missing activeWorker.worktreePath fails closed with 409 ---
+  const p16Dir = createTempMissionWorkspace();
+  const p16DotMission = path.join(p16Dir, ".mission");
+  fs.mkdirSync(p16DotMission, { recursive: true });
+  fs.writeFileSync(
+    path.join(p16DotMission, "state.json"),
+    JSON.stringify(
+      {
+        missionId: "mission-p16",
+        title: "P16 Missing Worktree",
+        repoPath: p16Dir,
+        status: "paused",
+        planAccepted: true,
+        revision: 2,
+        activeWorker: {
+          runId: "run-missing-wt",
+          workerNumber: 1,
+          featureId: "f1",
+          featureTitle: "First",
+          status: "paused",
+          taskId: "t",
+          childThreadId: "c",
+          worktreePath: path.join(p16Dir, "does-not-exist"),
+        },
+        sessions: [],
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  const srv16 = await createMissionHudServer({ missionDir: p16Dir, port: 0 });
+  t.after(async () => {
+    await srv16.close();
+    fs.rmSync(p16Dir, { recursive: true, force: true });
+  });
+
+  const missingWtRes = await fetch(`${srv16.url}/api/mission/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(missingWtRes.status, 409);
+  const missingWtData = await missingWtRes.json();
+  assert.equal(missingWtData.code, "RESUME_BLOCKED_BY_GIT_ERROR");
+  assert.equal(missingWtData.gitCheck.canResume, false);
+  assert.equal(missingWtData.gitCheck.isGitRepo, false);
+  assert.equal(missingWtData.gitCheck.clean, false);
+  const p16DiskState = JSON.parse(
+    fs.readFileSync(path.join(p16DotMission, "state.json"), "utf8")
+  );
+  assert.equal(p16DiskState.status, "paused");
+
+  // --- P18: Running retry session must NOT inherit previous attempt's handoff or commands ---
+  const appSrc = fs
+    .readFileSync(APP_JS_PATH, "utf8")
+    .replace("export function applySnapshot", "function applySnapshot")
+    .replace(/initHud\(\);\s*$/, "");
+  const vmCtx = vm.createContext({});
+  vm.runInContext(appSrc, vmCtx);
+  vmCtx.retryState = {
+    status: "running",
+    activeWorker: {
+      runId: "run-attempt-2",
+      workerNumber: 2,
+      role: "Worker",
+      featureId: "retry",
+      featureTitle: "Retry feature",
+      milestoneId: "m1",
+      status: "running",
+      taskId: "new-task",
+      childThreadId: "new-thread",
+    },
+    sessions: [
+      {
+        runId: "run-attempt-1",
+        workerNumber: 1,
+        role: "Worker",
+        featureId: "retry",
+        featureTitle: "Retry feature",
+        milestoneId: "m1",
+        status: "completed",
+        taskId: "old-task",
+        childThreadId: "old-thread",
+        handoff: {
+          whatWasImplemented:
+            "OLD RUN SUMMARY: this handoff belongs only to the failed first attempt and must not appear as current progress.",
+          commandsRun: ["old-attempt-only"],
+          discoveredIssues: [],
+        },
+      },
+      {
+        runId: "run-attempt-2",
+        workerNumber: 2,
+        role: "Worker",
+        featureId: "retry",
+        featureTitle: "Retry feature",
+        milestoneId: "m1",
+        status: "running",
+        taskId: "new-task",
+        childThreadId: "new-thread",
+      },
+    ],
+  };
+  vmCtx.retryFeatures = [
+    {
+      id: "retry",
+      milestoneId: "m1",
+      title: "Retry feature",
+      status: "running",
+      attempts: 2,
+      taskId: "new-task",
+      childThreadId: "new-thread",
+      lastHandoff: {
+        whatWasImplemented:
+          "OLD RUN SUMMARY: this handoff belongs only to the failed first attempt and must not appear as current progress.",
+        commandsRun: ["old-attempt-only"],
+        discoveredIssues: [],
+      },
+    },
+  ];
+  const p18Sessions = JSON.parse(
+    vm.runInContext("JSON.stringify(synthesizeSessions(retryState, retryFeatures))", vmCtx)
+  );
+  const oldSession = p18Sessions.find((s) => s.runId === "run-attempt-1");
+  const runningSession = p18Sessions.find((s) => s.runId === "run-attempt-2");
+  assert.ok(oldSession);
+  assert.ok(runningSession);
+  assert.equal(
+    oldSession.handoff.whatWasImplemented,
+    "OLD RUN SUMMARY: this handoff belongs only to the failed first attempt and must not appear as current progress."
+  );
+  assert.deepEqual(oldSession.handoff.commandsRun, ["old-attempt-only"]);
+  assert.equal(runningSession.handoff.whatWasImplemented, "No handoff recorded yet.");
+  assert.deepEqual(runningSession.handoff.commandsRun, []);
+  assert.equal(runningSession.childThreadId, "new-thread");
+
+  // --- P20: Symlinked CLI path executes main guard and starts server ---
+  const p20Dir = createTempMissionWorkspace();
+  const symlinkDir = path.join(p20Dir, "symlink-parent");
+  fs.symlinkSync(path.dirname(SERVER_MJS_PATH), symlinkDir);
+  const symlinkedServerMjs = path.join(symlinkDir, "server.mjs");
+  const p20MissionDir = path.join(p20Dir, ".mission");
+  let p20Pid = null;
+  t.after(() => {
+    if (p20Pid) {
+      try {
+        process.kill(p20Pid, "SIGTERM");
+      } catch {}
+    }
+    fs.rmSync(p20Dir, { recursive: true, force: true });
+  });
+
+  const p20Stdout = execFileSync(
+    process.execPath,
+    [symlinkedServerMjs, "--mission-dir", p20MissionDir, "--port", "0"],
+    { cwd: p20Dir, timeout: 4000, encoding: "utf8" }
+  );
+  const p20Info = JSON.parse(p20Stdout.trim().split("\n")[0]);
+  p20Pid = p20Info.pid;
+  assert.equal(p20Info.ok, true);
+  const p20Res = await fetch(`${p20Info.url}/api/mission/state`);
+  assert.equal(p20Res.status, 200);
 });
