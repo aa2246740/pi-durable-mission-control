@@ -1341,3 +1341,84 @@ test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with
   assert.equal(afterAddReplace.pendingHandoffItems.length, 0);
   assert.equal(afterAddReplace.lastHandoffNeedsAttention, false);
 });
+
+test("F03-end-feature-daemon-leak: calling endFeatureRun directly terminates activeWorker.workerPid and unlinks activeWorker.daemonStateFile", async (t) => {
+  const projectDir = makeTempProjectDir(t);
+
+  proposeMission(projectDir, {
+    title: "Direct endFeatureRun Daemon Cleanup",
+    repoPath: projectDir,
+    milestones: [{ id: "m1", title: "Milestone 1", ordinal: 1 }],
+    assertions: [{ id: "VAL-1", description: "Daemon cleanup", milestoneId: "m1" }],
+    features: [
+      { id: "f1", milestoneId: "m1", title: "Feature 1", fulfills: ["VAL-1"] },
+    ],
+    modelSettings: {
+      skipScrutiny: true,
+      skipUserTesting: true,
+    },
+  });
+  approveMissionPlan(projectDir);
+
+  await startMissionRun(projectDir);
+  const daemonChild = cp.spawn(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    { stdio: "ignore" }
+  );
+  const daemonPid = daemonChild.pid;
+  const daemonStateFile = path.join(projectDir, ".mission", "worker-daemon-state.json");
+  fs.writeFileSync(daemonStateFile, JSON.stringify({ pid: daemonPid, status: "running" }) + "\n");
+
+  const st = loadState(projectDir);
+  const runId = st.activeWorker.runId;
+  st.activeWorker.workerPid = daemonPid;
+  st.activeWorker.daemonStateFile = daemonStateFile;
+  st.activeWorker.daemonStatus = "running";
+  st.sessions = st.sessions.map((s) =>
+    s.runId === runId
+      ? {
+          ...s,
+          workerPid: daemonPid,
+          daemonStateFile,
+          daemonStatus: "running",
+        }
+      : s
+  );
+  saveState(projectDir, st);
+
+  // Verify process and state file are alive before endFeatureRun
+  process.kill(daemonPid, 0);
+  assert.equal(fs.existsSync(daemonStateFile), true);
+
+  endFeatureRun(projectDir, {
+    runId,
+    featureId: "f1",
+    successState: "success",
+    validatorsPassed: true,
+    handoff: {
+      whatWasImplemented: VALID_SUMMARY_50,
+    },
+  });
+
+  // Wait briefly for SIGTERM to reap child if needed
+  await new Promise((r) => setTimeout(r, 80));
+
+  let pidAlive = true;
+  try {
+    process.kill(daemonPid, 0);
+  } catch {
+    pidAlive = false;
+  }
+  assert.equal(pidAlive, false, "Expected workerPid to be terminated by endFeatureRun");
+  assert.equal(
+    fs.existsSync(daemonStateFile),
+    false,
+    "Expected daemonStateFile to be unlinked by endFeatureRun"
+  );
+
+  const finalState = loadState(projectDir);
+  assert.equal(finalState.activeWorker, null);
+  assert.equal(finalState.sessions[0].daemonStatus, "stopped");
+  assert.equal(loadFeaturesDoc(projectDir).features[0].daemonStatus, "stopped");
+});

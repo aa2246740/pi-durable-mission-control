@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import {
   createRunId,
   inferFeatureKind,
@@ -17,6 +18,33 @@ import {
   checkMilestoneCompletionAndInjectValidation,
   endFeatureRun,
 } from "./tools.mjs";
+
+export function cleanupLocalWorkerDaemon(worker) {
+  if (!worker || typeof worker !== "object") {
+    return;
+  }
+  if (
+    worker.workerPid &&
+    typeof worker.workerPid === "number" &&
+    worker.workerPid > 0 &&
+    worker.workerPid !== process.pid
+  ) {
+    try {
+      process.kill(worker.workerPid, "SIGTERM");
+    } catch {
+      // Ignore if process already exited
+    }
+  }
+  if (worker.daemonStateFile && typeof worker.daemonStateFile === "string") {
+    try {
+      if (fs.existsSync(worker.daemonStateFile)) {
+        fs.unlinkSync(worker.daemonStateFile);
+      }
+    } catch {
+      // Ignore if file already removed
+    }
+  }
+}
 
 export function resolveFeatureSlot(feature, modelSettings) {
   const validator = isValidatorFeature(feature);
@@ -187,14 +215,7 @@ export async function dispatchFeatureToWorker(
     typeof result === "object" &&
     result.handoff
   ) {
-    if (
-      state.activeWorker?.workerPid &&
-      typeof state.activeWorker.workerPid === "number"
-    ) {
-      try {
-        process.kill(state.activeWorker.workerPid, "SIGTERM");
-      } catch {}
-    }
+    cleanupLocalWorkerDaemon(state.activeWorker);
     endFeatureRun(missionDir, {
       runId,
       featureId: candidate.id,
@@ -255,12 +276,8 @@ export async function startMissionRun(
     ) {
       const pendingRunId = existing.runId;
       const pendingFeatureId = existing.featureId;
-      if (existing.workerPid && typeof existing.workerPid === "number") {
-        try {
-          process.kill(existing.workerPid, "SIGTERM");
-        } catch {
-          // Ignore if process already exited
-        }
+      if (existing.workerPid || existing.daemonStateFile) {
+        cleanupLocalWorkerDaemon(existing);
         delete existing.workerPid;
         delete existing.daemonStateFile;
         delete existing.daemonStatus;
@@ -332,16 +349,7 @@ export async function startMissionRun(
 
       if (Object.keys(identity).length > 0) {
         if (state.activeWorker && state.activeWorker.runId === pendingRunId) {
-          if (
-            state.activeWorker.workerPid &&
-            typeof state.activeWorker.workerPid === "number"
-          ) {
-            try {
-              process.kill(state.activeWorker.workerPid, "SIGTERM");
-            } catch {
-              // Ignore if process already exited
-            }
-          }
+          cleanupLocalWorkerDaemon(state.activeWorker);
           state.activeWorker = {
             ...state.activeWorker,
             ...identity,
@@ -405,14 +413,7 @@ export async function startMissionRun(
         typeof result === "object" &&
         result.handoff
       ) {
-        if (
-          state.activeWorker?.workerPid &&
-          typeof state.activeWorker.workerPid === "number"
-        ) {
-          try {
-            process.kill(state.activeWorker.workerPid, "SIGTERM");
-          } catch {}
-        }
+        cleanupLocalWorkerDaemon(state.activeWorker);
         endFeatureRun(missionDir, {
           runId: pendingRunId,
           featureId: pendingFeatureId,
@@ -563,14 +564,7 @@ export async function startMissionRun(
     if (resumeResult && resumeResult.handoff) {
       const currentAfterResume = loadState(missionDir);
       if (currentAfterResume.activeWorker) {
-        if (
-          currentAfterResume.activeWorker?.workerPid &&
-          typeof currentAfterResume.activeWorker.workerPid === "number"
-        ) {
-          try {
-            process.kill(currentAfterResume.activeWorker.workerPid, "SIGTERM");
-          } catch {}
-        }
+        cleanupLocalWorkerDaemon(currentAfterResume.activeWorker);
         const endOutcome = endFeatureRun(missionDir, {
           runId: pausedActiveWorker.runId,
           featureId: pausedActiveWorker.featureId,
@@ -600,14 +594,7 @@ export async function startMissionRun(
   } else if (needsResume && state.activeWorker && options?.restartFeature === true) {
     const nowIso = new Date().toISOString();
     const oldFeatureId = state.activeWorker.featureId;
-    if (
-      state.activeWorker?.workerPid &&
-      typeof state.activeWorker.workerPid === "number"
-    ) {
-      try {
-        process.kill(state.activeWorker.workerPid, "SIGTERM");
-      } catch {}
-    }
+    cleanupLocalWorkerDaemon(state.activeWorker);
     state.activeWorker = null;
     state.status = "running";
     state.lastStartedAt = nowIso;
@@ -682,14 +669,7 @@ export async function startMissionRun(
               },
             ];
           }
-          if (
-            state.activeWorker?.workerPid &&
-            typeof state.activeWorker.workerPid === "number"
-          ) {
-            try {
-              process.kill(state.activeWorker.workerPid, "SIGTERM");
-            } catch {}
-          }
+          cleanupLocalWorkerDaemon(state.activeWorker);
           state.activeWorker = null;
           state.revision = (state.revision || 1) + 1;
           saveState(missionDir, state);
@@ -706,14 +686,7 @@ export async function startMissionRun(
         }
         state.lastStartedAt = null;
         state.status = "completed";
-        if (
-          state.activeWorker?.workerPid &&
-          typeof state.activeWorker.workerPid === "number"
-        ) {
-          try {
-            process.kill(state.activeWorker.workerPid, "SIGTERM");
-          } catch {}
-        }
+        cleanupLocalWorkerDaemon(state.activeWorker);
         state.activeWorker = null;
         state.revision = (state.revision || 1) + 1;
         saveState(missionDir, state);

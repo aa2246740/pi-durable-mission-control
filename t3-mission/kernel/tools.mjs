@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import {
   ASSERTION_STATUSES,
   createInitialState,
@@ -757,6 +758,10 @@ export function endFeatureRun(missionDir, input = {}) {
     feature.status = "pending";
   }
 
+  if (feature.daemonStatus || state.activeWorker?.daemonStatus) {
+    feature.daemonStatus = "stopped";
+  }
+
   featuresDoc.features[featureIdx] = normalizeFeature(feature, featureIdx);
 
   const discoveredIssues = Array.isArray(handoff.discoveredIssues)
@@ -871,6 +876,35 @@ export function endFeatureRun(missionDir, input = {}) {
   const completedWorker = state.activeWorker;
   const workerNumber = completedWorker.workerNumber ?? 1;
 
+  const workerPidToTerminate =
+    completedWorker?.workerPid ?? feature?.workerPid;
+  if (
+    workerPidToTerminate &&
+    typeof workerPidToTerminate === "number" &&
+    workerPidToTerminate > 0 &&
+    workerPidToTerminate !== process.pid
+  ) {
+    try {
+      process.kill(workerPidToTerminate, "SIGTERM");
+    } catch {
+      // Ignore if process already exited
+    }
+  }
+  const daemonStateFileToRemove =
+    completedWorker?.daemonStateFile ?? feature?.daemonStateFile;
+  if (
+    daemonStateFileToRemove &&
+    typeof daemonStateFileToRemove === "string"
+  ) {
+    try {
+      if (fs.existsSync(daemonStateFileToRemove)) {
+        fs.unlinkSync(daemonStateFileToRemove);
+      }
+    } catch {
+      // Ignore if file already removed
+    }
+  }
+
   if (Array.isArray(state.sessions)) {
     state.sessions = state.sessions.map((s) =>
       s.runId === completedWorker.runId
@@ -882,6 +916,9 @@ export function endFeatureRun(missionDir, input = {}) {
               !hasMissingValidatorAssertions
                 ? "completed"
                 : "failed",
+            ...(s.daemonStatus || completedWorker?.daemonStatus
+              ? { daemonStatus: "stopped" }
+              : {}),
             endedAt: nowIso,
             handoff: feature.lastHandoff,
             lastHandoff: feature.lastHandoff,
