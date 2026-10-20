@@ -420,29 +420,58 @@ function buildUninitializedState(repoDir) {
   };
 }
 
-function inspectGitTreeForResume(candidateDir, featureId) {
-  if (!candidateDir || !fs.existsSync(candidateDir)) {
+function inspectGitTreeForResume(candidateDir, featureId, { activeWorkerWorktreePath } = {}) {
+  if (
+    typeof activeWorkerWorktreePath === "string" &&
+    activeWorkerWorktreePath.trim().length > 0 &&
+    !fs.existsSync(activeWorkerWorktreePath)
+  ) {
+    const summary = `Cannot resume mission: worktree path "${activeWorkerWorktreePath}" does not exist.`;
     return {
+      path: activeWorkerWorktreePath,
       isGitRepo: false,
+      clean: false,
+      canResume: false,
+      hasConflicts: false,
+      hasUncommittedChanges: false,
+      modifiedFiles: [],
+      conflictedFiles: [],
+      error: "Active worker worktree path does not exist",
+      summary,
+      diagnostic: summary,
+    };
+  }
+
+  if (!candidateDir || !fs.existsSync(candidateDir)) {
+    const diagnostic = `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`;
+    return {
+      path: candidateDir || null,
+      isGitRepo: false,
+      clean: true,
       canResume: true,
       hasConflicts: false,
       hasUncommittedChanges: false,
       modifiedFiles: [],
       conflictedFiles: [],
-      diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`,
+      summary: diagnostic,
+      diagnostic,
     };
   }
 
   const dotGitPath = path.join(candidateDir, ".git");
   if (!fs.existsSync(dotGitPath)) {
+    const diagnostic = `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`;
     return {
+      path: candidateDir,
       isGitRepo: false,
+      clean: true,
       canResume: true,
       hasConflicts: false,
       hasUncommittedChanges: false,
       modifiedFiles: [],
       conflictedFiles: [],
-      diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`,
+      summary: diagnostic,
+      diagnostic,
     };
   }
 
@@ -462,14 +491,18 @@ function inspectGitTreeForResume(candidateDir, featureId) {
       const conflictedFiles = conflictLines
         .map((line) => line.slice(3).trim())
         .filter(Boolean);
+      const diagnostic = `The mission was paused on ${featureId}, and the code tree has unresolved git merge conflicts (${conflictedFiles.join(", ")}), so resume is blocked.`;
       return {
+        path: candidateDir,
         isGitRepo: true,
+        clean: false,
         canResume: false,
         hasConflicts: true,
         hasUncommittedChanges: true,
         modifiedFiles: conflictedFiles,
         conflictedFiles,
-        diagnostic: `The mission was paused on ${featureId}, and the code tree has unresolved git merge conflicts (${conflictedFiles.join(", ")}), so resume is blocked.`,
+        summary: diagnostic,
+        diagnostic,
       };
     }
 
@@ -477,36 +510,49 @@ function inspectGitTreeForResume(candidateDir, featureId) {
       const modifiedFiles = statusLines
         .map((line) => line.slice(3).trim())
         .filter(Boolean);
+      const diagnostic = `The mission was paused one minute after the ${featureId} worker started, and the code tree has uncommitted changes (${modifiedFiles.join(", ")}), so I'm resuming that worker.`;
       return {
+        path: candidateDir,
         isGitRepo: true,
+        clean: false,
         canResume: true,
         hasConflicts: false,
         hasUncommittedChanges: true,
         modifiedFiles,
         conflictedFiles: [],
-        diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has uncommitted changes (${modifiedFiles.join(", ")}), so I'm resuming that worker.`,
+        summary: diagnostic,
+        diagnostic,
       };
     }
 
+    const diagnostic = `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`;
     return {
+      path: candidateDir,
       isGitRepo: true,
+      clean: true,
       canResume: true,
       hasConflicts: false,
       hasUncommittedChanges: false,
       modifiedFiles: [],
       conflictedFiles: [],
-      diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`,
+      summary: diagnostic,
+      diagnostic,
     };
   } catch (err) {
+    const errMsg = err?.message || "Git status check failed";
+    const diagnostic = `Failed to inspect git working tree at ${candidateDir}: ${errMsg}`;
     return {
-      isGitRepo: true,
+      path: candidateDir,
+      isGitRepo: false,
+      clean: false,
       canResume: false,
       hasConflicts: false,
       hasUncommittedChanges: false,
-      error: err?.message || "Git status check failed",
+      error: errMsg,
       modifiedFiles: [],
       conflictedFiles: [],
-      diagnostic: `Failed to inspect git working tree at ${candidateDir}: ${err?.message || "unknown error"}`,
+      summary: diagnostic,
+      diagnostic,
     };
   }
 }
@@ -703,6 +749,40 @@ export function createMissionHudServer({
       .join("|");
   }
 
+  function captureDiskBackup() {
+    const targets = [
+      paths.statePath,
+      paths.featuresPath,
+      paths.modelSettingsPath,
+      paths.progressLogPath,
+    ];
+    return targets.map((filePath) => {
+      try {
+        if (fs.existsSync(filePath)) {
+          return {
+            filePath,
+            exists: true,
+            content: fs.readFileSync(filePath, "utf8"),
+          };
+        }
+      } catch {}
+      return { filePath, exists: false, content: null };
+    });
+  }
+
+  function restoreDiskBackup(backup) {
+    for (const item of backup) {
+      try {
+        if (item.exists && item.content !== null) {
+          writeFileAtomicSync(item.filePath, item.content);
+        } else if (!item.exists && fs.existsSync(item.filePath)) {
+          fs.unlinkSync(item.filePath);
+        }
+      } catch {}
+    }
+    lastDiskSignature = computeDiskSignature();
+  }
+
   function writeSseEvent(res, eventName, data, id) {
     const eventId = id ?? sseEventSeq++;
     const serialized = JSON.stringify(data);
@@ -795,11 +875,34 @@ export function createMissionHudServer({
   async function handleApprove(req, res) {
     const body = await readJsonBody(req);
     fs.mkdirSync(paths.dotMissionDir, { recursive: true });
+    const backup = captureDiskBackup();
     const nowIso = new Date().toISOString();
     const existing = safeReadJsonSync(paths.statePath, null) || buildUninitializedState(paths.repoDir);
+    const rawFeatures = safeReadJsonSync(paths.featuresPath, null);
+    const featuresList = Array.isArray(rawFeatures)
+      ? structuredClone(rawFeatures)
+      : Array.isArray(rawFeatures?.features)
+        ? structuredClone(rawFeatures.features)
+        : [];
+    const modelSettings = normalizeHudModelSettings(
+      safeReadJsonSync(paths.modelSettingsPath, {}) || {},
+      DEFAULT_HUD_MODEL_SETTINGS
+    );
 
     const hasActiveWorker = Boolean(existing.activeWorker);
-    const nextStatus = body.status || (hasActiveWorker ? "running" : "orchestrator_turn");
+    const hasCustomStart =
+      !hasActiveWorker &&
+      dispatchAdapter &&
+      typeof dispatchAdapter.startMissionRun === "function";
+    const pendingFeatureIdx =
+      !hasActiveWorker && !hasCustomStart
+        ? featuresList.findIndex((f) => (f.status || "pending") === "pending")
+        : -1;
+
+    const nextStatus =
+      body.status ||
+      (hasActiveWorker || pendingFeatureIdx !== -1 ? "running" : "orchestrator_turn");
+
     const updatedState = {
       ...existing,
       initialized: true,
@@ -810,40 +913,144 @@ export function createMissionHudServer({
         nextStatus === "running" ? existing.lastStartedAt || nowIso : existing.lastStartedAt ?? null,
       approvedAt: nowIso,
     };
+
     if (hasActiveWorker && updatedState.activeWorker) {
       updatedState.activeWorker = {
         ...updatedState.activeWorker,
         status: "running",
       };
     }
-    delete updatedState.onboarding;
 
-    writeJsonAtomicSync(paths.statePath, updatedState);
-    const logEntry = appendProgressLogSync(paths.progressLogPath, {
-      timestamp: nowIso,
-      type: "plan_approved",
-      message: body.message || "Mission plan approved and started",
-      featureId: null,
-      workerNumber: null,
-    });
+    let selectedFeature = null;
+    let selectedWorkerEntry = null;
+    if (pendingFeatureIdx !== -1) {
+      const f = featuresList[pendingFeatureIdx];
+      const nextAttempt = (typeof f.attempts === "number" ? f.attempts : 0) + 1;
+      const workerNumber =
+        (Array.isArray(existing.sessions) ? existing.sessions.length : 0) + 1;
+      const runId = f.runId || `run-${crypto.randomUUID().slice(0, 8)}`;
+      const rawKind = String(f.kind || "").toLowerCase();
+      const rawId = String(f.id || "").toLowerCase();
+      const rawSkill = String(f.skillName || "").toLowerCase();
+      const isValidator =
+        rawKind === "scrutiny" ||
+        rawKind === "user_testing" ||
+        rawKind === "user-testing" ||
+        rawId.startsWith("scrutiny-validator") ||
+        rawId.startsWith("user-testing-validator") ||
+        rawSkill.includes("scrutiny") ||
+        rawSkill.includes("user-testing") ||
+        rawSkill.includes("user_testing");
+      const kind =
+        rawKind === "user-testing"
+          ? "user_testing"
+          : f.kind || (isValidator ? "scrutiny" : "implementation");
+      const role = isValidator ? "Validator" : kind === "explorer" ? "Explorer" : "Worker";
+      const slotName = isValidator ? "validator" : "worker";
+      const slotCfg = modelSettings[slotName] || DEFAULT_HUD_MODEL_SETTINGS[slotName];
 
-    if (!hasActiveWorker && dispatchAdapter && typeof dispatchAdapter.startMissionRun === "function") {
-      await dispatchAdapter.startMissionRun(paths.dotMissionDir, {}, dispatchAdapter);
+      featuresList[pendingFeatureIdx] = {
+        ...f,
+        status: "running",
+        attempts: nextAttempt,
+      };
+      selectedFeature = featuresList[pendingFeatureIdx];
+
+      selectedWorkerEntry = {
+        runId,
+        sessionId: f.sessionId || `${slotName}-${workerNumber}`,
+        workerNumber,
+        role,
+        featureId: f.id,
+        featureTitle: f.title || f.id,
+        milestoneId: f.milestoneId || "m1",
+        kind,
+        skillName:
+          f.skillName ||
+          (isValidator
+            ? `${kind}-validator-${f.milestoneId || "m1"}`
+            : "worker-implementation"),
+        slot: slotName,
+        providerInstanceId: slotCfg.providerInstanceId,
+        model: slotCfg.model,
+        options: slotCfg.options || {},
+        status: "running",
+        dispatchPending: true,
+        attempt: nextAttempt,
+        startedAt: nowIso,
+      };
+
+      updatedState.activeWorker = selectedWorkerEntry;
+      updatedState.sessions = [
+        ...(Array.isArray(existing.sessions) ? existing.sessions : []),
+        { ...selectedWorkerEntry },
+      ];
     }
 
-    const snapshot = broadcastSnapshot("plan_approved");
-    await notifyCommand("approve", { body, logEntry }, snapshot);
-    sendJson(res, 200, {
-      ok: true,
-      state: snapshot ? snapshot.state : updatedState,
-      logEntry,
-      snapshot,
-    });
+    delete updatedState.onboarding;
+
+    try {
+      if (selectedFeature) {
+        const nextFeaturesDoc = Array.isArray(rawFeatures)
+          ? { features: featuresList, updatedAt: nowIso }
+          : {
+              ...(rawFeatures && typeof rawFeatures === "object" ? rawFeatures : {}),
+              features: featuresList,
+              updatedAt: nowIso,
+            };
+        writeJsonAtomicSync(paths.featuresPath, nextFeaturesDoc);
+      }
+
+      writeJsonAtomicSync(paths.statePath, updatedState);
+      const logEntry = appendProgressLogSync(paths.progressLogPath, {
+        timestamp: nowIso,
+        type: "plan_approved",
+        message: body.message || "Mission plan approved and started",
+        featureId: null,
+        workerNumber: null,
+      });
+
+      if (selectedWorkerEntry) {
+        appendProgressLogSync(paths.progressLogPath, {
+          timestamp: nowIso,
+          type: "worker_selected",
+          message: `${selectedWorkerEntry.role} #${selectedWorkerEntry.workerNumber} selected ${selectedWorkerEntry.featureTitle}`,
+          featureId: selectedWorkerEntry.featureId,
+          workerNumber: selectedWorkerEntry.workerNumber,
+        });
+        appendProgressLogSync(paths.progressLogPath, {
+          timestamp: nowIso,
+          type: "worker_started",
+          message: `${selectedWorkerEntry.role} #${selectedWorkerEntry.workerNumber} started ${selectedWorkerEntry.featureTitle}`,
+          featureId: selectedWorkerEntry.featureId,
+          workerNumber: selectedWorkerEntry.workerNumber,
+        });
+      }
+
+      if (hasCustomStart) {
+        await dispatchAdapter.startMissionRun(paths.dotMissionDir, {}, dispatchAdapter);
+      }
+
+      lastDiskSignature = computeDiskSignature();
+      const preBroadcastSnapshot = loadSnapshot();
+      await notifyCommand("approve", { body, logEntry }, preBroadcastSnapshot);
+      const snapshot = broadcastSnapshot("plan_approved");
+      sendJson(res, 200, {
+        ok: true,
+        state: snapshot ? snapshot.state : updatedState,
+        logEntry,
+        snapshot,
+      });
+    } catch (err) {
+      restoreDiskBackup(backup);
+      throw err;
+    }
   }
 
   async function handleModelSlots(req, res) {
     const body = await readJsonBody(req);
     fs.mkdirSync(paths.dotMissionDir, { recursive: true });
+    const backup = captureDiskBackup();
     const nowIso = new Date().toISOString();
 
     const currentSettings = normalizeHudModelSettings(
@@ -928,8 +1135,6 @@ export function createMissionHudServer({
     }
 
     const updatedSettings = normalizeHudModelSettings(patch, currentSettings);
-    writeJsonAtomicSync(paths.modelSettingsPath, updatedSettings);
-
     const existingState =
       safeReadJsonSync(paths.statePath, null) || buildUninitializedState(paths.repoDir);
     const updatedState = {
@@ -937,7 +1142,6 @@ export function createMissionHudServer({
       initialized: true,
       revision: (typeof existingState.revision === "number" ? existingState.revision : 0) + 1,
     };
-    writeJsonAtomicSync(paths.statePath, updatedState);
 
     const changedRoles = Object.keys(patch).filter((k) =>
       ["orchestrator", "worker", "validator"].includes(k)
@@ -947,27 +1151,38 @@ export function createMissionHudServer({
         `${role}=${updatedSettings[role].model} (${updatedSettings[role].reasoningEffort}/${updatedSettings[role].effort})`
     );
 
-    const logEntry = appendProgressLogSync(paths.progressLogPath, {
-      timestamp: nowIso,
-      type: "model_slots_updated",
-      message: `Model slots updated: ${summaryParts.join(", ")}`,
-      details: { updatedSettings, changedRoles },
-    });
+    try {
+      writeJsonAtomicSync(paths.modelSettingsPath, updatedSettings);
+      writeJsonAtomicSync(paths.statePath, updatedState);
 
-    const snapshot = broadcastSnapshot("model_slots_updated");
-    await notifyCommand("model-slots", { body, updatedSettings, logEntry }, snapshot);
-    sendJson(res, 200, {
-      ok: true,
-      modelSettings: updatedSettings,
-      state: updatedState,
-      logEntry,
-      snapshot,
-    });
+      const logEntry = appendProgressLogSync(paths.progressLogPath, {
+        timestamp: nowIso,
+        type: "model_slots_updated",
+        message: `Model slots updated: ${summaryParts.join(", ")}`,
+        details: { updatedSettings, changedRoles },
+      });
+
+      lastDiskSignature = computeDiskSignature();
+      const preBroadcastSnapshot = loadSnapshot();
+      await notifyCommand("model-slots", { body, updatedSettings, logEntry }, preBroadcastSnapshot);
+      const snapshot = broadcastSnapshot("model_slots_updated");
+      sendJson(res, 200, {
+        ok: true,
+        modelSettings: updatedSettings,
+        state: updatedState,
+        logEntry,
+        snapshot,
+      });
+    } catch (err) {
+      restoreDiskBackup(backup);
+      throw err;
+    }
   }
 
   async function handlePause(req, res) {
     const body = await readJsonBody(req);
     fs.mkdirSync(paths.dotMissionDir, { recursive: true });
+    const backup = captureDiskBackup();
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
@@ -988,61 +1203,68 @@ export function createMissionHudServer({
     updatedState.revision =
       (typeof updatedState.revision === "number" ? updatedState.revision : 0) + 1;
 
-    const logEntries = [];
-    if (updatedState.activeWorker) {
-      const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
-      const featureTitle =
-        updatedState.activeWorker.featureTitle ||
-        updatedState.activeWorker.title ||
-        updatedState.activeWorker.featureId ||
-        "M2 material test gaps";
-      updatedState.activeWorker = {
-        ...updatedState.activeWorker,
-        status: "paused",
-        pausedAt: nowIso,
-      };
+    try {
+      const logEntries = [];
+      if (updatedState.activeWorker) {
+        const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
+        const featureTitle =
+          updatedState.activeWorker.featureTitle ||
+          updatedState.activeWorker.title ||
+          updatedState.activeWorker.featureId ||
+          "M2 material test gaps";
+        updatedState.activeWorker = {
+          ...updatedState.activeWorker,
+          status: "paused",
+          pausedAt: nowIso,
+        };
 
-      if (Array.isArray(updatedState.sessions)) {
-        updatedState.sessions = updatedState.sessions.map((s) =>
-          s.runId === updatedState.activeWorker.runId ||
-          s.workerNumber === workerNumber ||
-          (updatedState.activeWorker.featureId &&
-            s.featureId === updatedState.activeWorker.featureId)
-            ? { ...s, status: "paused", pausedAt: nowIso }
-            : s
+        if (Array.isArray(updatedState.sessions)) {
+          updatedState.sessions = updatedState.sessions.map((s) =>
+            s.runId === updatedState.activeWorker.runId ||
+            s.workerNumber === workerNumber ||
+            (updatedState.activeWorker.featureId &&
+              s.featureId === updatedState.activeWorker.featureId)
+              ? { ...s, status: "paused", pausedAt: nowIso }
+              : s
+          );
+        }
+
+        logEntries.push(
+          appendProgressLogSync(paths.progressLogPath, {
+            timestamp: nowIso,
+            type: "worker_paused",
+            message: `Worker #${workerNumber} paused ${featureTitle}`,
+            featureId: updatedState.activeWorker.featureId ?? null,
+            workerNumber,
+          })
         );
       }
 
       logEntries.push(
         appendProgressLogSync(paths.progressLogPath, {
           timestamp: nowIso,
-          type: "worker_paused",
-          message: `Worker #${workerNumber} paused ${featureTitle}`,
-          featureId: updatedState.activeWorker.featureId ?? null,
-          workerNumber,
+          type: "mission_paused",
+          message: "Mission paused",
+          featureId: updatedState.activeWorker?.featureId ?? null,
+          workerNumber: updatedState.activeWorker?.workerNumber ?? null,
         })
       );
+
+      writeJsonAtomicSync(paths.statePath, updatedState);
+      lastDiskSignature = computeDiskSignature();
+      const preBroadcastSnapshot = loadSnapshot();
+      await notifyCommand("pause", { body, logEntries }, preBroadcastSnapshot);
+      const snapshot = broadcastSnapshot("mission_paused");
+      sendJson(res, 200, {
+        ok: true,
+        state: snapshot ? snapshot.state : updatedState,
+        logEntries,
+        snapshot,
+      });
+    } catch (err) {
+      restoreDiskBackup(backup);
+      throw err;
     }
-
-    logEntries.push(
-      appendProgressLogSync(paths.progressLogPath, {
-        timestamp: nowIso,
-        type: "mission_paused",
-        message: "Mission paused",
-        featureId: updatedState.activeWorker?.featureId ?? null,
-        workerNumber: updatedState.activeWorker?.workerNumber ?? null,
-      })
-    );
-
-    writeJsonAtomicSync(paths.statePath, updatedState);
-    const snapshot = broadcastSnapshot("mission_paused");
-    await notifyCommand("pause", { body, logEntries }, snapshot);
-    sendJson(res, 200, {
-      ok: true,
-      state: updatedState,
-      logEntries,
-      snapshot,
-    });
   }
 
   async function handleResume(req, res) {
@@ -1101,20 +1323,25 @@ export function createMissionHudServer({
         featureId;
     }
 
+    const activeWorkerWorktreePath = existingState.activeWorker?.worktreePath || null;
     const candidateDir =
-      existingState.activeWorker?.worktreePath ||
+      activeWorkerWorktreePath ||
       existingState.repoPath ||
       paths.repoDir;
-    const gitCheck = inspectGitTreeForResume(candidateDir, featureId);
+    const gitCheck = inspectGitTreeForResume(candidateDir, featureId, {
+      activeWorkerWorktreePath,
+    });
 
     if (!gitCheck.canResume) {
       sendJson(res, 409, {
         ok: false,
-        code: gitCheck.hasConflicts ? "RESUME_BLOCKED_BY_CONFLICTS" : "GIT_PREFLIGHT_FAILED",
+        code: gitCheck.hasConflicts
+          ? "RESUME_BLOCKED_BY_CONFLICTS"
+          : "RESUME_BLOCKED_BY_GIT_ERROR",
         error: gitCheck.hasConflicts
           ? "Unresolved git merge conflicts in working tree"
-          : gitCheck.error || "Git preflight check failed",
-        diagnostic: gitCheck.diagnostic,
+          : gitCheck.error || gitCheck.summary || "Git preflight check failed",
+        diagnostic: gitCheck.summary || gitCheck.diagnostic,
         gitCheck,
         state: existingState,
       });
@@ -1160,58 +1387,66 @@ export function createMissionHudServer({
         ? `Resume M2 fixes: ${featureId} (${featureTitle})`
         : "Resume mission execution");
 
-    const logEntries = [];
-    logEntries.push(
-      appendProgressLogSync(paths.progressLogPath, {
-        timestamp: nowIso,
-        type: "mission_resumed",
-        message: "Mission resumed",
-        featureId: updatedState.activeWorker ? featureId : null,
-        workerNumber,
-        details: {
+    const backup = captureDiskBackup();
+    try {
+      const logEntries = [];
+      logEntries.push(
+        appendProgressLogSync(paths.progressLogPath, {
+          timestamp: nowIso,
+          type: "mission_resumed",
+          message: "Mission resumed",
+          featureId: updatedState.activeWorker ? featureId : null,
+          workerNumber,
+          details: {
+            trigger: "[resume the mission]",
+            diagnostic,
+            gitCheck,
+          },
+        })
+      );
+
+      logEntries.push(
+        appendProgressLogSync(paths.progressLogPath, {
+          timestamp: nowIso,
+          type: "run_started",
+          message: `Run started: ${resumeSummary}`,
+          featureId: updatedState.activeWorker ? featureId : null,
+          workerNumber,
+          details: {
+            trigger: "[resume the mission]",
+            diagnostic,
+          },
+        })
+      );
+
+      writeJsonAtomicSync(paths.statePath, updatedState);
+      lastDiskSignature = computeDiskSignature();
+      const preBroadcastSnapshot = loadSnapshot();
+      await notifyCommand(
+        "resume",
+        {
+          body,
           trigger: "[resume the mission]",
           diagnostic,
           gitCheck,
+          logEntries,
         },
-      })
-    );
-
-    logEntries.push(
-      appendProgressLogSync(paths.progressLogPath, {
-        timestamp: nowIso,
-        type: "run_started",
-        message: `Run started: ${resumeSummary}`,
-        featureId: updatedState.activeWorker ? featureId : null,
-        workerNumber,
-        details: {
-          trigger: "[resume the mission]",
-          diagnostic,
-        },
-      })
-    );
-
-    writeJsonAtomicSync(paths.statePath, updatedState);
-    const snapshot = broadcastSnapshot("mission_resumed");
-    await notifyCommand(
-      "resume",
-      {
-        body,
+        preBroadcastSnapshot
+      );
+      const snapshot = broadcastSnapshot("mission_resumed");
+      sendJson(res, 200, {
+        ok: true,
         trigger: "[resume the mission]",
         diagnostic,
         gitCheck,
+        state: snapshot ? snapshot.state : updatedState,
         logEntries,
-      },
-      snapshot
-    );
-    sendJson(res, 200, {
-      ok: true,
-      trigger: "[resume the mission]",
-      diagnostic,
-      gitCheck,
-      state: updatedState,
-      logEntries,
-      snapshot,
-    });
+        snapshot,
+      });
+    } catch (err) {
+      restoreDiskBackup(backup);
+      throw err;
+    }
   }
 
   function serveStaticAsset(res, filename, contentType) {
@@ -1558,7 +1793,18 @@ async function runCli() {
   process.on("SIGTERM", shutdown);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
+function resolveRealOrAbsPath(targetPath) {
+  try {
+    return fs.realpathSync(targetPath);
+  } catch {
+    return path.resolve(targetPath);
+  }
+}
+
+if (
+  process.argv[1] &&
+  resolveRealOrAbsPath(process.argv[1]) === resolveRealOrAbsPath(__filename)
+) {
   runCli().catch((err) => {
     process.stderr.write(`${err?.stack || err?.message || String(err)}\n`);
     process.exit(1);
