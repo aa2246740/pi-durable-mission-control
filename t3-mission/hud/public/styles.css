@@ -858,11 +858,36 @@ body {
   transform: scaleY(1.15);
 }
 
-/* Features Checklist */
-.features-list {
-  max-height: 290px;
+/* Features & Validation Contract Checklists */
+.features-list,
+.assertions-list {
+  max-height: 240px;
   overflow-y: auto;
   padding: 6px 12px 10px;
+}
+
+.assertion-row {
+  cursor: default;
+}
+
+.assertion-status-badge {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-light);
+  color: var(--text-muted);
+}
+
+.assertion-status-badge.passed {
+  color: var(--approve-green);
+  background: var(--approve-green-soft);
+  border-color: var(--approve-green-border);
+}
+
+.assertion-status-badge.failed {
+  color: #dc2626;
+  background: #fef2f2;
+  border-color: #fecaca;
 }
 
 .feature-milestone-group {
@@ -914,6 +939,10 @@ body {
 
 .feature-icon.pending {
   color: var(--text-muted);
+}
+
+.feature-icon.failed {
+  color: #dc2626;
 }
 
 .feature-title-text {

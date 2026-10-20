@@ -56,8 +56,8 @@ function computeLiveElapsedMs(state) {
 function getStatusBannerText(state) {
   if (!state) return "PLANNING";
   const st = String(state.status || "planning").toLowerCase();
-  if (st === "awaiting_input" && !state.planAccepted) {
-    return "AWAITING APPROVAL";
+  if (st === "awaiting_input") {
+    return "AWAITING INPUT";
   }
   if (st === "orchestrator_turn") return "ORCHESTRATOR TURN";
   if (st === "running") return "RUNNING";
@@ -561,7 +561,8 @@ function renderCenterColumn(snapshot) {
           <button
             type="button"
             class="btn-approve-large"
-            id="btn-approve-mission"
+            id="btn-approve"
+            data-testid="btn-approve-mission"
             data-action="approve"
           >
             ✓ Approve &amp; Start Mission
@@ -611,7 +612,7 @@ function renderCenterColumn(snapshot) {
           </div>
         </div>
       `;
-      const approveBtn = approvalEl.querySelector("#btn-approve-mission");
+      const approveBtn = approvalEl.querySelector("#btn-approve");
       approveBtn?.addEventListener("click", () => triggerApprove());
     } else {
       approvalEl.classList.add("hidden");
@@ -960,6 +961,33 @@ function renderRightColumn(snapshot) {
         }
       });
     });
+  }
+
+  // 2.5 Validation Contract Assertions Checklist
+  const assertionsCountEl = document.getElementById("assertions-count");
+  const assertionsListEl = document.getElementById("assertions-list");
+  const assertions = Array.isArray(state.assertions) ? state.assertions : [];
+  const passedAssertions = assertions.filter((a) => a.status === "passed").length;
+  if (assertionsCountEl) {
+    assertionsCountEl.textContent = `${passedAssertions}/${assertions.length}`;
+  }
+  if (assertionsListEl) {
+    assertionsListEl.innerHTML = assertions.length
+      ? assertions
+          .map((a) => {
+            const st = String(a.status || "pending").toLowerCase();
+            const icon = st === "passed" ? "✓" : st === "failed" ? "✕" : "•";
+            return `
+              <div class="feature-row assertion-row" data-assertion-id="${escapeHtml(a.id)}" data-assertion-status="${escapeHtml(st)}">
+                <span class="feature-icon ${escapeHtml(st === "passed" ? "completed" : st)}">${icon}</span>
+                <span class="mono" style="font-size:11px;font-weight:600;">${escapeHtml(a.id)}</span>
+                <span class="feature-title-text" style="flex:1;">${escapeHtml(a.description || "")}</span>
+                <span class="mono assertion-status-badge ${escapeHtml(st)}" style="font-size:10px;text-transform:uppercase;">${escapeHtml(st)}</span>
+              </div>
+            `;
+          })
+          .join("")
+      : `<div style="color:var(--text-muted);font-size:12px;">No validation assertions registered yet.</div>`;
   }
 
   // 3. Progress Log (newest to oldest)
