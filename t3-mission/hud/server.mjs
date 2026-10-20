@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -88,6 +89,21 @@ const EFFORT_NAME_TO_LEVEL = {
   max: 5,
 };
 
+export function effortToReasoningEffort(effort, fallback = "high") {
+  const num = Number(effort);
+  if (Number.isFinite(num)) {
+    const clamped = Math.max(1, Math.min(5, Math.round(num)));
+    return EFFORT_LEVEL_TO_NAME[clamped] || fallback;
+  }
+  if (typeof effort === "string" && effort.trim()) {
+    const key = effort.trim().toLowerCase();
+    if (EFFORT_NAME_TO_LEVEL[key]) {
+      return EFFORT_LEVEL_TO_NAME[EFFORT_NAME_TO_LEVEL[key]] || key;
+    }
+  }
+  return fallback;
+}
+
 export const DEFAULT_HUD_MODEL_SETTINGS = {
   orchestrator: {
     providerInstanceId: "claude-code",
@@ -133,6 +149,12 @@ function findCatalogEntry(modelOrLabel) {
 
 function normalizeEffortPair(rawEffort, rawReasoningEffort, fallbackLevel = 4) {
   let level = null;
+  const hasExplicitEffort =
+    (typeof rawEffort === "number" && Number.isFinite(rawEffort)) ||
+    (typeof rawEffort === "string" && rawEffort.trim().length > 0);
+  const hasExplicitReasoning =
+    typeof rawReasoningEffort === "string" && rawReasoningEffort.trim().length > 0;
+
   if (typeof rawEffort === "number" && Number.isFinite(rawEffort)) {
     level = Math.max(1, Math.min(5, Math.round(rawEffort)));
   } else if (typeof rawEffort === "string" && rawEffort.trim()) {
@@ -143,7 +165,7 @@ function normalizeEffortPair(rawEffort, rawReasoningEffort, fallbackLevel = 4) {
       level = EFFORT_NAME_TO_LEVEL[rawEffort.trim().toLowerCase()];
     }
   }
-  if (level === null && typeof rawReasoningEffort === "string" && rawReasoningEffort.trim()) {
+  if (level === null && hasExplicitReasoning) {
     const key = rawReasoningEffort.trim().toLowerCase();
     if (EFFORT_NAME_TO_LEVEL[key]) {
       level = EFFORT_NAME_TO_LEVEL[key];
@@ -152,10 +174,15 @@ function normalizeEffortPair(rawEffort, rawReasoningEffort, fallbackLevel = 4) {
   if (level === null) {
     level = Math.max(1, Math.min(5, fallbackLevel));
   }
-  const reasoningEffort =
-    typeof rawReasoningEffort === "string" && rawReasoningEffort.trim()
-      ? rawReasoningEffort.trim().toLowerCase()
-      : EFFORT_LEVEL_TO_NAME[level] || "high";
+
+  let reasoningEffort;
+  if (hasExplicitEffort && !hasExplicitReasoning) {
+    reasoningEffort = EFFORT_LEVEL_TO_NAME[level] || "high";
+  } else if (hasExplicitReasoning) {
+    reasoningEffort = rawReasoningEffort.trim().toLowerCase();
+  } else {
+    reasoningEffort = EFFORT_LEVEL_TO_NAME[level] || "high";
+  }
   return { effort: level, reasoningEffort };
 }
 
@@ -188,9 +215,21 @@ function normalizeSlotConfig(rawSlot, fallbackSlot) {
 
   const candidateModel = rawSlot.model || rawSlot.id || rawSlot.label || base.model;
   const entry = findCatalogEntry(candidateModel);
+
+  const explicitEffort =
+    rawSlot.effort !== undefined ? rawSlot.effort : rawSlot.options?.effort;
+  const explicitReasoning =
+    rawSlot.effort !== undefined && rawSlot.reasoningEffort === undefined
+      ? undefined
+      : rawSlot.reasoningEffort !== undefined
+        ? rawSlot.reasoningEffort
+        : rawSlot.options?.reasoningEffort !== undefined
+          ? rawSlot.options.reasoningEffort
+          : entry?.reasoningEffort;
+
   const { effort, reasoningEffort } = normalizeEffortPair(
-    rawSlot.effort ?? rawSlot.options?.effort,
-    rawSlot.reasoningEffort ?? rawSlot.options?.reasoningEffort ?? entry?.reasoningEffort,
+    explicitEffort,
+    explicitReasoning,
     entry?.effort ?? base.effort ?? 4
   );
 
@@ -381,6 +420,97 @@ function buildUninitializedState(repoDir) {
   };
 }
 
+function inspectGitTreeForResume(candidateDir, featureId) {
+  if (!candidateDir || !fs.existsSync(candidateDir)) {
+    return {
+      isGitRepo: false,
+      canResume: true,
+      hasConflicts: false,
+      hasUncommittedChanges: false,
+      modifiedFiles: [],
+      conflictedFiles: [],
+      diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`,
+    };
+  }
+
+  const dotGitPath = path.join(candidateDir, ".git");
+  if (!fs.existsSync(dotGitPath)) {
+    return {
+      isGitRepo: false,
+      canResume: true,
+      hasConflicts: false,
+      hasUncommittedChanges: false,
+      modifiedFiles: [],
+      conflictedFiles: [],
+      diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`,
+    };
+  }
+
+  try {
+    const rawStatus = execFileSync(
+      "git",
+      ["--no-optional-locks", "-C", candidateDir, "status", "--porcelain"],
+      { encoding: "utf8" }
+    );
+    const statusLines = rawStatus
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0);
+    const conflictLines = statusLines.filter((line) =>
+      /^(UU|AA|DD|AU|UA|DU|UD)/.test(line.slice(0, 2))
+    );
+    if (conflictLines.length > 0) {
+      const conflictedFiles = conflictLines
+        .map((line) => line.slice(3).trim())
+        .filter(Boolean);
+      return {
+        isGitRepo: true,
+        canResume: false,
+        hasConflicts: true,
+        hasUncommittedChanges: true,
+        modifiedFiles: conflictedFiles,
+        conflictedFiles,
+        diagnostic: `The mission was paused on ${featureId}, and the code tree has unresolved git merge conflicts (${conflictedFiles.join(", ")}), so resume is blocked.`,
+      };
+    }
+
+    if (statusLines.length > 0) {
+      const modifiedFiles = statusLines
+        .map((line) => line.slice(3).trim())
+        .filter(Boolean);
+      return {
+        isGitRepo: true,
+        canResume: true,
+        hasConflicts: false,
+        hasUncommittedChanges: true,
+        modifiedFiles,
+        conflictedFiles: [],
+        diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has uncommitted changes (${modifiedFiles.join(", ")}), so I'm resuming that worker.`,
+      };
+    }
+
+    return {
+      isGitRepo: true,
+      canResume: true,
+      hasConflicts: false,
+      hasUncommittedChanges: false,
+      modifiedFiles: [],
+      conflictedFiles: [],
+      diagnostic: `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`,
+    };
+  } catch (err) {
+    return {
+      isGitRepo: true,
+      canResume: false,
+      hasConflicts: false,
+      hasUncommittedChanges: false,
+      error: err?.message || "Git status check failed",
+      modifiedFiles: [],
+      conflictedFiles: [],
+      diagnostic: `Failed to inspect git working tree at ${candidateDir}: ${err?.message || "unknown error"}`,
+    };
+  }
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -416,6 +546,7 @@ export function createMissionHudServer({
   port = 0,
   host = "127.0.0.1",
   onCommand,
+  dispatchAdapter,
 } = {}) {
   const paths = resolveMissionPaths(missionDir || process.cwd());
   const sseClients = new Set();
@@ -425,6 +556,78 @@ export function createMissionHudServer({
   let pollInterval = null;
   let lastDiskSignature = "";
   let closed = false;
+
+  function reconcileStaleRunningStateOnStartup() {
+    const rawState = safeReadJsonSync(paths.statePath, null);
+    if (!rawState || rawState.status !== "running" || rawState.planAccepted !== true) {
+      return;
+    }
+
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const updatedState = structuredClone(rawState);
+
+    if (updatedState.lastStartedAt) {
+      const startedMs = Date.parse(updatedState.lastStartedAt);
+      if (!Number.isNaN(startedMs) && nowMs > startedMs) {
+        updatedState.elapsedMs = (updatedState.elapsedMs || 0) + (nowMs - startedMs);
+      }
+    }
+    updatedState.lastStartedAt = null;
+    updatedState.status = "paused";
+    updatedState.pausedAt = nowIso;
+    updatedState.revision =
+      (typeof updatedState.revision === "number" ? updatedState.revision : 1) + 1;
+
+    let pausedWorker = null;
+    if (updatedState.activeWorker && updatedState.activeWorker.status === "running") {
+      updatedState.activeWorker = {
+        ...updatedState.activeWorker,
+        status: "paused",
+        pausedAt: nowIso,
+      };
+      pausedWorker = updatedState.activeWorker;
+
+      if (Array.isArray(updatedState.sessions)) {
+        updatedState.sessions = updatedState.sessions.map((s) =>
+          s.runId === pausedWorker.runId ||
+          (pausedWorker.sessionId && s.sessionId === pausedWorker.sessionId) ||
+          (pausedWorker.workerNumber && s.workerNumber === pausedWorker.workerNumber) ||
+          (pausedWorker.featureId && s.featureId === pausedWorker.featureId)
+            ? { ...s, status: "paused", pausedAt: nowIso }
+            : s
+        );
+      }
+    }
+
+    writeJsonAtomicSync(paths.statePath, updatedState);
+
+    if (pausedWorker) {
+      const workerNumber = pausedWorker.workerNumber ?? 1;
+      const featureTitle =
+        pausedWorker.featureTitle ||
+        pausedWorker.title ||
+        pausedWorker.featureId ||
+        "feature";
+      appendProgressLogSync(paths.progressLogPath, {
+        timestamp: nowIso,
+        type: "worker_paused",
+        message: `Worker #${workerNumber} paused ${featureTitle}`,
+        featureId: pausedWorker.featureId ?? null,
+        workerNumber,
+      });
+    }
+
+    appendProgressLogSync(paths.progressLogPath, {
+      timestamp: nowIso,
+      type: "mission_paused",
+      message: "Mission paused",
+      featureId: pausedWorker ? pausedWorker.featureId ?? null : null,
+      workerNumber: pausedWorker ? pausedWorker.workerNumber ?? 1 : null,
+    });
+  }
+
+  reconcileStaleRunningStateOnStartup();
 
   function loadSnapshot() {
     const rawState = safeReadJsonSync(paths.statePath, null);
@@ -585,11 +788,7 @@ export function createMissionHudServer({
 
   async function notifyCommand(type, payload, snapshot) {
     if (typeof onCommand === "function") {
-      try {
-        await onCommand({ type, payload, snapshot });
-      } catch {
-        // Ignore callback errors so HUD HTTP responses stay reliable
-      }
+      await onCommand({ type, payload, snapshot });
     }
   }
 
@@ -599,16 +798,24 @@ export function createMissionHudServer({
     const nowIso = new Date().toISOString();
     const existing = safeReadJsonSync(paths.statePath, null) || buildUninitializedState(paths.repoDir);
 
-    const nextStatus = body.status || "running";
+    const hasActiveWorker = Boolean(existing.activeWorker);
+    const nextStatus = body.status || (hasActiveWorker ? "running" : "orchestrator_turn");
     const updatedState = {
       ...existing,
       initialized: true,
       planAccepted: true,
       status: nextStatus,
       revision: (typeof existing.revision === "number" ? existing.revision : 0) + 1,
-      lastStartedAt: existing.lastStartedAt || nowIso,
+      lastStartedAt:
+        nextStatus === "running" ? existing.lastStartedAt || nowIso : existing.lastStartedAt ?? null,
       approvedAt: nowIso,
     };
+    if (hasActiveWorker && updatedState.activeWorker) {
+      updatedState.activeWorker = {
+        ...updatedState.activeWorker,
+        status: "running",
+      };
+    }
     delete updatedState.onboarding;
 
     writeJsonAtomicSync(paths.statePath, updatedState);
@@ -620,11 +827,15 @@ export function createMissionHudServer({
       workerNumber: null,
     });
 
+    if (!hasActiveWorker && dispatchAdapter && typeof dispatchAdapter.startMissionRun === "function") {
+      await dispatchAdapter.startMissionRun(paths.dotMissionDir, {}, dispatchAdapter);
+    }
+
     const snapshot = broadcastSnapshot("plan_approved");
     await notifyCommand("approve", { body, logEntry }, snapshot);
     sendJson(res, 200, {
       ok: true,
-      state: updatedState,
+      state: snapshot ? snapshot.state : updatedState,
       logEntry,
       snapshot,
     });
@@ -640,29 +851,73 @@ export function createMissionHudServer({
       DEFAULT_HUD_MODEL_SETTINGS
     );
 
+    const buildSlotPatch = (prevSlot, incomingRaw) => {
+      if (typeof incomingRaw === "string") {
+        return incomingRaw;
+      }
+      if (!incomingRaw || typeof incomingRaw !== "object") {
+        return prevSlot;
+      }
+      const incoming =
+        typeof incomingRaw.config === "object" && incomingRaw.config
+          ? { ...incomingRaw.config, ...incomingRaw }
+          : incomingRaw;
+
+      const hasEffort =
+        incoming.effort !== undefined || incoming.options?.effort !== undefined;
+      const hasReasoning =
+        incoming.reasoningEffort !== undefined ||
+        incoming.options?.reasoningEffort !== undefined;
+
+      const rawEffortVal =
+        incoming.effort !== undefined ? incoming.effort : incoming.options?.effort;
+      const derivedReasoning =
+        hasEffort && !hasReasoning
+          ? effortToReasoningEffort(rawEffortVal, prevSlot?.reasoningEffort || "high")
+          : incoming.reasoningEffort ?? incoming.options?.reasoningEffort;
+
+      const nextOptions = {
+        ...(prevSlot?.options || {}),
+        ...(incoming.options || {}),
+      };
+      if (hasEffort) {
+        const numericEffort = Math.max(1, Math.min(5, Math.round(Number(rawEffortVal) || 4)));
+        nextOptions.effort = numericEffort;
+        if (!hasReasoning) {
+          nextOptions.reasoningEffort = derivedReasoning;
+        }
+      }
+      if (hasReasoning && derivedReasoning) {
+        nextOptions.reasoningEffort = String(derivedReasoning).trim().toLowerCase();
+      }
+
+      const merged = {
+        ...prevSlot,
+        ...(incoming.model !== undefined ? { model: incoming.model } : {}),
+        ...(incoming.providerInstanceId !== undefined
+          ? { providerInstanceId: incoming.providerInstanceId }
+          : {}),
+        ...(incoming.label !== undefined ? { label: incoming.label } : {}),
+        ...(hasEffort ? { effort: nextOptions.effort } : {}),
+        ...(derivedReasoning !== undefined ? { reasoningEffort: derivedReasoning } : {}),
+        options: nextOptions,
+      };
+      if (hasEffort && !hasReasoning) {
+        merged.reasoningEffort = derivedReasoning;
+      }
+      return merged;
+    };
+
     const patch = {};
     const slotKey = body.slot || body.role;
     if (slotKey && ["orchestrator", "worker", "validator"].includes(slotKey)) {
-      patch[slotKey] = {
-        ...currentSettings[slotKey],
-        ...(typeof body.config === "object" ? body.config : {}),
-        ...(body.model !== undefined ? { model: body.model } : {}),
-        ...(body.providerInstanceId !== undefined
-          ? { providerInstanceId: body.providerInstanceId }
-          : {}),
-        ...(body.label !== undefined ? { label: body.label } : {}),
-        ...(body.effort !== undefined ? { effort: body.effort } : {}),
-        ...(body.reasoningEffort !== undefined
-          ? { reasoningEffort: body.reasoningEffort }
-          : {}),
-        ...(body.options !== undefined ? { options: body.options } : {}),
-      };
+      patch[slotKey] = buildSlotPatch(currentSettings[slotKey], body);
     }
 
     const container = body.modelSettings || body.slots || body;
     for (const role of ["orchestrator", "worker", "validator"]) {
       if (container && container[role] !== undefined && role !== slotKey) {
-        patch[role] = container[role];
+        patch[role] = buildSlotPatch(currentSettings[role], container[role]);
       }
     }
     if (typeof container?.skipScrutiny === "boolean") {
@@ -795,8 +1050,79 @@ export function createMissionHudServer({
     fs.mkdirSync(paths.dotMissionDir, { recursive: true });
     const nowIso = new Date().toISOString();
 
-    const existingState =
-      safeReadJsonSync(paths.statePath, null) || buildUninitializedState(paths.repoDir);
+    const existingState = safeReadJsonSync(paths.statePath, null);
+    if (!existingState || existingState.planAccepted !== true) {
+      const stateFallback = existingState || buildUninitializedState(paths.repoDir);
+      sendJson(res, 409, {
+        ok: false,
+        code: "PLAN_ACCEPTANCE_REQUIRED",
+        error: "Cannot resume mission before plan is accepted",
+        state: stateFallback,
+      });
+      return;
+    }
+
+    if (
+      existingState.status !== "paused" &&
+      existingState.activeWorker?.status !== "paused"
+    ) {
+      sendJson(res, 409, {
+        ok: false,
+        code: "MISSION_NOT_PAUSED",
+        error: "Mission is not in a paused state",
+        state: existingState,
+      });
+      return;
+    }
+
+    if (existingState.lastHandoffNeedsAttention === true) {
+      sendJson(res, 409, {
+        ok: false,
+        code: "HANDOFF_ATTENTION_REQUIRED",
+        error: "Cannot resume mission while handoff items require orchestrator attention",
+        state: existingState,
+      });
+      return;
+    }
+
+    let workerNumber = null;
+    let featureId = "m2-material-test-gaps";
+    let featureTitle = "M2 material test gaps";
+
+    if (existingState.activeWorker) {
+      workerNumber = existingState.activeWorker.workerNumber ?? 28;
+      featureId =
+        existingState.activeWorker.featureId ||
+        existingState.activeWorker.id ||
+        "m2-material-test-gaps";
+      featureTitle =
+        existingState.activeWorker.featureTitle ||
+        existingState.activeWorker.title ||
+        featureId;
+    }
+
+    const candidateDir =
+      existingState.activeWorker?.worktreePath ||
+      existingState.repoPath ||
+      paths.repoDir;
+    const gitCheck = inspectGitTreeForResume(candidateDir, featureId);
+
+    if (!gitCheck.canResume) {
+      sendJson(res, 409, {
+        ok: false,
+        code: gitCheck.hasConflicts ? "RESUME_BLOCKED_BY_CONFLICTS" : "GIT_PREFLIGHT_FAILED",
+        error: gitCheck.hasConflicts
+          ? "Unresolved git merge conflicts in working tree"
+          : gitCheck.error || "Git preflight check failed",
+        diagnostic: gitCheck.diagnostic,
+        gitCheck,
+        state: existingState,
+      });
+      return;
+    }
+
+    const diagnostic = body.diagnostic || gitCheck.diagnostic;
+
     const updatedState = structuredClone(existingState);
     updatedState.initialized = true;
     updatedState.status = "running";
@@ -805,24 +1131,11 @@ export function createMissionHudServer({
     updatedState.revision =
       (typeof updatedState.revision === "number" ? updatedState.revision : 0) + 1;
 
-    let workerNumber = null;
-    let featureId = "m2-material-test-gaps";
-    let featureTitle = "M2 material test gaps";
-
     if (updatedState.activeWorker) {
-      workerNumber = updatedState.activeWorker.workerNumber ?? 28;
-      featureId =
-        updatedState.activeWorker.featureId ||
-        updatedState.activeWorker.id ||
-        "m2-material-test-gaps";
-      featureTitle =
-        updatedState.activeWorker.featureTitle ||
-        updatedState.activeWorker.title ||
-        featureId;
-
       updatedState.activeWorker = {
         ...updatedState.activeWorker,
         status: "running",
+        resumePending: true,
         resumedAt: nowIso,
       };
       delete updatedState.activeWorker.pausedAt;
@@ -832,15 +1145,11 @@ export function createMissionHudServer({
           s.runId === updatedState.activeWorker.runId ||
           s.workerNumber === workerNumber ||
           (featureId && s.featureId === featureId)
-            ? { ...s, status: "running", resumedAt: nowIso }
+            ? { ...s, status: "running", resumePending: true, resumedAt: nowIso }
             : s
         );
       }
     }
-
-    const diagnostic =
-      body.diagnostic ||
-      `The mission was paused one minute after the ${featureId} worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.`;
 
     updatedState.lastResumeTrigger = "[resume the mission]";
     updatedState.lastResumeDiagnostic = diagnostic;
@@ -862,6 +1171,7 @@ export function createMissionHudServer({
         details: {
           trigger: "[resume the mission]",
           diagnostic,
+          gitCheck,
         },
       })
     );
@@ -888,6 +1198,7 @@ export function createMissionHudServer({
         body,
         trigger: "[resume the mission]",
         diagnostic,
+        gitCheck,
         logEntries,
       },
       snapshot
@@ -896,6 +1207,7 @@ export function createMissionHudServer({
       ok: true,
       trigger: "[resume the mission]",
       diagnostic,
+      gitCheck,
       state: updatedState,
       logEntries,
       snapshot,
@@ -1106,4 +1418,149 @@ export function createMissionHudServer({
   });
 
   return thenable;
+}
+
+function parseCliArgs(argv) {
+  let missionDir = process.cwd();
+  let port = 4319;
+  let portExplicit = false;
+  let host = "127.0.0.1";
+  let foreground = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if ((arg === "--mission-dir" || arg === "--missionDir") && argv[i + 1]) {
+      missionDir = argv[++i];
+    } else if (arg.startsWith("--mission-dir=")) {
+      missionDir = arg.slice("--mission-dir=".length);
+    } else if (arg === "--port" && argv[i + 1]) {
+      port = Number(argv[++i]);
+      portExplicit = true;
+    } else if (arg.startsWith("--port=")) {
+      port = Number(arg.slice("--port=".length));
+      portExplicit = true;
+    } else if (arg === "--host" && argv[i + 1]) {
+      host = argv[++i];
+    } else if (arg.startsWith("--host=")) {
+      host = arg.slice("--host=".length);
+    } else if (arg === "--foreground") {
+      foreground = true;
+    }
+  }
+
+  return { missionDir, port, portExplicit, host, foreground };
+}
+
+async function runCli() {
+  const { missionDir, port, portExplicit, host, foreground } = parseCliArgs(
+    process.argv.slice(2)
+  );
+  const paths = resolveMissionPaths(missionDir);
+  fs.mkdirSync(paths.dotMissionDir, { recursive: true });
+
+  if (!foreground) {
+    const child = spawn(
+      process.execPath,
+      [__filename, ...process.argv.slice(2), "--foreground"],
+      {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+
+    const startupLine = await new Promise((resolve, reject) => {
+      let stdoutBuf = "";
+      let stderrBuf = "";
+      const timer = setTimeout(() => {
+        reject(new Error(`Timed out starting HUD server: ${stderrBuf}`));
+      }, 4000);
+
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdoutBuf += chunk;
+        const newlineIdx = stdoutBuf.indexOf("\n");
+        if (newlineIdx !== -1) {
+          clearTimeout(timer);
+          resolve(stdoutBuf.slice(0, newlineIdx).trim());
+        }
+      });
+
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderrBuf += chunk;
+      });
+
+      child.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        if (stdoutBuf.trim()) {
+          resolve(stdoutBuf.trim().split(/\r?\n/)[0]);
+        } else {
+          reject(new Error(`HUD background server exited with code ${code}: ${stderrBuf}`));
+        }
+      });
+    });
+
+    try {
+      fs.writeFileSync(path.join(paths.dotMissionDir, "hud.pid"), `${child.pid}\n`, "utf8");
+    } catch {}
+
+    process.stdout.write(`${startupLine}\n`);
+    child.stdout.destroy();
+    child.stderr.destroy();
+    child.unref();
+    return;
+  }
+
+  let srv;
+  try {
+    srv = await createMissionHudServer({ missionDir, port, host });
+  } catch (err) {
+    if (err && err.code === "EADDRINUSE" && !portExplicit) {
+      srv = await createMissionHudServer({ missionDir, port: 0, host });
+    } else {
+      throw err;
+    }
+  }
+
+  const info = {
+    ok: true,
+    url: srv.url,
+    port: srv.port,
+    host,
+    missionDir: srv.missionDir,
+    dotMissionDir: srv.dotMissionDir,
+    pid: process.pid,
+  };
+  process.stdout.write(`${JSON.stringify(info)}\n`);
+
+  const shutdown = async () => {
+    clearInterval(dirCheckTimer);
+    await srv.close();
+    process.exit(0);
+  };
+
+  const dirCheckTimer = setInterval(() => {
+    if (!fs.existsSync(paths.dotMissionDir)) {
+      shutdown();
+    }
+  }, 200);
+  if (typeof dirCheckTimer.unref === "function") {
+    dirCheckTimer.unref();
+  }
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
+  runCli().catch((err) => {
+    process.stderr.write(`${err?.stack || err?.message || String(err)}\n`);
+    process.exit(1);
+  });
 }

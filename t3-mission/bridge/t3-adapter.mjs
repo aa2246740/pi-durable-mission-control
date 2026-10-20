@@ -28,6 +28,33 @@ export const ROLE_BY_MISSION_KIND = {
   general: "general"
 };
 
+export const EFFORT_LEVEL_TO_STRING = {
+  1: "minimal",
+  2: "low",
+  3: "medium",
+  4: "high",
+  5: "max"
+};
+
+export const VALID_CODEX_REASONING_EFFORTS = new Set([
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+]);
+
+function extractNumericEffort(value) {
+  if (typeof value === "number" && Number.isInteger(value) && EFFORT_LEVEL_TO_STRING[value]) {
+    return value;
+  }
+  if (typeof value === "string" && /^[1-5]$/.test(value.trim())) {
+    return Number(value.trim());
+  }
+  return undefined;
+}
+
 /**
  * Normalize a model slot configuration from `.mission/model-settings.json`
  * into the `target: { providerInstanceId, model, options }` shape required by
@@ -35,7 +62,7 @@ export const ROLE_BY_MISSION_KIND = {
  *
  * Provider-specific mapping rules:
  * - `codex`: puts reasoning strength into `options.reasoningEffort`
- *   (e.g. `"low" | "medium" | "high" | "xhigh" | "max"`)
+ *   (`"minimal" | "low" | "medium" | "high" | "xhigh" | "max"`)
  * - `antigravity`: directly uses the corresponding `model` ID
  *   (e.g. `"gemini-4-argon-high"`, `"claude-opus-5-5-high"`)
  * - `acpRegistry_factory_droid`: puts reasoning strength into
@@ -71,26 +98,60 @@ export function normalizeTargetFromSlot(slotConfig) {
       ? { ...slotConfig.options }
       : {};
 
-  const effortValue =
+  const topNumericEffort = extractNumericEffort(slotConfig.effort);
+  const optionsNumericEffort = extractNumericEffort(rawOptions.effort);
+  const numericEffort = topNumericEffort ?? optionsNumericEffort;
+
+  const explicitReasoningRaw =
     slotConfig.reasoningEffort ??
     slotConfig.reasoning_effort ??
     slotConfig.thinking ??
-    slotConfig.effort ??
     rawOptions.reasoningEffort ??
     rawOptions.reasoning_effort ??
-    rawOptions.thinking ??
-    rawOptions.effort;
+    rawOptions.thinking;
+  const explicitReasoning =
+    explicitReasoningRaw !== undefined && explicitReasoningRaw !== null
+      ? String(explicitReasoningRaw).trim()
+      : "";
+
+  let effortValue;
+  if (typeof numericEffort === "number" && EFFORT_LEVEL_TO_STRING[numericEffort]) {
+    if (numericEffort === 5 && explicitReasoning.toLowerCase() === "xhigh") {
+      effortValue = "xhigh";
+    } else {
+      effortValue = EFFORT_LEVEL_TO_STRING[numericEffort];
+    }
+  } else {
+    const rawFallbackEffort =
+      explicitReasoning ||
+      (slotConfig.effort !== undefined && slotConfig.effort !== null
+        ? String(slotConfig.effort).trim()
+        : "") ||
+      (rawOptions.effort !== undefined && rawOptions.effort !== null
+        ? String(rawOptions.effort).trim()
+        : "");
+    effortValue = rawFallbackEffort || undefined;
+  }
 
   const options = {};
 
   if (providerInstanceId === "codex") {
     for (const [key, val] of Object.entries(rawOptions)) {
-      if (key !== "effort" && key !== "reasoning_effort" && key !== "thinking" && val !== undefined) {
+      if (
+        key !== "effort" &&
+        key !== "reasoningEffort" &&
+        key !== "reasoning_effort" &&
+        key !== "thinking" &&
+        val !== undefined
+      ) {
         options[key] = val;
       }
     }
     if (effortValue !== undefined && effortValue !== null && String(effortValue).trim() !== "") {
-      options.reasoningEffort = String(effortValue).trim();
+      const normalizedEffort = String(effortValue).trim().toLowerCase();
+      options.reasoningEffort = VALID_CODEX_REASONING_EFFORTS.has(normalizedEffort)
+        ? normalizedEffort
+        : String(effortValue).trim();
     }
   } else if (providerInstanceId === "antigravity") {
     for (const [key, val] of Object.entries(rawOptions)) {
@@ -106,7 +167,13 @@ export function normalizeTargetFromSlot(slotConfig) {
     }
   } else if (providerInstanceId === "acpRegistry_factory_droid") {
     for (const [key, val] of Object.entries(rawOptions)) {
-      if (key !== "effort" && key !== "reasoningEffort" && key !== "thinking" && val !== undefined) {
+      if (
+        key !== "effort" &&
+        key !== "reasoningEffort" &&
+        key !== "reasoning_effort" &&
+        key !== "thinking" &&
+        val !== undefined
+      ) {
         options[key] = val;
       }
     }
@@ -122,7 +189,13 @@ export function normalizeTargetFromSlot(slotConfig) {
     options.autonomy_level = String(autonomyLevel).trim() || "auto-high";
   } else if (providerInstanceId === "pi") {
     for (const [key, val] of Object.entries(rawOptions)) {
-      if (key !== "effort" && key !== "reasoningEffort" && key !== "reasoning_effort" && val !== undefined) {
+      if (
+        key !== "effort" &&
+        key !== "reasoningEffort" &&
+        key !== "reasoning_effort" &&
+        key !== "thinking" &&
+        val !== undefined
+      ) {
         options[key] = val;
       }
     }
@@ -130,8 +203,12 @@ export function normalizeTargetFromSlot(slotConfig) {
       options.thinking = String(effortValue).trim();
     }
   } else {
-    Object.assign(options, rawOptions);
-    if (effortValue !== undefined && effortValue !== null && options.effort === undefined) {
+    for (const [key, val] of Object.entries(rawOptions)) {
+      if (val !== undefined) {
+        options[key] = val;
+      }
+    }
+    if (effortValue !== undefined && effortValue !== null && String(effortValue).trim() !== "") {
       options.effort = String(effortValue).trim();
     }
   }
@@ -549,6 +626,11 @@ export async function delegateMissionTask(params, envOrOptions = process.env) {
   const response = await callT3McpTool("delegate_task", delegateArgs, envOrOptions);
   return {
     ...response,
+    taskId: response?.taskId ?? null,
+    childThreadId: response?.childThreadId ?? response?.threadId ?? null,
+    childRunId: response?.childRunId ?? response?.runId ?? null,
+    worktreePath: response?.worktreePath ?? null,
+    response,
     request: delegateArgs,
     title,
     role,
@@ -570,7 +652,7 @@ export async function runFeature(feature, slotConfig, missionState = {}, envOrOp
   const activeWorker = missionState?.activeWorker || {};
   const workerNumber = activeWorker.workerNumber ?? feature.workerNumber ?? 1;
   const attempt = activeWorker.attempt ?? feature.attempts ?? 1;
-  return await delegateMissionTask(
+  const delegation = await delegateMissionTask(
     {
       missionId: missionState?.missionId ?? "mission",
       milestoneId: feature.milestoneId ?? activeWorker.milestoneId ?? "M1",
@@ -587,6 +669,14 @@ export async function runFeature(feature, slotConfig, missionState = {}, envOrOp
     },
     envOrOptions
   );
+  const response = delegation?.response ?? delegation;
+  return {
+    ...delegation,
+    taskId: response?.taskId ?? delegation.taskId ?? null,
+    childThreadId: response?.childThreadId ?? delegation.childThreadId ?? null,
+    childRunId: response?.childRunId ?? delegation.childRunId ?? null,
+    worktreePath: response?.worktreePath ?? delegation.worktreePath ?? null
+  };
 }
 
 const CONFLICT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
@@ -607,6 +697,7 @@ const CONFLICT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]
  *   modifiedFiles: string[],
  *   statusLines: string[],
  *   canResume: boolean,
+ *   error?: string,
  *   summary: string
  * }>}
  */
@@ -684,20 +775,21 @@ export async function checkGitTreeBeforeResume(targetPath, options = {}) {
       canResume,
       summary
     };
-  } catch (error) {
+  } catch (err) {
+    const errMessage = err instanceof Error ? err.message : String(err);
     return {
       path: resolvedPath,
       isGitRepo: false,
       branch: null,
-      clean: true,
+      clean: false,
       hasConflicts: false,
       hasUncommittedChanges: false,
       conflictedFiles: [],
       modifiedFiles: [],
       statusLines: [],
-      canResume: true,
-      summary: `The mission was paused on ${featureLabel}, and the code tree has no uncommitted changes, so I'm resuming that worker.`,
-      warning: error instanceof Error ? error.message : String(error)
+      canResume: false,
+      error: errMessage,
+      summary: `Cannot resume mission: Git inspection failed (${errMessage}).`
     };
   }
 }
@@ -706,9 +798,10 @@ export async function checkGitTreeBeforeResume(targetPath, options = {}) {
  * Resume an interrupted/paused Worker without losing conversation context (VAL-BRIDGE-002).
  *
  * 1. Runs `checkGitTreeBeforeResume(worktreePath || repoPath)` to verify workspace state.
- * 2. If `activeWorker.childThreadId` exists, calls `t3_thread_send({ threadId: activeWorker.childThreadId, message })`
+ * 2. If `!preflight.canResume || preflight.hasConflicts`, fails closed without dispatching.
+ * 3. If `activeWorker.childThreadId` exists, calls `t3_thread_send({ threadId: activeWorker.childThreadId, message })`
  *    to wake up the original worker thread instead of spawning a duplicate worker.
- * 3. Falls back to `delegateMissionTask` only if no `childThreadId` exists.
+ * 4. Falls back to `delegateMissionTask` only if no `childThreadId` exists.
  *
  * @param {Record<string, unknown>} params
  * @param {Record<string, unknown> | Function} [envOrOptions=process.env]
@@ -745,23 +838,33 @@ export async function resumeWorker(params, envOrOptions = process.env, maybeMiss
     missionState?.currentFeatureId ??
     null;
 
-  const gitCheck =
-    params.gitCheck && typeof params.gitCheck === "object"
-      ? params.gitCheck
-      : await checkGitTreeBeforeResume(String(targetWorktreePath), {
-          ...(typeof envOrOptions === "object" ? envOrOptions : {}),
-          featureId,
-          workerTitle: activeWorker.featureTitle ?? activeWorker.title
-        });
+  const preflight =
+    params.preflight && typeof params.preflight === "object"
+      ? params.preflight
+      : params.gitCheck && typeof params.gitCheck === "object"
+        ? params.gitCheck
+        : await checkGitTreeBeforeResume(String(targetWorktreePath), {
+            ...(typeof envOrOptions === "object" ? envOrOptions : {}),
+            featureId,
+            workerTitle: activeWorker.featureTitle ?? activeWorker.title
+          });
 
-  if (gitCheck.hasConflicts && params.allowConflicts !== true) {
+  if ((!preflight.canResume || preflight.hasConflicts) && params.allowConflicts !== true) {
+    const blockedStatus = preflight.hasConflicts ? "blocked_by_conflicts" : "blocked_by_git_error";
     return {
       resumed: false,
-      action: "blocked_by_conflicts",
-      reason: "git_conflicts",
-      gitCheck,
-      summary: gitCheck.summary,
-      threadId: activeWorker.childThreadId ?? activeWorker.threadId ?? null
+      canResume: false,
+      status: blockedStatus,
+      action: blockedStatus,
+      reason: preflight.summary,
+      preflight,
+      gitCheck: preflight,
+      summary: preflight.summary,
+      threadId: activeWorker.childThreadId ?? activeWorker.threadId ?? null,
+      childThreadId: activeWorker.childThreadId ?? activeWorker.threadId ?? null,
+      taskId: activeWorker.taskId ?? null,
+      childRunId: activeWorker.childRunId ?? null,
+      worktreePath: preflight.path ?? String(targetWorktreePath)
     };
   }
 
@@ -771,7 +874,7 @@ export async function resumeWorker(params, envOrOptions = process.env, maybeMiss
 
   const defaultResumeMessage = [
     "[resume the mission]",
-    gitCheck.summary,
+    preflight.summary,
     featureId ? `Continue implementing feature "${featureId}" and complete verification.` : "Continue the interrupted worker task and complete verification."
   ].join("\n\n");
 
@@ -792,11 +895,17 @@ export async function resumeWorker(params, envOrOptions = process.env, maybeMiss
     const response = await callT3McpTool("t3_thread_send", sendArgs, envOrOptions);
     return {
       resumed: true,
+      canResume: true,
+      status: "running",
       action: "t3_thread_send",
       threadId: childThreadId,
       childThreadId,
-      gitCheck,
-      summary: gitCheck.summary,
+      taskId: response?.taskId ?? activeWorker.taskId ?? null,
+      childRunId: response?.childRunId ?? activeWorker.childRunId ?? null,
+      worktreePath: preflight.path ?? String(targetWorktreePath),
+      preflight,
+      gitCheck: preflight,
+      summary: preflight.summary,
       request: sendArgs,
       response
     };
@@ -815,11 +924,17 @@ export async function resumeWorker(params, envOrOptions = process.env, maybeMiss
 
   return {
     resumed: true,
+    canResume: true,
+    status: "running",
     action: "delegate_task",
     threadId: delegated.childThreadId ?? null,
     childThreadId: delegated.childThreadId ?? null,
-    gitCheck,
-    summary: gitCheck.summary,
+    taskId: delegated.taskId ?? activeWorker.taskId ?? null,
+    childRunId: delegated.childRunId ?? activeWorker.childRunId ?? null,
+    worktreePath: delegated.worktreePath ?? preflight.path ?? String(targetWorktreePath),
+    preflight,
+    gitCheck: preflight,
+    summary: preflight.summary,
     response: delegated
   };
 }
@@ -896,6 +1011,8 @@ export function createT3Adapter(defaultOptions = {}) {
 }
 
 export default {
+  EFFORT_LEVEL_TO_STRING,
+  VALID_CODEX_REASONING_EFFORTS,
   normalizeTargetFromSlot,
   resolveTargetFromModelSettings,
   callT3McpTool,

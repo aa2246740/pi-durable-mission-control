@@ -67,106 +67,198 @@ function getStatusBannerText(state) {
   return st.toUpperCase();
 }
 
+function inferSessionRole(item, matchedFeature = null) {
+  const roleRaw = String(item?.role || matchedFeature?.role || "")
+    .trim()
+    .toLowerCase();
+  if (roleRaw === "validator") return "Validator";
+  if (roleRaw === "explorer") return "Explorer";
+  if (roleRaw === "worker") return "Worker";
+
+  const slotRaw = String(item?.slot || matchedFeature?.slot || "")
+    .trim()
+    .toLowerCase();
+  if (slotRaw === "validator") return "Validator";
+
+  const kindRaw = String(item?.kind || matchedFeature?.kind || "")
+    .trim()
+    .toLowerCase();
+  if (["scrutiny", "user-testing", "user_testing", "validator"].includes(kindRaw)) {
+    return "Validator";
+  }
+  if (kindRaw === "explorer") {
+    return "Explorer";
+  }
+
+  const combinedText = [
+    item?.featureId,
+    item?.id,
+    item?.title,
+    item?.featureTitle,
+    matchedFeature?.id,
+    matchedFeature?.title,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  if (
+    combinedText.includes("validator") ||
+    combinedText.includes("scrutiny") ||
+    combinedText.includes("user-testing") ||
+    combinedText.includes("user_testing")
+  ) {
+    return "Validator";
+  }
+  if (combinedText.includes("explorer")) {
+    return "Explorer";
+  }
+
+  return "Worker";
+}
+
 function synthesizeSessions(state, features) {
   const explicitSessions = Array.isArray(state?.sessions) ? state.sessions : [];
+  const featuresList = Array.isArray(features) ? features : [];
   const byId = new Map();
 
   for (const [idx, s] of explicitSessions.entries()) {
     const id = s.sessionId || s.runId || s.id || `session-${idx + 1}`;
-    const role =
-      s.role ||
-      (String(s.kind || s.title || "").toLowerCase().includes("validator")
-        ? "Validator"
-        : String(s.kind || s.title || "").toLowerCase().includes("explorer")
-          ? "Explorer"
-          : "Worker");
+    const matchedFeature =
+      featuresList.find((f) => f.id && f.id === s.featureId) || null;
+    const role = inferSessionRole(s, matchedFeature);
     const number = s.workerNumber ?? idx + 1;
+    const title =
+      s.title || s.featureTitle || matchedFeature?.title || s.featureId || `${role} #${number}`;
+    const status = s.status || "completed";
+
+    const matchingFeatureHandoff =
+      matchedFeature?.lastHandoff &&
+      (!matchedFeature.lastHandoff.runId ||
+        matchedFeature.lastHandoff.runId === s.runId) &&
+      status === "completed"
+        ? matchedFeature.lastHandoff
+        : null;
+
+    const h = s.handoff || matchingFeatureHandoff || {};
     const childThreadId =
-      s.childThreadId || s.threadId || `thread-${id.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+      s.childThreadId ||
+      s.threadId ||
+      h.childThreadId ||
+      matchedFeature?.childThreadId ||
+      null;
+
     byId.set(id, {
       id,
+      runId: s.runId || null,
       role,
       workerNumber: number,
-      milestoneId: s.milestoneId || "m1",
+      milestoneId: s.milestoneId || matchedFeature?.milestoneId || "m1",
       featureId: s.featureId || id,
-      title: s.title || s.featureTitle || `${role} #${number}`,
-      label: s.label || `${role} #${number}: ${s.title || s.featureTitle || s.featureId || id}`,
-      status: s.status || "completed",
-      timeLabel: s.timeLabel || formatRelativeTime(s.endedAt || s.startedAt, "1h"),
+      title,
+      label: s.label || `${role} #${number}: ${title}`,
+      status,
+      timeLabel:
+        s.timeLabel ||
+        formatRelativeTime(
+          s.endedAt || s.startedAt,
+          status === "running" ? "now" : "1h"
+        ),
       childThreadId,
-      handoff: s.handoff || {
+      handoff: {
         salientSummary:
           s.salientSummary ||
-          `Completed ${s.title || s.featureTitle || id} with verified contract assertions.`,
+          h.salientSummary ||
+          (status === "running"
+            ? `Running ${title}`
+            : status === "paused"
+              ? `Paused ${title}`
+              : status === "pending"
+                ? `Scheduled ${title}`
+                : "No handoff summary recorded."),
         whatWasImplemented:
           s.whatWasImplemented ||
-          `Implemented and verified ${s.title || s.featureTitle || id} in isolated mission worktree.`,
-        commandsRun: s.commandsRun || [
-          `node --test t3-mission/test/hud.test.mjs`,
-        ],
-        discoveredIssues: s.discoveredIssues || [],
+          h.whatWasImplemented ||
+          "No handoff recorded yet.",
+        commandsRun: Array.isArray(s.commandsRun)
+          ? s.commandsRun
+          : Array.isArray(h.commandsRun)
+            ? h.commandsRun
+            : [],
+        discoveredIssues: Array.isArray(s.discoveredIssues)
+          ? s.discoveredIssues
+          : Array.isArray(h.discoveredIssues)
+            ? h.discoveredIssues
+            : [],
       },
     });
   }
 
-  for (const [idx, f] of (features || []).entries()) {
-    const existing = Array.from(byId.values()).find((s) => s.featureId === f.id);
-    if (existing) {
+  for (const [idx, f] of featuresList.entries()) {
+    const matchingSessions = Array.from(byId.values()).filter(
+      (s) => s.featureId === f.id
+    );
+    if (matchingSessions.length > 0) {
       if (f.lastHandoff) {
-        existing.handoff = {
-          salientSummary:
-            f.lastHandoff.salientSummary ||
-            f.lastHandoff.whatWasImplemented ||
-            existing.handoff.salientSummary,
-          whatWasImplemented:
-            f.lastHandoff.whatWasImplemented || existing.handoff.whatWasImplemented,
-          commandsRun: f.lastHandoff.commandsRun || existing.handoff.commandsRun,
-          discoveredIssues:
-            f.lastHandoff.discoveredIssues || existing.handoff.discoveredIssues,
-        };
+        const targetSession =
+          (f.lastHandoff.runId &&
+            matchingSessions.find((s) => s.runId === f.lastHandoff.runId)) ||
+          matchingSessions.at(-1);
+        if (targetSession) {
+          targetSession.handoff = {
+            salientSummary:
+              f.lastHandoff.salientSummary ||
+              f.lastHandoff.whatWasImplemented ||
+              targetSession.handoff.salientSummary,
+            whatWasImplemented:
+              f.lastHandoff.whatWasImplemented ||
+              targetSession.handoff.whatWasImplemented,
+            commandsRun: Array.isArray(f.lastHandoff.commandsRun)
+              ? f.lastHandoff.commandsRun
+              : targetSession.handoff.commandsRun,
+            discoveredIssues: Array.isArray(f.lastHandoff.discoveredIssues)
+              ? f.lastHandoff.discoveredIssues
+              : targetSession.handoff.discoveredIssues,
+          };
+        }
       }
       continue;
     }
 
-    const kind = String(f.kind || "").toLowerCase();
-    const role =
-      kind === "scrutiny" || kind === "user_testing" || f.id?.includes("validator")
-        ? "Validator"
-        : kind === "explorer" || f.id?.includes("explorer")
-          ? "Explorer"
-          : "Worker";
+    const role = inferSessionRole(f);
     const number = f.workerNumber ?? idx + 1;
     const id = `session-${f.id || idx + 1}`;
-    const childThreadId =
-      f.childThreadId ||
-      f.lastHandoff?.childThreadId ||
-      `w${number}-${String(f.id || "task").slice(0, 20)}`;
+    const title = f.title || f.id;
+    const status = f.status || "pending";
+    const h = f.lastHandoff || {};
+    const childThreadId = f.childThreadId || h.childThreadId || null;
 
     byId.set(id, {
       id,
+      runId: h.runId || null,
       role,
       workerNumber: number,
       milestoneId: f.milestoneId || "m1",
       featureId: f.id,
-      title: f.title || f.id,
-      label: `${role} #${number}: ${f.title || f.id}`,
-      status: f.status || "pending",
-      timeLabel: formatRelativeTime(f.lastHandoff?.completedAt, f.status === "running" ? "now" : "1h"),
+      title,
+      label: `${role} #${number}: ${title}`,
+      status,
+      timeLabel: formatRelativeTime(
+        h.completedAt,
+        status === "running" ? "now" : "1h"
+      ),
       childThreadId,
       handoff: {
         salientSummary:
-          f.lastHandoff?.salientSummary ||
+          h.salientSummary ||
           f.description ||
-          `${role} #${number} session for ${f.title || f.id}.`,
+          (status === "running" ? `Running ${title}` : `Scheduled ${title}`),
         whatWasImplemented:
-          f.lastHandoff?.whatWasImplemented ||
-          (f.status === "completed"
-            ? `Implemented ${f.title || f.id} and verified all linked assertions (${(f.fulfills || []).join(", ") || "pass"}).`
-            : `In progress / scheduled for ${f.title || f.id}.`),
-        commandsRun: f.lastHandoff?.commandsRun || [
-          `node --test t3-mission/test/hud.test.mjs`,
-        ],
-        discoveredIssues: f.lastHandoff?.discoveredIssues || [],
+          h.whatWasImplemented || "No handoff recorded yet.",
+        commandsRun: Array.isArray(h.commandsRun) ? h.commandsRun : [],
+        discoveredIssues: Array.isArray(h.discoveredIssues)
+          ? h.discoveredIssues
+          : [],
       },
     });
   }
@@ -175,39 +267,67 @@ function synthesizeSessions(state, features) {
     const aw = state.activeWorker;
     const number = aw.workerNumber ?? 28;
     const awId = aw.sessionId || aw.runId || `worker-${number}`;
-    const featureTitle = aw.featureTitle || aw.title || aw.featureId || "M2 material test gaps";
+    const matchedFeature =
+      featuresList.find((f) => f.id && f.id === aw.featureId) || null;
     const existing =
       byId.get(awId) ||
       Array.from(byId.values()).find(
-        (s) => s.workerNumber === number || (aw.featureId && s.featureId === aw.featureId)
+        (s) =>
+          (aw.runId && s.runId === aw.runId) ||
+          s.workerNumber === number ||
+          (aw.featureId && s.featureId === aw.featureId)
       );
+    const role = inferSessionRole(aw, existing || matchedFeature);
+    const featureTitle =
+      aw.featureTitle ||
+      aw.title ||
+      existing?.title ||
+      matchedFeature?.title ||
+      aw.featureId ||
+      "M2 material test gaps";
+    const status = aw.status || (state.status === "paused" ? "paused" : "running");
+    const h = aw.handoff || {};
+
     const sessionObj = {
       id: existing?.id || awId,
-      role: aw.role || "Worker",
+      runId: aw.runId || existing?.runId || null,
+      role,
       workerNumber: number,
       milestoneId: aw.milestoneId || existing?.milestoneId || "m2",
       featureId: aw.featureId || existing?.featureId || "m2-material-test-gaps",
       title: featureTitle,
-      label: `Worker #${number}: ${featureTitle}`,
-      status: aw.status || (state.status === "paused" ? "paused" : "running"),
+      label: `${role} #${number}: ${featureTitle}`,
+      status,
       timeLabel: "now",
-      childThreadId: aw.childThreadId || existing?.childThreadId || `worker-${number}-thread`,
+      childThreadId:
+        aw.childThreadId || aw.threadId || existing?.childThreadId || null,
       handoff: {
         salientSummary:
-          aw.handoff?.salientSummary ||
+          aw.salientSummary ||
+          h.salientSummary ||
           existing?.handoff?.salientSummary ||
-          `Active Worker #${number} executing ${featureTitle}.`,
+          (status === "paused"
+            ? `Paused ${featureTitle}`
+            : `Running ${featureTitle}`),
         whatWasImplemented:
-          aw.handoff?.whatWasImplemented ||
+          aw.whatWasImplemented ||
+          h.whatWasImplemented ||
           existing?.handoff?.whatWasImplemented ||
-          `Working on ${featureTitle} (${aw.featureId || "m2-material-test-gaps"}) with clean working tree.`,
-        commandsRun: aw.handoff?.commandsRun ||
-          existing?.handoff?.commandsRun || [
-            `git status -sb`,
-            `node --test t3-mission/test/hud.test.mjs`,
-          ],
-        discoveredIssues:
-          aw.handoff?.discoveredIssues || existing?.handoff?.discoveredIssues || [],
+          "No handoff recorded yet.",
+        commandsRun: Array.isArray(aw.commandsRun)
+          ? aw.commandsRun
+          : Array.isArray(h.commandsRun)
+            ? h.commandsRun
+            : Array.isArray(existing?.handoff?.commandsRun)
+              ? existing.handoff.commandsRun
+              : [],
+        discoveredIssues: Array.isArray(aw.discoveredIssues)
+          ? aw.discoveredIssues
+          : Array.isArray(h.discoveredIssues)
+            ? h.discoveredIssues
+            : Array.isArray(existing?.handoff?.discoveredIssues)
+              ? existing.handoff.discoveredIssues
+              : [],
       },
     };
     byId.set(sessionObj.id, sessionObj);
@@ -277,8 +397,9 @@ function renderStatusStrip(snapshot) {
   if (stripEl) stripEl.dataset.status = status;
   if (labelEl) labelEl.textContent = getStatusBannerText(state);
 
+  const activeRole = state.activeWorker ? inferSessionRole(state.activeWorker) : "Worker";
   const activeWorkerSummary = state.activeWorker
-    ? ` · Worker #${state.activeWorker.workerNumber ?? 28} (${state.activeWorker.status || status})`
+    ? ` · ${activeRole} #${state.activeWorker.workerNumber ?? 28} (${state.activeWorker.status || status})`
     : "";
   if (subEl) {
     subEl.textContent = `Revision #${state.revision ?? 1}${activeWorkerSummary}`;
@@ -490,7 +611,9 @@ function renderCenterColumn(snapshot) {
   if (handoffEl) {
     if (selectedSession) {
       handoffEl.classList.remove("hidden");
-      const threadUri = `t3-thread://v1/${selectedSession.childThreadId}`;
+      const threadUri = selectedSession.childThreadId
+        ? `t3-thread://v1/${selectedSession.childThreadId}`
+        : "Unavailable";
       const commands = Array.isArray(selectedSession.handoff?.commandsRun)
         ? selectedSession.handoff.commandsRun
         : [];
@@ -530,7 +653,7 @@ function renderCenterColumn(snapshot) {
         <div class="handoff-section">
           <div class="handoff-section-title">whatWasImplemented</div>
           <div class="handoff-block" id="handoff-what-was-implemented">
-            ${escapeHtml(selectedSession.handoff?.whatWasImplemented || "No implementation details recorded.")}
+            ${escapeHtml(selectedSession.handoff?.whatWasImplemented || "No handoff recorded yet.")}
           </div>
         </div>
 
@@ -546,7 +669,7 @@ function renderCenterColumn(snapshot) {
                         : `$ ${escapeHtml(cmd.command || JSON.stringify(cmd))}`
                     )
                     .join("<br/>")
-                : "$ node --test t3-mission/test/hud.test.mjs"
+                : "No commands recorded yet."
             }
           </div>
         </div>
@@ -592,9 +715,18 @@ function renderCenterColumn(snapshot) {
 
   // 4. Orchestrator Turn & Action Stream (Droid style)
   if (streamEl) {
+    const hasDismissed =
+      Array.isArray(state.lastDismissedHandoffItems) &&
+      state.lastDismissedHandoffItems.length > 0;
+    const hasResumeEvent =
+      Boolean(state.lastResumeDiagnostic) ||
+      Boolean(state.lastResumeTrigger) ||
+      (progressLog || []).some((e) => e.type === "mission_resumed");
     const resumeDiagnostic =
       state.lastResumeDiagnostic ||
-      "The mission was paused one minute after the m2-material-test-gaps worker started, and the code tree has no uncommitted changes, so I'm resuming that worker.";
+      (state.activeWorker
+        ? `${inferSessionRole(state.activeWorker)} #${state.activeWorker.workerNumber ?? 1} (${state.activeWorker.featureTitle || state.activeWorker.featureId}) is currently ${state.activeWorker.status || state.status}.`
+        : `Mission status is ${state.status || "planning"}.`);
 
     const recentLogCards = (progressLog || [])
       .slice(-6)
@@ -608,17 +740,22 @@ function renderCenterColumn(snapshot) {
       )
       .join("");
 
+    const activeRole = state.activeWorker ? inferSessionRole(state.activeWorker) : "Worker";
+
     streamEl.innerHTML = `
-      <div class="stream-pill-Input">[resume the mission]</div>
-      <div class="stream-tool-row">
-        <span><strong>Dismiss Handoff Items</strong> · Validated prior worker handoffs</span>
-        <span class="mono">Completed</span>
-      </div>
-      <div class="stream-tool-row">
-        <span><strong>Start Mission Run</strong> · Queue M2 fixes and owner rerun</span>
-        <span class="mono">Completed</span>
-      </div>
-      <div class="stream-pill-Input">[resume the mission]</div>
+      ${
+        hasDismissed
+          ? `<div class="stream-tool-row">
+              <span><strong>Dismiss Handoff Items</strong> · Dismissed ${state.lastDismissedHandoffItems.length} item(s)</span>
+              <span class="mono">Completed</span>
+            </div>`
+          : ""
+      }
+      ${
+        hasResumeEvent
+          ? `<div class="stream-pill-Input">[resume the mission]</div>`
+          : ""
+      }
       <div class="stream-narrative-card" id="resume-diagnostic-card">
         <div class="stream-narrative-title">▣ Check mission state before resuming</div>
         <div>${escapeHtml(resumeDiagnostic)}</div>
@@ -626,10 +763,10 @@ function renderCenterColumn(snapshot) {
       <div class="stream-tool-row">
         <span><strong>Start Mission Run</strong> · ${escapeHtml(
           state.activeWorker
-            ? `Worker #${state.activeWorker.workerNumber ?? 28}: ${state.activeWorker.featureTitle || state.activeWorker.featureId || "M2 material test gaps"}`
-            : "Active mission execution loop"
+            ? `${activeRole} #${state.activeWorker.workerNumber ?? 28}: ${state.activeWorker.featureTitle || state.activeWorker.featureId || "M2 material test gaps"}`
+            : "Mission execution loop"
         )}</span>
-        <span class="mono">${escapeHtml(state.status || "running")}</span>
+        <span class="mono">${escapeHtml(state.status || "planning")}</span>
       </div>
       ${recentLogCards}
     `;
@@ -638,14 +775,23 @@ function renderCenterColumn(snapshot) {
   // 5. Bottom Composer & Milestone Capsule
   if (pipelineTextEl) {
     const milestones = Array.isArray(state.milestones) ? state.milestones : [];
-    if (milestones.length >= 2) {
-      const mLabels = milestones.map((m, i) =>
-        i === 0 ? `${m.id.toUpperCase()} 已通过验收` : `${m.id.toUpperCase()}（${m.title}）`
-      );
+    const featuresList = Array.isArray(features) ? features : [];
+    const assertionsList = Array.isArray(state.assertions) ? state.assertions : [];
+    if (milestones.length >= 1) {
+      const mLabels = milestones.map((m) => {
+        const mFeatures = featuresList.filter((f) => f.milestoneId === m.id);
+        const mAssertions = assertionsList.filter((a) => a.milestoneId === m.id);
+        const allFeaturesDone =
+          mFeatures.length > 0 && mFeatures.every((f) => f.status === "completed");
+        const allAssertionsPassed =
+          mAssertions.length === 0 || mAssertions.every((a) => a.status === "passed");
+        return allFeaturesDone && allAssertionsPassed
+          ? `${m.id.toUpperCase()} 已通过验收`
+          : `${m.id.toUpperCase()}（${m.title || m.id}）`;
+      });
       pipelineTextEl.textContent = `执行并处理交接：${mLabels.join(" → ")}`;
     } else {
-      pipelineTextEl.textContent =
-        "执行并处理交接：M1 已通过验收 → M2（资料进入生成）→ M3（模板）";
+      pipelineTextEl.textContent = "执行并处理交接：等待里程碑初始化";
     }
   }
 

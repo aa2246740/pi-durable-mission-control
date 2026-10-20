@@ -17,8 +17,8 @@ Every Mission uses three independent model slots configured in `.mission/model-s
 
 ### Provider Slot Normalization (`normalizeTargetFromSlot`)
 
-When dispatching via `delegate_task`, model slot settings are normalized into `target: { providerInstanceId, model, options }`:
-- `providerInstanceId === "codex"` -> `options.reasoningEffort` (`"low" | "medium" | "high" | "xhigh" | "max"`)
+When dispatching via `delegate_task`, model slot settings (including numeric effort bars `1..5`: `1 -> "minimal"`, `2 -> "low"`, `3 -> "medium"`, `4 -> "high"`, `5 -> "max"`) are normalized into `target: { providerInstanceId, model, options }`:
+- `providerInstanceId === "codex"` -> `options.reasoningEffort` (`"minimal" | "low" | "medium" | "high" | "xhigh" | "max"`)
 - `providerInstanceId === "antigravity"` -> direct `model` ID (e.g. `"gemini-4-argon-high"`, `"claude-opus-5-5-high"`)
 - `providerInstanceId === "acpRegistry_factory_droid"` -> `options.reasoning_effort` and `options.autonomy_level: "auto-high"`
 - `providerInstanceId === "pi"` -> `options.thinking`
@@ -62,11 +62,11 @@ When the user triggers `/mission <需求>` or asks to start a Mission ("开启 m
    ```
 2. For each pending Feature in the active Milestone:
    - Dispatch the Worker using `delegate_task` with standardized title `[M<N>] Worker #<K>: <Feature Title>`, `role: "implementation"`, `isolation: "worktree"`, normalized `target` from the `worker` slot, and a stable idempotent `clientRequestId`.
-   - When the Worker finishes, record its structured handoff via `EndFeatureRun`:
+   - When the Worker finishes, record its structured handoff via `EndFeatureRun` (always supplying `featureId` and `runId` to fence against stale workers):
      ```bash
      node t3-mission/bridge/cli.mjs EndFeatureRun --mission-dir .mission --json '<handoff-payload>'
      ```
-   - If the Worker handoff reports `discoveredIssues` or `whatWasLeftUndone`, either inject repair features with `UpdateMissionFeatures` or explicitly justify and dismiss non-blocking items with `DismissHandoffItems`.
+   - If the Worker handoff reports `discoveredIssues` or `whatWasLeftUndone`, either inject repair features with `UpdateMissionFeatures` or explicitly justify (`>= 20` characters) and dismiss non-blocking items with `DismissHandoffItems` (`type`, `sourceFeatureId`, `summary`, `justification`).
 3. At the end of every Milestone:
    - Automatically inject and run two independent Validators using the `validator` model slot:
      1. **Scrutiny Validator** (`[M<N>] Validator #<K>: Scrutiny validation for <Milestone>`, `role: "review"`) for code quality, boundary compliance, and test coverage.
@@ -88,7 +88,7 @@ When the user closes and reopens T3 Code, or sends `[resume the mission]` / `继
    - Reconciles `.mission/state.json` (`reconcileMissionOnLoad`) and inspects `state.activeWorker`.
    - Runs `checkGitTreeBeforeResume(worktreePath || repoPath)` to inspect `git status --porcelain` for uncommitted changes or unresolved merge conflicts, producing a diagnostic summary such as:
      > `"The mission was paused on feature "f1", and the code tree has no uncommitted changes, so I'm resuming that worker."`
-3. If unresolved Git merge conflicts are detected (`hasConflicts: true`), report the conflicted files to the user and do not overwrite or blindly restart the worktree.
+3. If unresolved Git merge conflicts are detected (`hasConflicts: true`) or Git inspection fails (`canResume: false`), report the diagnostic to the user and do not overwrite or blindly restart the worktree.
 
 ### Step 2: Wake Up the Original Worker Thread (`StartMissionRun` -> `resumeWorker`)
 1. If an interrupted `activeWorker` exists and `canResume` is `true`, invoke `StartMissionRun`:

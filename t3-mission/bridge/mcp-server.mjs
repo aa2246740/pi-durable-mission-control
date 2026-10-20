@@ -10,6 +10,7 @@ import {
   normalizeTargetFromSlot,
   resolveTargetFromModelSettings,
   resumeWorker,
+  runFeature,
   settleCompletedMilestoneThreads
 } from "./t3-adapter.mjs";
 
@@ -85,14 +86,42 @@ export const MISSION_TOOLS = [
           items: {
             type: "object",
             properties: {
-              itemId: { type: "string" },
-              type: { type: "string" },
-              reason: { type: "string" }
-            }
+              type: {
+                type: "string",
+                enum: [
+                  "discovered_issue",
+                  "non_interactive_check",
+                  "validator_failure",
+                  "handoff_attention"
+                ]
+              },
+              sourceFeatureId: {
+                type: "string",
+                description: "Feature ID that originated the handoff item"
+              },
+              summary: {
+                type: "string",
+                description: "Summary or identifier of the handoff item being dismissed"
+              },
+              justification: {
+                type: "string",
+                minLength: 20,
+                description: "Explicit justification (at least 20 characters) for dismissing this item"
+              },
+              itemId: {
+                type: "string",
+                description: "Optional legacy item identifier alias for summary"
+              },
+              reason: {
+                type: "string",
+                description: "Optional legacy alias for justification"
+              }
+            },
+            required: ["type", "sourceFeatureId", "summary", "justification"]
           }
         }
       },
-      required: ["missionDir"]
+      required: ["missionDir", "dismissals"]
     }
   },
   {
@@ -103,21 +132,27 @@ export const MISSION_TOOLS = [
       type: "object",
       properties: {
         missionDir: { type: "string", description: "Path to the project or .mission directory" },
-        runId: { type: "string" },
-        featureId: { type: "string" },
+        runId: {
+          type: "string",
+          description: "Active worker runId (strongly recommended / required when available to fence stale worker runs)"
+        },
+        featureId: {
+          type: "string",
+          description: "Feature ID being completed by the active worker"
+        },
         successState: { type: "string", enum: ["success", "failure", "partial"] },
         validatorsPassed: { type: "boolean" },
         returnToOrchestrator: { type: "boolean" },
         assertionResults: { type: "object" },
         handoff: { type: "object" }
       },
-      required: ["missionDir", "handoff"]
+      required: ["missionDir", "featureId", "handoff"]
     }
   },
   {
     name: "UpdateMissionFeatures",
     description:
-      "Add, update, or reorder features, milestones, or validation assertions in .mission/features.json and .mission/state.json.",
+      "Add, update, or reorder features, milestones, validation assertions, modelSettings, or bonusAttempts in .mission/features.json and .mission/state.json.",
     inputSchema: {
       type: "object",
       properties: {
@@ -125,6 +160,9 @@ export const MISSION_TOOLS = [
         features: { type: "array", items: { type: "object" } },
         addFeatures: { type: "array", items: { type: "object" } },
         updateFeatures: { type: "array", items: { type: "object" } },
+        updateAssertions: { type: "array", items: { type: "object" } },
+        modelSettings: { type: "object" },
+        bonusAttempts: { type: "object" },
         milestones: { type: "array", items: { type: "object" } },
         assertions: { type: "array", items: { type: "object" } }
       },
@@ -191,6 +229,10 @@ function resolveFallbackBaseDir(missionDir) {
   if (path.basename(abs) === ".mission") {
     return abs;
   }
+  const dotMission = path.join(abs, ".mission");
+  if (fs.existsSync(dotMission)) {
+    return dotMission;
+  }
   if (
     fs.existsSync(path.join(abs, "state.json")) ||
     fs.existsSync(path.join(abs, "features.json")) ||
@@ -198,7 +240,7 @@ function resolveFallbackBaseDir(missionDir) {
   ) {
     return abs;
   }
-  return path.join(abs, ".mission");
+  return dotMission;
 }
 
 function readJsonFileSafe(filePath, fallback = null) {
@@ -248,6 +290,269 @@ const DEFAULT_FALLBACK_MODEL_SETTINGS = {
   skipScrutiny: false,
   skipUserTesting: false
 };
+
+/**
+ * Normalize legacy dismissal item aliases (`reason` -> `justification`, `itemId` -> `summary`)
+ * at the Bridge boundary while preserving strict Kernel validation.
+ *
+ * @param {unknown[]} dismissals
+ */
+export function normalizeDismissalPayloadItems(dismissals) {
+  if (!Array.isArray(dismissals)) {
+    return dismissals;
+  }
+  return dismissals.map((item) => {
+    if (!item || typeof item !== "object") {
+      return item;
+    }
+    const normalized = { ...item };
+    if (!normalized.justification && normalized.reason) {
+      normalized.justification = normalized.reason;
+    }
+    if (!normalized.summary && normalized.itemId) {
+      normalized.summary = normalized.itemId;
+    }
+    return normalized;
+  });
+}
+
+function loadStateFromKernelOrDisk(missionDir, kernel) {
+  if (kernel && typeof kernel.tryLoadState === "function") {
+    try {
+      return kernel.tryLoadState(missionDir);
+    } catch {
+      // Fallback to direct disk read
+    }
+  }
+  const baseDir =
+    kernel && typeof kernel.resolveMissionBaseDir === "function"
+      ? kernel.resolveMissionBaseDir(missionDir)
+      : resolveFallbackBaseDir(missionDir);
+  return readJsonFileSafe(path.join(baseDir, "state.json"), null);
+}
+
+function saveStateToKernelOrDisk(missionDir, kernel, state) {
+  if (kernel && typeof kernel.saveState === "function") {
+    return kernel.saveState(missionDir, state);
+  }
+  const baseDir =
+    kernel && typeof kernel.resolveMissionBaseDir === "function"
+      ? kernel.resolveMissionBaseDir(missionDir)
+      : resolveFallbackBaseDir(missionDir);
+  writeJsonFileSafe(path.join(baseDir, "state.json"), state);
+  return state;
+}
+
+function persistWorkerMetadataIntoState(missionDir, kernel, meta) {
+  if (!meta || typeof meta !== "object") {
+    return null;
+  }
+  const { runId, featureId, taskId, childThreadId, childRunId, worktreePath } = meta;
+  if (!taskId && !childThreadId && !childRunId && !worktreePath) {
+    return null;
+  }
+
+  const state = loadStateFromKernelOrDisk(missionDir, kernel);
+  if (!state || typeof state !== "object" || !state.activeWorker) {
+    return null;
+  }
+
+  if (runId && state.activeWorker.runId && state.activeWorker.runId !== runId) {
+    return state;
+  }
+  if (!runId && featureId && state.activeWorker.featureId && state.activeWorker.featureId !== featureId) {
+    return state;
+  }
+
+  const nextActiveWorker = {
+    ...state.activeWorker,
+    taskId: taskId ?? state.activeWorker.taskId ?? null,
+    childThreadId: childThreadId ?? state.activeWorker.childThreadId ?? null,
+    childRunId: childRunId ?? state.activeWorker.childRunId ?? null,
+    worktreePath: worktreePath ?? state.activeWorker.worktreePath ?? null
+  };
+
+  state.activeWorker = nextActiveWorker;
+  if (Array.isArray(state.sessions)) {
+    const targetRunId = nextActiveWorker.runId;
+    state.sessions = state.sessions.map((session) => {
+      const matchesRun = targetRunId && session.runId === targetRunId;
+      const matchesFeature = !targetRunId && featureId && session.featureId === featureId;
+      if (!matchesRun && !matchesFeature) {
+        return session;
+      }
+      return {
+        ...session,
+        taskId: taskId ?? session.taskId ?? null,
+        childThreadId: childThreadId ?? session.childThreadId ?? null,
+        childRunId: childRunId ?? session.childRunId ?? null,
+        worktreePath: worktreePath ?? session.worktreePath ?? null
+      };
+    });
+  }
+
+  return saveStateToKernelOrDisk(missionDir, kernel, state);
+}
+
+/**
+ * Wrap a dispatch adapter so `runFeature` and `resumeWorker` always pass through
+ * full adapter metadata (`taskId`, `childThreadId`, `childRunId`, `worktreePath`,
+ * `resumed`, `canResume`, `status`, `preflight`, `handoff`) and defensively persist
+ * runtime task/thread/worktree metadata into `state.activeWorker` and `state.sessions` on disk.
+ *
+ * @param {string} missionDir
+ * @param {Record<string, any>} baseAdapter
+ * @param {Record<string, any>} [kernel]
+ */
+export function createBridgeDispatchAdapter(missionDir, baseAdapter = {}, kernel = undefined) {
+  let lastRunFeatureResult = null;
+  let lastResumeResult = null;
+
+  const hasRunFeature = typeof baseAdapter?.runFeature === "function";
+  const hasResumeWorker = typeof baseAdapter?.resumeWorker === "function";
+
+  const wrapped = {
+    ...baseAdapter,
+    getLastRunFeatureResult: () => lastRunFeatureResult,
+    getLastResumeResult: () => lastResumeResult
+  };
+
+  if (hasRunFeature) {
+    wrapped.runFeature = async (feature, slotConfig, missionState = {}, opts = undefined) => {
+      const res = await baseAdapter.runFeature(feature, slotConfig, missionState, opts);
+      const response = res?.response ?? res;
+      const fullResult = {
+        ...(res && typeof res === "object" ? res : {}),
+        taskId: response?.taskId ?? res?.taskId ?? null,
+        childThreadId:
+          response?.childThreadId ??
+          res?.childThreadId ??
+          response?.threadId ??
+          res?.threadId ??
+          null,
+        childRunId:
+          response?.childRunId ??
+          res?.childRunId ??
+          response?.runId ??
+          res?.runId ??
+          null,
+        worktreePath: response?.worktreePath ?? res?.worktreePath ?? null,
+        resumed: Boolean(res?.resumed ?? false),
+        canResume: res?.canResume !== undefined ? Boolean(res.canResume) : true,
+        status: res?.status ?? response?.status ?? "running",
+        preflight: res?.preflight ?? res?.gitCheck ?? null,
+        handoff: res?.handoff
+      };
+
+      const runId = missionState?.activeWorker?.runId ?? null;
+      const featureId = feature?.id ?? missionState?.activeWorker?.featureId ?? null;
+      lastRunFeatureResult = {
+        ...fullResult,
+        runId,
+        featureId
+      };
+
+      persistWorkerMetadataIntoState(missionDir, kernel, lastRunFeatureResult);
+      return fullResult;
+    };
+  }
+
+  if (hasResumeWorker) {
+    wrapped.resumeWorker = async (activeWorkerOrParams, opts = undefined, maybeState = undefined) => {
+      const res = await baseAdapter.resumeWorker(activeWorkerOrParams, opts, maybeState);
+      const response = res?.response ?? res;
+      const preflight = res?.preflight ?? res?.gitCheck ?? null;
+      const canResume =
+        res?.canResume !== undefined
+          ? Boolean(res.canResume)
+          : preflight?.canResume !== undefined
+            ? Boolean(preflight.canResume)
+            : true;
+      const resumed = Boolean(res?.resumed && canResume);
+      const status =
+        res?.status ??
+        (resumed
+          ? "running"
+          : preflight?.hasConflicts
+            ? "blocked_by_conflicts"
+            : "blocked_by_git_error");
+
+      const activeWorker =
+        (activeWorkerOrParams &&
+        typeof activeWorkerOrParams === "object" &&
+        activeWorkerOrParams.activeWorker
+          ? activeWorkerOrParams.activeWorker
+          : activeWorkerOrParams) ||
+        maybeState?.activeWorker ||
+        {};
+
+      const fullResult = {
+        ...(res && typeof res === "object" ? res : {}),
+        taskId:
+          response?.taskId ??
+          res?.taskId ??
+          activeWorker?.taskId ??
+          null,
+        childThreadId:
+          response?.childThreadId ??
+          res?.childThreadId ??
+          res?.threadId ??
+          activeWorker?.childThreadId ??
+          activeWorker?.threadId ??
+          null,
+        childRunId:
+          response?.childRunId ??
+          res?.childRunId ??
+          activeWorker?.childRunId ??
+          null,
+        worktreePath:
+          response?.worktreePath ??
+          res?.worktreePath ??
+          preflight?.path ??
+          activeWorker?.worktreePath ??
+          null,
+        resumed,
+        canResume,
+        status,
+        preflight,
+        handoff: res?.handoff
+      };
+
+      const runId = activeWorker?.runId ?? maybeState?.activeWorker?.runId ?? null;
+      const featureId = activeWorker?.featureId ?? maybeState?.activeWorker?.featureId ?? null;
+      lastResumeResult = {
+        ...fullResult,
+        runId,
+        featureId
+      };
+
+      if (!resumed || !canResume) {
+        const diskState = loadStateFromKernelOrDisk(missionDir, kernel);
+        if (diskState && typeof diskState === "object") {
+          diskState.status = "paused";
+          if (diskState.activeWorker) {
+            diskState.activeWorker = {
+              ...diskState.activeWorker,
+              status: "paused"
+            };
+          }
+          if (Array.isArray(diskState.sessions) && runId) {
+            diskState.sessions = diskState.sessions.map((s) =>
+              s.runId === runId ? { ...s, status: "paused" } : s
+            );
+          }
+          saveStateToKernelOrDisk(missionDir, kernel, diskState);
+        }
+      } else {
+        persistWorkerMetadataIntoState(missionDir, kernel, lastResumeResult);
+      }
+
+      return fullResult;
+    };
+  }
+
+  return wrapped;
+}
 
 /**
  * Create the built-in durable fallback kernel used when `../kernel/index.mjs` is not yet merged
@@ -377,7 +682,9 @@ export function createFallbackKernel() {
         throw new Error(`Mission state not found in ${baseDir}`);
       }
       if (state.planAccepted !== true) {
-        throw new Error("PLAN_ACCEPTANCE_REQUIRED: Mission plan must be approved before starting a mission run");
+        const err = new Error("PLAN_ACCEPTANCE_REQUIRED: Mission plan must be approved before starting a mission run");
+        /** @type {any} */ (err).code = "PLAN_ACCEPTANCE_REQUIRED";
+        throw err;
       }
 
       const featuresDoc = readJsonFileSafe(featuresPath, { features: [] });
@@ -386,24 +693,39 @@ export function createFallbackKernel() {
 
       const wasPaused = state.status === "paused";
       if (wasPaused && state.activeWorker && options?.restartFeature !== true) {
+        let resumeInfo = null;
+        if (typeof dispatchAdapter?.resumeWorker === "function") {
+          resumeInfo = await dispatchAdapter.resumeWorker(state.activeWorker, options, state);
+          if (resumeInfo && (resumeInfo.resumed === false || resumeInfo.canResume === false)) {
+            return {
+              ...state,
+              resumed: false,
+              canResume: false,
+              resumeResult: resumeInfo
+            };
+          }
+        }
         state.status = "running";
         state.activeWorker = {
           ...state.activeWorker,
           status: "running",
-          resumedAt: nowIso
+          resumedAt: nowIso,
+          taskId: resumeInfo?.taskId ?? state.activeWorker.taskId ?? null,
+          childThreadId: resumeInfo?.childThreadId ?? state.activeWorker.childThreadId ?? null,
+          childRunId: resumeInfo?.childRunId ?? state.activeWorker.childRunId ?? null,
+          worktreePath: resumeInfo?.worktreePath ?? state.activeWorker.worktreePath ?? null
         };
         state.revision = (state.revision || 1) + 1;
         writeJsonFileSafe(statePath, state);
-
-        let resumeInfo = null;
-        if (typeof dispatchAdapter?.resumeWorker === "function") {
-          resumeInfo = await dispatchAdapter.resumeWorker(state.activeWorker, options, state);
-        }
         return {
           ...state,
           resumed: true,
           resumeResult: resumeInfo
         };
+      }
+
+      if (state.status === "running" && state.activeWorker && state.activeWorker.status === "running") {
+        return state;
       }
 
       const nextFeature = featuresDoc.features.find((f) => f.status === "pending");
@@ -458,12 +780,22 @@ export function createFallbackKernel() {
       let dispatchResult = null;
       if (typeof dispatchAdapter?.runFeature === "function") {
         dispatchResult = await dispatchAdapter.runFeature(nextFeature, slotConfig, state);
-        if (dispatchResult?.childThreadId || dispatchResult?.taskId) {
+        if (
+          dispatchResult?.childThreadId ||
+          dispatchResult?.taskId ||
+          dispatchResult?.childRunId ||
+          dispatchResult?.worktreePath
+        ) {
           state.activeWorker = {
             ...state.activeWorker,
-            childThreadId: dispatchResult.childThreadId ?? state.activeWorker.childThreadId,
-            taskId: dispatchResult.taskId ?? state.activeWorker.taskId
+            childThreadId: dispatchResult.childThreadId ?? state.activeWorker.childThreadId ?? null,
+            taskId: dispatchResult.taskId ?? state.activeWorker.taskId ?? null,
+            childRunId: dispatchResult.childRunId ?? state.activeWorker.childRunId ?? null,
+            worktreePath: dispatchResult.worktreePath ?? state.activeWorker.worktreePath ?? null
           };
+          state.sessions = state.sessions.map((s) =>
+            s.runId === state.activeWorker.runId ? { ...state.activeWorker } : s
+          );
           writeJsonFileSafe(statePath, state);
         }
       }
@@ -478,10 +810,11 @@ export function createFallbackKernel() {
       const baseDir = resolveFallbackBaseDir(missionDir);
       const statePath = path.join(baseDir, "state.json");
       const state = readJsonFileSafe(statePath, {});
+      const normalized = normalizeDismissalPayloadItems(input.dismissals || []);
       state.lastHandoffNeedsAttention = false;
       state.dismissals = [
         ...(Array.isArray(state.dismissals) ? state.dismissals : []),
-        ...(Array.isArray(input.dismissals) ? input.dismissals : [])
+        ...(Array.isArray(normalized) ? normalized : [])
       ];
       state.revision = (state.revision || 1) + 1;
       writeJsonFileSafe(statePath, state);
@@ -533,6 +866,7 @@ export function createFallbackKernel() {
       const baseDir = resolveFallbackBaseDir(missionDir);
       const statePath = path.join(baseDir, "state.json");
       const featuresPath = path.join(baseDir, "features.json");
+      const modelSettingsPath = path.join(baseDir, "model-settings.json");
       const state = readJsonFileSafe(statePath, {});
       const featuresDoc = readJsonFileSafe(featuresPath, { features: [] });
       const nowIso = new Date().toISOString();
@@ -551,6 +885,42 @@ export function createFallbackKernel() {
             }
           }
         }
+      }
+
+      if (input.bonusAttempts && typeof input.bonusAttempts === "object") {
+        for (const [featureId, extra] of Object.entries(input.bonusAttempts)) {
+          const idx = featuresDoc.features.findIndex((f) => f.id === featureId);
+          if (idx !== -1 && typeof extra === "number" && extra > 0) {
+            featuresDoc.features[idx] = {
+              ...featuresDoc.features[idx],
+              maxAttempts: (featuresDoc.features[idx].maxAttempts || 5) + extra
+            };
+          }
+        }
+      }
+
+      if (Array.isArray(input.milestones)) {
+        state.milestones = input.milestones;
+      }
+      if (Array.isArray(input.assertions)) {
+        state.assertions = input.assertions;
+      } else if (Array.isArray(input.updateAssertions)) {
+        const assertions = Array.isArray(state.assertions) ? [...state.assertions] : [];
+        for (const patch of input.updateAssertions) {
+          if (!patch || !patch.id) continue;
+          const idx = assertions.findIndex((a) => a.id === patch.id);
+          if (idx !== -1) {
+            assertions[idx] = { ...assertions[idx], ...patch };
+          } else {
+            assertions.push(patch);
+          }
+        }
+        state.assertions = assertions;
+      }
+
+      if (input.modelSettings && typeof input.modelSettings === "object") {
+        const currentSettings = readJsonFileSafe(modelSettingsPath, DEFAULT_FALLBACK_MODEL_SETTINGS);
+        writeJsonFileSafe(modelSettingsPath, { ...currentSettings, ...input.modelSettings });
       }
 
       state.lastHandoffNeedsAttention = false;
@@ -626,17 +996,25 @@ async function invokeKernelFunction(kernel, fn, missionDir, payload, extraArg) {
     return await fn.call(kernel, missionDir, payload, extraArg);
   }
 
-  // Inspect parameter signature for mock kernels
+  // Inspect parameter signature for mock kernels (function, shorthand method, or arrow function)
   const fnSource = Function.prototype.toString.call(fn).trim();
-  const paramMatch = fnSource.match(/^(?:async\s+)?(?:function\s*[^(]*\(([^)]*)\)|\(([^)]*)\)\s*=>|([A-Za-z0-9_$]+)\s*=>)/);
-  const rawParams = (paramMatch?.[1] ?? paramMatch?.[2] ?? paramMatch?.[3] ?? "").trim();
+  const paramMatch = fnSource.match(
+    /^(?:async\s+)?(?:function\s*[^(]*\(([^)]*)\)|[A-Za-z0-9_$]+\s*\(([^)]*)\)|\(([^)]*)\)\s*=>|([A-Za-z0-9_$]+)\s*=>)/
+  );
+  const rawParams = (
+    paramMatch?.[1] ??
+    paramMatch?.[2] ??
+    paramMatch?.[3] ??
+    paramMatch?.[4] ??
+    ""
+  ).trim();
   const paramList = rawParams
     ? rawParams.split(",").map((p) => p.trim()).filter(Boolean)
     : [];
 
   const firstParam = paramList[0] || "";
   const expectsMissionDirFirst =
-    /^(missionDir|dir|baseDir|projectDir)\b/i.test(firstParam) ||
+    /^_?(missionDir|dir|baseDir|projectDir)\b/i.test(firstParam) ||
     (paramList.length >= 2 && !firstParam.startsWith("{") && !/^(args|input|payload|params|opts|options)\b/i.test(firstParam));
 
   if (expectsMissionDirFirst) {
@@ -665,6 +1043,22 @@ export async function callMissionTool(toolName, rawArgs = {}, context = {}) {
     args.missionDir ?? context.missionDir ?? process.cwd()
   ).trim();
   args.missionDir = missionDir;
+
+  if (canonicalName === "EndFeatureRun") {
+    const hasFeatureId = typeof args.featureId === "string" && args.featureId.trim().length > 0;
+    const hasRunId = typeof args.runId === "string" && args.runId.trim().length > 0;
+    if (!hasFeatureId && !hasRunId) {
+      const err = new Error(
+        "MISSING_RUN_IDENTITY: EndFeatureRun requires featureId and/or runId to fence worker completion"
+      );
+      /** @type {any} */ (err).code = "MISSING_RUN_IDENTITY";
+      throw err;
+    }
+  }
+
+  if (canonicalName === "DismissHandoffItems" && Array.isArray(args.dismissals)) {
+    args.dismissals = normalizeDismissalPayloadItems(args.dismissals);
+  }
 
   const kernel = await resolveMissionKernel(context);
   const adapter =
@@ -756,11 +1150,111 @@ export async function callMissionTool(toolName, rawArgs = {}, context = {}) {
         context.kernel ||
         (context.env ?? process.env)?.T3_ACP_MCP_NODE
     );
-    const dispatchAdapter =
+    const rawDispatchAdapter =
       args.dispatchAdapter ??
       context.dispatchAdapter ??
       (hasLiveT3Transport ? adapter : {});
-    return await invokeKernelFunction(kernel, fn, missionDir, args, dispatchAdapter);
+    const dispatchAdapter = createBridgeDispatchAdapter(missionDir, rawDispatchAdapter, kernel);
+    const result = await invokeKernelFunction(kernel, fn, missionDir, args, dispatchAdapter);
+
+    const lastMeta =
+      dispatchAdapter.getLastRunFeatureResult?.() ??
+      dispatchAdapter.getLastResumeResult?.();
+    if (lastMeta && (lastMeta.taskId || lastMeta.childThreadId || lastMeta.childRunId || lastMeta.worktreePath)) {
+      const persistedState = persistWorkerMetadataIntoState(missionDir, kernel, lastMeta);
+      if (result && typeof result === "object" && result.activeWorker) {
+        result.activeWorker = {
+          ...result.activeWorker,
+          taskId: result.activeWorker.taskId ?? lastMeta.taskId ?? null,
+          childThreadId: result.activeWorker.childThreadId ?? lastMeta.childThreadId ?? null,
+          childRunId: result.activeWorker.childRunId ?? lastMeta.childRunId ?? null,
+          worktreePath: result.activeWorker.worktreePath ?? lastMeta.worktreePath ?? null
+        };
+        if (Array.isArray(persistedState?.sessions)) {
+          result.sessions = persistedState.sessions;
+        }
+      }
+    }
+    return result;
+  }
+
+  if (canonicalName === "UpdateMissionFeatures") {
+    const result = await invokeKernelFunction(kernel, fn, missionDir, args, adapter);
+
+    // If caller passed replacement `features`, `milestones`, or `assertions` and the loaded
+    // disk-backed Kernel did not apply those top-level replacement arrays, persist them cleanly.
+    const isDiskBackedKernel =
+      typeof kernel.loadFeaturesDoc === "function" &&
+      typeof kernel.saveFeaturesDoc === "function" &&
+      typeof kernel.loadState === "function" &&
+      typeof kernel.saveState === "function";
+
+    if (
+      isDiskBackedKernel &&
+      (Array.isArray(args.features) || Array.isArray(args.milestones) || Array.isArray(args.assertions))
+    ) {
+      let updatedFeatures = result?.features;
+      let updatedState = result?.state;
+
+      if (
+        Array.isArray(args.features) &&
+        !Array.isArray(args.addFeatures) &&
+        !Array.isArray(args.updateFeatures)
+      ) {
+        const currentDoc = kernel.loadFeaturesDoc(missionDir);
+        const requestedIds = args.features.map((f, idx) => String(f?.id || `f${idx + 1}`).trim());
+        const currentIds = (currentDoc.features || []).map((f) => f.id);
+        const matchesRequested =
+          requestedIds.length === currentIds.length &&
+          requestedIds.every((id, idx) => currentIds[idx] === id);
+
+        if (!matchesRequested) {
+          const savedDoc = kernel.saveFeaturesDoc(missionDir, {
+            ...currentDoc,
+            features: args.features,
+            updatedAt: new Date().toISOString()
+          });
+          updatedFeatures = savedDoc.features;
+        }
+      }
+
+      if (Array.isArray(args.milestones) || Array.isArray(args.assertions)) {
+        const state = kernel.loadState(missionDir);
+        let stateChanged = false;
+
+        if (Array.isArray(args.milestones)) {
+          const normalizedMilestones =
+            typeof kernel.normalizeMilestone === "function"
+              ? args.milestones.map((m, i) => kernel.normalizeMilestone(m, i))
+              : args.milestones;
+          state.milestones = normalizedMilestones;
+          stateChanged = true;
+        }
+
+        if (Array.isArray(args.assertions) && !Array.isArray(args.updateAssertions)) {
+          const normalizedAssertions =
+            typeof kernel.normalizeAssertion === "function"
+              ? args.assertions.map((a, i) => kernel.normalizeAssertion(a, i))
+              : args.assertions;
+          state.assertions = normalizedAssertions;
+          stateChanged = true;
+        }
+
+        if (stateChanged) {
+          updatedState = kernel.saveState(missionDir, state);
+        }
+      }
+
+      if (result && typeof result === "object") {
+        return {
+          ...result,
+          ...(updatedState ? { state: updatedState } : {}),
+          ...(updatedFeatures ? { features: updatedFeatures } : {})
+        };
+      }
+    }
+
+    return result;
   }
 
   return await invokeKernelFunction(kernel, fn, missionDir, args, adapter);
@@ -1013,6 +1507,8 @@ export default {
   MISSION_TOOLS,
   resolveCanonicalToolName,
   resolveMissionKernel,
+  normalizeDismissalPayloadItems,
+  createBridgeDispatchAdapter,
   callMissionTool,
   handleJsonRpcMessage,
   createMissionMcpServer,
@@ -1020,6 +1516,7 @@ export default {
   normalizeTargetFromSlot,
   resolveTargetFromModelSettings,
   delegateMissionTask,
+  runFeature,
   checkGitTreeBeforeResume,
   resumeWorker,
   settleCompletedMilestoneThreads

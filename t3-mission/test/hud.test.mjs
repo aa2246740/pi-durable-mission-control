@@ -4,7 +4,15 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import http from "node:http";
+import vm from "node:vm";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createMissionHudServer } from "../hud/server.mjs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const SERVER_MJS_PATH = path.resolve(__dirname, "../hud/server.mjs");
+const APP_JS_PATH = path.resolve(__dirname, "../hud/public/app.js");
 
 function createTempMissionWorkspace() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "t3-mission-hud-test-"));
@@ -438,9 +446,47 @@ test("VAL-HUD-003: POST /api/mission/model-slots hot-swaps Validator model from 
   assert.equal(diskSettings.validator.effort, 4);
   assert.equal(diskSettings.validator.options.reasoningEffort, "high");
 
+  // Effort-only updates (F09 & I-02): effort=1 -> "minimal", effort=2 -> "low"
+  const effortOnlyWorkerRes = await fetch(`${hud.url}/api/mission/model-slots`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      slot: "worker",
+      model: "gpt-6.1-sol",
+      effort: 1,
+    }),
+  });
+  assert.equal(effortOnlyWorkerRes.status, 200);
+  const effortOnlyWorkerData = await effortOnlyWorkerRes.json();
+  assert.equal(effortOnlyWorkerData.modelSettings.worker.effort, 1);
+  assert.equal(effortOnlyWorkerData.modelSettings.worker.reasoningEffort, "minimal");
+  assert.equal(effortOnlyWorkerData.modelSettings.worker.options.reasoningEffort, "minimal");
+
+  const effortOnlyValidatorRes = await fetch(`${hud.url}/api/mission/model-slots`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      slot: "validator",
+      model: "gpt-6.1-sol",
+      providerInstanceId: "codex",
+      effort: 2,
+    }),
+  });
+  assert.equal(effortOnlyValidatorRes.status, 200);
+  const effortOnlyValidatorData = await effortOnlyValidatorRes.json();
+  assert.equal(effortOnlyValidatorData.modelSettings.validator.effort, 2);
+  assert.equal(effortOnlyValidatorData.modelSettings.validator.reasoningEffort, "low");
+  assert.equal(effortOnlyValidatorData.modelSettings.validator.options.reasoningEffort, "low");
+
+  const diskSettingsAfter = JSON.parse(
+    fs.readFileSync(path.join(dotMission, "model-settings.json"), "utf8")
+  );
+  assert.equal(diskSettingsAfter.worker.options.reasoningEffort, "minimal");
+  assert.equal(diskSettingsAfter.validator.options.reasoningEffort, "low");
+
   // Verify state revision incremented and progress_log.jsonl recorded the change
   const diskState = JSON.parse(fs.readFileSync(path.join(dotMission, "state.json"), "utf8"));
-  assert.equal(diskState.revision, 2);
+  assert.equal(diskState.revision, 4);
 
   const logLines = fs
     .readFileSync(path.join(dotMission, "progress_log.jsonl"), "utf8")
@@ -460,6 +506,16 @@ test("VAL-HUD-004: POST /api/mission/pause and POST /api/mission/resume reproduc
     await hud.close();
     fs.rmSync(workspaceDir, { recursive: true, force: true });
   });
+
+  // Unapproved resume must be rejected (F03)
+  const unapprovedRes = await fetch(`${hud.url}/api/mission/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(unapprovedRes.status, 409);
+  const unapprovedData = await unapprovedRes.json();
+  assert.equal(unapprovedData.code, "PLAN_ACCEPTANCE_REQUIRED");
 
   // First approve plan so mission is running with Worker #28 active
   await fetch(`${hud.url}/api/mission/approve`, { method: "POST" });
@@ -493,6 +549,7 @@ test("VAL-HUD-004: POST /api/mission/pause and POST /api/mission/resume reproduc
   );
   assert.equal(resumeData.state.status, "running");
   assert.equal(resumeData.state.activeWorker.status, "running");
+  assert.equal(resumeData.state.activeWorker.resumePending, true);
 
   // 3. Verify complete progress_log.jsonl sequence:
   // Worker #28 paused -> Mission paused -> Mission resumed -> Run started: Resume ...
@@ -520,4 +577,156 @@ test("VAL-HUD-004: POST /api/mission/pause and POST /api/mission/resume reproduc
   assert.ok(idxMissionPaused > idxWorkerPaused, "Expected Mission paused after Worker #28 paused");
   assert.ok(idxMissionResumed > idxMissionPaused, "Expected Mission resumed after Mission paused");
   assert.ok(idxRunStarted > idxMissionResumed, "Expected Run started: Resume after Mission resumed");
+});
+
+test("I-04, I-07, I-03, F11, F04: Startup reconciliation, real Git dirty diagnostic, Validator role synthesis, and CLI startup", async (t) => {
+  // 1. I-04 & I-07: Real Git repo with stale running state and dirty working tree on resume
+  const gitRepoDir = createTempMissionWorkspace();
+  execFileSync("git", ["init", "-q"], { cwd: gitRepoDir });
+  fs.writeFileSync(path.join(gitRepoDir, ".gitignore"), ".mission/\n");
+  fs.writeFileSync(path.join(gitRepoDir, "README.md"), "Initial repo\n");
+  execFileSync("git", ["add", "."], { cwd: gitRepoDir });
+  execFileSync(
+    "git",
+    ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "init"],
+    { cwd: gitRepoDir }
+  );
+
+  const dotMission = path.join(gitRepoDir, ".mission");
+  fs.mkdirSync(dotMission, { recursive: true });
+  const staleRunningState = {
+    missionId: "mission-reconcile",
+    title: "Stale Running Mission",
+    repoPath: gitRepoDir,
+    status: "running",
+    planAccepted: true,
+    revision: 2,
+    elapsedMs: 1000,
+    lastStartedAt: new Date(Date.now() - 2000).toISOString(),
+    milestones: [{ id: "m1", title: "M1", ordinal: 1 }],
+    assertions: [],
+    activeWorker: {
+      runId: "run:restart",
+      workerNumber: 1,
+      featureId: "f1",
+      featureTitle: "First feature",
+      milestoneId: "m1",
+      status: "running",
+      childThreadId: "thread:123",
+      taskId: "task:123",
+      worktreePath: gitRepoDir,
+    },
+    sessions: [
+      {
+        runId: "run:restart",
+        workerNumber: 1,
+        featureId: "f1",
+        featureTitle: "First feature",
+        milestoneId: "m1",
+        status: "running",
+        childThreadId: "thread:123",
+        taskId: "task:123",
+        worktreePath: gitRepoDir,
+      },
+    ],
+  };
+  fs.writeFileSync(
+    path.join(dotMission, "state.json"),
+    JSON.stringify(staleRunningState, null, 2) + "\n"
+  );
+
+  const hud = await createMissionHudServer({ missionDir: dotMission, port: 0 });
+  t.after(async () => {
+    await hud.close();
+    fs.rmSync(gitRepoDir, { recursive: true, force: true });
+  });
+
+  // Verify I-04: Startup reconciled running state to paused
+  const stateRes = await fetch(`${hud.url}/api/mission/state`);
+  const snap = await stateRes.json();
+  assert.equal(snap.state.status, "paused");
+  assert.equal(snap.state.activeWorker.status, "paused");
+  assert.ok(snap.state.elapsedMs >= 2000);
+
+  // Dirty tracked file in gitRepoDir and test I-07 resume diagnostic
+  fs.appendFileSync(path.join(gitRepoDir, "README.md"), "uncommitted change\n");
+  const dirtyResumeRes = await fetch(`${hud.url}/api/mission/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(dirtyResumeRes.status, 200);
+  const dirtyResumeData = await dirtyResumeRes.json();
+  assert.ok(
+    !dirtyResumeData.diagnostic.includes("no uncommitted changes"),
+    `Expected dirty diagnostic, got: ${dirtyResumeData.diagnostic}`
+  );
+  assert.match(dirtyResumeData.diagnostic, /has uncommitted changes \(README\.md\)/);
+  assert.equal(dirtyResumeData.state.activeWorker.resumePending, true);
+
+  // 2. I-03 & F11: Frontend synthesizeSessions preserves Validator role for scrutiny/user-testing and avoids fabricating handoffs
+  const appSrc = fs
+    .readFileSync(APP_JS_PATH, "utf8")
+    .replace("export function applySnapshot", "function applySnapshot")
+    .replace(/initHud\(\);\s*$/, "");
+  const vmCtx = vm.createContext({});
+  vm.runInContext(appSrc, vmCtx);
+  vmCtx.testState = {
+    status: "running",
+    activeWorker: {
+      runId: "validator-run-4",
+      workerNumber: 4,
+      kind: "scrutiny",
+      slot: "validator",
+      featureId: "scrutiny-validator-m1",
+      featureTitle: "Scrutiny validation for Milestone one",
+      milestoneId: "m1",
+      status: "running",
+    },
+    sessions: [
+      {
+        runId: "validator-run-4",
+        workerNumber: 4,
+        kind: "scrutiny",
+        slot: "validator",
+        featureId: "scrutiny-validator-m1",
+        featureTitle: "Scrutiny validation for Milestone one",
+        milestoneId: "m1",
+        status: "running",
+      },
+    ],
+  };
+  const synthesized = JSON.parse(
+    vm.runInContext(
+      "JSON.stringify(synthesizeSessions(testState, [{ id: 'scrutiny-validator-m1', title: 'Scrutiny validation for Milestone one', status: 'running', kind: 'scrutiny', milestoneId: 'm1' }]))",
+      vmCtx
+    )
+  );
+  assert.equal(synthesized.length, 1);
+  assert.equal(synthesized[0].role, "Validator");
+  assert.match(synthesized[0].label, /^Validator #4: Scrutiny validation/);
+  assert.deepEqual(synthesized[0].handoff.commandsRun, []);
+  assert.equal(synthesized[0].handoff.whatWasImplemented, "No handoff recorded yet.");
+  assert.equal(synthesized[0].childThreadId, null);
+
+  // 3. F04: Standalone CLI execution starts server, creates .mission, outputs listening JSON, and serves HTTP
+  const cliTempDir = createTempMissionWorkspace();
+  t.after(() => {
+    fs.rmSync(cliTempDir, { recursive: true, force: true });
+  });
+  const cliMissionDir = path.join(cliTempDir, ".mission");
+  const cliStdout = execFileSync(
+    process.execPath,
+    [SERVER_MJS_PATH, "--mission-dir", cliMissionDir, "--port", "0"],
+    { cwd: cliTempDir, timeout: 3000, encoding: "utf8" }
+  );
+  assert.ok(fs.existsSync(cliMissionDir), "CLI should create .mission directory");
+  const cliInfo = JSON.parse(cliStdout.trim());
+  assert.equal(cliInfo.ok, true);
+  assert.ok(cliInfo.url.startsWith("http://127.0.0.1:"));
+
+  const cliHttpRes = await fetch(`${cliInfo.url}/api/mission/state`);
+  assert.equal(cliHttpRes.status, 200);
+  const cliSnap = await cliHttpRes.json();
+  assert.equal(cliSnap.initialized, false);
 });
