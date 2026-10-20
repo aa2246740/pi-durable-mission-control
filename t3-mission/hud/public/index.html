@@ -44,7 +44,7 @@
       <section class="status-strip" id="status-strip" data-status="awaiting_input">
         <div class="status-strip-left">
           <span class="status-dot" id="status-strip-dot"></span>
-          <span class="status-text" id="status-strip-label">AWAITING APPROVAL</span>
+          <span class="status-text" id="status-strip-label">AWAITING INPUT</span>
           <span class="status-subtext" id="status-strip-subtext">Revision #1 · Live SSE Connected</span>
         </div>
         <div class="status-strip-actions">
@@ -136,7 +136,7 @@
           </footer>
         </section>
 
-        <!-- Right Column: Model Slots + Features + Progress Log -->
+        <!-- Right Column: Model Slots + Features + Validation Contract + Progress Log -->
         <aside class="hud-col hud-col-right" id="right-panel" aria-label="Model, Features, and Progress Log">
           <!-- Model 3-Slot Selector -->
           <section class="right-section model-section" id="model-section">
@@ -214,6 +214,17 @@
               <span class="section-count mono" id="features-count">0/0</span>
             </div>
             <div class="features-list" id="features-list">
+              <!-- Populated by app.js -->
+            </div>
+          </section>
+
+          <!-- Validation Assertions Checklist -->
+          <section class="right-section assertions-section" id="assertions-section">
+            <div class="section-header">
+              <span class="section-title">Validation Contract</span>
+              <span class="section-count mono" id="assertions-count">0/0</span>
+            </div>
+            <div class="assertions-list" id="assertions-list">
               <!-- Populated by app.js -->
             </div>
           </section>

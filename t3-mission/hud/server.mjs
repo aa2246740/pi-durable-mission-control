@@ -1752,6 +1752,9 @@ export function createMissionHudServer({
       sendJson(res, 409, {
         ok: false,
         code: gitCheck.hasConflicts
+          ? "GIT_RESUME_BLOCKED"
+          : "RESUME_BLOCKED_BY_GIT_ERROR",
+        reasonCode: gitCheck.hasConflicts
           ? "RESUME_BLOCKED_BY_CONFLICTS"
           : "RESUME_BLOCKED_BY_GIT_ERROR",
         error: gitCheck.hasConflicts

@@ -1790,3 +1790,236 @@ test("Round 6 Scrutiny Fix (F03-dead-worker-control-success): Killing default HU
     "Expected all 4 .mission/* files unchanged after rejected resume"
   );
 });
+
+test("Round 7 E2E Browser Contract Fixes (UI-STATUS-LABEL, UI-APPROVE-ID, RESUME-ERROR-CODE, ASSERTIONS-NOT-RENDERED)", async (t) => {
+  // 1. Verify index.html static markup has #status-strip-label = AWAITING INPUT and #assertions-section / #assertions-list
+  const indexHtmlPath = path.resolve(__dirname, "../hud/public/index.html");
+  const indexHtml = fs.readFileSync(indexHtmlPath, "utf8");
+  assert.match(indexHtml, /id="status-strip-label">AWAITING INPUT<\/span>/);
+  assert.match(indexHtml, /id="assertions-section"/);
+  assert.match(indexHtml, /id="assertions-count">0\/0<\/span>/);
+  assert.match(indexHtml, /id="assertions-list"/);
+
+  // 2. Verify app.js DOM rendering for UI-STATUS-LABEL, UI-APPROVE-ID (#btn-approve), and ASSERTIONS-NOT-RENDERED (#assertions-list)
+  const appSrc = fs
+    .readFileSync(APP_JS_PATH, "utf8")
+    .replace("export function applySnapshot", "function applySnapshot")
+    .replace(/initHud\(\);\s*$/, "");
+
+  const elements = new Map();
+  let approvedTriggeredCount = 0;
+
+  function makeEl(id) {
+    const el = {
+      id,
+      textContent: "",
+      innerHTML: "",
+      dataset: {},
+      style: {},
+      value: "",
+      listeners: {},
+      classList: {
+        classes: new Set(),
+        add(c) {
+          this.classes.add(c);
+        },
+        remove(c) {
+          this.classes.delete(c);
+        },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this.classes.has(c)) this.classes.delete(c);
+            else this.classes.add(c);
+          } else if (force) {
+            this.classes.add(c);
+          } else {
+            this.classes.delete(c);
+          }
+        },
+        contains(c) {
+          return this.classes.has(c);
+        },
+      },
+      addEventListener(type, fn) {
+        this.listeners[type] = fn;
+      },
+      querySelector(sel) {
+        if (sel === "#btn-approve" && this.innerHTML.includes('id="btn-approve"')) {
+          if (!this._btnApprove) {
+            this._btnApprove = makeEl("btn-approve");
+          }
+          return this._btnApprove;
+        }
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+    };
+    return el;
+  }
+
+  for (const id of [
+    "status-strip",
+    "status-strip-label",
+    "status-strip-subtext",
+    "strip-approve-btn",
+    "btn-pause",
+    "btn-resume",
+    "onboarding-card",
+    "plan-approval-card",
+    "session-handoff-view",
+    "orchestrator-stream",
+    "pipeline-text",
+    "composer-status-msg",
+    "toolbar-orchestrator-model",
+    "features-count",
+    "features-list",
+    "assertions-count",
+    "assertions-list",
+    "progress-log-count",
+    "progress-log-list",
+  ]) {
+    elements.set(id, makeEl(id));
+  }
+
+  const vmCtx = vm.createContext({
+    document: {
+      getElementById: (id) => elements.get(id) || null,
+    },
+    fetch: async (url) => {
+      if (url === "/api/mission/approve") {
+        approvedTriggeredCount += 1;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true }),
+      };
+    },
+  });
+
+  vm.runInContext(appSrc, vmCtx);
+
+  // Verify getStatusBannerText returns "AWAITING INPUT" regardless of planAccepted when status === "awaiting_input"
+  assert.equal(
+    vm.runInContext('getStatusBannerText({ status: "awaiting_input", planAccepted: false })', vmCtx),
+    "AWAITING INPUT"
+  );
+  assert.equal(
+    vm.runInContext('getStatusBannerText({ status: "awaiting_input", planAccepted: true })', vmCtx),
+    "AWAITING INPUT"
+  );
+
+  // Apply snapshot and inspect rendered DOM elements
+  const testSnapshot = {
+    initialized: true,
+    state: {
+      status: "awaiting_input",
+      planAccepted: false,
+      revision: 1,
+      title: "Test Mission",
+      milestones: [{ id: "m1", title: "M1" }],
+      assertions: [
+        { id: "VAL-HUD-001", description: "Live SSE stream", status: "passed" },
+        { id: "VAL-HUD-002", description: "Approve mission button", status: "pending" },
+        { id: "VAL-HUD-003", description: "Model slot switch", status: "failed" },
+      ],
+    },
+    features: [{ id: "f1", title: "Feature 1", milestoneId: "m1", status: "completed" }],
+    progressLog: [],
+    modelSettings: {},
+    catalog: [],
+  };
+
+  vmCtx.testSnapshot = testSnapshot;
+  vm.runInContext("applySnapshot(testSnapshot)", vmCtx);
+
+  assert.equal(elements.get("status-strip-label").textContent, "AWAITING INPUT");
+
+  const approvalCard = elements.get("plan-approval-card");
+  assert.match(approvalCard.innerHTML, /id="btn-approve"/);
+  assert.match(approvalCard.innerHTML, /data-testid="btn-approve-mission"/);
+  assert.match(approvalCard.innerHTML, /data-action="approve"/);
+  assert.ok(approvalCard._btnApprove?.listeners?.click, "Expected click listener on #btn-approve");
+  await approvalCard._btnApprove.listeners.click();
+  assert.equal(approvedTriggeredCount, 1, "Clicking #btn-approve should trigger triggerApprove()");
+
+  assert.equal(elements.get("assertions-count").textContent, "1/3");
+  const assertionsHtml = elements.get("assertions-list").innerHTML;
+  assert.match(assertionsHtml, /data-assertion-id="VAL-HUD-001"/);
+  assert.match(assertionsHtml, /data-assertion-status="passed"/);
+  assert.match(assertionsHtml, /data-assertion-id="VAL-HUD-002"/);
+  assert.match(assertionsHtml, /data-assertion-status="pending"/);
+  assert.match(assertionsHtml, /data-assertion-id="VAL-HUD-003"/);
+  assert.match(assertionsHtml, /data-assertion-status="failed"/);
+
+  // 3. Verify RESUME-ERROR-CODE: Unresolved git merge conflicts return code="GIT_RESUME_BLOCKED" and reasonCode="RESUME_BLOCKED_BY_CONFLICTS"
+  const conflictDir = createTempMissionWorkspace();
+  execFileSync("git", ["init", "-q", "-b", "main", conflictDir]);
+  execFileSync("git", ["-C", conflictDir, "config", "user.name", "Test"]);
+  execFileSync("git", ["-C", conflictDir, "config", "user.email", "test@example.invalid"]);
+  fs.writeFileSync(path.join(conflictDir, ".gitignore"), ".mission/\n");
+  fs.writeFileSync(path.join(conflictDir, "shared.txt"), "base line\n");
+  execFileSync("git", ["-C", conflictDir, "add", "."]);
+  execFileSync("git", ["-C", conflictDir, "commit", "-qm", "base"]);
+
+  execFileSync("git", ["-C", conflictDir, "checkout", "-qb", "feature-branch"]);
+  fs.writeFileSync(path.join(conflictDir, "shared.txt"), "feature change\n");
+  execFileSync("git", ["-C", conflictDir, "commit", "-qam", "feature commit"]);
+
+  execFileSync("git", ["-C", conflictDir, "checkout", "-q", "main"]);
+  fs.writeFileSync(path.join(conflictDir, "shared.txt"), "main conflicting change\n");
+  execFileSync("git", ["-C", conflictDir, "commit", "-qam", "main commit"]);
+
+  assert.throws(() => {
+    execFileSync("git", ["-C", conflictDir, "merge", "feature-branch"]);
+  });
+
+  const dotM = path.join(conflictDir, ".mission");
+  fs.mkdirSync(dotM, { recursive: true });
+  fs.writeFileSync(
+    path.join(dotM, "state.json"),
+    JSON.stringify(
+      {
+        missionId: "mission-conflict-test",
+        title: "Conflict Resume Test",
+        repoPath: conflictDir,
+        status: "paused",
+        planAccepted: true,
+        revision: 2,
+        activeWorker: {
+          runId: "run-conflict-1",
+          workerNumber: 1,
+          featureId: "f-conflict",
+          featureTitle: "Conflict feature",
+          status: "paused",
+          worktreePath: conflictDir,
+        },
+        sessions: [],
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  const conflictHud = await createMissionHudServer({ missionDir: conflictDir, port: 0 });
+  t.after(async () => {
+    await conflictHud.close();
+    fs.rmSync(conflictDir, { recursive: true, force: true });
+  });
+
+  const conflictRes = await fetch(`${conflictHud.url}/api/mission/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(conflictRes.status, 409);
+  const conflictBody = await conflictRes.json();
+  assert.equal(conflictBody.ok, false);
+  assert.equal(conflictBody.code, "GIT_RESUME_BLOCKED");
+  assert.equal(conflictBody.reasonCode, "RESUME_BLOCKED_BY_CONFLICTS");
+  assert.equal(conflictBody.error, "Unresolved git merge conflicts in working tree");
+  assert.equal(conflictBody.gitCheck.hasConflicts, true);
+  assert.equal(conflictBody.gitCheck.canResume, false);
+});
