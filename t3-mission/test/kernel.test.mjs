@@ -1126,7 +1126,7 @@ test("F03, F07, F08, F09, F10, F11, F12: handoff attention ledger, strict dismis
   assert.equal(loadedBare.features[0].id, "f-bare-array");
 });
 
-test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with unchanged/unrelated features preserves pendingHandoffItems, and startMissionRun upgrades hud-default-runtime workers", async (t) => {
+test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with unchanged/unrelated features preserves pendingHandoffItems, and startMissionRun upgrades hud-default-runtime and bridge-cli-subprocess workers", async (t) => {
   const projectDir = makeTempProjectDir(t);
 
   proposeMission(projectDir, {
@@ -1175,6 +1175,51 @@ test("F07 (P26) & F03 default HUD runtime upgrade: full-feature replacement with
   assert.equal(stUpgraded.activeWorker.childThreadId, "upgraded-thread-1");
   assert.equal(stUpgraded.sessions[0].delegatedBy, undefined);
   assert.equal(stUpgraded.sessions[0].taskId, "upgraded-task-1");
+
+  // Simulate activeWorker with runtimeTransport: "bridge-cli-subprocess" (and dispatchPending: undefined)
+  stUpgraded.activeWorker.runtimeTransport = "bridge-cli-subprocess";
+  delete stUpgraded.activeWorker.dispatchPending;
+  stUpgraded.sessions = stUpgraded.sessions.map((s) => {
+    if (s.runId === runId) {
+      const copy = { ...s, runtimeTransport: "bridge-cli-subprocess" };
+      delete copy.dispatchPending;
+      return copy;
+    }
+    return s;
+  });
+  saveState(projectDir, stUpgraded);
+
+  await startMissionRun(
+    projectDir,
+    {},
+    {
+      async runFeature() {
+        return {
+          taskId: "upgraded-task-cli",
+          childThreadId: "upgraded-thread-cli",
+          childRunId: "upgraded-crun-cli",
+          worktreePath: "/tmp/upgraded-wt-cli",
+        };
+      },
+    }
+  );
+
+  const stCliUpgraded = loadState(projectDir);
+  assert.equal(stCliUpgraded.activeWorker.runtimeTransport, undefined);
+  assert.equal(stCliUpgraded.activeWorker.dispatchPending, undefined);
+  assert.equal(stCliUpgraded.activeWorker.delegatedBy, undefined);
+  assert.equal(stCliUpgraded.activeWorker.taskId, "upgraded-task-cli");
+  assert.equal(stCliUpgraded.activeWorker.childThreadId, "upgraded-thread-cli");
+  assert.equal(stCliUpgraded.activeWorker.childRunId, "upgraded-crun-cli");
+  assert.equal(stCliUpgraded.activeWorker.worktreePath, "/tmp/upgraded-wt-cli");
+  assert.equal(stCliUpgraded.sessions[0].runtimeTransport, undefined);
+  assert.equal(stCliUpgraded.sessions[0].taskId, "upgraded-task-cli");
+  assert.equal(stCliUpgraded.sessions[0].childThreadId, "upgraded-thread-cli");
+  const upgradedF1 = loadFeaturesDoc(projectDir).features.find((f) => f.id === "f1");
+  assert.equal(upgradedF1.taskId, "upgraded-task-cli");
+  assert.equal(upgradedF1.childThreadId, "upgraded-thread-cli");
+  assert.equal(upgradedF1.childRunId, "upgraded-crun-cli");
+  assert.equal(upgradedF1.worktreePath, "/tmp/upgraded-wt-cli");
 
   // Complete f1 with a discoveredIssue ("must-remain")
   endFeatureRun(projectDir, {
