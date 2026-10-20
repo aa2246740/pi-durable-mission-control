@@ -1405,6 +1405,220 @@ test("CLI runtime execution subcommands: DispatchWorkerRuntime spawns controllab
   }
 });
 
+test("F03-daemon-lifetime & F03-dead-worker-control-success: PauseWorkerRuntime and ResumeWorkerRuntime fail with WORKER_NOT_ALIVE when local worker daemon is dead, and LocalWorkerDaemon exits on completed state.json session", async () => {
+  const tempMissionDir = createTempDir("t3-f03-dead-worker-");
+  let spawnedPid = null;
+  try {
+    const cleanEnv = { ...process.env, T3_ACP_MCP_NODE: "" };
+
+    // Pre-commit state.json with activeWorker: null and empty sessions (as during POST /api/mission/approve)
+    fs.writeFileSync(
+      path.join(tempMissionDir, "state.json"),
+      JSON.stringify({ activeWorker: null, sessions: [] }),
+      "utf8"
+    );
+
+    const dispatchStdout = execFileSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "DispatchWorkerRuntime",
+        "--mission-dir",
+        tempMissionDir,
+        "--json",
+        JSON.stringify({
+          missionId: "m-f03",
+          runId: "run-f03-1",
+          repoPath: tempMissionDir,
+          feature: { id: "f-f03-1", title: "F03 Feature" }
+        })
+      ],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    const dispatchRes = JSON.parse(dispatchStdout);
+    spawnedPid = dispatchRes.workerPid;
+
+    // Daemon stays alive when activeWorker is null and sessions does not yet have a completed/failed entry for runId
+    await new Promise((r) => setTimeout(r, 150));
+    assert.doesNotThrow(() => process.kill(dispatchRes.workerPid, 0));
+
+    // Kill the local worker daemon process
+    process.kill(dispatchRes.workerPid, "SIGKILL");
+    for (let i = 0; i < 40; i++) {
+      try {
+        process.kill(dispatchRes.workerPid, 0);
+        await new Promise((r) => setTimeout(r, 20));
+      } catch {
+        break;
+      }
+    }
+
+    // PauseWorkerRuntime fails with exitCode: 1 and WORKER_NOT_ALIVE when workerPid is dead
+    assert.throws(
+      () => {
+        execFileSync(
+          process.execPath,
+          [
+            CLI_PATH,
+            "PauseWorkerRuntime",
+            "--mission-dir",
+            tempMissionDir,
+            "--json",
+            JSON.stringify({
+              activeWorker: {
+                taskId: dispatchRes.taskId,
+                childThreadId: dispatchRes.childThreadId,
+                workerPid: dispatchRes.workerPid,
+                daemonStateFile: dispatchRes.daemonStateFile,
+                runtimeTransport: "bridge-cli-subprocess"
+              }
+            })
+          ],
+          { env: cleanEnv, encoding: "utf8" }
+        );
+      },
+      (err) => {
+        assert.equal(err.status, 1);
+        const parsedErr = JSON.parse(err.stderr);
+        assert.equal(parsedErr.ok, false);
+        assert.equal(parsedErr.paused, false);
+        assert.equal(parsedErr.canPause, false);
+        assert.equal(parsedErr.code, "WORKER_NOT_ALIVE");
+        assert.equal(parsedErr.error, "Active worker daemon process is not alive");
+        return true;
+      }
+    );
+
+    // ResumeWorkerRuntime fails with exitCode: 1 and WORKER_NOT_ALIVE when workerPid is dead
+    assert.throws(
+      () => {
+        execFileSync(
+          process.execPath,
+          [
+            CLI_PATH,
+            "ResumeWorkerRuntime",
+            "--mission-dir",
+            tempMissionDir,
+            "--json",
+            JSON.stringify({
+              activeWorker: {
+                taskId: dispatchRes.taskId,
+                childThreadId: dispatchRes.childThreadId,
+                workerPid: dispatchRes.workerPid,
+                daemonStateFile: dispatchRes.daemonStateFile,
+                worktreePath: tempMissionDir,
+                runtimeTransport: "bridge-cli-subprocess"
+              }
+            })
+          ],
+          { env: cleanEnv, encoding: "utf8" }
+        );
+      },
+      (err) => {
+        assert.equal(err.status, 1);
+        const parsedErr = JSON.parse(err.stderr);
+        assert.equal(parsedErr.ok, false);
+        assert.equal(parsedErr.resumed, false);
+        assert.equal(parsedErr.canResume, false);
+        assert.equal(parsedErr.code, "WORKER_NOT_ALIVE");
+        assert.equal(parsedErr.error, "Active worker daemon process is not alive");
+        return true;
+      }
+    );
+
+    // In-memory activeWorker (without workerPid/daemonStateFile/runtimeTransport: "bridge-cli-subprocess") still succeeds
+    const inMemoryPauseOut = execFileSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "PauseWorkerRuntime",
+        "--mission-dir",
+        tempMissionDir,
+        "--json",
+        JSON.stringify({
+          activeWorker: {
+            taskId: "in-mem-task-1",
+            childThreadId: "in-mem-thread-1"
+          }
+        })
+      ],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    assert.equal(JSON.parse(inMemoryPauseOut).paused, true);
+
+    const inMemoryResumeOut = execFileSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "ResumeWorkerRuntime",
+        "--mission-dir",
+        tempMissionDir,
+        "--json",
+        JSON.stringify({
+          activeWorker: {
+            taskId: "in-mem-task-1",
+            childThreadId: "in-mem-thread-1",
+            worktreePath: tempMissionDir
+          }
+        })
+      ],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    assert.equal(JSON.parse(inMemoryResumeOut).resumed, true);
+
+    // Spawn a second daemon and verify it self-terminates when state.json records completed session for runId
+    const dispatchStdout2 = execFileSync(
+      process.execPath,
+      [
+        CLI_PATH,
+        "DispatchWorkerRuntime",
+        "--mission-dir",
+        tempMissionDir,
+        "--json",
+        JSON.stringify({
+          missionId: "m-f03",
+          runId: "run-f03-2",
+          repoPath: tempMissionDir,
+          feature: { id: "f-f03-2", title: "F03 Feature 2" }
+        })
+      ],
+      { env: cleanEnv, encoding: "utf8" }
+    );
+    const dispatchRes2 = JSON.parse(dispatchStdout2);
+    spawnedPid = dispatchRes2.workerPid;
+    assert.doesNotThrow(() => process.kill(dispatchRes2.workerPid, 0));
+
+    fs.writeFileSync(
+      path.join(tempMissionDir, "state.json"),
+      JSON.stringify({
+        activeWorker: null,
+        sessions: [{ runId: "run-f03-2", featureId: "f-f03-2", status: "completed" }]
+      }),
+      "utf8"
+    );
+
+    let exited2 = false;
+    for (let i = 0; i < 40; i++) {
+      try {
+        process.kill(dispatchRes2.workerPid, 0);
+        await new Promise((r) => setTimeout(r, 25));
+      } catch {
+        exited2 = true;
+        break;
+      }
+    }
+    assert.equal(exited2, true);
+    assert.equal(fs.existsSync(dispatchRes2.daemonStateFile), false);
+  } finally {
+    if (spawnedPid) {
+      try {
+        process.kill(spawnedPid, "SIGTERM");
+      } catch {}
+    }
+    fs.rmSync(tempMissionDir, { recursive: true, force: true });
+  }
+});
+
 test("SKILL.md contains complete YAML frontmatter and required workflow instructions", () => {
   const content = fs.readFileSync(SKILL_PATH, "utf8");
   assert.match(content, /^---\r?\nname:\s*t3-mission-mode\r?\ndescription:\s*.+\r?\n---/s);

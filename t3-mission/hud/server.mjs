@@ -430,7 +430,19 @@ function execRuntimeSubprocess(action, missionDir, payload = {}) {
       },
       (err, stdout, stderr) => {
         if (err) {
-          reject(new Error((stderr && String(stderr).trim()) || err.message));
+          const rawErrText = (stderr && String(stderr).trim()) || (stdout && String(stdout).trim()) || "";
+          if (rawErrText.startsWith("{")) {
+            try {
+              const parsedErr = JSON.parse(rawErrText.split("\n").pop() || rawErrText);
+              if (parsedErr && typeof parsedErr === "object" && parsedErr.ok === false) {
+                resolve(parsedErr);
+                return;
+              }
+            } catch {
+              // Fall through to reject
+            }
+          }
+          reject(new Error(rawErrText || err.message));
           return;
         }
         try {
@@ -441,6 +453,18 @@ function execRuntimeSubprocess(action, missionDir, payload = {}) {
       }
     );
   });
+}
+
+function isLocalWorkerPidAlive(pid) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function createDefaultHudRuntimeAdapter(paths) {
@@ -461,10 +485,35 @@ function createDefaultHudRuntimeAdapter(paths) {
       });
     },
     async pauseWorker(worker, state) {
-      return await execRuntimeSubprocess("pause-worker", paths.dotMissionDir, {
+      const res = await execRuntimeSubprocess("pause-worker", paths.dotMissionDir, {
         missionId: state?.missionId || "mission",
         activeWorker: worker,
       });
+      if (
+        res &&
+        res.ok !== false &&
+        worker &&
+        typeof worker === "object" &&
+        !(process.env.T3_ACP_MCP_NODE && String(process.env.T3_ACP_MCP_NODE).trim() && worker.childThreadId) &&
+        (typeof worker.workerPid === "number" ||
+          typeof worker.daemonStateFile === "string" ||
+          worker.runtimeTransport === "bridge-cli-subprocess")
+      ) {
+        if (
+          typeof worker.workerPid !== "number" ||
+          !isLocalWorkerPidAlive(worker.workerPid) ||
+          (worker.daemonStateFile && !fs.existsSync(worker.daemonStateFile))
+        ) {
+          return {
+            ok: false,
+            paused: false,
+            canPause: false,
+            code: "WORKER_NOT_ALIVE",
+            error: "Active worker daemon process is not alive",
+          };
+        }
+      }
+      return res;
     },
     async pauseMission(state) {
       return await execRuntimeSubprocess("pause-mission", paths.dotMissionDir, {
@@ -472,12 +521,37 @@ function createDefaultHudRuntimeAdapter(paths) {
       });
     },
     async resumeWorker(worker, payload, state) {
-      return await execRuntimeSubprocess("resume-worker", paths.dotMissionDir, {
+      const res = await execRuntimeSubprocess("resume-worker", paths.dotMissionDir, {
         missionId: state?.missionId || "mission",
         activeWorker: worker,
         trigger: payload?.trigger || "[resume the mission]",
         diagnostic: payload?.diagnostic || "",
       });
+      if (
+        res &&
+        res.ok !== false &&
+        worker &&
+        typeof worker === "object" &&
+        !(process.env.T3_ACP_MCP_NODE && String(process.env.T3_ACP_MCP_NODE).trim() && worker.childThreadId) &&
+        (typeof worker.workerPid === "number" ||
+          typeof worker.daemonStateFile === "string" ||
+          worker.runtimeTransport === "bridge-cli-subprocess")
+      ) {
+        if (
+          typeof worker.workerPid !== "number" ||
+          !isLocalWorkerPidAlive(worker.workerPid) ||
+          (worker.daemonStateFile && !fs.existsSync(worker.daemonStateFile))
+        ) {
+          return {
+            ok: false,
+            resumed: false,
+            canResume: false,
+            code: "WORKER_NOT_ALIVE",
+            error: "Active worker daemon process is not alive",
+          };
+        }
+      }
+      return res;
     },
   };
 }
@@ -1794,7 +1868,7 @@ export function createMissionHudServer({
           restoreDiskBackup(backup);
           sendJson(res, 409, {
             ok: false,
-            code: "RESUME_BLOCKED_BY_RUNTIME",
+            code: rwRes.code || "RESUME_BLOCKED_BY_RUNTIME",
             error: rwRes.error || "Runtime resumeWorker rejected resume",
             state: existingState,
           });
@@ -1825,7 +1899,7 @@ export function createMissionHudServer({
           restoreDiskBackup(backup);
           sendJson(res, 409, {
             ok: false,
-            code: "RESUME_BLOCKED_BY_RUNTIME",
+            code: smRes.code || "RESUME_BLOCKED_BY_RUNTIME",
             error: smRes.error || "Runtime startMissionRun rejected resume",
             state: existingState,
           });
