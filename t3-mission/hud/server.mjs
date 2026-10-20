@@ -1138,9 +1138,37 @@ export function createMissionHudServer({
             typeof resultObj === "object" &&
             (resultObj.ok === false ||
               resultObj.dispatched === false ||
+              resultObj.accepted === false ||
               resultObj.started === false ||
-              resultObj.canStart === false)
+              resultObj.canStart === false ||
+              resultObj.blocked === true)
         );
+
+      const applyRuntimeDaemonMetadata = (runtimeResult) => {
+        if (!runtimeResult || typeof runtimeResult !== "object" || !updatedState.activeWorker) {
+          return;
+        }
+        const lastSession =
+          Array.isArray(updatedState.sessions) && updatedState.sessions.length > 0
+            ? updatedState.sessions[updatedState.sessions.length - 1]
+            : null;
+        if (runtimeResult.daemonStateFile && typeof runtimeResult.daemonStateFile === "string") {
+          updatedState.activeWorker.daemonStateFile = runtimeResult.daemonStateFile;
+          if (selectedWorkerEntry) selectedWorkerEntry.daemonStateFile = runtimeResult.daemonStateFile;
+          if (lastSession) lastSession.daemonStateFile = runtimeResult.daemonStateFile;
+          if (pendingFeatureIdx !== -1 && featuresList[pendingFeatureIdx]) {
+            featuresList[pendingFeatureIdx].daemonStateFile = runtimeResult.daemonStateFile;
+          }
+        }
+        if (runtimeResult.daemonStatus && typeof runtimeResult.daemonStatus === "string") {
+          updatedState.activeWorker.daemonStatus = runtimeResult.daemonStatus;
+          if (selectedWorkerEntry) selectedWorkerEntry.daemonStatus = runtimeResult.daemonStatus;
+          if (lastSession) lastSession.daemonStatus = runtimeResult.daemonStatus;
+          if (pendingFeatureIdx !== -1 && featuresList[pendingFeatureIdx]) {
+            featuresList[pendingFeatureIdx].daemonStatus = runtimeResult.daemonStatus;
+          }
+        }
+      };
 
       if (selectedFeature && selectedWorkerEntry) {
         if (typeof effectiveAdapter.runFeature === "function") {
@@ -1180,6 +1208,7 @@ export function createMissionHudServer({
                 featuresList[pendingFeatureIdx][key] = runRes[key];
               }
             }
+            applyRuntimeDaemonMetadata(runRes);
             if (runRes.dispatchPending === true) {
               selectedWorkerEntry.dispatchPending = true;
               updatedState.activeWorker.dispatchPending = true;
@@ -1207,6 +1236,7 @@ export function createMissionHudServer({
             });
             return;
           }
+          applyRuntimeDaemonMetadata(startRes);
         }
       } else if (hasCustomAdapter) {
         if (typeof effectiveAdapter.startMissionRun === "function") {
@@ -1225,6 +1255,7 @@ export function createMissionHudServer({
             });
             return;
           }
+          applyRuntimeDaemonMetadata(startRes);
         } else if (typeof effectiveAdapter.runFeature === "function") {
           const runRes = await effectiveAdapter.runFeature(
             existing.activeWorker || null,
@@ -1241,6 +1272,7 @@ export function createMissionHudServer({
             });
             return;
           }
+          applyRuntimeDaemonMetadata(runRes);
         }
       }
 
@@ -1514,6 +1546,20 @@ export function createMissionHudServer({
           });
           return;
         }
+        if (pwRes?.daemonStatus && typeof pwRes.daemonStatus === "string" && updatedState.activeWorker) {
+          updatedState.activeWorker.daemonStatus = pwRes.daemonStatus;
+          if (Array.isArray(updatedState.sessions)) {
+            const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
+            updatedState.sessions = updatedState.sessions.map((s) =>
+              s.runId === updatedState.activeWorker.runId ||
+              s.workerNumber === workerNumber ||
+              (updatedState.activeWorker.featureId &&
+                s.featureId === updatedState.activeWorker.featureId)
+                ? { ...s, daemonStatus: pwRes.daemonStatus }
+                : s
+            );
+          }
+        }
       }
 
       if (typeof effectiveAdapter.pauseMission === "function") {
@@ -1531,6 +1577,20 @@ export function createMissionHudServer({
             state: existingState,
           });
           return;
+        }
+        if (pmRes?.daemonStatus && typeof pmRes.daemonStatus === "string" && updatedState.activeWorker) {
+          updatedState.activeWorker.daemonStatus = pmRes.daemonStatus;
+          if (Array.isArray(updatedState.sessions)) {
+            const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
+            updatedState.sessions = updatedState.sessions.map((s) =>
+              s.runId === updatedState.activeWorker.runId ||
+              s.workerNumber === workerNumber ||
+              (updatedState.activeWorker.featureId &&
+                s.featureId === updatedState.activeWorker.featureId)
+                ? { ...s, daemonStatus: pmRes.daemonStatus }
+                : s
+            );
+          }
         }
       }
 
@@ -1740,6 +1800,18 @@ export function createMissionHudServer({
           });
           return;
         }
+        if (rwRes?.daemonStatus && typeof rwRes.daemonStatus === "string" && updatedState.activeWorker) {
+          updatedState.activeWorker.daemonStatus = rwRes.daemonStatus;
+          if (Array.isArray(updatedState.sessions)) {
+            updatedState.sessions = updatedState.sessions.map((s) =>
+              s.runId === updatedState.activeWorker.runId ||
+              s.workerNumber === workerNumber ||
+              (featureId && s.featureId === featureId)
+                ? { ...s, daemonStatus: rwRes.daemonStatus }
+                : s
+            );
+          }
+        }
       } else if (typeof effectiveAdapter.startMissionRun === "function") {
         const smRes = await effectiveAdapter.startMissionRun(
           paths.dotMissionDir,
@@ -1758,6 +1830,18 @@ export function createMissionHudServer({
             state: existingState,
           });
           return;
+        }
+        if (smRes?.daemonStatus && typeof smRes.daemonStatus === "string" && updatedState.activeWorker) {
+          updatedState.activeWorker.daemonStatus = smRes.daemonStatus;
+          if (Array.isArray(updatedState.sessions)) {
+            updatedState.sessions = updatedState.sessions.map((s) =>
+              s.runId === updatedState.activeWorker.runId ||
+              s.workerNumber === workerNumber ||
+              (featureId && s.featureId === featureId)
+                ? { ...s, daemonStatus: smRes.daemonStatus }
+                : s
+            );
+          }
         }
       }
 
