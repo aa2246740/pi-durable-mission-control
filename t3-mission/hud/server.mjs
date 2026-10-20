@@ -366,27 +366,83 @@ function readProgressLogSync(progressLogPath) {
   }
 }
 
+function buildProgressLogEntries(existingLogs, entriesToAppend) {
+  const baseSeq =
+    existingLogs.length > 0
+      ? Math.max(...existingLogs.map((e) => (typeof e.seq === "number" ? e.seq : 0)))
+      : 0;
+  return entriesToAppend.map((entryInput, idx) => {
+    const entry = {
+      seq: baseSeq + idx + 1,
+      timestamp: entryInput.timestamp || new Date().toISOString(),
+      type: String(entryInput.type || "info"),
+      message: String(entryInput.message || ""),
+    };
+    if (entryInput.featureId !== undefined) entry.featureId = entryInput.featureId;
+    if (entryInput.workerNumber !== undefined) entry.workerNumber = entryInput.workerNumber;
+    if (entryInput.milestoneId !== undefined) entry.milestoneId = entryInput.milestoneId;
+    if (entryInput.details !== undefined) entry.details = entryInput.details;
+    return entry;
+  });
+}
+
+function writeProgressLogEntriesSync(progressLogPath, entriesToWrite) {
+  const entries = readProgressLogSync(progressLogPath);
+  const content =
+    [...entries, ...entriesToWrite].map((item) => JSON.stringify(item)).join("\n") + "\n";
+  writeFileAtomicSync(progressLogPath, content);
+  return entriesToWrite;
+}
+
 function appendProgressLogSync(progressLogPath, entryInput) {
   const entries = readProgressLogSync(progressLogPath);
-  const nextSeq =
-    entries.length > 0
-      ? Math.max(...entries.map((e) => (typeof e.seq === "number" ? e.seq : 0))) + 1
-      : 1;
-  const entry = {
-    seq: nextSeq,
-    timestamp: entryInput.timestamp || new Date().toISOString(),
-    type: String(entryInput.type || "info"),
-    message: String(entryInput.message || ""),
-  };
-  if (entryInput.featureId !== undefined) entry.featureId = entryInput.featureId;
-  if (entryInput.workerNumber !== undefined) entry.workerNumber = entryInput.workerNumber;
-  if (entryInput.milestoneId !== undefined) entry.milestoneId = entryInput.milestoneId;
-  if (entryInput.details !== undefined) entry.details = entryInput.details;
-
+  const [entry] = buildProgressLogEntries(entries, [entryInput]);
   const content =
     [...entries, entry].map((item) => JSON.stringify(item)).join("\n") + "\n";
   writeFileAtomicSync(progressLogPath, content);
   return entry;
+}
+
+function createDefaultHudRuntimeAdapter(paths) {
+  return {
+    isDefaultHudRuntime: true,
+    async runFeature(feature, slotConfig, state) {
+      const runId =
+        state?.activeWorker?.runId ||
+        slotConfig?.runId ||
+        feature?.runId ||
+        `run-${crypto.randomUUID().slice(0, 8)}`;
+      const fid = feature?.id || state?.activeWorker?.featureId || "feature";
+      return {
+        taskId: `hud-task-${fid}-${runId}`,
+        childThreadId: `hud-thread-${fid}-${runId}`,
+        childRunId: runId,
+        worktreePath: state?.repoPath || paths.repoDir,
+        delegatedBy: "hud-default-runtime",
+        dispatchPending: true,
+      };
+    },
+    async pauseWorker(worker, _state) {
+      return {
+        ok: true,
+        paused: true,
+        taskId: worker?.taskId || null,
+        childThreadId: worker?.childThreadId || null,
+      };
+    },
+    async pauseMission(_state) {
+      return { ok: true, status: "paused" };
+    },
+    async resumeWorker(worker, payload, _state) {
+      return {
+        ok: true,
+        resumed: true,
+        taskId: worker?.taskId || null,
+        childThreadId: worker?.childThreadId || null,
+        trigger: payload?.trigger || "[resume the mission]",
+      };
+    },
+  };
 }
 
 function buildUninitializedState(repoDir) {
@@ -593,8 +649,12 @@ export function createMissionHudServer({
   host = "127.0.0.1",
   onCommand,
   dispatchAdapter,
+  runtimeAdapter,
 } = {}) {
   const paths = resolveMissionPaths(missionDir || process.cwd());
+  const hasCustomAdapter = Boolean(dispatchAdapter || runtimeAdapter);
+  const effectiveAdapter =
+    dispatchAdapter || runtimeAdapter || createDefaultHudRuntimeAdapter(paths);
   const sseClients = new Set();
   let sseEventSeq = 1;
   let fsWatcher = null;
@@ -675,14 +735,9 @@ export function createMissionHudServer({
 
   reconcileStaleRunningStateOnStartup();
 
-  function loadSnapshot() {
-    const rawState = safeReadJsonSync(paths.statePath, null);
-    const rawFeatures = safeReadJsonSync(paths.featuresPath, null);
-    const rawModelSettings = safeReadJsonSync(paths.modelSettingsPath, null);
-    const progressLog = readProgressLogSync(paths.progressLogPath);
-
-    const initialized = rawState !== null;
-    const state = rawState
+  function buildInMemorySnapshot({ state: rawState, features: rawFeatures, modelSettings: rawModelSettings, progressLog }) {
+    const initialized = rawState !== null && rawState !== undefined;
+    const state = initialized
       ? {
           initialized: true,
           missionId: rawState.missionId || "mission-active",
@@ -722,12 +777,27 @@ export function createMissionHudServer({
 
     return {
       initialized,
+      executionHooksConfigured: true,
       state,
       features: featuresList,
       modelSettings,
-      progressLog,
+      progressLog: Array.isArray(progressLog) ? progressLog : [],
       catalog: BUILTIN_MODEL_CATALOG,
     };
+  }
+
+  function loadSnapshot() {
+    const rawState = safeReadJsonSync(paths.statePath, null);
+    const rawFeatures = safeReadJsonSync(paths.featuresPath, null);
+    const rawModelSettings = safeReadJsonSync(paths.modelSettingsPath, null);
+    const progressLog = readProgressLogSync(paths.progressLogPath);
+
+    return buildInMemorySnapshot({
+      state: rawState,
+      features: rawFeatures,
+      modelSettings: rawModelSettings,
+      progressLog,
+    });
   }
 
   function computeDiskSignature() {
@@ -874,7 +944,6 @@ export function createMissionHudServer({
 
   async function handleApprove(req, res) {
     const body = await readJsonBody(req);
-    fs.mkdirSync(paths.dotMissionDir, { recursive: true });
     const backup = captureDiskBackup();
     const nowIso = new Date().toISOString();
     const existing = safeReadJsonSync(paths.statePath, null) || buildUninitializedState(paths.repoDir);
@@ -888,16 +957,12 @@ export function createMissionHudServer({
       safeReadJsonSync(paths.modelSettingsPath, {}) || {},
       DEFAULT_HUD_MODEL_SETTINGS
     );
+    const existingLogs = readProgressLogSync(paths.progressLogPath);
 
     const hasActiveWorker = Boolean(existing.activeWorker);
-    const hasCustomStart =
-      !hasActiveWorker &&
-      dispatchAdapter &&
-      typeof dispatchAdapter.startMissionRun === "function";
-    const pendingFeatureIdx =
-      !hasActiveWorker && !hasCustomStart
-        ? featuresList.findIndex((f) => (f.status || "pending") === "pending")
-        : -1;
+    const pendingFeatureIdx = !hasActiveWorker
+      ? featuresList.findIndex((f) => (f.status || "pending") === "pending")
+      : -1;
 
     const nextStatus =
       body.status ||
@@ -989,7 +1054,104 @@ export function createMissionHudServer({
 
     delete updatedState.onboarding;
 
+    const entriesToAppend = [
+      {
+        timestamp: nowIso,
+        type: "plan_approved",
+        message: body.message || "Mission plan approved and started",
+        featureId: null,
+        workerNumber: null,
+      },
+    ];
+
+    if (selectedWorkerEntry) {
+      entriesToAppend.push(
+        {
+          timestamp: nowIso,
+          type: "worker_selected",
+          message: `${selectedWorkerEntry.role} #${selectedWorkerEntry.workerNumber} selected ${selectedWorkerEntry.featureTitle}`,
+          featureId: selectedWorkerEntry.featureId,
+          workerNumber: selectedWorkerEntry.workerNumber,
+        },
+        {
+          timestamp: nowIso,
+          type: "worker_started",
+          message: `${selectedWorkerEntry.role} #${selectedWorkerEntry.workerNumber} started ${selectedWorkerEntry.featureTitle}`,
+          featureId: selectedWorkerEntry.featureId,
+          workerNumber: selectedWorkerEntry.workerNumber,
+        }
+      );
+    }
+
+    const logEntries = buildProgressLogEntries(existingLogs, entriesToAppend);
+    const logEntry = logEntries[0];
+
     try {
+      const preBroadcastSnapshot = buildInMemorySnapshot({
+        state: updatedState,
+        features: featuresList,
+        modelSettings,
+        progressLog: [...existingLogs, ...logEntries],
+      });
+
+      await notifyCommand("approve", { body, logEntry, logEntries }, preBroadcastSnapshot);
+
+      if (selectedFeature && selectedWorkerEntry) {
+        if (typeof effectiveAdapter.runFeature === "function") {
+          const runRes = await effectiveAdapter.runFeature(
+            selectedFeature,
+            selectedWorkerEntry,
+            updatedState
+          );
+          if (runRes && typeof runRes === "object") {
+            const lastSession =
+              Array.isArray(updatedState.sessions) && updatedState.sessions.length > 0
+                ? updatedState.sessions[updatedState.sessions.length - 1]
+                : null;
+            for (const key of [
+              "taskId",
+              "childThreadId",
+              "childRunId",
+              "worktreePath",
+              "delegatedBy",
+            ]) {
+              if (runRes[key] !== undefined) {
+                selectedWorkerEntry[key] = runRes[key];
+                updatedState.activeWorker[key] = runRes[key];
+                if (lastSession) lastSession[key] = runRes[key];
+                featuresList[pendingFeatureIdx][key] = runRes[key];
+              }
+            }
+            if (runRes.dispatchPending !== undefined) {
+              selectedWorkerEntry.dispatchPending = Boolean(runRes.dispatchPending);
+              updatedState.activeWorker.dispatchPending = Boolean(runRes.dispatchPending);
+              if (lastSession) lastSession.dispatchPending = Boolean(runRes.dispatchPending);
+            } else if (hasCustomAdapter && runRes.dispatchPending === undefined) {
+              delete selectedWorkerEntry.dispatchPending;
+              delete updatedState.activeWorker.dispatchPending;
+              if (lastSession) delete lastSession.dispatchPending;
+            }
+          }
+        }
+        if (hasCustomAdapter && typeof effectiveAdapter.startMissionRun === "function") {
+          await effectiveAdapter.startMissionRun(
+            paths.dotMissionDir,
+            { feature: selectedFeature, state: updatedState },
+            effectiveAdapter
+          );
+        }
+      } else if (
+        !hasActiveWorker &&
+        hasCustomAdapter &&
+        typeof effectiveAdapter.startMissionRun === "function"
+      ) {
+        await effectiveAdapter.startMissionRun(
+          paths.dotMissionDir,
+          { feature: null, state: updatedState },
+          effectiveAdapter
+        );
+      }
+
       if (selectedFeature) {
         const nextFeaturesDoc = Array.isArray(rawFeatures)
           ? { features: featuresList, updatedAt: nowIso }
@@ -1002,43 +1164,15 @@ export function createMissionHudServer({
       }
 
       writeJsonAtomicSync(paths.statePath, updatedState);
-      const logEntry = appendProgressLogSync(paths.progressLogPath, {
-        timestamp: nowIso,
-        type: "plan_approved",
-        message: body.message || "Mission plan approved and started",
-        featureId: null,
-        workerNumber: null,
-      });
-
-      if (selectedWorkerEntry) {
-        appendProgressLogSync(paths.progressLogPath, {
-          timestamp: nowIso,
-          type: "worker_selected",
-          message: `${selectedWorkerEntry.role} #${selectedWorkerEntry.workerNumber} selected ${selectedWorkerEntry.featureTitle}`,
-          featureId: selectedWorkerEntry.featureId,
-          workerNumber: selectedWorkerEntry.workerNumber,
-        });
-        appendProgressLogSync(paths.progressLogPath, {
-          timestamp: nowIso,
-          type: "worker_started",
-          message: `${selectedWorkerEntry.role} #${selectedWorkerEntry.workerNumber} started ${selectedWorkerEntry.featureTitle}`,
-          featureId: selectedWorkerEntry.featureId,
-          workerNumber: selectedWorkerEntry.workerNumber,
-        });
-      }
-
-      if (hasCustomStart) {
-        await dispatchAdapter.startMissionRun(paths.dotMissionDir, {}, dispatchAdapter);
-      }
+      writeProgressLogEntriesSync(paths.progressLogPath, logEntries);
 
       lastDiskSignature = computeDiskSignature();
-      const preBroadcastSnapshot = loadSnapshot();
-      await notifyCommand("approve", { body, logEntry }, preBroadcastSnapshot);
       const snapshot = broadcastSnapshot("plan_approved");
       sendJson(res, 200, {
         ok: true,
         state: snapshot ? snapshot.state : updatedState,
         logEntry,
+        logEntries,
         snapshot,
       });
     } catch (err) {
@@ -1049,7 +1183,6 @@ export function createMissionHudServer({
 
   async function handleModelSlots(req, res) {
     const body = await readJsonBody(req);
-    fs.mkdirSync(paths.dotMissionDir, { recursive: true });
     const backup = captureDiskBackup();
     const nowIso = new Date().toISOString();
 
@@ -1057,6 +1190,8 @@ export function createMissionHudServer({
       safeReadJsonSync(paths.modelSettingsPath, {}) || {},
       DEFAULT_HUD_MODEL_SETTINGS
     );
+    const rawFeatures = safeReadJsonSync(paths.featuresPath, null);
+    const existingLogs = readProgressLogSync(paths.progressLogPath);
 
     const buildSlotPatch = (prevSlot, incomingRaw) => {
       if (typeof incomingRaw === "string") {
@@ -1151,20 +1286,31 @@ export function createMissionHudServer({
         `${role}=${updatedSettings[role].model} (${updatedSettings[role].reasoningEffort}/${updatedSettings[role].effort})`
     );
 
-    try {
-      writeJsonAtomicSync(paths.modelSettingsPath, updatedSettings);
-      writeJsonAtomicSync(paths.statePath, updatedState);
-
-      const logEntry = appendProgressLogSync(paths.progressLogPath, {
+    const logEntries = buildProgressLogEntries(existingLogs, [
+      {
         timestamp: nowIso,
         type: "model_slots_updated",
         message: `Model slots updated: ${summaryParts.join(", ")}`,
         details: { updatedSettings, changedRoles },
+      },
+    ]);
+    const logEntry = logEntries[0];
+
+    try {
+      const preBroadcastSnapshot = buildInMemorySnapshot({
+        state: updatedState,
+        features: rawFeatures,
+        modelSettings: updatedSettings,
+        progressLog: [...existingLogs, ...logEntries],
       });
 
-      lastDiskSignature = computeDiskSignature();
-      const preBroadcastSnapshot = loadSnapshot();
       await notifyCommand("model-slots", { body, updatedSettings, logEntry }, preBroadcastSnapshot);
+
+      writeJsonAtomicSync(paths.modelSettingsPath, updatedSettings);
+      writeJsonAtomicSync(paths.statePath, updatedState);
+      writeProgressLogEntriesSync(paths.progressLogPath, logEntries);
+
+      lastDiskSignature = computeDiskSignature();
       const snapshot = broadcastSnapshot("model_slots_updated");
       sendJson(res, 200, {
         ok: true,
@@ -1181,13 +1327,16 @@ export function createMissionHudServer({
 
   async function handlePause(req, res) {
     const body = await readJsonBody(req);
-    fs.mkdirSync(paths.dotMissionDir, { recursive: true });
     const backup = captureDiskBackup();
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
     const existingState =
       safeReadJsonSync(paths.statePath, null) || buildUninitializedState(paths.repoDir);
+    const rawFeatures = safeReadJsonSync(paths.featuresPath, null);
+    const rawModelSettings = safeReadJsonSync(paths.modelSettingsPath, null);
+    const existingLogs = readProgressLogSync(paths.progressLogPath);
+
     const updatedState = structuredClone(existingState);
     updatedState.initialized = true;
 
@@ -1203,57 +1352,77 @@ export function createMissionHudServer({
     updatedState.revision =
       (typeof updatedState.revision === "number" ? updatedState.revision : 0) + 1;
 
-    try {
-      const logEntries = [];
-      if (updatedState.activeWorker) {
-        const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
-        const featureTitle =
-          updatedState.activeWorker.featureTitle ||
-          updatedState.activeWorker.title ||
-          updatedState.activeWorker.featureId ||
-          "M2 material test gaps";
-        updatedState.activeWorker = {
-          ...updatedState.activeWorker,
-          status: "paused",
-          pausedAt: nowIso,
-        };
+    const entriesToAppend = [];
+    if (updatedState.activeWorker) {
+      const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
+      const featureTitle =
+        updatedState.activeWorker.featureTitle ||
+        updatedState.activeWorker.title ||
+        updatedState.activeWorker.featureId ||
+        "M2 material test gaps";
+      updatedState.activeWorker = {
+        ...updatedState.activeWorker,
+        status: "paused",
+        pausedAt: nowIso,
+      };
 
-        if (Array.isArray(updatedState.sessions)) {
-          updatedState.sessions = updatedState.sessions.map((s) =>
-            s.runId === updatedState.activeWorker.runId ||
-            s.workerNumber === workerNumber ||
-            (updatedState.activeWorker.featureId &&
-              s.featureId === updatedState.activeWorker.featureId)
-              ? { ...s, status: "paused", pausedAt: nowIso }
-              : s
-          );
-        }
-
-        logEntries.push(
-          appendProgressLogSync(paths.progressLogPath, {
-            timestamp: nowIso,
-            type: "worker_paused",
-            message: `Worker #${workerNumber} paused ${featureTitle}`,
-            featureId: updatedState.activeWorker.featureId ?? null,
-            workerNumber,
-          })
+      if (Array.isArray(updatedState.sessions)) {
+        updatedState.sessions = updatedState.sessions.map((s) =>
+          s.runId === updatedState.activeWorker.runId ||
+          s.workerNumber === workerNumber ||
+          (updatedState.activeWorker.featureId &&
+            s.featureId === updatedState.activeWorker.featureId)
+            ? { ...s, status: "paused", pausedAt: nowIso }
+            : s
         );
       }
 
-      logEntries.push(
-        appendProgressLogSync(paths.progressLogPath, {
-          timestamp: nowIso,
-          type: "mission_paused",
-          message: "Mission paused",
-          featureId: updatedState.activeWorker?.featureId ?? null,
-          workerNumber: updatedState.activeWorker?.workerNumber ?? null,
-        })
-      );
+      entriesToAppend.push({
+        timestamp: nowIso,
+        type: "worker_paused",
+        message: `Worker #${workerNumber} paused ${featureTitle}`,
+        featureId: updatedState.activeWorker.featureId ?? null,
+        workerNumber,
+      });
+    }
 
+    entriesToAppend.push({
+      timestamp: nowIso,
+      type: "mission_paused",
+      message: "Mission paused",
+      featureId: updatedState.activeWorker?.featureId ?? null,
+      workerNumber: updatedState.activeWorker?.workerNumber ?? null,
+    });
+
+    const logEntries = buildProgressLogEntries(existingLogs, entriesToAppend);
+
+    try {
+      const preBroadcastSnapshot = buildInMemorySnapshot({
+        state: updatedState,
+        features: rawFeatures,
+        modelSettings: rawModelSettings,
+        progressLog: [...existingLogs, ...logEntries],
+      });
+
+      await notifyCommand("pause", { body, logEntries }, preBroadcastSnapshot);
+
+      if (existingState.activeWorker && typeof effectiveAdapter.pauseWorker === "function") {
+        const pwRes = await effectiveAdapter.pauseWorker(existingState.activeWorker, existingState);
+        if (pwRes && (pwRes.paused === false || pwRes.ok === false)) {
+          throw new Error(pwRes.error || "Runtime pauseWorker rejected");
+        }
+      }
+
+      if (typeof effectiveAdapter.pauseMission === "function") {
+        const pmRes = await effectiveAdapter.pauseMission(existingState);
+        if (pmRes && (pmRes.paused === false || pmRes.ok === false)) {
+          throw new Error(pmRes.error || "Runtime pauseMission rejected");
+        }
+      }
+
+      writeProgressLogEntriesSync(paths.progressLogPath, logEntries);
       writeJsonAtomicSync(paths.statePath, updatedState);
       lastDiskSignature = computeDiskSignature();
-      const preBroadcastSnapshot = loadSnapshot();
-      await notifyCommand("pause", { body, logEntries }, preBroadcastSnapshot);
       const snapshot = broadcastSnapshot("mission_paused");
       sendJson(res, 200, {
         ok: true,
@@ -1269,7 +1438,6 @@ export function createMissionHudServer({
 
   async function handleResume(req, res) {
     const body = await readJsonBody(req);
-    fs.mkdirSync(paths.dotMissionDir, { recursive: true });
     const nowIso = new Date().toISOString();
 
     const existingState = safeReadJsonSync(paths.statePath, null);
@@ -1349,6 +1517,9 @@ export function createMissionHudServer({
     }
 
     const diagnostic = body.diagnostic || gitCheck.diagnostic;
+    const rawFeatures = safeReadJsonSync(paths.featuresPath, null);
+    const rawModelSettings = safeReadJsonSync(paths.modelSettingsPath, null);
+    const existingLogs = readProgressLogSync(paths.progressLogPath);
 
     const updatedState = structuredClone(existingState);
     updatedState.initialized = true;
@@ -1387,41 +1558,43 @@ export function createMissionHudServer({
         ? `Resume M2 fixes: ${featureId} (${featureTitle})`
         : "Resume mission execution");
 
+    const entriesToAppend = [
+      {
+        timestamp: nowIso,
+        type: "mission_resumed",
+        message: "Mission resumed",
+        featureId: updatedState.activeWorker ? featureId : null,
+        workerNumber,
+        details: {
+          trigger: "[resume the mission]",
+          diagnostic,
+          gitCheck,
+        },
+      },
+      {
+        timestamp: nowIso,
+        type: "run_started",
+        message: `Run started: ${resumeSummary}`,
+        featureId: updatedState.activeWorker ? featureId : null,
+        workerNumber,
+        details: {
+          trigger: "[resume the mission]",
+          diagnostic,
+        },
+      },
+    ];
+
+    const logEntries = buildProgressLogEntries(existingLogs, entriesToAppend);
     const backup = captureDiskBackup();
+
     try {
-      const logEntries = [];
-      logEntries.push(
-        appendProgressLogSync(paths.progressLogPath, {
-          timestamp: nowIso,
-          type: "mission_resumed",
-          message: "Mission resumed",
-          featureId: updatedState.activeWorker ? featureId : null,
-          workerNumber,
-          details: {
-            trigger: "[resume the mission]",
-            diagnostic,
-            gitCheck,
-          },
-        })
-      );
+      const preBroadcastSnapshot = buildInMemorySnapshot({
+        state: updatedState,
+        features: rawFeatures,
+        modelSettings: rawModelSettings,
+        progressLog: [...existingLogs, ...logEntries],
+      });
 
-      logEntries.push(
-        appendProgressLogSync(paths.progressLogPath, {
-          timestamp: nowIso,
-          type: "run_started",
-          message: `Run started: ${resumeSummary}`,
-          featureId: updatedState.activeWorker ? featureId : null,
-          workerNumber,
-          details: {
-            trigger: "[resume the mission]",
-            diagnostic,
-          },
-        })
-      );
-
-      writeJsonAtomicSync(paths.statePath, updatedState);
-      lastDiskSignature = computeDiskSignature();
-      const preBroadcastSnapshot = loadSnapshot();
       await notifyCommand(
         "resume",
         {
@@ -1433,6 +1606,50 @@ export function createMissionHudServer({
         },
         preBroadcastSnapshot
       );
+
+      if (existingState.activeWorker && typeof effectiveAdapter.resumeWorker === "function") {
+        const rwRes = await effectiveAdapter.resumeWorker(
+          existingState.activeWorker,
+          { trigger: "[resume the mission]", diagnostic, gitCheck, body },
+          existingState
+        );
+        if (
+          rwRes &&
+          (rwRes.resumed === false || rwRes.canResume === false || rwRes.ok === false)
+        ) {
+          restoreDiskBackup(backup);
+          sendJson(res, 409, {
+            ok: false,
+            code: "RESUME_BLOCKED_BY_RUNTIME",
+            error: rwRes.error || "Runtime resumeWorker rejected resume",
+            state: existingState,
+          });
+          return;
+        }
+      } else if (typeof effectiveAdapter.startMissionRun === "function") {
+        const smRes = await effectiveAdapter.startMissionRun(
+          paths.dotMissionDir,
+          { trigger: "[resume the mission]", diagnostic, gitCheck, body },
+          effectiveAdapter
+        );
+        if (
+          smRes &&
+          (smRes.resumed === false || smRes.canResume === false || smRes.ok === false)
+        ) {
+          restoreDiskBackup(backup);
+          sendJson(res, 409, {
+            ok: false,
+            code: "RESUME_BLOCKED_BY_RUNTIME",
+            error: smRes.error || "Runtime startMissionRun rejected resume",
+            state: existingState,
+          });
+          return;
+        }
+      }
+
+      writeProgressLogEntriesSync(paths.progressLogPath, logEntries);
+      writeJsonAtomicSync(paths.statePath, updatedState);
+      lastDiskSignature = computeDiskSignature();
       const snapshot = broadcastSnapshot("mission_resumed");
       sendJson(res, 200, {
         ok: true,
@@ -1620,6 +1837,9 @@ export function createMissionHudServer({
     missionDir: paths.repoDir,
     dotMissionDir: paths.dotMissionDir,
     paths,
+    executionHooksConfigured: true,
+    dispatchAdapter: effectiveAdapter,
+    runtimeAdapter: effectiveAdapter,
     get port() {
       const addr = server.address();
       return typeof addr === "object" && addr ? addr.port : port;

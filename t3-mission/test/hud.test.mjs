@@ -739,7 +739,7 @@ test("I-04, I-07, I-03, F11, F04: Startup reconciliation, real Git dirty diagnos
 });
 
 test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature selection, onCommand rollback, missing worktree preflight, retry session handoff isolation, and symlink CLI guard", async (t) => {
-  // --- P14: Default HUD approve selects first pending feature with dispatchPending=true ---
+  // --- P14: Default HUD approve selects first pending feature with dispatchPending=true and default runtime metadata ---
   const p14Dir = createTempMissionWorkspace();
   execFileSync("git", ["init", "-q", p14Dir]);
   execFileSync("git", ["-C", p14Dir, "config", "user.name", "Test"]);
@@ -794,6 +794,9 @@ test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature 
     fs.rmSync(p14Dir, { recursive: true, force: true });
   });
 
+  assert.equal(srv14.executionHooksConfigured, true);
+  assert.ok(srv14.dispatchAdapter);
+
   const approveRes = await fetch(`${srv14.url}/api/mission/approve`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -818,6 +821,11 @@ test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature 
   assert.equal(afterApproveState.activeWorker.featureId, "f1");
   assert.equal(afterApproveState.activeWorker.status, "running");
   assert.equal(afterApproveState.activeWorker.dispatchPending, true);
+  assert.ok(afterApproveState.activeWorker.taskId);
+  assert.ok(afterApproveState.activeWorker.childThreadId);
+  assert.ok(afterApproveState.activeWorker.childRunId);
+  assert.equal(afterApproveState.activeWorker.worktreePath, p14Dir);
+  assert.equal(afterApproveState.activeWorker.delegatedBy, "hud-default-runtime");
   assert.deepEqual(
     afterApproveFeatures.map((f) => f.status),
     ["running", "pending"]
@@ -1022,4 +1030,278 @@ test("Round 2 Scrutiny Fixes (P14, P15, P16, P18, P20): Default approve feature 
   assert.equal(p20Info.ok, true);
   const p20Res = await fetch(`${p20Info.url}/api/mission/state`);
   assert.equal(p20Res.status, 200);
+});
+
+test("Round 3 Scrutiny Fixes (P22, P23): Runtime adapter wiring on pause/resume/approve and pre-commit onCommand hook execution order", async (t) => {
+  // --- P22: dispatchAdapter pauseWorker / pauseMission / resumeWorker wired and rollback on error ---
+  const p22Dir = createTempMissionWorkspace();
+  execFileSync("git", ["init", "-q", p22Dir]);
+  execFileSync("git", ["-C", p22Dir, "config", "user.name", "Test"]);
+  execFileSync("git", ["-C", p22Dir, "config", "user.email", "test@example.invalid"]);
+  fs.writeFileSync(path.join(p22Dir, ".gitignore"), ".mission/\n");
+  fs.writeFileSync(path.join(p22Dir, "file.txt"), "baseline\n");
+  execFileSync("git", ["-C", p22Dir, "add", "."]);
+  execFileSync("git", ["-C", p22Dir, "commit", "-qm", "fixture"]);
+
+  const p22DotMission = path.join(p22Dir, ".mission");
+  fs.mkdirSync(p22DotMission, { recursive: true });
+  fs.writeFileSync(
+    path.join(p22DotMission, "state.json"),
+    JSON.stringify(
+      {
+        missionId: "mission-p22",
+        title: "P22 Runtime Adapter Wiring",
+        repoPath: p22Dir,
+        status: "running",
+        planAccepted: true,
+        revision: 2,
+        elapsedMs: 0,
+        lastStartedAt: new Date().toISOString(),
+        milestones: [{ id: "m1", title: "Milestone one", ordinal: 1 }],
+        assertions: [],
+        activeWorker: {
+          runId: "run-p22",
+          workerNumber: 1,
+          featureId: "f1",
+          featureTitle: "First",
+          milestoneId: "m1",
+          status: "running",
+          taskId: "runtime-task",
+          childThreadId: "runtime-child",
+          worktreePath: p22Dir,
+        },
+        sessions: [
+          {
+            runId: "run-p22",
+            workerNumber: 1,
+            featureId: "f1",
+            featureTitle: "First",
+            milestoneId: "m1",
+            status: "running",
+            taskId: "runtime-task",
+            childThreadId: "runtime-child",
+            worktreePath: p22Dir,
+          },
+        ],
+      },
+      null,
+      2
+    ) + "\n"
+  );
+
+  const calls = [];
+  const dispatchAdapter = {
+    startMissionRun: async () => {
+      calls.push("startMissionRun");
+    },
+    runFeature: async () => {
+      calls.push("runFeature");
+    },
+    pauseMission: async () => {
+      calls.push("pauseMission");
+      throw new Error("Runtime pause unavailable");
+    },
+    pauseWorker: async () => {
+      calls.push("pauseWorker");
+      throw new Error("Runtime pause unavailable");
+    },
+    resumeWorker: async () => {
+      calls.push("resumeWorker");
+      throw new Error("Runtime resume unavailable");
+    },
+  };
+
+  // Re-write state as running after server init (since server startup reconciles stale running state)
+  const srv22 = await createMissionHudServer({
+    missionDir: p22Dir,
+    port: 0,
+    dispatchAdapter,
+  });
+  t.after(async () => {
+    await srv22.close();
+    fs.rmSync(p22Dir, { recursive: true, force: true });
+  });
+
+  const runningState = JSON.parse(
+    fs.readFileSync(path.join(p22DotMission, "state.json"), "utf8")
+  );
+  runningState.status = "running";
+  runningState.activeWorker.status = "running";
+  fs.writeFileSync(
+    path.join(p22DotMission, "state.json"),
+    JSON.stringify(runningState, null, 2) + "\n"
+  );
+
+  const pauseRes = await fetch(`${srv22.url}/api/mission/pause`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(pauseRes.status, 500);
+  assert.ok(calls.includes("pauseWorker"), "Expected pauseWorker to be invoked");
+  const stateAfterFailedPause = JSON.parse(
+    fs.readFileSync(path.join(p22DotMission, "state.json"), "utf8")
+  );
+  assert.equal(stateAfterFailedPause.status, "running");
+
+  // Set state to paused and test resumeWorker failure
+  runningState.status = "paused";
+  runningState.activeWorker.status = "paused";
+  fs.writeFileSync(
+    path.join(p22DotMission, "state.json"),
+    JSON.stringify(runningState, null, 2) + "\n"
+  );
+
+  const resumeRes = await fetch(`${srv22.url}/api/mission/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(resumeRes.status, 500);
+  assert.ok(calls.includes("resumeWorker"), "Expected resumeWorker to be invoked");
+  const stateAfterFailedResume = JSON.parse(
+    fs.readFileSync(path.join(p22DotMission, "state.json"), "utf8")
+  );
+  assert.equal(stateAfterFailedResume.status, "paused");
+
+  // --- P23: Across all 4 routes (approve, model-slots, pause, resume), onCommand runs BEFORE disk writes ---
+  for (const route of ["approve", "model-slots", "pause", "resume"]) {
+    const p23Dir = createTempMissionWorkspace();
+    execFileSync("git", ["init", "-q", p23Dir]);
+    execFileSync("git", ["-C", p23Dir, "config", "user.name", "Test"]);
+    execFileSync("git", ["-C", p23Dir, "config", "user.email", "test@example.invalid"]);
+    fs.writeFileSync(path.join(p23Dir, ".gitignore"), ".mission/\n");
+    fs.writeFileSync(path.join(p23Dir, "file.txt"), "baseline\n");
+    execFileSync("git", ["-C", p23Dir, "add", "."]);
+    execFileSync("git", ["-C", p23Dir, "commit", "-qm", "fixture"]);
+
+    const dotM = path.join(p23Dir, ".mission");
+    fs.mkdirSync(dotM, { recursive: true });
+
+    const initialStatus =
+      route === "approve"
+        ? "awaiting_input"
+        : route === "resume"
+          ? "paused"
+          : "running";
+
+    fs.writeFileSync(
+      path.join(dotM, "state.json"),
+      JSON.stringify(
+        {
+          missionId: `mission-p23-${route}`,
+          title: `P23 ${route}`,
+          repoPath: p23Dir,
+          status: initialStatus,
+          planAccepted: route !== "approve",
+          revision: 1,
+          elapsedMs: 0,
+          lastStartedAt: initialStatus === "running" ? new Date().toISOString() : null,
+          milestones: [{ id: "m1", title: "M1", ordinal: 1 }],
+          assertions: [],
+          activeWorker:
+            route === "approve"
+              ? null
+              : {
+                  runId: "run-p23",
+                  workerNumber: 1,
+                  featureId: "f1",
+                  featureTitle: "First",
+                  milestoneId: "m1",
+                  status: initialStatus === "paused" ? "paused" : "running",
+                  taskId: "t1",
+                  childThreadId: "c1",
+                  worktreePath: p23Dir,
+                },
+          sessions: [],
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(dotM, "features.json"),
+      JSON.stringify(
+        {
+          features: [
+            {
+              id: "f1",
+              title: "First",
+              milestoneId: "m1",
+              status: route === "approve" ? "pending" : "running",
+              attempts: route === "approve" ? 0 : 1,
+            },
+          ],
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(dotM, "model-settings.json"),
+      JSON.stringify({ validator: { model: "grok-4.7", effort: 3 } }, null, 2) + "\n"
+    );
+    fs.writeFileSync(
+      path.join(dotM, "progress_log.jsonl"),
+      JSON.stringify({ seq: 1, timestamp: new Date().toISOString(), type: "init", message: "init" }) +
+        "\n"
+    );
+
+    const snap = () => ({
+      state: fs.readFileSync(path.join(dotM, "state.json"), "utf8"),
+      features: fs.readFileSync(path.join(dotM, "features.json"), "utf8"),
+      modelSettings: fs.readFileSync(path.join(dotM, "model-settings.json"), "utf8"),
+      progressLog: fs.readFileSync(path.join(dotM, "progress_log.jsonl"), "utf8"),
+    });
+
+    let before;
+    let during = null;
+    const srv23 = await createMissionHudServer({
+      missionDir: p23Dir,
+      port: 0,
+      onCommand: async ({ type }) => {
+        const currentState = JSON.parse(
+          fs.readFileSync(path.join(dotM, "state.json"), "utf8")
+        );
+        during = {
+          type,
+          diskStatus: currentState.status,
+          diskAlreadyChanged: JSON.stringify(snap()) !== JSON.stringify(before),
+        };
+        throw new Error(`Independent ${route} hook rejection`);
+      },
+    });
+
+    // If route is pause or model-slots, restore running state after startup reconciliation
+    if (initialStatus === "running") {
+      const st = JSON.parse(fs.readFileSync(path.join(dotM, "state.json"), "utf8"));
+      st.status = "running";
+      if (st.activeWorker) st.activeWorker.status = "running";
+      fs.writeFileSync(path.join(dotM, "state.json"), JSON.stringify(st, null, 2) + "\n");
+    }
+
+    before = snap();
+    const res = await fetch(`${srv23.url}/api/mission/${route}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        route === "model-slots" ? { slot: "validator", effort: 2 } : {}
+      ),
+    });
+    assert.equal(res.status, 500, `Expected 500 for ${route}`);
+    const after = snap();
+
+    assert.ok(during, `Expected onCommand to run for ${route}`);
+    assert.equal(during.type, route);
+    assert.equal(
+      during.diskAlreadyChanged,
+      false,
+      `Expected diskAlreadyChanged === false during onCommand for ${route}`
+    );
+    assert.deepEqual(after, before, `Expected disk files unchanged after failed ${route}`);
+
+    await srv23.close();
+    fs.rmSync(p23Dir, { recursive: true, force: true });
+  }
 });
