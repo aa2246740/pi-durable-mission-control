@@ -4,10 +4,13 @@ export {
   FEATURE_KINDS,
   DISMISSAL_TYPES,
   ASSERTION_STATUSES,
+  EFFORT_LEVEL_TO_REASONING,
+  REASONING_TO_EFFORT_LEVEL,
   DEFAULT_MODEL_SETTINGS,
   MissionKernelError,
   createMissionId,
   createRunId,
+  normalizeSlotConfig,
   normalizeModelSettings,
   normalizeMilestone,
   inferFeatureKind,
@@ -48,4 +51,9 @@ export {
   endFeatureRun,
 } from "./tools.mjs";
 
-export { resolveFeatureSlot, startMissionRun } from "./runner.mjs";
+export {
+  resolveFeatureSlot,
+  extractDelegationIdentity,
+  dispatchFeatureToWorker,
+  startMissionRun,
+} from "./runner.mjs";

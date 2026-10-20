@@ -84,16 +84,26 @@ export function loadState(missionDir) {
       `Mission state not found at ${statePath}`
     );
   }
+  if (!Array.isArray(state.pendingHandoffItems)) {
+    state.pendingHandoffItems = [];
+  }
   return state;
 }
 
 export function tryLoadState(missionDir) {
   const { statePath } = getMissionPaths(missionDir);
-  return readJsonSync(statePath, null);
+  const state = readJsonSync(statePath, null);
+  if (state && !Array.isArray(state.pendingHandoffItems)) {
+    state.pendingHandoffItems = [];
+  }
+  return state;
 }
 
 export function saveState(missionDir, state) {
   const { statePath } = ensureMissionDir(missionDir);
+  if (state && !Array.isArray(state.pendingHandoffItems)) {
+    state.pendingHandoffItems = [];
+  }
   writeJsonAtomicSync(statePath, state);
   return state;
 }
@@ -104,6 +114,12 @@ export function loadFeaturesDoc(missionDir) {
   if (!doc) {
     return {
       features: [],
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (Array.isArray(doc)) {
+    return {
+      features: doc.map((f, i) => normalizeFeature(f, i)),
       updatedAt: new Date().toISOString(),
     };
   }

@@ -17,6 +17,7 @@ import {
   loadState,
   loadFeaturesDoc,
   loadModelSettings,
+  normalizeSlotConfig,
   readProgressLog,
   saveState,
   getMissionPaths,
@@ -69,6 +70,7 @@ test("VAL-KERNEL-001: proposeMission initializes 4 files, enforces planAccepted 
 
   assert.equal(proposed.state.status, "awaiting_input");
   assert.equal(proposed.state.planAccepted, false);
+  assert.deepEqual(proposed.state.pendingHandoffItems, []);
   assert.equal(proposed.modelSettings.validator.model, "gpt-6.1-sol");
 
   const logsAfterPropose = readProgressLog(projectDir);
@@ -546,6 +548,7 @@ test("Dynamic repair feature expansion (18/24 -> 18/27) via updateMissionFeature
   assert.equal(docAt18.features.length, 24);
   assert.equal(stateAt18.status, "orchestrator_turn");
   assert.equal(stateAt18.lastHandoffNeedsAttention, true);
+  assert.equal(stateAt18.pendingHandoffItems.length, 3);
 
   // Orchestrator dynamically appends 3 repair features (18/24 -> 18/27)
   const updated = updateMissionFeatures(projectDir, {
@@ -581,6 +584,7 @@ test("Dynamic repair feature expansion (18/24 -> 18/27) via updateMissionFeature
   assert.equal(updated.features.length, 27);
   // Updating features automatically releases the handoff attention gate!
   assert.equal(updated.state.lastHandoffNeedsAttention, false);
+  assert.deepEqual(updated.state.pendingHandoffItems, []);
 });
 
 test("Max attempts enforcement and partial/failure retry behavior", async (t) => {
@@ -685,4 +689,343 @@ test("Max attempts enforcement and partial/failure retry behavior", async (t) =>
   );
   assert.equal(s4.status, "completed");
   assert.equal(loadFeaturesDoc(projectDir).features[0].attempts, 3);
+});
+
+test("F01 & F02: async delegation identity persistence, role assignment, serial concurrency guard, and blocked/async resume", async (t) => {
+  const projectDir = makeTempProjectDir(t);
+
+  proposeMission(projectDir, {
+    title: "Async Delegation & Serial Guard",
+    repoPath: projectDir,
+    milestones: [{ id: "m1", title: "Milestone 1", ordinal: 1 }],
+    assertions: [{ id: "VAL-1", description: "Async serial check", milestoneId: "m1" }],
+    features: [
+      { id: "f1", milestoneId: "m1", title: "Feature 1", kind: "implementation" },
+      { id: "f2", milestoneId: "m1", title: "Feature 2", kind: "explorer" },
+    ],
+    modelSettings: {
+      skipScrutiny: true,
+      skipUserTesting: true,
+    },
+  });
+  approveMissionPlan(projectDir);
+
+  let runCalls = 0;
+  const adapter = {
+    async runFeature(feature) {
+      runCalls += 1;
+      return {
+        taskId: `task-${feature.id}-${runCalls}`,
+        childThreadId: `thread-${feature.id}-${runCalls}`,
+        childRunId: `crun-${feature.id}-${runCalls}`,
+        worktreePath: `/tmp/worktree-${feature.id}`,
+      };
+    },
+  };
+
+  // First startMissionRun dispatches f1 asynchronously and returns immediately while f1 is running
+  const s1 = await startMissionRun(projectDir, {}, adapter);
+  assert.equal(runCalls, 1);
+  assert.equal(s1.status, "running");
+  assert.equal(s1.activeWorker.featureId, "f1");
+  assert.equal(s1.activeWorker.role, "Worker");
+  assert.equal(s1.activeWorker.taskId, "task-f1-1");
+  assert.equal(s1.activeWorker.childThreadId, "thread-f1-1");
+  assert.equal(s1.activeWorker.childRunId, "crun-f1-1");
+  assert.equal(s1.activeWorker.worktreePath, "/tmp/worktree-f1");
+  assert.equal(s1.sessions[0].taskId, "task-f1-1");
+  assert.equal(s1.sessions[0].childThreadId, "thread-f1-1");
+  assert.equal(s1.sessions[0].role, "Worker");
+
+  const featuresAfterF1 = loadFeaturesDoc(projectDir).features;
+  assert.equal(featuresAfterF1[0].status, "running");
+  assert.equal(featuresAfterF1[0].taskId, "task-f1-1");
+  assert.equal(featuresAfterF1[0].childThreadId, "thread-f1-1");
+  assert.equal(featuresAfterF1[0].worktreePath, "/tmp/worktree-f1");
+  assert.equal(featuresAfterF1[1].status, "pending");
+
+  // Second startMissionRun while f1 is running MUST NOT dispatch f2 (F02 serialStart guard)
+  const s2 = await startMissionRun(projectDir, {}, adapter);
+  assert.equal(runCalls, 1);
+  assert.equal(s2.activeWorker.featureId, "f1");
+  assert.equal(loadFeaturesDoc(projectDir).features[1].status, "pending");
+
+  // Reconcile to paused, then test blocked resume (F02 blockedResume)
+  reconcileMissionOnLoad(projectDir);
+  const blockedState = await startMissionRun(
+    projectDir,
+    {},
+    {
+      async resumeWorker() {
+        return {
+          resumed: false,
+          action: "blocked_by_conflicts",
+          status: "blocked_by_conflicts",
+          canResume: false,
+        };
+      },
+      async runFeature() {
+        assert.fail("Must not dispatch pending feature when resume is blocked");
+      },
+    }
+  );
+  assert.equal(blockedState.status, "paused");
+  assert.equal(blockedState.activeWorker.status, "paused");
+  assert.equal(blockedState.activeWorker.featureId, "f1");
+  assert.equal(loadFeaturesDoc(projectDir).features[1].status, "pending");
+
+  // Now test resumePending flag (I-06) + async resume without handoff (I-05)
+  const stPending = loadState(projectDir);
+  stPending.status = "running";
+  stPending.activeWorker.status = "running";
+  stPending.activeWorker.resumePending = true;
+  saveState(projectDir, stPending);
+
+  let resumeCalled = 0;
+  const asyncResumedState = await startMissionRun(
+    projectDir,
+    {},
+    {
+      async resumeWorker(activeWorker) {
+        resumeCalled += 1;
+        return {
+          resumed: true,
+          taskId: activeWorker.taskId,
+          childThreadId: activeWorker.childThreadId,
+          childRunId: "crun-f1-resumed",
+          worktreePath: activeWorker.worktreePath,
+        };
+      },
+      async runFeature() {
+        assert.fail("Must not fall through to dispatch f2 after async resume of f1");
+      },
+    }
+  );
+
+  assert.equal(resumeCalled, 1);
+  assert.equal(asyncResumedState.status, "running");
+  assert.equal(asyncResumedState.activeWorker.featureId, "f1");
+  assert.equal(asyncResumedState.activeWorker.status, "running");
+  assert.equal(asyncResumedState.activeWorker.resumePending, undefined);
+  assert.equal(asyncResumedState.activeWorker.childRunId, "crun-f1-resumed");
+  assert.equal(loadFeaturesDoc(projectDir).features[1].status, "pending");
+});
+
+test("F07, F08, F09, F10, F12: handoff attention ledger, strict dismissal/update validation, failed assertion gate, effort normalization, bare-array features, and run identity fencing", async (t) => {
+  const projectDir = makeTempProjectDir(t);
+
+  proposeMission(projectDir, {
+    title: "Kernel Scrutiny Fixes",
+    repoPath: projectDir,
+    milestones: [{ id: "m1", title: "Milestone 1", ordinal: 1 }],
+    assertions: [{ id: "VAL-1", description: "Must pass validation", milestoneId: "m1" }],
+    features: [{ id: "f1", milestoneId: "m1", title: "Feature 1", fulfills: ["VAL-1"] }],
+    modelSettings: {
+      skipUserTesting: false,
+    },
+  });
+  approveMissionPlan(projectDir);
+
+  // F09: normalizeSlotConfig keeps effort and reasoningEffort consistent
+  const normalizedLow = normalizeSlotConfig(
+    { providerInstanceId: "codex", model: "gpt-6.1-sol", effort: 2, reasoningEffort: "high" },
+    { providerInstanceId: "codex", model: "gpt-6.1-sol", options: { reasoningEffort: "high" } }
+  );
+  assert.equal(normalizedLow.options.effort, 2);
+  assert.equal(normalizedLow.options.reasoningEffort, "low");
+
+  const normalizedMinimal = normalizeSlotConfig({
+    providerInstanceId: "codex",
+    model: "gpt-6.1-sol",
+    effort: 1,
+  });
+  assert.equal(normalizedMinimal.options.effort, 1);
+  assert.equal(normalizedMinimal.options.reasoningEffort, "minimal");
+
+  // Start f1 asynchronously
+  await startMissionRun(projectDir, {}, { async runFeature() { return { taskId: "t1", childThreadId: "c1" }; } });
+  const active = loadState(projectDir).activeWorker;
+
+  // F12: EndFeatureRun requires featureId or runId, and fences against stale featureId or runId
+  assert.throws(
+    () =>
+      endFeatureRun(projectDir, {
+        successState: "success",
+        validatorsPassed: true,
+        handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+      }),
+    (err) => err.code === "MISSING_RUN_IDENTITY"
+  );
+
+  assert.throws(
+    () =>
+      endFeatureRun(projectDir, {
+        featureId: "wrong-feature",
+        successState: "success",
+        validatorsPassed: true,
+        handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+      }),
+    (err) => err.code === "STALE_WORKER_RUN"
+  );
+
+  assert.throws(
+    () =>
+      endFeatureRun(projectDir, {
+        runId: "wrong-run",
+        successState: "success",
+        validatorsPassed: true,
+        handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+      }),
+    (err) => err.code === "STALE_WORKER_RUN"
+  );
+
+  // Complete f1 with a discoveredIssue and a nonInteractiveCheck (F07)
+  endFeatureRun(projectDir, {
+    runId: active.runId,
+    featureId: "f1",
+    successState: "success",
+    validatorsPassed: true,
+    handoff: {
+      whatWasImplemented: VALID_SUMMARY_50,
+      discoveredIssues: [{ id: "iss-1", description: "Edge case bug" }],
+      nonInteractiveChecks: [{ id: "chk-1", summary: "Verify CLI exit code" }],
+    },
+  });
+
+  const stateWithPending = loadState(projectDir);
+  assert.equal(stateWithPending.lastHandoffNeedsAttention, true);
+  assert.equal(stateWithPending.pendingHandoffItems.length, 2);
+
+  // F07: Dismissing nonexistent feature/item throws UNKNOWN_HANDOFF_ITEM and does not clear gate
+  assert.throws(
+    () =>
+      dismissHandoffItems(projectDir, {
+        dismissals: [
+          {
+            type: "discovered_issue",
+            sourceFeatureId: "nonexistent-feature",
+            summary: "nonexistent issue",
+            justification: "This unrelated dismissal must be rejected by the kernel.",
+          },
+        ],
+      }),
+    (err) => err.code === "UNKNOWN_HANDOFF_ITEM"
+  );
+  assert.equal(loadState(projectDir).lastHandoffNeedsAttention, true);
+
+  // F07: updateMissionFeatures with nonexistent feature ID throws UNKNOWN_FEATURE_ID and does not clear gate
+  assert.throws(
+    () =>
+      updateMissionFeatures(projectDir, {
+        updateFeatures: [{ id: "missing-id", title: "no-op" }],
+      }),
+    (err) => err.code === "UNKNOWN_FEATURE_ID"
+  );
+  assert.equal(loadState(projectDir).lastHandoffNeedsAttention, true);
+
+  // F07: No-op updateMissionFeatures does not clear gate
+  updateMissionFeatures(projectDir, {});
+  assert.equal(loadState(projectDir).lastHandoffNeedsAttention, true);
+
+  // F07: Dismissing only 1 of 2 pending items leaves the other pending and keeps gate true
+  dismissHandoffItems(projectDir, {
+    dismissals: [
+      {
+        itemId: "iss-1",
+        type: "discovered_issue",
+        sourceFeatureId: "f1",
+        reason: "Resolved via dedicated follow-up validation check.",
+      },
+    ],
+  });
+  assert.equal(loadState(projectDir).pendingHandoffItems.length, 1);
+  assert.equal(loadState(projectDir).lastHandoffNeedsAttention, true);
+
+  // Dismissing the second item clears pendingHandoffItems and sets lastHandoffNeedsAttention = false
+  dismissHandoffItems(projectDir, {
+    dismissals: [
+      {
+        itemId: "chk-1",
+        type: "non_interactive_check",
+        sourceFeatureId: "f1",
+        summary: "Verify CLI exit code",
+        justification: "Verified manually in CI logs with zero exit code.",
+      },
+    ],
+  });
+  assert.equal(loadState(projectDir).pendingHandoffItems.length, 0);
+  assert.equal(loadState(projectDir).lastHandoffNeedsAttention, false);
+
+  // F08: Run scrutiny-validator-m1 which reports VAL-1: 'failed'
+  const stateAtValidators = await startMissionRun(
+    projectDir,
+    {},
+    {
+      async runFeature(feature, _slot, currentState) {
+        if (feature.id === "scrutiny-validator-m1") {
+          assert.equal(currentState.activeWorker.role, "Validator");
+          endFeatureRun(projectDir, {
+            runId: currentState.activeWorker.runId,
+            featureId: feature.id,
+            successState: "success",
+            validatorsPassed: true,
+            assertionResults: { "VAL-1": "failed" },
+            handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+          });
+        }
+      },
+    }
+  );
+
+  // Failed assertion must trigger orchestrator_turn and lastHandoffNeedsAttention, NOT completed
+  assert.equal(stateAtValidators.status, "orchestrator_turn");
+  assert.equal(stateAtValidators.lastHandoffNeedsAttention, true);
+  assert.equal(stateAtValidators.assertions[0].status, "failed");
+  assert.equal(
+    stateAtValidators.pendingHandoffItems.some((i) => i.type === "validator_failure"),
+    true
+  );
+
+  // Dismiss the validator_failure to run user-testing-validator-m1 WITHOUT explicit assertionResults:
+  // VAL-1 must remain 'failed' (not overwritten by automatic pass fallback) and mission must NOT complete
+  dismissHandoffItems(projectDir, {
+    dismissals: [
+      {
+        type: "validator_failure",
+        sourceFeatureId: "scrutiny-validator-m1",
+        summary: "Validator or assertion failure",
+        justification: "Acknowledging scrutiny failure to inspect user-testing stage.",
+      },
+    ],
+  });
+
+  const stateAfterUserTesting = await startMissionRun(
+    projectDir,
+    {},
+    {
+      async runFeature(feature, _slot, currentState) {
+        endFeatureRun(projectDir, {
+          runId: currentState.activeWorker.runId,
+          featureId: feature.id,
+          successState: "success",
+          validatorsPassed: true,
+          handoff: { whatWasImplemented: VALID_SUMMARY_50 },
+        });
+      },
+    }
+  );
+
+  assert.equal(stateAfterUserTesting.assertions[0].status, "failed");
+  assert.equal(stateAfterUserTesting.status, "orchestrator_turn");
+  assert.equal(stateAfterUserTesting.lastHandoffNeedsAttention, true);
+
+  // F10: Bare-array features.json is normalized on load
+  const paths = getMissionPaths(projectDir);
+  fs.writeFileSync(
+    paths.featuresPath,
+    JSON.stringify([{ id: "f-bare-array", milestoneId: "m1", status: "pending" }])
+  );
+  const loadedBare = loadFeaturesDoc(projectDir);
+  assert.equal(loadedBare.features.length, 1);
+  assert.equal(loadedBare.features[0].id, "f-bare-array");
 });

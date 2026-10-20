@@ -22,15 +22,35 @@ export const FEATURE_KINDS = [
   "scrutiny",
   "user_testing",
   "repair",
+  "explorer",
 ];
 
 export const DISMISSAL_TYPES = [
   "discovered_issue",
   "critical_context",
   "incomplete_work",
+  "non_interactive_check",
+  "validator_failure",
 ];
 
 export const ASSERTION_STATUSES = ["pending", "passed", "failed"];
+
+export const EFFORT_LEVEL_TO_REASONING = {
+  1: "minimal",
+  2: "low",
+  3: "medium",
+  4: "high",
+  5: "max",
+};
+
+export const REASONING_TO_EFFORT_LEVEL = {
+  minimal: 1,
+  low: 2,
+  medium: 3,
+  high: 4,
+  xhigh: 5,
+  max: 5,
+};
 
 export const DEFAULT_MODEL_SETTINGS = {
   orchestrator: {
@@ -69,45 +89,123 @@ export function createRunId() {
   return `run-${crypto.randomUUID().slice(0, 8)}`;
 }
 
-export function normalizeModelSettings(partial = {}, base = DEFAULT_MODEL_SETTINGS) {
+function parseEffortLevel(rawEffort) {
+  if (typeof rawEffort === "number" && Number.isFinite(rawEffort)) {
+    return Math.max(1, Math.min(5, Math.round(rawEffort)));
+  }
+  if (typeof rawEffort === "string" && rawEffort.trim()) {
+    const trimmed = rawEffort.trim().toLowerCase();
+    const num = Number(trimmed);
+    if (Number.isFinite(num) && num >= 1 && num <= 5) {
+      return Math.round(num);
+    }
+    if (REASONING_TO_EFFORT_LEVEL[trimmed]) {
+      return REASONING_TO_EFFORT_LEVEL[trimmed];
+    }
+  }
+  return null;
+}
+
+export function normalizeSlotConfig(raw = {}, base = {}) {
+  const safeRaw = raw && typeof raw === "object" ? raw : {};
+  const safeBase = base && typeof base === "object" ? base : {};
+
+  const providerInstanceId =
+    safeRaw.providerInstanceId ??
+    safeBase.providerInstanceId ??
+    "antigravity";
+  const model = safeRaw.model ?? safeBase.model ?? "gemini-4-argon-high";
+
+  const baseOptions =
+    safeBase.options && typeof safeBase.options === "object"
+      ? { ...safeBase.options }
+      : {};
+  const rawOptions =
+    safeRaw.options && typeof safeRaw.options === "object"
+      ? { ...safeRaw.options }
+      : {};
+
+  const options = {
+    ...baseOptions,
+    ...rawOptions,
+  };
+
+  const rawEffortVal = safeRaw.effort ?? rawOptions.effort;
+  const rawReasoningVal =
+    safeRaw.reasoningEffort ?? rawOptions.reasoningEffort;
+
+  const parsedLevel = parseEffortLevel(rawEffortVal);
+  if (parsedLevel !== null) {
+    const mappedReasoning = EFFORT_LEVEL_TO_REASONING[parsedLevel];
+    const normRawReasoning =
+      typeof rawReasoningVal === "string" && rawReasoningVal.trim()
+        ? rawReasoningVal.trim().toLowerCase()
+        : null;
+    const rawReasoningLevel = normRawReasoning
+      ? REASONING_TO_EFFORT_LEVEL[normRawReasoning] ?? null
+      : null;
+
+    options.effort = parsedLevel;
+    if (normRawReasoning && rawReasoningLevel === parsedLevel) {
+      options.reasoningEffort = normRawReasoning;
+    } else {
+      options.reasoningEffort = mappedReasoning;
+    }
+  } else if (
+    typeof rawReasoningVal === "string" &&
+    rawReasoningVal.trim() !== ""
+  ) {
+    const normRawReasoning = rawReasoningVal.trim().toLowerCase();
+    options.reasoningEffort = normRawReasoning;
+    if (
+      options.effort !== undefined &&
+      REASONING_TO_EFFORT_LEVEL[normRawReasoning]
+    ) {
+      options.effort = REASONING_TO_EFFORT_LEVEL[normRawReasoning];
+    }
+  }
+
   return {
-    orchestrator: {
-      providerInstanceId:
-        partial?.orchestrator?.providerInstanceId ??
-        base.orchestrator.providerInstanceId,
-      model: partial?.orchestrator?.model ?? base.orchestrator.model,
-      options: {
-        ...(base.orchestrator.options || {}),
-        ...(partial?.orchestrator?.options || {}),
-      },
-    },
-    worker: {
-      providerInstanceId:
-        partial?.worker?.providerInstanceId ?? base.worker.providerInstanceId,
-      model: partial?.worker?.model ?? base.worker.model,
-      options: {
-        ...(base.worker.options || {}),
-        ...(partial?.worker?.options || {}),
-      },
-    },
-    validator: {
-      providerInstanceId:
-        partial?.validator?.providerInstanceId ??
-        base.validator.providerInstanceId,
-      model: partial?.validator?.model ?? base.validator.model,
-      options: {
-        ...(base.validator.options || {}),
-        ...(partial?.validator?.options || {}),
-      },
-    },
+    providerInstanceId,
+    model,
+    options,
+  };
+}
+
+export function normalizeModelSettings(
+  partial = {},
+  base = DEFAULT_MODEL_SETTINGS
+) {
+  const source =
+    partial?.slots && typeof partial.slots === "object"
+      ? { ...partial, ...partial.slots }
+      : partial || {};
+  const baseSource =
+    base?.slots && typeof base.slots === "object"
+      ? { ...base, ...base.slots }
+      : base || DEFAULT_MODEL_SETTINGS;
+
+  return {
+    orchestrator: normalizeSlotConfig(
+      source.orchestrator,
+      baseSource.orchestrator || DEFAULT_MODEL_SETTINGS.orchestrator
+    ),
+    worker: normalizeSlotConfig(
+      source.worker,
+      baseSource.worker || DEFAULT_MODEL_SETTINGS.worker
+    ),
+    validator: normalizeSlotConfig(
+      source.validator,
+      baseSource.validator || DEFAULT_MODEL_SETTINGS.validator
+    ),
     skipScrutiny:
-      typeof partial?.skipScrutiny === "boolean"
-        ? partial.skipScrutiny
-        : Boolean(base.skipScrutiny),
+      typeof source.skipScrutiny === "boolean"
+        ? source.skipScrutiny
+        : Boolean(baseSource.skipScrutiny),
     skipUserTesting:
-      typeof partial?.skipUserTesting === "boolean"
-        ? partial.skipUserTesting
-        : Boolean(base.skipUserTesting),
+      typeof source.skipUserTesting === "boolean"
+        ? source.skipUserTesting
+        : Boolean(baseSource.skipUserTesting),
   };
 }
 
@@ -131,6 +229,9 @@ export function normalizeMilestone(milestone, index = 0) {
 }
 
 export function inferFeatureKind(feature) {
+  if (feature.kind === "user-testing") {
+    return "user_testing";
+  }
   if (feature.kind && FEATURE_KINDS.includes(feature.kind)) {
     return feature.kind;
   }
@@ -139,11 +240,18 @@ export function inferFeatureKind(feature) {
   if (skill.includes("scrutiny") || id.startsWith("scrutiny-validator")) {
     return "scrutiny";
   }
-  if (skill.includes("user-testing") || id.startsWith("user-testing-validator")) {
+  if (
+    skill.includes("user-testing") ||
+    skill.includes("user_testing") ||
+    id.startsWith("user-testing-validator")
+  ) {
     return "user_testing";
   }
   if (skill.includes("repair")) {
     return "repair";
+  }
+  if (skill.includes("explorer") || id.startsWith("explorer-")) {
+    return "explorer";
   }
   return "implementation";
 }
@@ -251,6 +359,9 @@ export function createInitialState(input = {}, existingState = null) {
     sessions: Array.isArray(existingState?.sessions)
       ? existingState.sessions
       : [],
+    pendingHandoffItems: Array.isArray(input.pendingHandoffItems)
+      ? input.pendingHandoffItems
+      : [],
     lastHandoffNeedsAttention: false,
     lastHandoffSummary: null,
     lastHandoffAt: null,
@@ -289,26 +400,36 @@ export function validateDismissals(dismissals) {
         `Dismissal at index ${idx} requires sourceFeatureId`
       );
     }
-    const summary = String(item.summary || "").trim();
+    const itemId =
+      typeof item.itemId === "string" && item.itemId.trim()
+        ? item.itemId.trim()
+        : undefined;
+    const summary = String(item.summary || item.itemId || "").trim();
     if (!summary) {
       throw new MissionKernelError(
         "INVALID_DISMISSAL_SUMMARY",
         `Dismissal at index ${idx} requires summary`
       );
     }
-    const justification = String(item.justification || "").trim();
+    const justification = String(
+      item.justification ?? item.reason ?? ""
+    ).trim();
     if (justification.length < 20) {
       throw new MissionKernelError(
         "INVALID_JUSTIFICATION",
         `Dismissal justification at index ${idx} must be at least 20 characters (got ${justification.length})`
       );
     }
-    return {
+    const normalized = {
       type: item.type,
       sourceFeatureId,
       summary,
       justification,
     };
+    if (itemId) {
+      normalized.itemId = itemId;
+    }
+    return normalized;
   });
 }
 
@@ -317,7 +438,13 @@ export function isNonEmptyLeftUndone(value) {
   const trimmed = value.trim();
   if (!trimmed) return false;
   const lower = trimmed.toLowerCase();
-  if (lower === "none" || lower === "n/a" || lower === "nil" || trimmed === "无" || trimmed === "没有") {
+  if (
+    lower === "none" ||
+    lower === "n/a" ||
+    lower === "nil" ||
+    trimmed === "无" ||
+    trimmed === "没有"
+  ) {
     return false;
   }
   return true;
@@ -326,5 +453,9 @@ export function isNonEmptyLeftUndone(value) {
 export function isValidatorFeature(feature) {
   if (!feature) return false;
   const kind = inferFeatureKind(feature);
-  return kind === "scrutiny" || kind === "user_testing";
+  return (
+    kind === "scrutiny" ||
+    kind === "user_testing" ||
+    feature.kind === "user-testing"
+  );
 }

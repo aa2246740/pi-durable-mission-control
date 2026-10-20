@@ -7,6 +7,7 @@ import {
   MissionKernelError,
   normalizeAssertion,
   normalizeFeature,
+  normalizeMilestone,
   normalizeModelSettings,
   validateDismissals,
 } from "./schema.mjs";
@@ -87,7 +88,10 @@ export function approveMissionPlan(missionDir) {
     workerNumber: null,
   });
 
-  return state;
+  return {
+    ...state,
+    state,
+  };
 }
 
 export function rejectMissionPlan(missionDir, feedback = "") {
@@ -112,11 +116,69 @@ export function rejectMissionPlan(missionDir, feedback = "") {
   return state;
 }
 
+function doesDismissalMatchPending(pending, dismissal) {
+  if (!pending || typeof pending !== "object") return false;
+  if (pending.sourceFeatureId !== dismissal.sourceFeatureId) return false;
+  if (pending.type !== dismissal.type) return false;
+  const pendingSummary = String(pending.summary || "");
+  const dismissalSummary = String(dismissal.summary || "");
+  return (
+    (pendingSummary &&
+      dismissalSummary &&
+      pendingSummary.includes(dismissalSummary)) ||
+    (pendingSummary &&
+      dismissalSummary &&
+      dismissalSummary.includes(pendingSummary)) ||
+    (dismissal.itemId && pending.id === dismissal.itemId) ||
+    pending.id === dismissalSummary ||
+    pendingSummary === dismissalSummary
+  );
+}
+
 export function dismissHandoffItems(missionDir, { dismissals } = {}) {
   const validated = validateDismissals(dismissals);
   const state = loadState(missionDir);
+  const featuresDoc = loadFeaturesDoc(missionDir);
 
-  state.lastHandoffNeedsAttention = false;
+  if (
+    Array.isArray(state.pendingHandoffItems) &&
+    state.pendingHandoffItems.length > 0
+  ) {
+    for (const dismissal of validated) {
+      const matched = state.pendingHandoffItems.some((pending) =>
+        doesDismissalMatchPending(pending, dismissal)
+      );
+      if (!matched) {
+        throw new MissionKernelError(
+          "UNKNOWN_HANDOFF_ITEM",
+          `Dismissal for feature "${dismissal.sourceFeatureId}" (${dismissal.type}: "${dismissal.summary}") does not match any pending handoff item`
+        );
+      }
+    }
+
+    state.pendingHandoffItems = state.pendingHandoffItems.filter(
+      (pending) =>
+        !validated.some((dismissal) =>
+          doesDismissalMatchPending(pending, dismissal)
+        )
+    );
+    state.lastHandoffNeedsAttention = state.pendingHandoffItems.length > 0;
+  } else {
+    for (const dismissal of validated) {
+      const feature = featuresDoc.features.find(
+        (f) => f.id === dismissal.sourceFeatureId
+      );
+      if (!feature || !feature.lastHandoff) {
+        throw new MissionKernelError(
+          "UNKNOWN_HANDOFF_ITEM",
+          `Dismissal for feature "${dismissal.sourceFeatureId}" does not match any pending handoff item`
+        );
+      }
+    }
+    state.pendingHandoffItems = [];
+    state.lastHandoffNeedsAttention = false;
+  }
+
   state.revision = (state.revision || 1) + 1;
   state.lastDismissedHandoffItems = validated;
   saveState(missionDir, state);
@@ -138,8 +200,11 @@ export function dismissHandoffItems(missionDir, { dismissals } = {}) {
 export function updateMissionFeatures(
   missionDir,
   {
+    features: replacementFeatures,
     addFeatures = [],
     updateFeatures = [],
+    milestones: replacementMilestones,
+    assertions: replacementAssertions,
     updateAssertions = [],
     modelSettings,
     bonusAttempts = {},
@@ -147,28 +212,48 @@ export function updateMissionFeatures(
 ) {
   const state = loadState(missionDir);
   const featuresDoc = loadFeaturesDoc(missionDir);
-  const features = [...featuresDoc.features];
+  let features = [...featuresDoc.features];
 
-  let mutatedFeatures = false;
+  let addedCount = 0;
+  let updatedCount = 0;
+  let replacedCount = 0;
+
+  if (Array.isArray(replacementFeatures)) {
+    features = replacementFeatures.map((f, i) => normalizeFeature(f, i));
+    replacedCount += replacementFeatures.length || 1;
+  }
 
   if (Array.isArray(updateFeatures) && updateFeatures.length > 0) {
     for (const patch of updateFeatures) {
-      if (!patch || !patch.id) continue;
-      const idx = features.findIndex((f) => f.id === patch.id);
-      if (idx !== -1) {
-        features[idx] = normalizeFeature(
-          { ...features[idx], ...patch },
-          idx
+      const patchId = patch?.id ? String(patch.id).trim() : "";
+      if (!patchId) {
+        throw new MissionKernelError(
+          "UNKNOWN_FEATURE_ID",
+          "Feature update patch requires a valid id"
         );
-        mutatedFeatures = true;
       }
+      const idx = features.findIndex((f) => f.id === patchId);
+      if (idx === -1) {
+        throw new MissionKernelError(
+          "UNKNOWN_FEATURE_ID",
+          `Feature "${patchId}" not found`
+        );
+      }
+      features[idx] = normalizeFeature({ ...features[idx], ...patch }, idx);
+      updatedCount += 1;
     }
   }
 
   if (bonusAttempts && typeof bonusAttempts === "object") {
     for (const [featureId, extra] of Object.entries(bonusAttempts)) {
       const idx = features.findIndex((f) => f.id === featureId);
-      if (idx !== -1 && typeof extra === "number" && extra > 0) {
+      if (idx === -1) {
+        throw new MissionKernelError(
+          "UNKNOWN_FEATURE_ID",
+          `Feature "${featureId}" not found`
+        );
+      }
+      if (typeof extra === "number" && extra > 0) {
         features[idx] = normalizeFeature(
           {
             ...features[idx],
@@ -176,7 +261,7 @@ export function updateMissionFeatures(
           },
           idx
         );
-        mutatedFeatures = true;
+        updatedCount += 1;
       }
     }
   }
@@ -190,11 +275,26 @@ export function updateMissionFeatures(
           { ...features[existingIdx], ...normalized },
           existingIdx
         );
+        updatedCount += 1;
       } else {
         features.push(normalized);
+        addedCount += 1;
       }
-      mutatedFeatures = true;
     }
+  }
+
+  if (Array.isArray(replacementMilestones)) {
+    state.milestones = replacementMilestones.map((m, i) =>
+      normalizeMilestone(m, i)
+    );
+    replacedCount += replacementMilestones.length || 1;
+  }
+
+  if (Array.isArray(replacementAssertions)) {
+    state.assertions = replacementAssertions.map((a, i) =>
+      normalizeAssertion(a, i)
+    );
+    replacedCount += replacementAssertions.length || 1;
   }
 
   if (Array.isArray(updateAssertions) && updateAssertions.length > 0) {
@@ -209,8 +309,10 @@ export function updateMissionFeatures(
           { ...assertions[idx], ...patch },
           idx
         );
+        updatedCount += 1;
       } else {
         assertions.push(normalizeAssertion(patch, assertions.length));
+        addedCount += 1;
       }
     }
     state.assertions = assertions;
@@ -232,9 +334,9 @@ export function updateMissionFeatures(
     updatedAt: nowIso,
   });
 
-  // Modifying features.json or calling updateMissionFeatures clears lastHandoffNeedsAttention
-  if (mutatedFeatures || addFeatures.length > 0 || updateFeatures.length > 0) {
+  if (addedCount > 0 || updatedCount > 0 || replacedCount > 0) {
     state.lastHandoffNeedsAttention = false;
+    state.pendingHandoffItems = [];
   }
   state.revision = (state.revision || 1) + 1;
   saveState(missionDir, state);
@@ -243,7 +345,11 @@ export function updateMissionFeatures(
     timestamp: nowIso,
     type: "features_updated",
     message: `Mission features updated (${savedDoc.features.filter((f) => f.status === "completed").length}/${savedDoc.features.length} completed)`,
-    featureId: addFeatures[0]?.id ?? updateFeatures[0]?.id ?? null,
+    featureId:
+      addFeatures[0]?.id ??
+      updateFeatures[0]?.id ??
+      replacementFeatures?.[0]?.id ??
+      null,
     workerNumber: null,
   });
 
@@ -370,7 +476,10 @@ export function checkMilestoneCompletionAndInjectValidation(missionDir) {
     });
   }
 
-  if (injectedFeatures.length > 0 || Object.keys(state.milestoneValidationTriggered).length > 0) {
+  if (
+    injectedFeatures.length > 0 ||
+    Object.keys(state.milestoneValidationTriggered).length > 0
+  ) {
     saveState(missionDir, state);
   }
   if (injectedFeatures.length > 0) {
@@ -388,6 +497,13 @@ export function checkMilestoneCompletionAndInjectValidation(missionDir) {
 }
 
 export function endFeatureRun(missionDir, input = {}) {
+  if (!input?.featureId && !input?.runId) {
+    throw new MissionKernelError(
+      "MISSING_RUN_IDENTITY",
+      "EndFeatureRun requires featureId or runId"
+    );
+  }
+
   const state = loadState(missionDir);
   const featuresDoc = loadFeaturesDoc(missionDir);
 
@@ -409,16 +525,18 @@ export function endFeatureRun(missionDir, input = {}) {
     );
   }
 
-  const targetFeatureId = input.featureId || state.activeWorker.featureId;
   if (
+    input.featureId &&
     state.activeWorker.featureId &&
-    targetFeatureId !== state.activeWorker.featureId
+    input.featureId !== state.activeWorker.featureId
   ) {
     throw new MissionKernelError(
-      "WORKER_FEATURE_MISMATCH",
-      `Active worker is assigned to ${state.activeWorker.featureId}, not ${targetFeatureId}`
+      "STALE_WORKER_RUN",
+      `Active worker is assigned to ${state.activeWorker.featureId}, not ${input.featureId}`
     );
   }
+
+  const targetFeatureId = input.featureId || state.activeWorker.featureId;
 
   const handoff = input.handoff || {};
   const whatWasImplemented = String(handoff.whatWasImplemented || "").trim();
@@ -450,61 +568,159 @@ export function endFeatureRun(missionDir, input = {}) {
   const feature = featuresDoc.features[featureIdx];
   const nowIso = new Date().toISOString();
 
+  const assertionResults =
+    input.assertionResults || handoff.assertionResults || {};
+  const hasFailedAssertions = Object.values(assertionResults).some(
+    (v) => v === "failed" || v?.status === "failed"
+  );
+
   feature.lastHandoff = {
     ...handoff,
     whatWasImplemented,
     successState,
-    validatorsPassed: Boolean(input.validatorsPassed),
+    validatorsPassed: Boolean(input.validatorsPassed) && !hasFailedAssertions,
     completedAt: nowIso,
   };
 
+  if (
+    Object.keys(assertionResults).length > 0 ||
+    isValidatorFeature(feature)
+  ) {
+    const fulfilledIds = new Set(feature.fulfills || []);
+    const isVal = isValidatorFeature(feature);
+    state.assertions = (state.assertions || []).map((assertion) => {
+      const rawVal = assertionResults[assertion.id];
+      const explicitStatus =
+        typeof rawVal === "string" ? rawVal : rawVal?.status;
+      if (explicitStatus && ASSERTION_STATUSES.includes(explicitStatus)) {
+        return {
+          ...assertion,
+          status: explicitStatus,
+        };
+      }
+      if (
+        successState === "success" &&
+        isVal &&
+        assertion.status !== "failed" &&
+        (fulfilledIds.has(assertion.id) ||
+          (fulfilledIds.size === 0 &&
+            assertion.milestoneId === feature.milestoneId))
+      ) {
+        return {
+          ...assertion,
+          status: "passed",
+        };
+      }
+      return assertion;
+    });
+  }
+
   if (successState === "success") {
     feature.status = "completed";
-
-    if (isValidatorFeature(feature)) {
-      const fulfilledIds = new Set(feature.fulfills || []);
-      const assertionResults =
-        input.assertionResults || handoff.assertionResults || {};
-      state.assertions = (state.assertions || []).map((assertion) => {
-        if (
-          assertionResults[assertion.id] &&
-          ASSERTION_STATUSES.includes(assertionResults[assertion.id])
-        ) {
-          return {
-            ...assertion,
-            status: assertionResults[assertion.id],
-          };
-        }
-        if (
-          fulfilledIds.has(assertion.id) ||
-          (fulfilledIds.size === 0 &&
-            assertion.milestoneId === feature.milestoneId)
-        ) {
-          return {
-            ...assertion,
-            status: "passed",
-          };
-        }
-        return assertion;
-      });
-    }
   } else {
     feature.status = "pending";
   }
 
   featuresDoc.features[featureIdx] = normalizeFeature(feature, featureIdx);
 
-  const hasDiscoveredIssues =
-    Array.isArray(handoff.discoveredIssues) &&
-    handoff.discoveredIssues.length > 0;
+  const discoveredIssues = Array.isArray(handoff.discoveredIssues)
+    ? handoff.discoveredIssues
+    : [];
+  const nonInteractiveChecks = Array.isArray(handoff.nonInteractiveChecks)
+    ? handoff.nonInteractiveChecks
+    : Array.isArray(input.nonInteractiveChecks)
+      ? input.nonInteractiveChecks
+      : [];
+  const hasDiscoveredIssues = discoveredIssues.length > 0;
+  const hasNonInteractiveChecks = nonInteractiveChecks.length > 0;
   const hasLeftUndone = isNonEmptyLeftUndone(handoff.whatWasLeftUndone);
-  const hasAttentionItems = hasDiscoveredIssues || hasLeftUndone;
+
+  const pendingItems = [];
+  discoveredIssues.forEach((iss, idx) => {
+    const id =
+      (iss && typeof iss === "object" && iss.id) ||
+      `${feature.id}:discovered_issue:${idx}`;
+    const summary = String(
+      typeof iss === "string"
+        ? iss
+        : iss?.summary ||
+            iss?.description ||
+            iss?.title ||
+            (iss?.id
+              ? `${iss.id} ${iss.description || ""}`
+              : JSON.stringify(iss))
+    ).trim();
+    pendingItems.push({
+      id,
+      type: "discovered_issue",
+      sourceFeatureId: feature.id,
+      summary,
+    });
+  });
+
+  nonInteractiveChecks.forEach((chk, idx) => {
+    const id =
+      (chk && typeof chk === "object" && chk.id) ||
+      `${feature.id}:non_interactive_check:${idx}`;
+    const summary = String(
+      typeof chk === "string"
+        ? chk
+        : chk?.summary || chk?.description || chk?.title || JSON.stringify(chk)
+    ).trim();
+    pendingItems.push({
+      id,
+      type: "non_interactive_check",
+      sourceFeatureId: feature.id,
+      summary,
+    });
+  });
+
+  if (
+    hasFailedAssertions ||
+    (isValidatorFeature(feature) && input.validatorsPassed === false)
+  ) {
+    pendingItems.push({
+      id: `${feature.id}:validator_failure`,
+      type: "validator_failure",
+      sourceFeatureId: feature.id,
+      summary: "Validator or assertion failure",
+    });
+  }
+
+  if (hasLeftUndone && pendingItems.length === 0) {
+    pendingItems.push({
+      id: `${feature.id}:incomplete_work`,
+      type: "incomplete_work",
+      sourceFeatureId: feature.id,
+      summary: String(handoff.whatWasLeftUndone).trim(),
+    });
+  }
+
+  if (!Array.isArray(state.pendingHandoffItems)) {
+    state.pendingHandoffItems = [];
+  }
+  for (const item of pendingItems) {
+    const existingIdx = state.pendingHandoffItems.findIndex(
+      (p) => p.id === item.id
+    );
+    if (existingIdx !== -1) {
+      state.pendingHandoffItems[existingIdx] = item;
+    } else {
+      state.pendingHandoffItems.push(item);
+    }
+  }
+
+  const hasAttentionItems =
+    hasDiscoveredIssues ||
+    hasNonInteractiveChecks ||
+    hasLeftUndone ||
+    hasFailedAssertions ||
+    state.pendingHandoffItems.length > 0;
 
   const shouldReturnToOrchestrator =
     successState !== "success" ||
     input.returnToOrchestrator === true ||
-    hasDiscoveredIssues ||
-    hasLeftUndone;
+    hasAttentionItems;
 
   const completedWorker = state.activeWorker;
   const workerNumber = completedWorker.workerNumber ?? 1;
@@ -514,8 +730,13 @@ export function endFeatureRun(missionDir, input = {}) {
       s.runId === completedWorker.runId
         ? {
             ...s,
-            status: successState === "success" ? "completed" : "failed",
+            status:
+              successState === "success" && !hasFailedAssertions
+                ? "completed"
+                : "failed",
             endedAt: nowIso,
+            handoff: feature.lastHandoff,
+            lastHandoff: feature.lastHandoff,
           }
         : s
     );
@@ -525,10 +746,7 @@ export function endFeatureRun(missionDir, input = {}) {
   state.lastHandoffAt = nowIso;
   state.lastHandoffSummary = whatWasImplemented;
   state.revision = (state.revision || 1) + 1;
-
-  if (hasAttentionItems || ( shouldReturnToOrchestrator && successState !== "success" )) {
-    state.lastHandoffNeedsAttention = hasAttentionItems;
-  }
+  state.lastHandoffNeedsAttention = state.pendingHandoffItems.length > 0;
 
   if (shouldReturnToOrchestrator) {
     state.status = "orchestrator_turn";
@@ -548,10 +766,7 @@ export function endFeatureRun(missionDir, input = {}) {
     workerNumber,
   });
 
-  if (!shouldReturnToOrchestrator && successState === "success") {
-    checkMilestoneCompletionAndInjectValidation(missionDir);
-  } else if (successState === "success") {
-    // Still check milestone completion so validators are ready in queue after orchestrator resolves handoff
+  if (successState === "success") {
     checkMilestoneCompletionAndInjectValidation(missionDir);
   }
 
