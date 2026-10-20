@@ -1665,3 +1665,128 @@ test("Round 3, Round 4 & Round 5 Scrutiny Fixes (P22, P23, R4-approval-explicit-
     fs.rmSync(r5DaemonDir, { recursive: true, force: true });
   }
 });
+
+test("Round 6 Scrutiny Fix (F03-dead-worker-control-success): Killing default HUD runtime daemon causes POST /api/mission/pause and POST /api/mission/resume to return HTTP 409 and preserve all 4 .mission/* files", async (t) => {
+  const r6Dir = createTempMissionWorkspace();
+  execFileSync("git", ["init", "-q", r6Dir]);
+  execFileSync("git", ["-C", r6Dir, "config", "user.name", "Test"]);
+  execFileSync("git", ["-C", r6Dir, "config", "user.email", "test@example.invalid"]);
+  fs.writeFileSync(path.join(r6Dir, ".gitignore"), ".mission/\n");
+  fs.writeFileSync(path.join(r6Dir, "file.txt"), "baseline\n");
+  execFileSync("git", ["-C", r6Dir, "add", "."]);
+  execFileSync("git", ["-C", r6Dir, "commit", "-qm", "fixture"]);
+
+  const r6DotM = path.join(r6Dir, ".mission");
+  fs.mkdirSync(r6DotM, { recursive: true });
+  fs.writeFileSync(
+    path.join(r6DotM, "state.json"),
+    JSON.stringify(
+      {
+        missionId: "mission-r6-dead-worker",
+        title: "R6 Dead Worker Control",
+        repoPath: r6Dir,
+        status: "awaiting_input",
+        planAccepted: false,
+        revision: 1,
+        elapsedMs: 0,
+        lastStartedAt: null,
+        milestones: [{ id: "m1", title: "M1", ordinal: 1 }],
+        assertions: [],
+        activeWorker: null,
+        sessions: [],
+      },
+      null,
+      2
+    ) + "\n"
+  );
+  fs.writeFileSync(
+    path.join(r6DotM, "features.json"),
+    JSON.stringify(
+      {
+        features: [
+          { id: "f1", title: "First", milestoneId: "m1", status: "pending", attempts: 0 },
+        ],
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    ) + "\n"
+  );
+  fs.writeFileSync(
+    path.join(r6DotM, "model-settings.json"),
+    JSON.stringify({ validator: { model: "grok-4.7", effort: 3 } }, null, 2) + "\n"
+  );
+  fs.writeFileSync(
+    path.join(r6DotM, "progress_log.jsonl"),
+    JSON.stringify({ seq: 1, timestamp: new Date().toISOString(), type: "init", message: "init" }) +
+      "\n"
+  );
+
+  const snapFourFiles = () => ({
+    state: fs.readFileSync(path.join(r6DotM, "state.json"), "utf8"),
+    features: fs.readFileSync(path.join(r6DotM, "features.json"), "utf8"),
+    modelSettings: fs.readFileSync(path.join(r6DotM, "model-settings.json"), "utf8"),
+    progressLog: fs.readFileSync(path.join(r6DotM, "progress_log.jsonl"), "utf8"),
+  });
+
+  const srv = await createMissionHudServer({ missionDir: r6Dir, port: 0 });
+  t.after(async () => {
+    await srv.close();
+    fs.rmSync(r6Dir, { recursive: true, force: true });
+  });
+
+  // 1. Approve mission to launch real local worker daemon
+  const appRes = await fetch(`${srv.url}/api/mission/approve`, { method: "POST" });
+  assert.equal(appRes.status, 200);
+  const runningState = JSON.parse(fs.readFileSync(path.join(r6DotM, "state.json"), "utf8"));
+  const workerPid = runningState.activeWorker.workerPid;
+  const daemonStateFile = runningState.activeWorker.daemonStateFile;
+  assert.equal(typeof workerPid, "number");
+  assert.equal(typeof daemonStateFile, "string");
+
+  // Kill the active worker daemon and remove its daemonStateFile while running
+  try {
+    process.kill(workerPid, "SIGKILL");
+  } catch {}
+  for (let i = 0; i < 40; i++) {
+    try {
+      process.kill(workerPid, 0);
+      await new Promise((r) => setTimeout(r, 15));
+    } catch {
+      break;
+    }
+  }
+  if (fs.existsSync(daemonStateFile)) {
+    fs.unlinkSync(daemonStateFile);
+  }
+
+  const beforePauseFiles = snapFourFiles();
+  const deadPauseRes = await fetch(`${srv.url}/api/mission/pause`, { method: "POST" });
+  assert.equal(deadPauseRes.status, 409, "Expected HTTP 409 when pausing dead worker");
+  const deadPauseBody = await deadPauseRes.json();
+  assert.equal(deadPauseBody.ok, false);
+  assert.equal(deadPauseBody.code, "WORKER_NOT_ALIVE");
+  assert.deepEqual(
+    snapFourFiles(),
+    beforePauseFiles,
+    "Expected all 4 .mission/* files unchanged after rejected pause"
+  );
+
+  // 2. Transition state on disk to paused (as if previously paused before daemon died) and verify POST /api/mission/resume also rejects with 409 and preserves all 4 .mission/* files
+  const pausedState = structuredClone(runningState);
+  pausedState.status = "paused";
+  pausedState.activeWorker.status = "paused";
+  fs.writeFileSync(path.join(r6DotM, "state.json"), JSON.stringify(pausedState, null, 2) + "\n");
+
+  const beforeResumeFiles = snapFourFiles();
+  const deadResumeRes = await fetch(`${srv.url}/api/mission/resume`, { method: "POST" });
+  assert.equal(deadResumeRes.status, 409, "Expected HTTP 409 when resuming dead worker");
+  const deadResumeBody = await deadResumeRes.json();
+  assert.equal(deadResumeBody.ok, false);
+  assert.equal(deadResumeBody.code, "WORKER_NOT_ALIVE");
+  assert.deepEqual(
+    snapFourFiles(),
+    beforeResumeFiles,
+    "Expected all 4 .mission/* files unchanged after rejected resume"
+  );
+});
