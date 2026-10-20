@@ -266,15 +266,44 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
       process.on("SIGTERM", cleanupAndExit);
       process.on("SIGINT", cleanupAndExit);
 
-      const startMs = Date.now();
       setInterval(() => {
         if (
           !missionDir ||
           !fs.existsSync(missionDir) ||
           (repoPath && !fs.existsSync(repoPath)) ||
-          Date.now() - startMs > 30000
+          (stateFile && !fs.existsSync(stateFile))
         ) {
           cleanupAndExit();
+          return;
+        }
+
+        const statePath = fs.existsSync(path.join(missionDir, "state.json"))
+          ? path.join(missionDir, "state.json")
+          : path.join(missionDir, ".mission", "state.json");
+        if (fs.existsSync(statePath)) {
+          try {
+            const current = JSON.parse(fs.readFileSync(statePath, "utf8"));
+            if (current && typeof current === "object") {
+              if (
+                (current.activeWorker === null &&
+                  Array.isArray(current.sessions) &&
+                  current.sessions.some(
+                    (s) =>
+                      s &&
+                      s.runId === runId &&
+                      (s.status === "completed" || s.status === "failed")
+                  )) ||
+                (current.activeWorker &&
+                  current.activeWorker.runId === runId &&
+                  typeof current.activeWorker.workerPid === "number" &&
+                  current.activeWorker.workerPid !== process.pid)
+              ) {
+                cleanupAndExit();
+              }
+            }
+          } catch {
+            // Ignore transient JSON parse errors during atomic writes
+          }
         }
       }, 50);
 
@@ -387,6 +416,12 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
         payload.activeWorker && typeof payload.activeWorker === "object"
           ? /** @type {Record<string, any>} */ (payload.activeWorker)
           : {};
+      const requiresLocalDaemon = Boolean(
+        typeof activeWorker.workerPid === "number" ||
+          typeof activeWorker.daemonStateFile === "string" ||
+          activeWorker.runtimeTransport === "bridge-cli-subprocess"
+      );
+
       if (
         process.env.T3_ACP_MCP_NODE &&
         String(process.env.T3_ACP_MCP_NODE).trim() &&
@@ -395,26 +430,84 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
         await callT3McpTool("t3_thread_interrupt", {
           threadId: activeWorker.childThreadId
         });
-      } else if (
-        typeof activeWorker.workerPid === "number" &&
-        isPidAlive(activeWorker.workerPid)
-      ) {
+      } else if (requiresLocalDaemon) {
+        if (
+          typeof activeWorker.workerPid !== "number" ||
+          !isPidAlive(activeWorker.workerPid) ||
+          (activeWorker.daemonStateFile && !fs.existsSync(activeWorker.daemonStateFile))
+        ) {
+          const errorMsg = "Active worker daemon process is not alive";
+          stderr.write(
+            `${JSON.stringify({
+              ok: false,
+              paused: false,
+              canPause: false,
+              code: "WORKER_NOT_ALIVE",
+              error: errorMsg
+            })}\n`
+          );
+          return { exitCode: 1, error: errorMsg };
+        }
+
         try {
           process.kill(activeWorker.workerPid, "SIGUSR1");
-        } catch {}
-        if (activeWorker.daemonStateFile && fs.existsSync(activeWorker.daemonStateFile)) {
+        } catch {
+          const errorMsg = "Active worker daemon process is not alive";
+          stderr.write(
+            `${JSON.stringify({
+              ok: false,
+              paused: false,
+              canPause: false,
+              code: "WORKER_NOT_ALIVE",
+              error: errorMsg
+            })}\n`
+          );
+          return { exitCode: 1, error: errorMsg };
+        }
+
+        if (activeWorker.daemonStateFile) {
+          let transitioned = false;
           const waitStart = Date.now();
           while (Date.now() - waitStart < 500) {
             try {
-              const parsed = JSON.parse(fs.readFileSync(activeWorker.daemonStateFile, "utf8"));
-              if (parsed && parsed.status === "paused") {
-                break;
+              if (fs.existsSync(activeWorker.daemonStateFile)) {
+                const parsed = JSON.parse(fs.readFileSync(activeWorker.daemonStateFile, "utf8"));
+                if (parsed && parsed.status === "paused") {
+                  transitioned = true;
+                  break;
+                }
               }
             } catch {}
             await sleep(10);
           }
+          if (!transitioned || !isPidAlive(activeWorker.workerPid)) {
+            const errorMsg = "Failed to verify paused state on local worker daemon";
+            stderr.write(
+              `${JSON.stringify({
+                ok: false,
+                paused: false,
+                canPause: false,
+                code: "WORKER_PAUSE_FAILED",
+                error: errorMsg
+              })}\n`
+            );
+            return { exitCode: 1, error: errorMsg };
+          }
+        } else if (!isPidAlive(activeWorker.workerPid)) {
+          const errorMsg = "Failed to verify paused state on local worker daemon";
+          stderr.write(
+            `${JSON.stringify({
+              ok: false,
+              paused: false,
+              canPause: false,
+              code: "WORKER_PAUSE_FAILED",
+              error: errorMsg
+            })}\n`
+          );
+          return { exitCode: 1, error: errorMsg };
         }
       }
+
       const result = {
         ok: true,
         paused: true,
@@ -466,6 +559,12 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
         return { exitCode: 1, error: errorMsg };
       }
 
+      const requiresLocalDaemon = Boolean(
+        typeof activeWorker.workerPid === "number" ||
+          typeof activeWorker.daemonStateFile === "string" ||
+          activeWorker.runtimeTransport === "bridge-cli-subprocess"
+      );
+
       if (
         process.env.T3_ACP_MCP_NODE &&
         String(process.env.T3_ACP_MCP_NODE).trim() &&
@@ -475,24 +574,81 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
           threadId: activeWorker.childThreadId,
           message: diagnostic ? `${trigger}\n\n${diagnostic}` : trigger
         });
-      } else if (
-        typeof activeWorker.workerPid === "number" &&
-        isPidAlive(activeWorker.workerPid)
-      ) {
+      } else if (requiresLocalDaemon) {
+        if (
+          typeof activeWorker.workerPid !== "number" ||
+          !isPidAlive(activeWorker.workerPid) ||
+          (activeWorker.daemonStateFile && !fs.existsSync(activeWorker.daemonStateFile))
+        ) {
+          const errorMsg = "Active worker daemon process is not alive";
+          stderr.write(
+            `${JSON.stringify({
+              ok: false,
+              resumed: false,
+              canResume: false,
+              code: "WORKER_NOT_ALIVE",
+              error: errorMsg
+            })}\n`
+          );
+          return { exitCode: 1, error: errorMsg };
+        }
+
         try {
           process.kill(activeWorker.workerPid, "SIGUSR2");
-        } catch {}
-        if (activeWorker.daemonStateFile && fs.existsSync(activeWorker.daemonStateFile)) {
+        } catch {
+          const errorMsg = "Active worker daemon process is not alive";
+          stderr.write(
+            `${JSON.stringify({
+              ok: false,
+              resumed: false,
+              canResume: false,
+              code: "WORKER_NOT_ALIVE",
+              error: errorMsg
+            })}\n`
+          );
+          return { exitCode: 1, error: errorMsg };
+        }
+
+        if (activeWorker.daemonStateFile) {
+          let transitioned = false;
           const waitStart = Date.now();
           while (Date.now() - waitStart < 500) {
             try {
-              const parsed = JSON.parse(fs.readFileSync(activeWorker.daemonStateFile, "utf8"));
-              if (parsed && parsed.status === "running") {
-                break;
+              if (fs.existsSync(activeWorker.daemonStateFile)) {
+                const parsed = JSON.parse(fs.readFileSync(activeWorker.daemonStateFile, "utf8"));
+                if (parsed && parsed.status === "running") {
+                  transitioned = true;
+                  break;
+                }
               }
             } catch {}
             await sleep(10);
           }
+          if (!transitioned || !isPidAlive(activeWorker.workerPid)) {
+            const errorMsg = "Failed to verify running state on local worker daemon";
+            stderr.write(
+              `${JSON.stringify({
+                ok: false,
+                resumed: false,
+                canResume: false,
+                code: "WORKER_RESUME_FAILED",
+                error: errorMsg
+              })}\n`
+            );
+            return { exitCode: 1, error: errorMsg };
+          }
+        } else if (!isPidAlive(activeWorker.workerPid)) {
+          const errorMsg = "Failed to verify running state on local worker daemon";
+          stderr.write(
+            `${JSON.stringify({
+              ok: false,
+              resumed: false,
+              canResume: false,
+              code: "WORKER_RESUME_FAILED",
+              error: errorMsg
+            })}\n`
+          );
+          return { exitCode: 1, error: errorMsg };
         }
       }
 
