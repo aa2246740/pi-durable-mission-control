@@ -2614,3 +2614,263 @@ test("First-Principles T3-Native HUD Redesign: No fake composer/toolbar/fallback
   assert.match(logHtml, /max\/5/);
   assert.equal(logHtml.includes("low/2"), false, "Earlier consecutive model_slots_updated entries should be coalesced");
 });
+
+test("Validator #8 Visual Polish Fixes (HUD-V8-001, HUD-V8-002, HUD-V8-003, HUD-V8-004): formatted 409 error without raw JSON dump, cleared stale resume diagnostic on running/completed, WCAG AA contrast tokens, and contextual pause/resume button disabled states", async () => {
+  const stylesCssPath = path.resolve(__dirname, "../hud/public/styles.css");
+  const stylesCss = fs.readFileSync(stylesCssPath, "utf8");
+  const appRaw = fs.readFileSync(APP_JS_PATH, "utf8");
+
+  // HUD-V8-003: Verify WCAG AA (>= 4.5:1) semantic color tokens in styles.css
+  assert.match(stylesCss, /--text-muted:\s*#475569/i);
+  assert.match(stylesCss, /--status-running-fg:\s*#1d4ed8/i);
+  assert.match(stylesCss, /--status-amber-fg:\s*#b45309/i);
+  assert.match(stylesCss, /--status-emerald-fg:\s*#166534/i);
+  assert.match(stylesCss, /--status-rose-fg:\s*#b91c1c/i);
+  assert.match(stylesCss, /--status-slate-fg:\s*#475569/i);
+  assert.equal(stylesCss.includes("#16a34a"), false, "Low-contrast #16a34a must not be used in styles.css");
+
+  const appSrc = appRaw
+    .replace("export function applySnapshot", "function applySnapshot")
+    .replace(/initHud\(\);\s*$/, "");
+
+  const elements = new Map();
+  function makeEl(id) {
+    return {
+      id,
+      textContent: "",
+      innerHTML: "",
+      disabled: false,
+      dataset: {},
+      style: {},
+      value: "",
+      listeners: {},
+      classList: {
+        classes: new Set(),
+        add(c) { this.classes.add(c); },
+        remove(c) { this.classes.delete(c); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this.classes.has(c)) this.classes.delete(c);
+            else this.classes.add(c);
+          } else if (force) {
+            this.classes.add(c);
+          } else {
+            this.classes.delete(c);
+          }
+        },
+        contains(c) { return this.classes.has(c); },
+      },
+      addEventListener(type, fn) {
+        this.listeners[type] = fn;
+      },
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+    };
+  }
+
+  for (const id of [
+    "mission-repo-path",
+    "mission-title",
+    "metric-time",
+    "metric-progress",
+    "metric-progress-bar",
+    "metric-contract",
+    "metric-contract-bar",
+    "status-strip",
+    "status-strip-label",
+    "status-strip-subtext",
+    "strip-approve-btn",
+    "btn-pause",
+    "btn-resume",
+    "milestone-stepper-track",
+    "pipeline-text",
+    "sessions-list",
+    "sessions-count",
+    "onboarding-card",
+    "plan-approval-card",
+    "session-inspector",
+    "session-handoff-view",
+    "orchestrator-stream",
+    "resume-diagnostic-card",
+    "features-count",
+    "features-list",
+    "assertions-count",
+    "assertions-list",
+    "progress-log-count",
+    "progress-log-list",
+  ]) {
+    elements.set(id, makeEl(id));
+  }
+
+  const hugeSnapshotPayload = {
+    initialized: true,
+    state: {
+      status: "paused",
+      revision: 12,
+      lastResumeDiagnostic: "Resume blocked (RESUME_BLOCKED_BY_CONFLICTS): Git repository has unresolved merge conflicts (README.md). Resolve all conflicts before resuming.",
+      milestones: Array.from({ length: 4 }, (_, i) => ({ id: `m${i + 1}`, title: `Milestone ${i + 1}` })),
+    },
+    features: Array.from({ length: 20 }, (_, i) => ({
+      id: `f${String(i + 1).padStart(2, "0")}`,
+      title: `Feature ${i + 1} with long payload padding`,
+      status: "pending",
+    })),
+  };
+
+  const vmCtx = vm.createContext({
+    document: {
+      getElementById: (id) => elements.get(id) || null,
+    },
+    fetch: async (url) => {
+      if (url === "/api/mission/resume") {
+        return {
+          ok: false,
+          status: 409,
+          text: async () =>
+            JSON.stringify({
+              ok: false,
+              error: "Resume blocked (RESUME_BLOCKED_BY_CONFLICTS): Git repository has unresolved merge conflicts (README.md). Resolve all conflicts before resuming.",
+              code: "GIT_RESUME_BLOCKED",
+              reasonCode: "RESUME_BLOCKED_BY_CONFLICTS",
+              diagnostic: "Resume blocked (RESUME_BLOCKED_BY_CONFLICTS): Git repository has unresolved merge conflicts (README.md). Resolve all conflicts before resuming.",
+              gitCheck: {
+                ok: false,
+                canResume: false,
+                status: "conflicted",
+                reasonCode: "RESUME_BLOCKED_BY_CONFLICTS",
+                summary: "Git repository has unresolved merge conflicts (README.md). Resolve all conflicts before resuming.",
+              },
+              snapshot: hugeSnapshotPayload,
+              state: hugeSnapshotPayload.state,
+            }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    },
+  });
+
+  vm.runInContext(appSrc, vmCtx);
+  vm.runInContext("bindStaticListeners()", vmCtx);
+
+  // HUD-V8-004: Verify contextual disabled state across lifecycle phases
+  // 1) uninitialized -> both disabled
+  vmCtx.snapUninit = {
+    initialized: false,
+    state: { status: "uninitialized", planAccepted: false, revision: 0 },
+    features: [],
+    progressLog: [],
+  };
+  vm.runInContext("applySnapshot(snapUninit)", vmCtx);
+  assert.equal(elements.get("btn-pause").disabled, true);
+  assert.equal(elements.get("btn-resume").disabled, true);
+
+  // 2) awaiting_input (!planAccepted) -> both disabled
+  vmCtx.snapAwaiting = {
+    initialized: true,
+    state: { status: "awaiting_input", planAccepted: false, revision: 1 },
+    features: [],
+    progressLog: [],
+  };
+  vm.runInContext("applySnapshot(snapAwaiting)", vmCtx);
+  assert.equal(elements.get("btn-pause").disabled, true);
+  assert.equal(elements.get("btn-resume").disabled, true);
+
+  // 3) running -> pause enabled, resume disabled
+  vmCtx.snapRunning = {
+    initialized: true,
+    state: {
+      status: "running",
+      planAccepted: true,
+      revision: 2,
+      activeWorker: { featureId: "f01", title: "Feature 1", workerNumber: 1, status: "running" },
+    },
+    features: [{ id: "f01", title: "Feature 1", status: "running" }],
+    progressLog: [],
+  };
+  vm.runInContext("applySnapshot(snapRunning)", vmCtx);
+  assert.equal(elements.get("btn-pause").disabled, false);
+  assert.equal(elements.get("btn-resume").disabled, true);
+
+  // 4) paused -> pause disabled, resume enabled
+  vmCtx.snapPaused = {
+    initialized: true,
+    state: {
+      status: "paused",
+      planAccepted: true,
+      revision: 3,
+      lastResumeDiagnostic: "The mission was paused one minute after the f01 worker started. Resume f01.",
+      activeWorker: { featureId: "f01", title: "Feature 1", workerNumber: 1, status: "paused" },
+    },
+    features: [{ id: "f01", title: "Feature 1", status: "paused" }],
+    progressLog: [],
+  };
+  vm.runInContext("applySnapshot(snapPaused)", vmCtx);
+  assert.equal(elements.get("btn-pause").disabled, true);
+  assert.equal(elements.get("btn-resume").disabled, false);
+
+  // HUD-V8-001: Triggering 409 conflict on /api/mission/resume formats concise message without raw JSON dump and preserves Revision #3 in #status-strip-subtext
+  await elements.get("btn-resume").listeners.click();
+  const formattedErr = vm.runInContext("hudState.lastActionError", vmCtx);
+  assert.ok(formattedErr.length <= 240, `Expected error <= 240 chars, got ${formattedErr.length}`);
+  assert.equal(formattedErr.includes(`"snapshot"`), false, "Must never dump raw snapshot JSON");
+  assert.equal(formattedErr.includes("{"), false, "Must never dump raw JSON braces");
+  assert.match(formattedErr, /GIT_RESUME_BLOCKED/);
+  assert.match(formattedErr, /RESUME_BLOCKED_BY_CONFLICTS/);
+  assert.match(elements.get("status-strip-subtext").textContent, /^Revision #3 · /);
+  assert.equal(elements.get("resume-diagnostic-card").innerHTML.includes(`"snapshot"`), false);
+
+  // HUD-V8-002: Transitioning to running on subsequent worker clears lastActionError and does not show stale f01 lastResumeDiagnostic
+  vmCtx.snapRunningNext = {
+    initialized: true,
+    state: {
+      status: "running",
+      planAccepted: true,
+      revision: 4,
+      lastResumeDiagnostic: "The mission was paused one minute after the f01 worker started. Resume f01.",
+      activeWorker: { featureId: "f02", title: "Feature 2", workerNumber: 2, status: "running" },
+    },
+    features: [
+      { id: "f01", title: "Feature 1", status: "completed" },
+      { id: "f02", title: "Feature 2", status: "running" },
+    ],
+    progressLog: [],
+  };
+  vm.runInContext("applySnapshot(snapRunningNext)", vmCtx);
+  assert.equal(vm.runInContext("hudState.lastActionError", vmCtx), null);
+  assert.equal(
+    elements.get("orchestrator-stream").innerHTML.includes("The mission was paused one minute"),
+    false,
+    "Running state on f02 must not display stale f01 lastResumeDiagnostic"
+  );
+  assert.match(elements.get("orchestrator-stream").innerHTML, /Worker #2 \(Feature 2\) is currently running\./);
+
+  // HUD-V8-002 & HUD-V8-004: Transitioning to completed with stale lastResumeDiagnostic shows clean completion message and disables both pause and resume buttons
+  vmCtx.snapCompleted = {
+    initialized: true,
+    state: {
+      status: "completed",
+      planAccepted: true,
+      revision: 5,
+      lastResumeDiagnostic: "The mission was paused one minute after the f01 worker started. Resume f01.",
+      activeWorker: null,
+    },
+    features: [
+      { id: "f01", title: "Feature 1", status: "completed" },
+      { id: "f02", title: "Feature 2", status: "completed" },
+    ],
+    progressLog: [],
+  };
+  vm.runInContext("applySnapshot(snapCompleted)", vmCtx);
+  assert.equal(elements.get("btn-pause").disabled, true);
+  assert.equal(elements.get("btn-resume").disabled, true);
+  const completedStreamHtml = elements.get("orchestrator-stream").innerHTML;
+  assert.match(
+    completedStreamHtml,
+    /All milestones, features, and validation assertions completed\./
+  );
+  assert.equal(
+    completedStreamHtml.includes("The mission was paused one minute"),
+    false,
+    "Completed mission must not display stale lastResumeDiagnostic"
+  );
+});

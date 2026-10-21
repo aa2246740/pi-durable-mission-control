@@ -9,26 +9,26 @@
 
   --text-primary: #0f172a;
   --text-secondary: #475569;
-  --text-muted: #64748b;
+  --text-muted: #475569;
 
-  /* Semantic Status Tokens */
-  --status-running-fg: #2563eb;
+  /* Semantic Status Tokens (WCAG AA >= 4.5:1 for small text) */
+  --status-running-fg: #1d4ed8;
   --status-running-bg: #eff6ff;
   --status-running-border: #bfdbfe;
 
-  --status-amber-fg: #d97706;
+  --status-amber-fg: #b45309;
   --status-amber-bg: #fffbeb;
   --status-amber-border: #fde68a;
 
-  --status-emerald-fg: #16a34a;
+  --status-emerald-fg: #166534;
   --status-emerald-bg: #f0fdf4;
   --status-emerald-border: #bbf7d0;
 
-  --status-rose-fg: #dc2626;
+  --status-rose-fg: #b91c1c;
   --status-rose-bg: #fef2f2;
   --status-rose-border: #fecaca;
 
-  --status-slate-fg: #64748b;
+  --status-slate-fg: #475569;
   --status-slate-bg: #f1f5f9;
   --status-slate-border: #cbd5e1;
 
@@ -318,7 +318,7 @@ body {
 }
 
 .strip-btn-approve:hover:not(:disabled) {
-  background: #1d4ed8;
+  background: #1e40af;
 }
 
 .strip-btn-resume {
@@ -328,7 +328,7 @@ body {
 }
 
 .strip-btn-resume:hover:not(:disabled) {
-  background: #15803d;
+  background: #14532d;
 }
 
 /* Milestone Pipeline Stepper Strip */
@@ -657,7 +657,7 @@ body {
 }
 
 .btn-primary-approve:hover {
-  background: #1d4ed8;
+  background: #1e40af;
 }
 
 .approval-hint {

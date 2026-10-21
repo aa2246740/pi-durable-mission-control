@@ -384,16 +384,83 @@ function filterOrchestratorStreamEvents(entries) {
   return entries.filter((e) => e && e.type !== "model_slots_updated");
 }
 
+function formatApiErrorMessage(status, rawText) {
+  let raw = String(rawText ?? "").trim();
+  let resolvedStatus = status;
+  const httpMatch = raw.match(/^HTTP\s+(\d+)\s*:\s*([\s\S]*)$/i);
+  if (httpMatch) {
+    if (!resolvedStatus) resolvedStatus = Number(httpMatch[1]);
+    raw = httpMatch[2].trim();
+  }
+  const statusLabel = resolvedStatus ? `HTTP ${resolvedStatus}` : "";
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        const baseSummary = String(
+          parsed.diagnostic ||
+            parsed.error ||
+            parsed.gitCheck?.summary ||
+            parsed.message ||
+            statusLabel ||
+            "Request failed"
+        )
+          .replace(/\s+/g, " ")
+          .trim();
+        const reasonSuffix =
+          parsed.reasonCode &&
+          parsed.reasonCode !== parsed.code &&
+          !baseSummary.includes(String(parsed.reasonCode))
+            ? ` (${parsed.reasonCode})`
+            : "";
+        const codePrefix =
+          parsed.code &&
+          !baseSummary.startsWith(`${parsed.code}:`) &&
+          !baseSummary.includes(String(parsed.code))
+            ? `${parsed.code}${reasonSuffix}: `
+            : reasonSuffix
+              ? `${parsed.reasonCode}: `
+              : "";
+        const withCode = `${codePrefix}${baseSummary}`.trim();
+        const full =
+          statusLabel && !withCode.includes(statusLabel)
+            ? `${statusLabel} \u00b7 ${withCode}`
+            : withCode;
+        return full.length > 240 ? `${full.slice(0, 237)}...` : full;
+      }
+    } catch {
+      // Fall through to plain-text sanitization
+    }
+  }
+  const stripped = raw.replace(/\{[\s\S]*\}/g, "").replace(/\s+/g, " ").trim();
+  const fallback = stripped
+    ? statusLabel && !stripped.includes(statusLabel)
+      ? `${statusLabel}: ${stripped}`
+      : stripped
+    : statusLabel || "Request failed";
+  return fallback.length > 240 ? `${fallback.slice(0, 237)}...` : fallback;
+}
+
 function handleActionError(err) {
-  hudState.lastActionError = err?.message || String(err);
+  const rawMsg = err?.message || String(err);
+  hudState.lastActionError = formatApiErrorMessage(null, rawMsg);
   const subEl = document.getElementById("status-strip-subtext");
   if (subEl) {
-    subEl.textContent = hudState.lastActionError;
+    const rev = hudState.snapshot?.state?.revision;
+    subEl.textContent =
+      rev != null
+        ? `Revision #${rev} \u00b7 ${hudState.lastActionError}`
+        : hudState.lastActionError;
   }
   const diagEl = document.getElementById("resume-diagnostic-card");
   if (diagEl) {
+    const statusText = hudState.snapshot?.state?.status || "paused";
+    diagEl.classList.add("error");
     diagEl.innerHTML = `
-      <div class="stream-card-header"><span class="stream-tag">Diagnostic Alert</span></div>
+      <div class="stream-card-header">
+        <span class="stream-tag">Action Blocked</span>
+        <span class="stream-time mono">${escapeHtml(statusText)}</span>
+      </div>
       <div class="stream-body">${escapeHtml(hudState.lastActionError)}</div>
     `;
   }
@@ -407,7 +474,7 @@ async function postJson(url, payload = {}) {
   });
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`HTTP ${res.status}: ${errText}`);
+    throw new Error(formatApiErrorMessage(res.status, errText));
   }
   hudState.lastActionError = null;
   const data = await res.json();
@@ -499,11 +566,12 @@ function renderStatusStrip(snapshot) {
   const workerNumStr =
     state.activeWorker?.workerNumber != null ? ` #${state.activeWorker.workerNumber}` : "";
   const activeWorkerSummary = state.activeWorker
-    ? ` · ${activeRole}${workerNumStr} (${state.activeWorker.status || status})`
+    ? ` \u00b7 ${activeRole}${workerNumStr} (${state.activeWorker.status || status})`
     : "";
+  const activeError = status !== "completed" ? hudState.lastActionError : null;
   if (subEl) {
-    subEl.textContent = hudState.lastActionError
-      ? hudState.lastActionError
+    subEl.textContent = activeError
+      ? `Revision #${state.revision ?? 0} \u00b7 ${activeError}`
       : `Revision #${state.revision ?? 0}${activeWorkerSummary}`;
   }
 
@@ -513,12 +581,24 @@ function renderStatusStrip(snapshot) {
     approveBtn.classList.toggle("is-primary-action", needsApproval);
   }
   if (pauseBtn) {
+    pauseBtn.disabled = Boolean(
+      isUninitialized ||
+        status === "completed" ||
+        status === "paused" ||
+        (status === "awaiting_input" && !state.planAccepted)
+    );
     pauseBtn.classList.toggle(
       "is-primary-action",
       status === "running" || status === "orchestrator_turn"
     );
   }
   if (resumeBtn) {
+    resumeBtn.disabled = Boolean(
+      isUninitialized ||
+        status === "completed" ||
+        status === "running" ||
+        (status === "awaiting_input" && !state.planAccepted)
+    );
     resumeBtn.classList.toggle("is-primary-action", status === "paused");
   }
 
@@ -536,9 +616,9 @@ function renderStatusStrip(snapshot) {
           const isRunning = mFeatures.some((f) => f.status === "running");
           const allDone = mFeatures.length > 0 && doneCount === mFeatures.length;
           const pillClass = allDone ? "step-completed" : isRunning ? "step-active" : "";
-          const badgeIcon = allDone ? "✓" : isRunning ? "●" : "";
+          const badgeIcon = allDone ? "\u2713" : isRunning ? "\u25cf" : "";
           const arrow =
-            idx < milestones.length - 1 ? `<span class="milestone-step-arrow">→</span>` : "";
+            idx < milestones.length - 1 ? `<span class="milestone-step-arrow">\u2192</span>` : "";
           return `
             <span class="milestone-step-pill ${pillClass}" data-milestone-id="${escapeHtml(m.id)}">
               <strong class="mono">${escapeHtml(m.id.toUpperCase())}</strong>
@@ -565,10 +645,10 @@ function renderStatusStrip(snapshot) {
         const allAssertionsPassed =
           mAssertions.length === 0 || mAssertions.every((a) => a.status === "passed");
         return allFeaturesDone && allAssertionsPassed
-          ? `${m.id.toUpperCase()} ✓`
+          ? `${m.id.toUpperCase()} \u2713`
           : `${m.id.toUpperCase()} (${m.title || m.id} ${doneCount}/${mFeatures.length})`;
       });
-      pipelineTextEl.textContent = mLabels.join(" → ");
+      pipelineTextEl.textContent = mLabels.join(" \u2192 ");
     } else {
       pipelineTextEl.textContent = isUninitialized
         ? "Waiting for mission initialization"
@@ -604,7 +684,7 @@ function renderSessionsColumn(snapshot) {
 
   const grouped = new Map();
   for (const m of milestones) {
-    grouped.set(m.id, { title: `${m.id.toUpperCase()} · ${m.title || m.id}`, items: [] });
+    grouped.set(m.id, { title: `${m.id.toUpperCase()} \u00b7 ${m.title || m.id}`, items: [] });
   }
   for (const s of sessions) {
     const mId = s.milestoneId || milestones[0]?.id || "m1";
@@ -698,7 +778,7 @@ function renderFeaturesAndAssertions(snapshot) {
       const passedInGroup = groupAssertions.filter((a) => a.status === "passed").length;
       const assertionMeta =
         groupAssertions.length > 0
-          ? ` · ${passedInGroup}/${groupAssertions.length} assertions`
+          ? ` \u00b7 ${passedInGroup}/${groupAssertions.length} assertions`
           : "";
 
       fHtml += `
@@ -723,7 +803,7 @@ function renderFeaturesAndAssertions(snapshot) {
                 ? "paused"
                 : "";
         const icon =
-          st === "completed" ? "✓" : st === "running" ? "●" : st === "paused" ? "||" : "•";
+          st === "completed" ? "\u2713" : st === "running" ? "\u25cf" : st === "paused" ? "||" : "\u2022";
         const kindLabel = f.kind || f.role || "implementation";
         const linkedIds = Array.isArray(f.fulfills)
           ? f.fulfills
@@ -852,7 +932,7 @@ function renderCenterColumn(snapshot) {
             data-testid="btn-approve-mission"
             data-action="approve"
           >
-            ✓ Approve &amp; Start Mission
+            \u2713 Approve &amp; Start Mission
           </button>
         </div>
         <div class="approval-summary-pills">
@@ -901,7 +981,7 @@ function renderCenterColumn(snapshot) {
       handoffEl.innerHTML = `
         <div class="handoff-header">
           <div>
-            <span class="status-pill ${escapeHtml(selectedSession.status)}">${escapeHtml(selectedSession.role)} · ${escapeHtml(selectedSession.status)}</span>
+            <span class="status-pill ${escapeHtml(selectedSession.status)}">${escapeHtml(selectedSession.role)} \u00b7 ${escapeHtml(selectedSession.status)}</span>
             <h3 class="handoff-title" style="margin-top:6px;">${escapeHtml(selectedSession.label)}</h3>
           </div>
           <div class="handoff-link-chip">
@@ -912,10 +992,10 @@ function renderCenterColumn(snapshot) {
               id="btn-copy-thread-uri"
               data-thread-uri="${escapeHtml(threadUri)}"
             >
-              ${hudState.copiedThreadUri === threadUri ? "✓ Copied" : "Copy URI"}
+              ${hudState.copiedThreadUri === threadUri ? "\u2713 Copied" : "Copy URI"}
             </button>
             <button type="button" class="strip-btn" id="btn-back-orchestrator">
-              ← Back to Board
+              \u2190 Back to Board
             </button>
           </div>
         </div>
@@ -959,11 +1039,11 @@ function renderCenterColumn(snapshot) {
                 ? issues
                     .map((iss) =>
                       typeof iss === "string"
-                        ? `• ${escapeHtml(iss)}`
-                        : `• ${escapeHtml(iss.summary || iss.description || JSON.stringify(iss))}`
+                        ? `\u2022 ${escapeHtml(iss)}`
+                        : `\u2022 ${escapeHtml(iss.summary || iss.description || JSON.stringify(iss))}`
                     )
                     .join("<br/>")
-                : "None — all assertions and checks clean."
+                : "None \u2014 all assertions and checks clean."
             }
           </div>
         </div>
@@ -993,6 +1073,13 @@ function renderCenterColumn(snapshot) {
 
   // 4. Orchestrator Status & Diagnostic Stream (Zero model_slots_updated spam)
   if (streamEl) {
+    const featuresList = Array.isArray(features) ? features : [];
+    const totalFeatures = featuresList.length;
+    const completedFeatures = featuresList.filter((f) => f.status === "completed").length;
+    const isCompleted =
+      state.status === "completed" ||
+      (!state.activeWorker && completedFeatures === totalFeatures && totalFeatures > 0);
+
     const activeRole = state.activeWorker ? inferSessionRole(state.activeWorker) : "Worker";
     const activeWorkerNum =
       state.activeWorker?.workerNumber != null ? ` #${state.activeWorker.workerNumber}` : "";
@@ -1002,20 +1089,32 @@ function renderCenterColumn(snapshot) {
       state.activeWorker?.featureId ||
       "active feature";
 
-    const resumeDiagnostic =
-      hudState.lastActionError ||
-      state.lastResumeDiagnostic ||
-      (state.activeWorker
-        ? `${activeRole}${activeWorkerNum} (${activeWorkerTitle}) is currently ${state.activeWorker.status || state.status}.`
-        : `Mission status is ${state.status || "planning"}.`);
+    const activeError = !isCompleted ? hudState.lastActionError : null;
+    const showResumeDiagnostic =
+      Boolean(state.lastResumeDiagnostic) &&
+      !isCompleted &&
+      (state.status === "paused" ||
+        (state.activeWorker?.resumePending === true &&
+          Boolean(state.activeWorker?.featureId) &&
+          String(state.lastResumeDiagnostic).includes(state.activeWorker.featureId)));
+
+    const resumeDiagnostic = activeError
+      ? activeError
+      : isCompleted
+        ? "All milestones, features, and validation assertions completed."
+        : showResumeDiagnostic
+          ? state.lastResumeDiagnostic
+          : state.activeWorker
+            ? `${activeRole}${activeWorkerNum} (${activeWorkerTitle}) is currently ${state.activeWorker.status || state.status}.`
+            : `Mission status is ${state.status || "planning"}.`;
 
     const filteredEvents = filterOrchestratorStreamEvents(progressLog);
     const latestMilestoneEvent = filteredEvents.at(-1);
 
     streamEl.innerHTML = `
-      <div class="stream-card diagnostic-card ${hudState.lastActionError ? "error" : ""}" id="resume-diagnostic-card">
+      <div class="stream-card diagnostic-card ${activeError ? "error" : ""}" id="resume-diagnostic-card">
         <div class="stream-card-header">
-          <span class="stream-tag">${hudState.lastActionError ? "Action Blocked" : "Execution Status"}</span>
+          <span class="stream-tag">${activeError ? "Action Blocked" : "Execution Status"}</span>
           <span class="stream-time mono">${escapeHtml(state.status || "planning")}</span>
         </div>
         <div class="stream-body">${escapeHtml(resumeDiagnostic)}</div>
@@ -1024,7 +1123,7 @@ function renderCenterColumn(snapshot) {
         latestMilestoneEvent
           ? `<div class="stream-card">
               <div class="stream-card-header">
-                <span class="stream-tag">Latest Event · ${escapeHtml(latestMilestoneEvent.type || "info")}</span>
+                <span class="stream-tag">Latest Event \u00b7 ${escapeHtml(latestMilestoneEvent.type || "info")}</span>
                 <span class="stream-time mono">${escapeHtml(formatRelativeTime(latestMilestoneEvent.timestamp, "now"))}</span>
               </div>
               <div class="stream-body">${escapeHtml(latestMilestoneEvent.message)}</div>
@@ -1172,6 +1271,20 @@ function renderRightColumn(snapshot) {
 
 export function applySnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return;
+  const prevRev = hudState.snapshot?.state?.revision;
+  const nextStatus = snapshot?.state?.status;
+  const nextRev = snapshot?.state?.revision;
+  if (
+    nextStatus === "running" ||
+    nextStatus === "completed" ||
+    (prevRev != null &&
+      nextRev != null &&
+      nextRev > prevRev &&
+      nextStatus !== "paused" &&
+      nextStatus !== "blocked")
+  ) {
+    hudState.lastActionError = null;
+  }
   hudState.snapshot = snapshot;
   renderTopBar(snapshot);
   renderStatusStrip(snapshot);
@@ -1284,7 +1397,7 @@ function connectSseStream() {
 
   es.addEventListener("open", () => {
     hudState.sseConnected = true;
-    if (indicatorEl) indicatorEl.textContent = "● Live";
+    if (indicatorEl) indicatorEl.textContent = "\u25cf Live";
   });
 
   es.addEventListener("mission_snapshot", (event) => {
@@ -1299,7 +1412,7 @@ function connectSseStream() {
 
   es.addEventListener("error", () => {
     hudState.sseConnected = false;
-    if (indicatorEl) indicatorEl.textContent = "○ Reconnecting";
+    if (indicatorEl) indicatorEl.textContent = "\u25cb Reconnecting";
   });
 }
 
