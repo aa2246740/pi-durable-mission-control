@@ -16,13 +16,17 @@ import {
   checkGitTreeBeforeResume,
   createT3Adapter,
   delegateMissionTask,
+  DROID_AUTONOMY_TO_T3_RUNTIME_MODE,
   EFFORT_LEVEL_TO_STRING,
   getOrchestratorCapabilities,
+  mapApprovalModeToProviderAutonomy,
   normalizeTargetFromSlot,
+  resolveEffectiveRuntimeMode,
   resolveTargetFromModelSettings,
   resumeWorker,
   runFeature,
   settleCompletedMilestoneThreads,
+  T3_APPROVAL_TO_DROID_AUTONOMY,
   VALID_CODEX_REASONING_EFFORTS
 } from "../bridge/t3-adapter.mjs";
 
@@ -246,6 +250,337 @@ test("VAL-BRIDGE-001: normalizeTargetFromSlot maps pi thinking option", () => {
       thinking: "max"
     }
   });
+});
+
+test("VAL-BRIDGE-001: bidirectional Droid autonomy <-> T3 runtimeMode mapping and provider-specific autonomy/effort helpers", () => {
+  assert.deepEqual(T3_APPROVAL_TO_DROID_AUTONOMY, {
+    plan: "spec",
+    "approval-required": "normal",
+    "auto-accept-edits": "auto-low",
+    auto: "auto-high",
+    "full-access": "auto-high"
+  });
+
+  assert.deepEqual(DROID_AUTONOMY_TO_T3_RUNTIME_MODE, {
+    spec: "approval-required",
+    normal: "approval-required",
+    "auto-low": "auto-accept-edits",
+    "auto-medium": "auto",
+    "auto-high": "full-access"
+  });
+
+  // mapApprovalModeToProviderAutonomy for Factory Droid
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", "plan"),
+    { autonomy_level: "spec" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", { interactionMode: "plan", runtimeMode: "auto" }),
+    { autonomy_level: "spec" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", "approval-required"),
+    { autonomy_level: "normal" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", { approvalMode: "approval-required" }),
+    { autonomy_level: "normal" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", "auto-accept-edits"),
+    { autonomy_level: "auto-low" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", { autonomy_level: "auto-medium", runtimeMode: "auto" }),
+    { autonomy_level: "auto-medium" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", "auto"),
+    { autonomy_level: "auto-high" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", "full-access"),
+    { autonomy_level: "auto-high" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid"),
+    { autonomy_level: "auto-high" }
+  );
+
+  // mapApprovalModeToProviderAutonomy for Devin
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_devin"),
+    { mode: "bypass" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_devin", "auto"),
+    { mode: "bypass" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_devin", { interactionMode: "plan" }),
+    { mode: "plan" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_devin", { runtimeMode: "approval-required" }),
+    { mode: "ask" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_devin", { runtimeMode: "auto-accept-edits" }),
+    { mode: "accept-edits" }
+  );
+
+  // mapApprovalModeToProviderAutonomy for Cursor
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_cursor"),
+    { mode: "agent" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_cursor", "auto"),
+    { mode: "agent" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_cursor", { interactionMode: "plan" }),
+    { mode: "plan" }
+  );
+  assert.deepEqual(
+    mapApprovalModeToProviderAutonomy("acpRegistry_cursor", { runtimeMode: "approval-required" }),
+    { mode: "ask" }
+  );
+
+  // resolveEffectiveRuntimeMode hierarchy, ceiling, and providerRuntimeModes filtering
+  assert.equal(resolveEffectiveRuntimeMode(), "full-access");
+  assert.equal(resolveEffectiveRuntimeMode({ autonomyLevel: "spec" }), "approval-required");
+  assert.equal(resolveEffectiveRuntimeMode({ autonomyLevel: "normal" }), "approval-required");
+  assert.equal(resolveEffectiveRuntimeMode({ autonomyLevel: "auto-low" }), "auto-accept-edits");
+  assert.equal(resolveEffectiveRuntimeMode({ autonomyLevel: "auto-medium" }), "auto");
+  assert.equal(resolveEffectiveRuntimeMode({ autonomyLevel: "auto-high" }), "full-access");
+  assert.equal(
+    resolveEffectiveRuntimeMode({ requestedMode: "full-access", parentRuntimeMode: "auto" }),
+    "auto"
+  );
+  assert.equal(
+    resolveEffectiveRuntimeMode({
+      autonomyLevel: "auto-high",
+      parentRuntimeMode: "auto",
+      providerRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"]
+    }),
+    "auto-accept-edits"
+  );
+  assert.equal(
+    resolveEffectiveRuntimeMode({
+      parentRuntimeMode: "full-access",
+      providerRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"]
+    }),
+    "full-access"
+  );
+});
+
+test("VAL-BRIDGE-001: normalizeTargetFromSlot maps acpRegistry_factory_droid, acpRegistry_devin, acpRegistry_cursor, and grok/cpa options accurately", () => {
+  // Factory Droid approval/runtime/interaction mode mappings
+  assert.deepEqual(
+    normalizeTargetFromSlot({
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      effort: 4,
+      runtimeMode: "approval-required"
+    }),
+    {
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      options: {
+        reasoning_effort: "high",
+        autonomy_level: "normal"
+      }
+    }
+  );
+
+  assert.deepEqual(
+    normalizeTargetFromSlot({
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      interactionMode: "plan"
+    }),
+    {
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      options: {
+        autonomy_level: "spec"
+      }
+    }
+  );
+
+  assert.deepEqual(
+    normalizeTargetFromSlot({
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      runtimeMode: "auto-accept-edits"
+    }),
+    {
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      options: {
+        autonomy_level: "auto-low"
+      }
+    }
+  );
+
+  assert.deepEqual(
+    normalizeTargetFromSlot({
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      autonomy_level: "auto-medium"
+    }),
+    {
+      providerInstanceId: "acpRegistry_factory_droid",
+      model: "claude-opus-4-6",
+      options: {
+        autonomy_level: "auto-medium"
+      }
+    }
+  );
+
+  // Devin: mode defaults to "bypass" and effort maps to thought_level ("medium" | "high" | "max")
+  for (const [inputEffort, expectedThought] of [
+    ["minimal", "medium"],
+    ["low", "medium"],
+    ["medium", "medium"],
+    ["high", "high"],
+    ["xhigh", "max"],
+    ["max", "max"],
+    [1, "medium"],
+    [4, "high"],
+    [5, "max"]
+  ]) {
+    assert.deepEqual(
+      normalizeTargetFromSlot({
+        providerInstanceId: "acpRegistry_devin",
+        model: "claude-opus-4-6",
+        effort: inputEffort
+      }),
+      {
+        providerInstanceId: "acpRegistry_devin",
+        model: "claude-opus-4-6",
+        options: {
+          mode: "bypass",
+          thought_level: expectedThought
+        }
+      }
+    );
+  }
+
+  assert.deepEqual(
+    normalizeTargetFromSlot({
+      providerInstanceId: "acpRegistry_devin",
+      model: "claude-opus-4-6",
+      runtimeMode: "auto-accept-edits",
+      effort: "high"
+    }),
+    {
+      providerInstanceId: "acpRegistry_devin",
+      model: "claude-opus-4-6",
+      options: {
+        mode: "accept-edits",
+        thought_level: "high"
+      }
+    }
+  );
+
+  // Cursor: mode defaults to "agent" and effort maps to reasoning_effort + effort
+  const cursorMatrix = [
+    ["minimal", "low", "low"],
+    ["low", "low", "low"],
+    ["medium", "medium", "medium"],
+    ["high", "high", "high"],
+    ["xhigh", "xhigh", "xhigh"],
+    ["max", "xhigh", "max"],
+    [1, "low", "low"],
+    [4, "high", "high"],
+    [5, "xhigh", "max"]
+  ];
+  for (const [inputEffort, expectedReasoning, expectedEffort] of cursorMatrix) {
+    assert.deepEqual(
+      normalizeTargetFromSlot({
+        providerInstanceId: "acpRegistry_cursor",
+        model: "claude-4.6-opus-max-thinking",
+        effort: inputEffort
+      }),
+      {
+        providerInstanceId: "acpRegistry_cursor",
+        model: "claude-4.6-opus-max-thinking",
+        options: {
+          mode: "agent",
+          reasoning_effort: expectedReasoning,
+          effort: expectedEffort
+        }
+      }
+    );
+  }
+
+  assert.deepEqual(
+    normalizeTargetFromSlot({
+      providerInstanceId: "acpRegistry_cursor",
+      model: "claude-4.6-opus-max-thinking",
+      interactionMode: "plan",
+      effort: "high"
+    }),
+    {
+      providerInstanceId: "acpRegistry_cursor",
+      model: "claude-4.6-opus-max-thinking",
+      options: {
+        mode: "plan",
+        reasoning_effort: "high",
+        effort: "high"
+      }
+    }
+  );
+
+  // Grok & CPA (grok-*): reasoningEffort clamps minimal -> low and max -> xhigh
+  for (const provider of ["grok", "cpa"]) {
+    assert.deepEqual(
+      normalizeTargetFromSlot({
+        providerInstanceId: provider,
+        model: "grok-4.7",
+        effort: "minimal"
+      }),
+      {
+        providerInstanceId: provider,
+        model: "grok-4.7",
+        options: {
+          reasoningEffort: "low"
+        }
+      }
+    );
+
+    assert.deepEqual(
+      normalizeTargetFromSlot({
+        providerInstanceId: provider,
+        model: "grok-4.7",
+        effort: "max"
+      }),
+      {
+        providerInstanceId: provider,
+        model: "grok-4.7",
+        options: {
+          reasoningEffort: "xhigh"
+        }
+      }
+    );
+
+    assert.deepEqual(
+      normalizeTargetFromSlot({
+        providerInstanceId: provider,
+        model: "grok-4.6",
+        effort: "high"
+      }),
+      {
+        providerInstanceId: provider,
+        model: "grok-4.6",
+        options: {
+          reasoningEffort: "high"
+        }
+      }
+    );
+  }
 });
 
 test("VAL-BRIDGE-001: resolveTargetFromModelSettings resolves worker, validator, and orchestrator slots", () => {
@@ -1629,4 +1964,8 @@ test("SKILL.md contains complete YAML frontmatter and required workflow instruct
   assert.match(content, /StartMissionRun/);
   assert.match(content, /CheckMissionStateBeforeResuming/);
   assert.match(content, /\[resume the mission\]/);
+  assert.match(content, /T3_APPROVAL_TO_DROID_AUTONOMY/);
+  assert.match(content, /DROID_AUTONOMY_TO_T3_RUNTIME_MODE/);
+  assert.match(content, /acpRegistry_devin/);
+  assert.match(content, /acpRegistry_cursor/);
 });

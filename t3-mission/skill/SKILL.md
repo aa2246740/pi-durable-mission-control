@@ -15,13 +15,31 @@ Every Mission uses three independent model slots configured in `.mission/model-s
 2. **Worker (`worker`)**: Executes scoped feature implementations inside isolated worktrees (`isolation: "worktree"`, `role: "implementation"`).
 3. **Validator (`validator`)**: Performs independent **Scrutiny** (`role: "review"`) and **User-Testing** (`role: "test"`) validation at the end of every Milestone.
 
-### Provider Slot Normalization (`normalizeTargetFromSlot`)
+### Provider Slot Normalization (`normalizeTargetFromSlot`) & Autonomy Mapping
 
 When dispatching via `delegate_task`, model slot settings (including numeric effort bars `1..5`: `1 -> "minimal"`, `2 -> "low"`, `3 -> "medium"`, `4 -> "high"`, `5 -> "max"`) are normalized into `target: { providerInstanceId, model, options }`:
 - `providerInstanceId === "codex"` -> `options.reasoningEffort` (`"minimal" | "low" | "medium" | "high" | "xhigh" | "max"`)
 - `providerInstanceId === "antigravity"` -> direct `model` ID (e.g. `"gemini-4-argon-high"`, `"claude-opus-5-5-high"`)
-- `providerInstanceId === "acpRegistry_factory_droid"` -> `options.reasoning_effort` and `options.autonomy_level: "auto-high"`
-- `providerInstanceId === "pi"` -> `options.thinking`
+- `providerInstanceId === "acpRegistry_factory_droid"` -> `options.reasoning_effort` and `options.autonomy_level` via `mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", slotConfig)` (defaults to `"auto-high"` in Mission Mode so workers do not stall in `"auto-medium"` or `"normal"`)
+- `providerInstanceId === "acpRegistry_devin"` -> `options.mode` via `mapApprovalModeToProviderAutonomy("acpRegistry_devin", slotConfig)` (defaults to `"bypass"` so Devin does not stall on shell commands in `"accept-edits"`) and `options.thought_level` (`"minimal"|"low"|"medium"` -> `"medium"`, `"high"` -> `"high"`, `"xhigh"|"max"` -> `"max"`)
+- `providerInstanceId === "acpRegistry_cursor"` -> `options.mode` via `mapApprovalModeToProviderAutonomy("acpRegistry_cursor", slotConfig)` (defaults to `"agent"`, or `"plan"` / `"ask"`) plus `options.reasoning_effort` (`"minimal"` -> `"low"`, `"max"` -> `"xhigh"`, else `"low"|"medium"|"high"|"xhigh"`) and `options.effort` (`"minimal"` -> `"low"`, else `"low"|"medium"|"high"|"xhigh"|"max"`)
+- `providerInstanceId === "grok"` or `"cpa"` (`grok-*` models) -> `options.reasoningEffort` (`"low" | "medium" | "high" | "xhigh"`, clamping `"minimal"` -> `"low"` and `"max"` -> `"xhigh"`)
+- `providerInstanceId === "pi"` -> `options.thinking` (and `resolveEffectiveRuntimeMode` filters against `pi`'s supported `runtimeModes: ["approval-required", "auto-accept-edits", "full-access"]` while respecting `parentRuntimeMode` as ceiling)
+
+#### Bidirectional Factory Droid `autonomy_level` <-> T3 Approval/Runtime Mode Mapping
+
+- `T3_APPROVAL_TO_DROID_AUTONOMY`:
+  - `"plan"` (`interactionMode: "plan"`) -> `"spec"`
+  - `"approval-required"` -> `"normal"`
+  - `"auto-accept-edits"` -> `"auto-low"`
+  - `"auto"` -> `"auto-high"` (explicit `autonomy_level: "auto-medium"` is still preserved when passed directly)
+  - `"full-access"` -> `"auto-high"`
+- `DROID_AUTONOMY_TO_T3_RUNTIME_MODE`:
+  - `"spec"` -> `"approval-required"`
+  - `"normal"` -> `"approval-required"`
+  - `"auto-low"` -> `"auto-accept-edits"`
+  - `"auto-medium"` -> `"auto"`
+  - `"auto-high"` -> `"full-access"`
 
 ---
 

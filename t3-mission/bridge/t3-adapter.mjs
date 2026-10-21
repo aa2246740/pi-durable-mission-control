@@ -45,6 +45,328 @@ export const VALID_CODEX_REASONING_EFFORTS = new Set([
   "max"
 ]);
 
+export const T3_RUNTIME_MODE_ORDER = Object.freeze([
+  "approval-required",
+  "auto-accept-edits",
+  "auto",
+  "full-access"
+]);
+
+export const T3_APPROVAL_TO_DROID_AUTONOMY = Object.freeze({
+  plan: "spec",
+  "approval-required": "normal",
+  "auto-accept-edits": "auto-low",
+  auto: "auto-high",
+  "full-access": "auto-high"
+});
+
+export const DROID_AUTONOMY_TO_T3_RUNTIME_MODE = Object.freeze({
+  spec: "approval-required",
+  normal: "approval-required",
+  "auto-low": "auto-accept-edits",
+  "auto-medium": "auto",
+  "auto-high": "full-access"
+});
+
+const VALID_DROID_AUTONOMY_LEVELS = new Set([
+  "spec",
+  "normal",
+  "auto-low",
+  "auto-medium",
+  "auto-high"
+]);
+
+function normalizeModeToken(value) {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  return String(value).trim().toLowerCase();
+}
+
+function normalizeToT3RuntimeMode(value, fallback = undefined) {
+  const token = normalizeModeToken(value);
+  if (!token) {
+    return fallback;
+  }
+  if (T3_RUNTIME_MODE_ORDER.includes(token)) {
+    return token;
+  }
+  if (DROID_AUTONOMY_TO_T3_RUNTIME_MODE[token]) {
+    return DROID_AUTONOMY_TO_T3_RUNTIME_MODE[token];
+  }
+  if (token === "plan" || token === "ask") {
+    return "approval-required";
+  }
+  if (token === "accept-edits") {
+    return "auto-accept-edits";
+  }
+  if (token === "agent") {
+    return "auto";
+  }
+  if (token === "bypass") {
+    return "full-access";
+  }
+  return fallback;
+}
+
+/**
+ * Map a T3 approval/runtime/interaction mode (or slot config) into the
+ * provider-specific autonomy/mode options required by T3 Code providers.
+ *
+ * - `acpRegistry_factory_droid`: `{ autonomy_level: "spec" | "normal" | "auto-low" | "auto-medium" | "auto-high" }`
+ * - `acpRegistry_devin`: `{ mode: "plan" | "ask" | "accept-edits" | "bypass" }`
+ * - `acpRegistry_cursor`: `{ mode: "plan" | "ask" | "agent" }`
+ *
+ * @param {string} providerInstanceId
+ * @param {string | Record<string, unknown>} [modeOrSlot={}]
+ * @returns {Record<string, string>}
+ */
+export function mapApprovalModeToProviderAutonomy(providerInstanceId, modeOrSlot = {}) {
+  const provider = String(providerInstanceId || "").trim();
+  const isStringInput = typeof modeOrSlot === "string";
+  const slotObj =
+    !isStringInput && modeOrSlot && typeof modeOrSlot === "object" && !Array.isArray(modeOrSlot)
+      ? modeOrSlot
+      : {};
+  const rawOptions =
+    slotObj.options && typeof slotObj.options === "object" && !Array.isArray(slotObj.options)
+      ? slotObj.options
+      : {};
+
+  if (provider === "acpRegistry_factory_droid") {
+    const mapDroidToken = (rawToken) => {
+      const token = normalizeModeToken(rawToken);
+      if (!token) {
+        return undefined;
+      }
+      if (VALID_DROID_AUTONOMY_LEVELS.has(token)) {
+        return token;
+      }
+      if (T3_APPROVAL_TO_DROID_AUTONOMY[token]) {
+        return T3_APPROVAL_TO_DROID_AUTONOMY[token];
+      }
+      if (token === "ask") {
+        return "normal";
+      }
+      if (token === "accept-edits") {
+        return "auto-low";
+      }
+      if (token === "bypass" || token === "agent") {
+        return "auto-high";
+      }
+      return undefined;
+    };
+
+    if (isStringInput) {
+      return {
+        autonomy_level: mapDroidToken(modeOrSlot) ?? "auto-high"
+      };
+    }
+
+    const candidates = [
+      slotObj.autonomy_level ?? slotObj.autonomyLevel,
+      normalizeModeToken(slotObj.interactionMode) === "plan" ? "plan" : undefined,
+      slotObj.runtimeMode ?? slotObj.approvalMode ?? slotObj.mode,
+      rawOptions.autonomy_level ?? rawOptions.autonomyLevel,
+      normalizeModeToken(rawOptions.interactionMode) === "plan" ? "plan" : undefined,
+      rawOptions.runtimeMode ?? rawOptions.approvalMode ?? rawOptions.mode
+    ];
+
+    for (const candidate of candidates) {
+      const mapped = mapDroidToken(candidate);
+      if (mapped) {
+        return { autonomy_level: mapped };
+      }
+    }
+
+    return { autonomy_level: "auto-high" };
+  }
+
+  if (provider === "acpRegistry_devin") {
+    const mapDevinToken = (rawToken) => {
+      const token = normalizeModeToken(rawToken);
+      if (!token) {
+        return undefined;
+      }
+      if (token === "plan" || token === "spec") {
+        return "plan";
+      }
+      if (token === "approval-required" || token === "normal" || token === "ask") {
+        return "ask";
+      }
+      if (
+        token === "auto-accept-edits" ||
+        token === "accept-edits" ||
+        token === "auto-low"
+      ) {
+        return "accept-edits";
+      }
+      if (
+        token === "auto" ||
+        token === "full-access" ||
+        token === "bypass" ||
+        token === "auto-medium" ||
+        token === "auto-high" ||
+        token === "agent"
+      ) {
+        return "bypass";
+      }
+      return undefined;
+    };
+
+    if (isStringInput) {
+      return {
+        mode: mapDevinToken(modeOrSlot) ?? "bypass"
+      };
+    }
+
+    const candidates = [
+      normalizeModeToken(slotObj.interactionMode) === "plan" ? "plan" : undefined,
+      slotObj.mode ??
+        slotObj.runtimeMode ??
+        slotObj.approvalMode ??
+        slotObj.autonomy_level ??
+        slotObj.autonomyLevel,
+      normalizeModeToken(rawOptions.interactionMode) === "plan" ? "plan" : undefined,
+      rawOptions.mode ??
+        rawOptions.runtimeMode ??
+        rawOptions.approvalMode ??
+        rawOptions.autonomy_level ??
+        rawOptions.autonomyLevel
+    ];
+
+    for (const candidate of candidates) {
+      const mapped = mapDevinToken(candidate);
+      if (mapped) {
+        return { mode: mapped };
+      }
+    }
+
+    return { mode: "bypass" };
+  }
+
+  if (provider === "acpRegistry_cursor") {
+    const mapCursorToken = (rawToken) => {
+      const token = normalizeModeToken(rawToken);
+      if (!token) {
+        return undefined;
+      }
+      if (token === "plan" || token === "spec") {
+        return "plan";
+      }
+      if (token === "approval-required" || token === "normal" || token === "ask") {
+        return "ask";
+      }
+      if (
+        token === "auto-accept-edits" ||
+        token === "accept-edits" ||
+        token === "auto-low" ||
+        token === "auto" ||
+        token === "full-access" ||
+        token === "agent" ||
+        token === "bypass" ||
+        token === "auto-medium" ||
+        token === "auto-high"
+      ) {
+        return "agent";
+      }
+      return undefined;
+    };
+
+    if (isStringInput) {
+      return {
+        mode: mapCursorToken(modeOrSlot) ?? "agent"
+      };
+    }
+
+    const candidates = [
+      normalizeModeToken(slotObj.interactionMode) === "plan" ? "plan" : undefined,
+      slotObj.mode ??
+        slotObj.runtimeMode ??
+        slotObj.approvalMode ??
+        slotObj.autonomy_level ??
+        slotObj.autonomyLevel,
+      normalizeModeToken(rawOptions.interactionMode) === "plan" ? "plan" : undefined,
+      rawOptions.mode ??
+        rawOptions.runtimeMode ??
+        rawOptions.approvalMode ??
+        rawOptions.autonomy_level ??
+        rawOptions.autonomyLevel
+    ];
+
+    for (const candidate of candidates) {
+      const mapped = mapCursorToken(candidate);
+      if (mapped) {
+        return { mode: mapped };
+      }
+    }
+
+    return { mode: "agent" };
+  }
+
+  return {};
+}
+
+/**
+ * Resolve the safest and most autonomous T3 `runtimeMode` allowed by T3's
+ * hierarchy (`approval-required` < `auto-accept-edits` < `auto` < `full-access`),
+ * respecting `parentRuntimeMode` as ceiling and filtering against
+ * `providerRuntimeModes` when provided.
+ *
+ * @param {{
+ *   requestedMode?: string,
+ *   autonomyLevel?: string,
+ *   parentRuntimeMode?: string,
+ *   providerRuntimeModes?: string[]
+ * }} [params={}]
+ * @returns {"approval-required" | "auto-accept-edits" | "auto" | "full-access"}
+ */
+export function resolveEffectiveRuntimeMode({
+  requestedMode,
+  autonomyLevel,
+  parentRuntimeMode,
+  providerRuntimeModes
+} = {}) {
+  const fromRequested = normalizeToT3RuntimeMode(requestedMode);
+  const fromAutonomy = normalizeToT3RuntimeMode(autonomyLevel);
+
+  let desiredMode = "full-access";
+  if (fromRequested && fromAutonomy) {
+    const reqRank = T3_RUNTIME_MODE_ORDER.indexOf(fromRequested);
+    const autRank = T3_RUNTIME_MODE_ORDER.indexOf(fromAutonomy);
+    desiredMode = reqRank <= autRank ? fromRequested : fromAutonomy;
+  } else if (fromRequested) {
+    desiredMode = fromRequested;
+  } else if (fromAutonomy) {
+    desiredMode = fromAutonomy;
+  }
+
+  const ceilingMode = normalizeToT3RuntimeMode(parentRuntimeMode, "full-access");
+  const desiredRank = T3_RUNTIME_MODE_ORDER.indexOf(desiredMode);
+  const ceilingRank = T3_RUNTIME_MODE_ORDER.indexOf(ceilingMode);
+  const maxAllowedRank = Math.min(desiredRank, ceilingRank);
+
+  const normalizedProviderModes = Array.isArray(providerRuntimeModes)
+    ? providerRuntimeModes
+        .map((m) => normalizeToT3RuntimeMode(m))
+        .filter((m) => Boolean(m))
+    : [];
+
+  const candidatePool =
+    normalizedProviderModes.length > 0
+      ? T3_RUNTIME_MODE_ORDER.filter((m) => normalizedProviderModes.includes(m))
+      : [...T3_RUNTIME_MODE_ORDER];
+
+  const withinCeiling = candidatePool.filter(
+    (m) => T3_RUNTIME_MODE_ORDER.indexOf(m) <= maxAllowedRank
+  );
+
+  if (withinCeiling.length > 0) {
+    return /** @type {any} */ (withinCeiling[withinCeiling.length - 1]);
+  }
+  return /** @type {any} */ (candidatePool[0] ?? "approval-required");
+}
+
 function extractNumericEffort(value) {
   if (typeof value === "number" && Number.isInteger(value) && EFFORT_LEVEL_TO_STRING[value]) {
     return value;
@@ -54,6 +376,78 @@ function extractNumericEffort(value) {
   }
   return undefined;
 }
+
+function mapDevinThoughtLevel(effortValue) {
+  const norm = String(effortValue).trim().toLowerCase();
+  if (norm === "minimal" || norm === "low" || norm === "medium") {
+    return "medium";
+  }
+  if (norm === "high") {
+    return "high";
+  }
+  if (norm === "xhigh" || norm === "max") {
+    return "max";
+  }
+  return String(effortValue).trim();
+}
+
+function mapCursorReasoningEffort(effortValue) {
+  const norm = String(effortValue).trim().toLowerCase();
+  if (norm === "minimal") {
+    return "low";
+  }
+  if (norm === "max") {
+    return "xhigh";
+  }
+  if (norm === "low" || norm === "medium" || norm === "high" || norm === "xhigh") {
+    return norm;
+  }
+  return String(effortValue).trim();
+}
+
+function mapCursorEffort(effortValue) {
+  const norm = String(effortValue).trim().toLowerCase();
+  if (norm === "minimal") {
+    return "low";
+  }
+  if (
+    norm === "low" ||
+    norm === "medium" ||
+    norm === "high" ||
+    norm === "xhigh" ||
+    norm === "max"
+  ) {
+    return norm;
+  }
+  return String(effortValue).trim();
+}
+
+function mapGrokReasoningEffort(effortValue) {
+  const norm = String(effortValue).trim().toLowerCase();
+  if (norm === "minimal") {
+    return "low";
+  }
+  if (norm === "max") {
+    return "xhigh";
+  }
+  if (norm === "low" || norm === "medium" || norm === "high" || norm === "xhigh") {
+    return norm;
+  }
+  return String(effortValue).trim();
+}
+
+const TRANSIENT_SLOT_OPTION_KEYS = new Set([
+  "effort",
+  "reasoningEffort",
+  "reasoning_effort",
+  "thinking",
+  "thought_level",
+  "runtimeMode",
+  "approvalMode",
+  "interactionMode",
+  "autonomy_level",
+  "autonomyLevel"
+]);
 
 /**
  * Normalize a model slot configuration from `.mission/model-settings.json`
@@ -66,7 +460,17 @@ function extractNumericEffort(value) {
  * - `antigravity`: directly uses the corresponding `model` ID
  *   (e.g. `"gemini-4-argon-high"`, `"claude-opus-5-5-high"`)
  * - `acpRegistry_factory_droid`: puts reasoning strength into
- *   `options.reasoning_effort` and sets `options.autonomy_level: "auto-high"`
+ *   `options.reasoning_effort` and maps approval/runtime mode into
+ *   `options.autonomy_level` (defaulting to `"auto-high"`)
+ * - `acpRegistry_devin`: maps approval/runtime mode into `options.mode`
+ *   (defaulting to `"bypass"`) and effort into `options.thought_level`
+ *   (`"medium" | "high" | "max"`)
+ * - `acpRegistry_cursor`: maps approval/runtime mode into `options.mode`
+ *   (defaulting to `"agent"`) and effort into `options.reasoning_effort` +
+ *   `options.effort`
+ * - `grok` / `cpa` (`grok-*`): puts reasoning strength into
+ *   `options.reasoningEffort` (clamping `"minimal"` -> `"low"` and
+ *   `"max"` -> `"xhigh"`)
  * - `pi`: puts thinking strength into `options.thinking`
  *
  * @param {Record<string, unknown> | null | undefined} slotConfig
@@ -106,9 +510,11 @@ export function normalizeTargetFromSlot(slotConfig) {
     slotConfig.reasoningEffort ??
     slotConfig.reasoning_effort ??
     slotConfig.thinking ??
+    slotConfig.thought_level ??
     rawOptions.reasoningEffort ??
     rawOptions.reasoning_effort ??
-    rawOptions.thinking;
+    rawOptions.thinking ??
+    rawOptions.thought_level;
   const explicitReasoning =
     explicitReasoningRaw !== undefined && explicitReasoningRaw !== null
       ? String(explicitReasoningRaw).trim()
@@ -134,16 +540,13 @@ export function normalizeTargetFromSlot(slotConfig) {
   }
 
   const options = {};
+  const isGrokTarget =
+    providerInstanceId === "grok" ||
+    (providerInstanceId === "cpa" && /^grok/i.test(model));
 
   if (providerInstanceId === "codex") {
     for (const [key, val] of Object.entries(rawOptions)) {
-      if (
-        key !== "effort" &&
-        key !== "reasoningEffort" &&
-        key !== "reasoning_effort" &&
-        key !== "thinking" &&
-        val !== undefined
-      ) {
+      if (!TRANSIENT_SLOT_OPTION_KEYS.has(key) && val !== undefined) {
         options[key] = val;
       }
     }
@@ -153,49 +556,61 @@ export function normalizeTargetFromSlot(slotConfig) {
         ? normalizedEffort
         : String(effortValue).trim();
     }
+  } else if (isGrokTarget) {
+    for (const [key, val] of Object.entries(rawOptions)) {
+      if (!TRANSIENT_SLOT_OPTION_KEYS.has(key) && val !== undefined) {
+        options[key] = val;
+      }
+    }
+    if (effortValue !== undefined && effortValue !== null && String(effortValue).trim() !== "") {
+      options.reasoningEffort = mapGrokReasoningEffort(effortValue);
+    }
   } else if (providerInstanceId === "antigravity") {
     for (const [key, val] of Object.entries(rawOptions)) {
-      if (
-        key !== "effort" &&
-        key !== "reasoningEffort" &&
-        key !== "reasoning_effort" &&
-        key !== "thinking" &&
-        val !== undefined
-      ) {
+      if (!TRANSIENT_SLOT_OPTION_KEYS.has(key) && val !== undefined) {
         options[key] = val;
       }
     }
   } else if (providerInstanceId === "acpRegistry_factory_droid") {
     for (const [key, val] of Object.entries(rawOptions)) {
-      if (
-        key !== "effort" &&
-        key !== "reasoningEffort" &&
-        key !== "reasoning_effort" &&
-        key !== "thinking" &&
-        val !== undefined
-      ) {
+      if (!TRANSIENT_SLOT_OPTION_KEYS.has(key) && val !== undefined) {
         options[key] = val;
       }
     }
     if (effortValue !== undefined && effortValue !== null && String(effortValue).trim() !== "") {
       options.reasoning_effort = String(effortValue).trim();
     }
-    const autonomyLevel =
-      slotConfig.autonomy_level ??
-      slotConfig.autonomyLevel ??
-      rawOptions.autonomy_level ??
-      rawOptions.autonomyLevel ??
-      "auto-high";
-    options.autonomy_level = String(autonomyLevel).trim() || "auto-high";
+    const { autonomy_level } = mapApprovalModeToProviderAutonomy(
+      "acpRegistry_factory_droid",
+      slotConfig
+    );
+    options.autonomy_level = autonomy_level || "auto-high";
+  } else if (providerInstanceId === "acpRegistry_devin") {
+    for (const [key, val] of Object.entries(rawOptions)) {
+      if (!TRANSIENT_SLOT_OPTION_KEYS.has(key) && key !== "mode" && val !== undefined) {
+        options[key] = val;
+      }
+    }
+    const { mode } = mapApprovalModeToProviderAutonomy("acpRegistry_devin", slotConfig);
+    options.mode = mode || "bypass";
+    if (effortValue !== undefined && effortValue !== null && String(effortValue).trim() !== "") {
+      options.thought_level = mapDevinThoughtLevel(effortValue);
+    }
+  } else if (providerInstanceId === "acpRegistry_cursor") {
+    for (const [key, val] of Object.entries(rawOptions)) {
+      if (!TRANSIENT_SLOT_OPTION_KEYS.has(key) && key !== "mode" && val !== undefined) {
+        options[key] = val;
+      }
+    }
+    const { mode } = mapApprovalModeToProviderAutonomy("acpRegistry_cursor", slotConfig);
+    options.mode = mode || "agent";
+    if (effortValue !== undefined && effortValue !== null && String(effortValue).trim() !== "") {
+      options.reasoning_effort = mapCursorReasoningEffort(effortValue);
+      options.effort = mapCursorEffort(effortValue);
+    }
   } else if (providerInstanceId === "pi") {
     for (const [key, val] of Object.entries(rawOptions)) {
-      if (
-        key !== "effort" &&
-        key !== "reasoningEffort" &&
-        key !== "reasoning_effort" &&
-        key !== "thinking" &&
-        val !== undefined
-      ) {
+      if (!TRANSIENT_SLOT_OPTION_KEYS.has(key) && val !== undefined) {
         options[key] = val;
       }
     }
@@ -614,7 +1029,18 @@ export async function delegateMissionTask(params, envOrOptions = process.env) {
     delegateArgs.target = target;
   }
   if (params.runtimeMode) {
-    delegateArgs.runtimeMode = params.runtimeMode;
+    delegateArgs.runtimeMode =
+      params.parentRuntimeMode || params.providerRuntimeModes
+        ? resolveEffectiveRuntimeMode({
+            requestedMode: String(params.runtimeMode),
+            parentRuntimeMode: params.parentRuntimeMode
+              ? String(params.parentRuntimeMode)
+              : undefined,
+            providerRuntimeModes: Array.isArray(params.providerRuntimeModes)
+              ? params.providerRuntimeModes
+              : undefined
+          })
+        : params.runtimeMode;
   }
   if (params.interactionMode) {
     delegateArgs.interactionMode = params.interactionMode;
@@ -1004,6 +1430,10 @@ export async function settleCompletedMilestoneThreads(childThreadIds = [], envOr
  */
 export function createT3Adapter(defaultOptions = {}) {
   return {
+    T3_APPROVAL_TO_DROID_AUTONOMY,
+    DROID_AUTONOMY_TO_T3_RUNTIME_MODE,
+    mapApprovalModeToProviderAutonomy,
+    resolveEffectiveRuntimeMode,
     normalizeTargetFromSlot,
     resolveTargetFromModelSettings,
     callT3McpTool: (toolName, args, opts) =>
@@ -1026,6 +1456,11 @@ export function createT3Adapter(defaultOptions = {}) {
 export default {
   EFFORT_LEVEL_TO_STRING,
   VALID_CODEX_REASONING_EFFORTS,
+  T3_RUNTIME_MODE_ORDER,
+  T3_APPROVAL_TO_DROID_AUTONOMY,
+  DROID_AUTONOMY_TO_T3_RUNTIME_MODE,
+  mapApprovalModeToProviderAutonomy,
+  resolveEffectiveRuntimeMode,
   normalizeTargetFromSlot,
   resolveTargetFromModelSettings,
   callT3McpTool,
