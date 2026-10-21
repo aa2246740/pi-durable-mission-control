@@ -187,7 +187,7 @@ function synthesizeSessions(state, features) {
         s.timeLabel ||
         formatRelativeTime(
           s.endedAt || s.startedAt,
-          status === "running" ? "now" : "1h"
+          status === "running" ? "now" : status === "pending" ? "queued" : "done"
         ),
       childThreadId,
       handoff: {
@@ -269,7 +269,7 @@ function synthesizeSessions(state, features) {
       status,
       timeLabel: formatRelativeTime(
         h.completedAt,
-        status === "running" ? "now" : "1h"
+        status === "running" ? "now" : status === "pending" ? "queued" : "done"
       ),
       childThreadId,
       handoff: {
@@ -289,8 +289,8 @@ function synthesizeSessions(state, features) {
 
   if (state?.activeWorker) {
     const aw = state.activeWorker;
-    const number = aw.workerNumber ?? 28;
-    const awId = aw.sessionId || aw.runId || `worker-${number}`;
+    const number = aw.workerNumber ?? null;
+    const awId = aw.sessionId || aw.runId || (number !== null ? `worker-${number}` : "active-worker");
     const matchedFeature =
       featuresList.find((f) => f.id && f.id === aw.featureId) || null;
     const existing =
@@ -298,7 +298,7 @@ function synthesizeSessions(state, features) {
       Array.from(byId.values()).find((s) =>
         aw.runId
           ? s.runId === aw.runId
-          : s.workerNumber === number ||
+          : (number !== null && s.workerNumber === number) ||
             (aw.featureId && s.featureId === aw.featureId && s.status !== "completed")
       );
     const role = inferSessionRole(aw, existing || matchedFeature);
@@ -308,19 +308,20 @@ function synthesizeSessions(state, features) {
       existing?.title ||
       matchedFeature?.title ||
       aw.featureId ||
-      "M2 material test gaps";
+      "Active Feature";
     const status = aw.status || (state.status === "paused" ? "paused" : "running");
     const h = aw.handoff || {};
+    const resolvedNumber = number ?? existing?.workerNumber ?? 1;
 
     const sessionObj = {
       id: existing?.id || awId,
       runId: aw.runId || existing?.runId || null,
       role,
-      workerNumber: number,
-      milestoneId: aw.milestoneId || existing?.milestoneId || "m2",
-      featureId: aw.featureId || existing?.featureId || "m2-material-test-gaps",
+      workerNumber: resolvedNumber,
+      milestoneId: aw.milestoneId || existing?.milestoneId || matchedFeature?.milestoneId || "m1",
+      featureId: aw.featureId || existing?.featureId || awId,
       title: featureTitle,
-      label: `${role} #${number}: ${featureTitle}`,
+      label: `${role} #${resolvedNumber}: ${featureTitle}`,
       status,
       timeLabel: "now",
       childThreadId:
@@ -360,6 +361,29 @@ function synthesizeSessions(state, features) {
   return Array.from(byId.values());
 }
 
+function coalesceProgressLog(entries) {
+  if (!Array.isArray(entries)) return [];
+  const result = [];
+  for (const item of entries) {
+    const prev = result[result.length - 1];
+    if (
+      prev &&
+      item?.type === "model_slots_updated" &&
+      prev?.type === "model_slots_updated"
+    ) {
+      result[result.length - 1] = item;
+    } else {
+      result.push(item);
+    }
+  }
+  return result;
+}
+
+function filterOrchestratorStreamEvents(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((e) => e && e.type !== "model_slots_updated");
+}
+
 function handleActionError(err) {
   hudState.lastActionError = err?.message || String(err);
   const subEl = document.getElementById("status-strip-subtext");
@@ -369,8 +393,8 @@ function handleActionError(err) {
   const diagEl = document.getElementById("resume-diagnostic-card");
   if (diagEl) {
     diagEl.innerHTML = `
-      <div class="stream-narrative-title">\u25a3 Check mission state before resuming</div>
-      <div>${escapeHtml(hudState.lastActionError)}</div>
+      <div class="stream-card-header"><span class="stream-tag">Diagnostic Alert</span></div>
+      <div class="stream-body">${escapeHtml(hudState.lastActionError)}</div>
     `;
   }
 }
@@ -402,7 +426,8 @@ function renderTopBar(snapshot) {
   const timeEl = document.getElementById("metric-time");
   const progressEl = document.getElementById("metric-progress");
   const progressBarEl = document.getElementById("metric-progress-bar");
-  const usageEl = document.getElementById("metric-usage");
+  const contractEl = document.getElementById("metric-contract");
+  const contractBarEl = document.getElementById("metric-contract-bar");
   const stripLabelEl = document.getElementById("status-strip-label");
 
   const isUninitialized =
@@ -413,8 +438,12 @@ function renderTopBar(snapshot) {
     stripLabelEl.textContent = "UNINITIALIZED";
   }
 
-  if (repoEl) repoEl.textContent = state.repoPath || "/Volumes/Workspace/project";
-  if (titleEl) titleEl.textContent = state.title || "T3 Mission Control";
+  if (repoEl) repoEl.textContent = state.repoPath || "";
+  if (titleEl) {
+    titleEl.textContent =
+      state.title ||
+      (isUninitialized ? "Waiting for Mission Initialization" : "T3 Mission Control");
+  }
 
   const elapsedMs = computeLiveElapsedMs(state);
   if (timeEl) timeEl.textContent = formatDurationHms(elapsedMs);
@@ -430,19 +459,29 @@ function renderTopBar(snapshot) {
     const pct = totalFeatures > 0 ? Math.round((completedFeatures / totalFeatures) * 100) : 0;
     progressBarEl.style.width = `${pct}%`;
   }
-  if (usageEl) {
-    usageEl.textContent = state.usage || "0%";
+
+  const assertions = Array.isArray(state.assertions) ? state.assertions : [];
+  const passedAssertions = assertions.filter((a) => a.status === "passed").length;
+  if (contractEl) {
+    contractEl.textContent = `${passedAssertions}/${assertions.length} PASSED`;
+  }
+  if (contractBarEl) {
+    const cPct =
+      assertions.length > 0 ? Math.round((passedAssertions / assertions.length) * 100) : 0;
+    contractBarEl.style.width = `${cPct}%`;
   }
 }
 
 function renderStatusStrip(snapshot) {
-  const { state = {} } = snapshot;
+  const { state = {}, features } = snapshot;
   const stripEl = document.getElementById("status-strip");
   const labelEl = document.getElementById("status-strip-label");
   const subEl = document.getElementById("status-strip-subtext");
   const approveBtn = document.getElementById("strip-approve-btn");
   const pauseBtn = document.getElementById("btn-pause");
   const resumeBtn = document.getElementById("btn-resume");
+  const stepperTrackEl = document.getElementById("milestone-stepper-track");
+  const pipelineTextEl = document.getElementById("pipeline-text");
 
   const isUninitialized =
     snapshot.initialized === false ||
@@ -457,13 +496,15 @@ function renderStatusStrip(snapshot) {
   }
 
   const activeRole = state.activeWorker ? inferSessionRole(state.activeWorker) : "Worker";
+  const workerNumStr =
+    state.activeWorker?.workerNumber != null ? ` #${state.activeWorker.workerNumber}` : "";
   const activeWorkerSummary = state.activeWorker
-    ? ` \u00b7 ${activeRole} #${state.activeWorker.workerNumber ?? 28} (${state.activeWorker.status || status})`
+    ? ` · ${activeRole}${workerNumStr} (${state.activeWorker.status || status})`
     : "";
   if (subEl) {
     subEl.textContent = hudState.lastActionError
       ? hudState.lastActionError
-      : `Revision #${state.revision ?? 1}${activeWorkerSummary}`;
+      : `Revision #${state.revision ?? 0}${activeWorkerSummary}`;
   }
 
   const needsApproval = !isUninitialized && status === "awaiting_input" && !state.planAccepted;
@@ -472,15 +513,72 @@ function renderStatusStrip(snapshot) {
     approveBtn.classList.toggle("is-primary-action", needsApproval);
   }
   if (pauseBtn) {
-    pauseBtn.classList.toggle("is-primary-action", status === "running" || status === "orchestrator_turn");
+    pauseBtn.classList.toggle(
+      "is-primary-action",
+      status === "running" || status === "orchestrator_turn"
+    );
   }
   if (resumeBtn) {
     resumeBtn.classList.toggle("is-primary-action", status === "paused");
   }
+
+  // Render Milestone Pipeline Stepper Strip
+  const milestones = Array.isArray(state.milestones) ? state.milestones : [];
+  const featuresList = Array.isArray(features) ? features : [];
+  const assertionsList = Array.isArray(state.assertions) ? state.assertions : [];
+
+  if (stepperTrackEl) {
+    if (milestones.length > 0) {
+      stepperTrackEl.innerHTML = milestones
+        .map((m, idx) => {
+          const mFeatures = featuresList.filter((f) => f.milestoneId === m.id);
+          const doneCount = mFeatures.filter((f) => f.status === "completed").length;
+          const isRunning = mFeatures.some((f) => f.status === "running");
+          const allDone = mFeatures.length > 0 && doneCount === mFeatures.length;
+          const pillClass = allDone ? "step-completed" : isRunning ? "step-active" : "";
+          const badgeIcon = allDone ? "✓" : isRunning ? "●" : "";
+          const arrow =
+            idx < milestones.length - 1 ? `<span class="milestone-step-arrow">→</span>` : "";
+          return `
+            <span class="milestone-step-pill ${pillClass}" data-milestone-id="${escapeHtml(m.id)}">
+              <strong class="mono">${escapeHtml(m.id.toUpperCase())}</strong>
+              <span>${escapeHtml(m.title || m.id)}</span>
+              <span class="mono">${doneCount}/${mFeatures.length}${badgeIcon ? ` ${badgeIcon}` : ""}</span>
+            </span>
+            ${arrow}
+          `;
+        })
+        .join("");
+    } else {
+      stepperTrackEl.innerHTML = "";
+    }
+  }
+
+  if (pipelineTextEl) {
+    if (milestones.length >= 1) {
+      const mLabels = milestones.map((m) => {
+        const mFeatures = featuresList.filter((f) => f.milestoneId === m.id);
+        const mAssertions = assertionsList.filter((a) => a.milestoneId === m.id);
+        const doneCount = mFeatures.filter((f) => f.status === "completed").length;
+        const allFeaturesDone =
+          mFeatures.length > 0 && doneCount === mFeatures.length;
+        const allAssertionsPassed =
+          mAssertions.length === 0 || mAssertions.every((a) => a.status === "passed");
+        return allFeaturesDone && allAssertionsPassed
+          ? `${m.id.toUpperCase()} ✓`
+          : `${m.id.toUpperCase()} (${m.title || m.id} ${doneCount}/${mFeatures.length})`;
+      });
+      pipelineTextEl.textContent = mLabels.join(" → ");
+    } else {
+      pipelineTextEl.textContent = isUninitialized
+        ? "Waiting for mission initialization"
+        : "No milestones registered yet";
+    }
+  }
 }
 
 function renderSessionsColumn(snapshot) {
-  const { state, features } = snapshot;
+  const { state = {}, features } = snapshot;
   const listEl = document.getElementById("sessions-list");
   const countEl = document.getElementById("sessions-count");
   if (!listEl) return;
@@ -488,13 +586,7 @@ function renderSessionsColumn(snapshot) {
   const sessions = synthesizeSessions(state, features);
   if (countEl) countEl.textContent = String(sessions.length + 1);
 
-  const milestones =
-    Array.isArray(state.milestones) && state.milestones.length > 0
-      ? state.milestones
-      : [
-          { id: "m1", title: "Milestone 1: Intake" },
-          { id: "m2", title: "Milestone 2: Materials In Run" },
-        ];
+  const milestones = Array.isArray(state.milestones) ? state.milestones : [];
 
   let html = `
     <button
@@ -503,28 +595,28 @@ function renderSessionsColumn(snapshot) {
       data-session-id="orchestrator"
     >
       <span class="session-item-left">
-        <span class="session-dot running"></span>
-        <span class="session-label">Orchestrator</span>
+        <span class="session-icon running"></span>
+        <span class="session-label">Orchestrator Overview</span>
       </span>
-      <span class="session-time">now</span>
+      <span class="session-time mono">live</span>
     </button>
   `;
 
   const grouped = new Map();
   for (const m of milestones) {
-    grouped.set(m.id, { title: m.title || m.id, items: [] });
+    grouped.set(m.id, { title: `${m.id.toUpperCase()} · ${m.title || m.id}`, items: [] });
   }
   for (const s of sessions) {
     const mId = s.milestoneId || milestones[0]?.id || "m1";
     if (!grouped.has(mId)) {
-      grouped.set(mId, { title: `Milestone: ${mId}`, items: [] });
+      grouped.set(mId, { title: mId.toUpperCase(), items: [] });
     }
     grouped.get(mId).items.push(s);
   }
 
   for (const [, group] of grouped.entries()) {
     if (group.items.length === 0) continue;
-    html += `<div class="session-milestone-header">${escapeHtml(group.title)}</div>`;
+    html += `<div class="session-group-header">${escapeHtml(group.title)}</div>`;
     for (const item of group.items) {
       const isSelected = hudState.selectedSessionId === item.id;
       const dotClass =
@@ -532,9 +624,11 @@ function renderSessionsColumn(snapshot) {
           ? "running"
           : item.status === "paused"
             ? "paused"
-            : item.status === "pending"
-              ? "pending"
-              : "completed";
+            : item.status === "failed"
+              ? "failed"
+              : item.status === "pending"
+                ? "pending"
+                : "completed";
       html += `
         <button
           type="button"
@@ -543,10 +637,10 @@ function renderSessionsColumn(snapshot) {
           data-feature-id="${escapeHtml(item.featureId || "")}"
         >
           <span class="session-item-left">
-            <span class="session-dot ${dotClass}"></span>
+            <span class="session-icon ${dotClass}"></span>
             <span class="session-label">${escapeHtml(item.label)}</span>
           </span>
-          <span class="session-time">${escapeHtml(item.timeLabel)}</span>
+          <span class="session-time mono">${escapeHtml(item.timeLabel)}</span>
         </button>
       `;
     }
@@ -563,49 +657,197 @@ function renderSessionsColumn(snapshot) {
   });
 }
 
+function renderFeaturesAndAssertions(snapshot) {
+  const { state = {}, features } = snapshot;
+  const featuresList = Array.isArray(features) ? features : [];
+  const assertions = Array.isArray(state.assertions) ? state.assertions : [];
+  const milestones = Array.isArray(state.milestones) ? state.milestones : [];
+
+  // 1. Features Swimlanes (Full list — never truncated)
+  const featuresCountEl = document.getElementById("features-count");
+  const featuresListEl = document.getElementById("features-list");
+  const totalFeatures = featuresList.length;
+  const completedFeatures = featuresList.filter((f) => f.status === "completed").length;
+  if (featuresCountEl) {
+    featuresCountEl.textContent = `${completedFeatures}/${totalFeatures}`;
+  }
+
+  const assertionMap = new Map();
+  for (const a of assertions) {
+    if (a?.id) assertionMap.set(a.id, a);
+  }
+
+  if (featuresListEl) {
+    const groups = new Map();
+    for (const m of milestones) {
+      groups.set(m.id, { id: m.id, title: m.title || m.id, items: [] });
+    }
+    for (const f of featuresList) {
+      const mId = f.milestoneId || milestones[0]?.id || "m1";
+      if (!groups.has(mId)) {
+        groups.set(mId, { id: mId, title: mId.toUpperCase(), items: [] });
+      }
+      groups.get(mId).items.push(f);
+    }
+
+    let fHtml = "";
+    for (const [, group] of groups.entries()) {
+      if (group.items.length === 0) continue;
+      const doneInGroup = group.items.filter((f) => f.status === "completed").length;
+      const groupAssertions = assertions.filter((a) => a.milestoneId === group.id);
+      const passedInGroup = groupAssertions.filter((a) => a.status === "passed").length;
+      const assertionMeta =
+        groupAssertions.length > 0
+          ? ` · ${passedInGroup}/${groupAssertions.length} assertions`
+          : "";
+
+      fHtml += `
+        <div class="milestone-swimlane" data-milestone-id="${escapeHtml(group.id)}">
+          <div class="milestone-swimlane-header">
+            <div class="milestone-swimlane-title">
+              <span class="milestone-badge">${escapeHtml(group.id.toUpperCase())}</span>
+              <span>${escapeHtml(group.title)}</span>
+            </div>
+            <span class="milestone-swimlane-meta mono">${doneInGroup}/${group.items.length} features${escapeHtml(assertionMeta)}</span>
+          </div>
+      `;
+
+      for (const f of group.items) {
+        const st = String(f.status || "pending").toLowerCase();
+        const checkClass =
+          st === "completed"
+            ? "done"
+            : st === "running"
+              ? "running"
+              : st === "paused"
+                ? "paused"
+                : "";
+        const icon =
+          st === "completed" ? "✓" : st === "running" ? "●" : st === "paused" ? "||" : "•";
+        const kindLabel = f.kind || f.role || "implementation";
+        const linkedIds = Array.isArray(f.fulfills)
+          ? f.fulfills
+          : Array.isArray(f.assertions)
+            ? f.assertions
+            : [];
+        const valPillsHtml = linkedIds.length
+          ? `<div class="feature-val-pills">${linkedIds
+              .map((valId) => {
+                const aObj = assertionMap.get(valId);
+                const aSt = String(aObj?.status || "pending").toLowerCase();
+                return `<span class="val-pill ${escapeHtml(aSt)}">${escapeHtml(valId)}</span>`;
+              })
+              .join("")}</div>`
+          : "";
+
+        fHtml += `
+          <div class="feature-row" data-feature-id="${escapeHtml(f.id)}" data-feature-status="${escapeHtml(st)}">
+            <div class="feature-row-main">
+              <span class="feature-check ${checkClass}">${icon}</span>
+              <div class="feature-info">
+                <div class="feature-title-row">
+                  <span class="feature-title">${escapeHtml(f.title || f.id)}</span>
+                  <span class="feature-kind-pill mono">${escapeHtml(kindLabel)}</span>
+                </div>
+                ${valPillsHtml}
+              </div>
+            </div>
+            <div class="feature-row-right">
+              <span class="status-pill ${escapeHtml(st)}">${escapeHtml(st)}</span>
+            </div>
+          </div>
+        `;
+      }
+      fHtml += `</div>`;
+    }
+
+    featuresListEl.innerHTML =
+      fHtml || `<div style="padding:12px 14px;color:var(--text-muted);font-size:12px;">No features planned yet.</div>`;
+
+    featuresListEl.querySelectorAll(".feature-row").forEach((row) => {
+      row.addEventListener("click", () => {
+        const fId = row.dataset.featureId;
+        const sessions = synthesizeSessions(state, features);
+        const match = sessions.find((s) => s.featureId === fId);
+        if (match) {
+          hudState.selectedSessionId = match.id;
+          renderCenterColumn(hudState.snapshot);
+          renderSessionsColumn(hudState.snapshot);
+        }
+      });
+    });
+  }
+
+  // 2. Validation Contract Matrix (Full list — never truncated)
+  const assertionsCountEl = document.getElementById("assertions-count");
+  const assertionsListEl = document.getElementById("assertions-list");
+  const passedAssertions = assertions.filter((a) => a.status === "passed").length;
+  if (assertionsCountEl) {
+    assertionsCountEl.textContent = `${passedAssertions}/${assertions.length}`;
+  }
+  if (assertionsListEl) {
+    assertionsListEl.innerHTML = assertions.length
+      ? assertions
+          .map((a) => {
+            const st = String(a.status || "pending").toLowerCase();
+            const mBadge = a.milestoneId
+              ? `<span class="milestone-badge">${escapeHtml(String(a.milestoneId).toUpperCase())}</span>`
+              : "";
+            return `
+              <div class="assertion-row" data-assertion-id="${escapeHtml(a.id)}" data-assertion-status="${escapeHtml(st)}">
+                <div class="assertion-main">
+                  <span class="assertion-id-badge">${escapeHtml(a.id)}</span>
+                  ${mBadge}
+                  <span class="assertion-desc">${escapeHtml(a.description || "")}</span>
+                </div>
+                <span class="status-pill ${escapeHtml(st)}">${escapeHtml(st)}</span>
+              </div>
+            `;
+          })
+          .join("")
+      : `<div style="padding:12px 14px;color:var(--text-muted);font-size:12px;">No validation assertions registered yet.</div>`;
+  }
+}
+
 function renderCenterColumn(snapshot) {
-  const { initialized, state, features, progressLog, modelSettings } = snapshot;
+  const { initialized, state = {}, features, progressLog } = snapshot;
   const onboardingEl = document.getElementById("onboarding-card");
   const approvalEl = document.getElementById("plan-approval-card");
   const inspectorEl = document.getElementById("session-inspector");
   const handoffEl = document.getElementById("session-handoff-view");
   const streamEl = document.getElementById("orchestrator-stream");
-  const pipelineTextEl = document.getElementById("pipeline-text");
-  const composerMsgEl = document.getElementById("composer-status-msg");
-  const toolbarModelEl = document.getElementById("toolbar-orchestrator-model");
 
   // 1. Uninitialized onboarding notice
   if (onboardingEl) {
     if (!initialized) {
       onboardingEl.classList.remove("hidden");
       onboardingEl.innerHTML = `
-        <div class="approval-badge">WAITING FOR INITIALIZATION</div>
-        <h3 class="approval-title">${escapeHtml(state.onboarding?.headline || "Mission directory (.mission/) not initialized yet")}</h3>
-        <p style="margin:6px 0 0;color:var(--text-secondary);">
-          ${escapeHtml(state.onboarding?.instructions || "Initialize .mission/state.json or click Approve & Start Mission to bootstrap.")}
-        </p>
+        <div class="approval-badge" style="margin-bottom:8px;">UNINITIALIZED</div>
+        <h2>${escapeHtml(state.onboarding?.headline || "Mission directory (.mission/) is not initialized yet")}</h2>
+        <p>${escapeHtml(state.onboarding?.instructions || "Use /mission <request> in T3 Code to propose a mission plan and Validation Contract.")}</p>
       `;
     } else {
       onboardingEl.classList.add("hidden");
     }
   }
 
-  // 2. Plan Approval Card when status === "awaiting_input" && !planAccepted
+  // 2. High-Clarity Plan Review Banner when status === "awaiting_input" && !planAccepted
   const showApprovalCard = state.status === "awaiting_input" && !state.planAccepted;
   if (approvalEl) {
     if (showApprovalCard) {
       approvalEl.classList.remove("hidden");
       const milestones = Array.isArray(state.milestones) ? state.milestones : [];
+      const featuresList = Array.isArray(features) ? features : [];
       const assertions = Array.isArray(state.assertions) ? state.assertions : [];
       approvalEl.innerHTML = `
-        <div class="approval-header">
+        <div class="approval-banner-top">
           <div>
-            <span class="approval-badge">Mission 计划书与 Validation Contract 审批卡</span>
-            <h2 class="approval-title">${escapeHtml(state.title || "Mission Plan & Validation Contract")}</h2>
+            <span class="approval-badge">Plan Review &amp; Validation Contract</span>
+            <h2 class="approval-title" style="margin-top:4px;">${escapeHtml(state.title || "Mission Plan Ready for Approval")}</h2>
           </div>
           <button
             type="button"
-            class="btn-approve-large"
+            class="btn-primary-approve"
             id="btn-approve"
             data-testid="btn-approve-mission"
             data-action="approve"
@@ -613,48 +855,13 @@ function renderCenterColumn(snapshot) {
             ✓ Approve &amp; Start Mission
           </button>
         </div>
-        <div class="approval-grid">
-          <div class="contract-box">
-            <h4>Milestones (${milestones.length})</h4>
-            <ul class="contract-list">
-              ${
-                milestones.length
-                  ? milestones
-                      .map((m) => `<li><strong>${escapeHtml(m.id)}</strong>: ${escapeHtml(m.title)}</li>`)
-                      .join("")
-                  : `<li>m1: Milestone 1: Intake</li><li>m2: Milestone 2: Materials In Run</li>`
-              }
-            </ul>
-          </div>
-          <div class="contract-box">
-            <h4>Planned Features (${features.length})</h4>
-            <ul class="contract-list">
-              ${
-                features.length
-                  ? features
-                      .slice(0, 8)
-                      .map((f) => `<li><strong>${escapeHtml(f.title || f.id)}</strong> (${escapeHtml(f.milestoneId || "m1")})</li>`)
-                      .join("")
-                  : `<li>Awaiting feature breakdown</li>`
-              }
-            </ul>
-          </div>
-          <div class="contract-box">
-            <h4>Validation Assertions (${assertions.length})</h4>
-            <ul class="contract-list">
-              ${
-                assertions.length
-                  ? assertions
-                      .slice(0, 8)
-                      .map(
-                        (a) =>
-                          `<li><span class="mono">${escapeHtml(a.id)}</span>: ${escapeHtml(a.description || a.status || "pending")}</li>`
-                      )
-                      .join("")
-                  : `<li><span class="mono">VAL-HUD-001</span> ~ <span class="mono">VAL-HUD-004</span></li>`
-              }
-            </ul>
-          </div>
+        <div class="approval-summary-pills">
+          <span class="approval-stat-pill mono">${milestones.length} Milestones</span>
+          <span class="approval-stat-pill mono">${featuresList.length} Planned Features</span>
+          <span class="approval-stat-pill mono">${assertions.length} Validation Assertions</span>
+        </div>
+        <div class="approval-hint">
+          Review the full milestone roadmap and Validation Contract below, then approve to dispatch the first worker.
         </div>
       `;
       const approveBtn = approvalEl.querySelector("#btn-approve");
@@ -670,7 +877,7 @@ function renderCenterColumn(snapshot) {
     }
   }
 
-  // 3. Session Handoff View when a non-Orchestrator Session is selected
+  // 3. Session Handoff Inspector when a Worker/Validator session is selected
   const sessions = synthesizeSessions(state, features);
   const selectedSession =
     hudState.selectedSessionId !== "orchestrator"
@@ -692,44 +899,44 @@ function renderCenterColumn(snapshot) {
         : [];
 
       handoffEl.innerHTML = `
-        <div class="handoff-topbar">
+        <div class="handoff-header">
           <div>
-            <span class="approval-badge">${escapeHtml(selectedSession.role)} Handoff Inspector</span>
-            <h3 class="approval-title">${escapeHtml(selectedSession.label)}</h3>
+            <span class="status-pill ${escapeHtml(selectedSession.status)}">${escapeHtml(selectedSession.role)} · ${escapeHtml(selectedSession.status)}</span>
+            <h3 class="handoff-title" style="margin-top:6px;">${escapeHtml(selectedSession.label)}</h3>
           </div>
-          <div class="thread-copy-group">
-            <code class="thread-uri-code" id="handoff-thread-uri">${escapeHtml(threadUri)}</code>
+          <div class="handoff-link-chip">
+            <code class="mono" id="handoff-thread-uri">${escapeHtml(threadUri)}</code>
             <button
               type="button"
-              class="btn-copy-thread"
+              class="strip-btn"
               id="btn-copy-thread-uri"
               data-thread-uri="${escapeHtml(threadUri)}"
             >
-              ${hudState.copiedThreadUri === threadUri ? "✓ Copied" : "Copy t3-thread URI"}
+              ${hudState.copiedThreadUri === threadUri ? "✓ Copied" : "Copy URI"}
             </button>
-            <button type="button" class="btn-back-orchestrator" id="btn-back-orchestrator">
-              ← Orchestrator Turn
+            <button type="button" class="strip-btn" id="btn-back-orchestrator">
+              ← Back to Board
             </button>
           </div>
         </div>
 
-        <div class="handoff-section">
-          <div class="handoff-section-title">salientSummary</div>
-          <div class="handoff-block" id="handoff-salient-summary">
+        <div>
+          <div class="handoff-section-title">Salient Summary</div>
+          <div class="handoff-box" id="handoff-salient-summary">
             ${escapeHtml(selectedSession.handoff?.salientSummary || "No summary recorded.")}
           </div>
         </div>
 
-        <div class="handoff-section">
-          <div class="handoff-section-title">whatWasImplemented</div>
-          <div class="handoff-block" id="handoff-what-was-implemented">
+        <div>
+          <div class="handoff-section-title">What Was Implemented</div>
+          <div class="handoff-box" id="handoff-what-was-implemented">
             ${escapeHtml(selectedSession.handoff?.whatWasImplemented || "No handoff recorded yet.")}
           </div>
         </div>
 
-        <div class="handoff-section">
-          <div class="handoff-section-title">commandsRun (${commands.length})</div>
-          <div class="handoff-block mono" id="handoff-commands-run">
+        <div>
+          <div class="handoff-section-title">Commands Run (${commands.length})</div>
+          <div class="handoff-box mono" id="handoff-commands-run">
             ${
               commands.length
                 ? commands
@@ -744,9 +951,9 @@ function renderCenterColumn(snapshot) {
           </div>
         </div>
 
-        <div class="handoff-section">
-          <div class="handoff-section-title">discoveredIssues (${issues.length})</div>
-          <div class="handoff-block" id="handoff-discovered-issues">
+        <div>
+          <div class="handoff-section-title">Discovered Issues (${issues.length})</div>
+          <div class="handoff-box" id="handoff-discovered-issues">
             ${
               issues.length
                 ? issues
@@ -784,108 +991,55 @@ function renderCenterColumn(snapshot) {
     }
   }
 
-  // 4. Orchestrator Turn & Action Stream (Droid style)
+  // 4. Orchestrator Status & Diagnostic Stream (Zero model_slots_updated spam)
   if (streamEl) {
-    const hasDismissed =
-      Array.isArray(state.lastDismissedHandoffItems) &&
-      state.lastDismissedHandoffItems.length > 0;
-    const hasResumeEvent =
-      Boolean(state.lastResumeDiagnostic) ||
-      Boolean(state.lastResumeTrigger) ||
-      (progressLog || []).some((e) => e.type === "mission_resumed");
+    const activeRole = state.activeWorker ? inferSessionRole(state.activeWorker) : "Worker";
+    const activeWorkerNum =
+      state.activeWorker?.workerNumber != null ? ` #${state.activeWorker.workerNumber}` : "";
+    const activeWorkerTitle =
+      state.activeWorker?.featureTitle ||
+      state.activeWorker?.title ||
+      state.activeWorker?.featureId ||
+      "active feature";
+
     const resumeDiagnostic =
       hudState.lastActionError ||
       state.lastResumeDiagnostic ||
       (state.activeWorker
-        ? `${inferSessionRole(state.activeWorker)} #${state.activeWorker.workerNumber ?? 1} (${state.activeWorker.featureTitle || state.activeWorker.featureId}) is currently ${state.activeWorker.status || state.status}.`
+        ? `${activeRole}${activeWorkerNum} (${activeWorkerTitle}) is currently ${state.activeWorker.status || state.status}.`
         : `Mission status is ${state.status || "planning"}.`);
 
-    const recentLogCards = (progressLog || [])
-      .slice(-6)
-      .map(
-        (entry) => `
-          <div class="stream-tool-row">
-            <span>● <strong>${escapeHtml(entry.type || "event")}</strong> — ${escapeHtml(entry.message)}</span>
-            <span class="mono">${escapeHtml(formatRelativeTime(entry.timestamp, "now"))}</span>
-          </div>
-        `
-      )
-      .join("");
-
-    const activeRole = state.activeWorker ? inferSessionRole(state.activeWorker) : "Worker";
+    const filteredEvents = filterOrchestratorStreamEvents(progressLog);
+    const latestMilestoneEvent = filteredEvents.at(-1);
 
     streamEl.innerHTML = `
+      <div class="stream-card diagnostic-card ${hudState.lastActionError ? "error" : ""}" id="resume-diagnostic-card">
+        <div class="stream-card-header">
+          <span class="stream-tag">${hudState.lastActionError ? "Action Blocked" : "Execution Status"}</span>
+          <span class="stream-time mono">${escapeHtml(state.status || "planning")}</span>
+        </div>
+        <div class="stream-body">${escapeHtml(resumeDiagnostic)}</div>
+      </div>
       ${
-        hasDismissed
-          ? `<div class="stream-tool-row">
-              <span><strong>Dismiss Handoff Items</strong> · Dismissed ${state.lastDismissedHandoffItems.length} item(s)</span>
-              <span class="mono">Completed</span>
+        latestMilestoneEvent
+          ? `<div class="stream-card">
+              <div class="stream-card-header">
+                <span class="stream-tag">Latest Event · ${escapeHtml(latestMilestoneEvent.type || "info")}</span>
+                <span class="stream-time mono">${escapeHtml(formatRelativeTime(latestMilestoneEvent.timestamp, "now"))}</span>
+              </div>
+              <div class="stream-body">${escapeHtml(latestMilestoneEvent.message)}</div>
             </div>`
           : ""
       }
-      ${
-        hasResumeEvent
-          ? `<div class="stream-pill-Input">[resume the mission]</div>`
-          : ""
-      }
-      <div class="stream-narrative-card" id="resume-diagnostic-card">
-        <div class="stream-narrative-title">▣ Check mission state before resuming</div>
-        <div>${escapeHtml(resumeDiagnostic)}</div>
-      </div>
-      <div class="stream-tool-row">
-        <span><strong>Start Mission Run</strong> · ${escapeHtml(
-          state.activeWorker
-            ? `${activeRole} #${state.activeWorker.workerNumber ?? 28}: ${state.activeWorker.featureTitle || state.activeWorker.featureId || "M2 material test gaps"}`
-            : "Mission execution loop"
-        )}</span>
-        <span class="mono">${escapeHtml(state.status || "planning")}</span>
-      </div>
-      ${recentLogCards}
     `;
   }
 
-  // 5. Bottom Composer & Milestone Capsule
-  if (pipelineTextEl) {
-    const milestones = Array.isArray(state.milestones) ? state.milestones : [];
-    const featuresList = Array.isArray(features) ? features : [];
-    const assertionsList = Array.isArray(state.assertions) ? state.assertions : [];
-    if (milestones.length >= 1) {
-      const mLabels = milestones.map((m) => {
-        const mFeatures = featuresList.filter((f) => f.milestoneId === m.id);
-        const mAssertions = assertionsList.filter((a) => a.milestoneId === m.id);
-        const allFeaturesDone =
-          mFeatures.length > 0 && mFeatures.every((f) => f.status === "completed");
-        const allAssertionsPassed =
-          mAssertions.length === 0 || mAssertions.every((a) => a.status === "passed");
-        return allFeaturesDone && allAssertionsPassed
-          ? `${m.id.toUpperCase()} 已通过验收`
-          : `${m.id.toUpperCase()}（${m.title || m.id}）`;
-      });
-      pipelineTextEl.textContent = `执行并处理交接：${mLabels.join(" → ")}`;
-    } else {
-      pipelineTextEl.textContent = "执行并处理交接：等待里程碑初始化";
-    }
-  }
-
-  if (composerMsgEl) {
-    if (state.status === "paused") {
-      composerMsgEl.textContent = "Mission is paused. Click ▶ Resume Mission to continue.";
-    } else if (state.status === "awaiting_input" && !state.planAccepted) {
-      composerMsgEl.textContent =
-        "Mission is awaiting approval. Click ✓ Approve & Start Mission above.";
-    } else {
-      composerMsgEl.textContent = "Mission is running. Pause to send messages.";
-    }
-  }
-
-  if (toolbarModelEl && modelSettings?.orchestrator) {
-    const orch = modelSettings.orchestrator;
-    toolbarModelEl.textContent = `${orch.label || orch.model} (${orch.model})`;
-  }
+  // 5. Render Milestone Swimlanes & Validation Contract Matrix
+  renderFeaturesAndAssertions(snapshot);
 }
 
 function renderRightColumn(snapshot) {
-  const { state, features, modelSettings, progressLog, catalog } = snapshot;
+  const { modelSettings, progressLog, catalog } = snapshot;
 
   const effortLevelNames = {
     1: "minimal",
@@ -895,7 +1049,7 @@ function renderRightColumn(snapshot) {
     5: "max",
   };
 
-  // 1. Model 3-Slot Controls
+  // 1. Role Models 3-Slot Controls
   for (const slot of ["orchestrator", "worker", "validator"]) {
     const selectEl = document.getElementById(`model-select-${slot}`);
     const barsEl = document.getElementById(`effort-bars-${slot}`);
@@ -963,7 +1117,7 @@ function renderRightColumn(snapshot) {
           barsHtml += `
           <button
             type="button"
-            class="effort-bar-btn ${isActive ? "active" : ""}"
+            class="effort-bar-btn ${isActive ? "filled active" : ""}"
             data-slot="${slot}"
             data-effort="${level}"
             title="Reasoning Effort: ${levelName} (${level}/5)"
@@ -990,101 +1144,11 @@ function renderRightColumn(snapshot) {
     }
   }
 
-  // 2. Features Checklist
-  const featuresCountEl = document.getElementById("features-count");
-  const featuresListEl = document.getElementById("features-list");
-  const totalFeatures = Array.isArray(features) ? features.length : 0;
-  const completedFeatures = Array.isArray(features)
-    ? features.filter((f) => f.status === "completed").length
-    : 0;
-  if (featuresCountEl) {
-    featuresCountEl.textContent = `${completedFeatures}/${totalFeatures}`;
-  }
-
-  if (featuresListEl) {
-    const milestones =
-      Array.isArray(state.milestones) && state.milestones.length > 0
-        ? state.milestones
-        : [
-            { id: "m1", title: "Milestone 1: Intake" },
-            { id: "m2", title: "Milestone 2: Materials In Run" },
-          ];
-    const groups = new Map();
-    for (const m of milestones) {
-      groups.set(m.id, { title: m.title || m.id, items: [] });
-    }
-    for (const f of features || []) {
-      const mId = f.milestoneId || milestones[0]?.id || "m1";
-      if (!groups.has(mId)) {
-        groups.set(mId, { title: `Milestone: ${mId}`, items: [] });
-      }
-      groups.get(mId).items.push(f);
-    }
-
-    let fHtml = "";
-    for (const [, group] of groups.entries()) {
-      if (group.items.length === 0) continue;
-      fHtml += `<div class="feature-milestone-group"><div class="feature-milestone-title">${escapeHtml(group.title)}</div>`;
-      for (const f of group.items) {
-        const st = f.status || "pending";
-        const icon = st === "completed" ? "✓" : st === "running" ? "●" : st === "paused" ? "||" : "•";
-        fHtml += `
-          <div class="feature-row" data-feature-id="${escapeHtml(f.id)}">
-            <span class="feature-icon ${escapeHtml(st)}">${icon}</span>
-            <span class="feature-title-text">${escapeHtml(f.title || f.id)}</span>
-          </div>
-        `;
-      }
-      fHtml += `</div>`;
-    }
-    featuresListEl.innerHTML =
-      fHtml || `<div style="color:var(--text-muted);font-size:12px;">No features registered yet.</div>`;
-
-    featuresListEl.querySelectorAll(".feature-row").forEach((row) => {
-      row.addEventListener("click", () => {
-        const fId = row.dataset.featureId;
-        const sessions = synthesizeSessions(state, features);
-        const match = sessions.find((s) => s.featureId === fId);
-        if (match) {
-          hudState.selectedSessionId = match.id;
-          renderCenterColumn(hudState.snapshot);
-          renderSessionsColumn(hudState.snapshot);
-        }
-      });
-    });
-  }
-
-  // 2.5 Validation Contract Assertions Checklist
-  const assertionsCountEl = document.getElementById("assertions-count");
-  const assertionsListEl = document.getElementById("assertions-list");
-  const assertions = Array.isArray(state.assertions) ? state.assertions : [];
-  const passedAssertions = assertions.filter((a) => a.status === "passed").length;
-  if (assertionsCountEl) {
-    assertionsCountEl.textContent = `${passedAssertions}/${assertions.length}`;
-  }
-  if (assertionsListEl) {
-    assertionsListEl.innerHTML = assertions.length
-      ? assertions
-          .map((a) => {
-            const st = String(a.status || "pending").toLowerCase();
-            const icon = st === "passed" ? "✓" : st === "failed" ? "✕" : "•";
-            return `
-              <div class="feature-row assertion-row" data-assertion-id="${escapeHtml(a.id)}" data-assertion-status="${escapeHtml(st)}">
-                <span class="feature-icon ${escapeHtml(st === "passed" ? "completed" : st)}">${icon}</span>
-                <span class="mono" style="font-size:11px;font-weight:600;">${escapeHtml(a.id)}</span>
-                <span class="feature-title-text" style="flex:1;">${escapeHtml(a.description || "")}</span>
-                <span class="mono assertion-status-badge ${escapeHtml(st)}" style="font-size:10px;text-transform:uppercase;">${escapeHtml(st)}</span>
-              </div>
-            `;
-          })
-          .join("")
-      : `<div style="color:var(--text-muted);font-size:12px;">No validation assertions registered yet.</div>`;
-  }
-
-  // 3. Progress Log (newest to oldest)
+  // 2. Activity Timeline (coalesces consecutive model_slots_updated entries)
   const logCountEl = document.getElementById("progress-log-count");
   const logListEl = document.getElementById("progress-log-list");
-  const entries = Array.isArray(progressLog) ? [...progressLog].reverse() : [];
+  const coalesced = coalesceProgressLog(progressLog || []);
+  const entries = [...coalesced].reverse();
   if (logCountEl) logCountEl.textContent = String(entries.length);
 
   if (logListEl) {
@@ -1092,17 +1156,17 @@ function renderRightColumn(snapshot) {
       ? entries
           .map(
             (item) => `
-              <div class="log-row" data-log-seq="${escapeHtml(item.seq || "")}">
-                <div class="log-left">
-                  <span class="log-dot ${escapeHtml(item.type || "info")}"></span>
-                  <span class="log-msg">${escapeHtml(item.message)}</span>
+              <div class="log-row" data-log-seq="${escapeHtml(item.seq || "")}" data-log-type="${escapeHtml(item.type || "info")}">
+                <div class="log-row-top">
+                  <span class="log-type mono">${escapeHtml(item.type || "event")}</span>
+                  <span class="log-time mono">${escapeHtml(formatRelativeTime(item.timestamp, "now"))}</span>
                 </div>
-                <span class="log-time">${escapeHtml(formatRelativeTime(item.timestamp, "now"))}</span>
+                <span class="log-msg">${escapeHtml(item.message)}</span>
               </div>
             `
           )
           .join("")
-      : `<div style="color:var(--text-muted);font-size:12px;">No progress log events yet.</div>`;
+      : `<div style="color:var(--text-muted);font-size:12px;">No activity events yet.</div>`;
   }
 }
 

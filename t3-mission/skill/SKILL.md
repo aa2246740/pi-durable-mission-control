@@ -19,7 +19,7 @@ Every Mission uses three independent model slots configured in `.mission/model-s
 
 When dispatching via `delegate_task`, model slot settings (including numeric effort bars `1..5`: `1 -> "minimal"`, `2 -> "low"`, `3 -> "medium"`, `4 -> "high"`, `5 -> "max"`) are normalized into `target: { providerInstanceId, model, options }`:
 - `providerInstanceId === "codex"` -> `options.reasoningEffort` (`"minimal" | "low" | "medium" | "high" | "xhigh" | "max"`)
-- `providerInstanceId === "antigravity"` -> direct `model` ID (e.g. `"gemini-4-argon-high"`, `"claude-opus-5-5-high"`)
+- `providerInstanceId === "antigravity"` -> direct `model` ID (e.g. `"gemini-4-argon-high"`, `"claude-opus-5-5-high"`), with `supportsEffort: false` (no `effort` or `reasoningEffort` keys persisted or passed)
 - `providerInstanceId === "acpRegistry_factory_droid"` -> `options.reasoning_effort` and `options.autonomy_level` via `mapApprovalModeToProviderAutonomy("acpRegistry_factory_droid", slotConfig)` (defaults to `"auto-high"` in Mission Mode so workers do not stall in `"auto-medium"` or `"normal"`)
 - `providerInstanceId === "acpRegistry_devin"` -> `options.mode` via `mapApprovalModeToProviderAutonomy("acpRegistry_devin", slotConfig)` (defaults to `"bypass"` so Devin does not stall on shell commands in `"accept-edits"`) and `options.thought_level` (`"minimal"|"low"|"medium"` -> `"medium"`, `"high"` -> `"high"`, `"xhigh"|"max"` -> `"max"`)
 - `providerInstanceId === "acpRegistry_cursor"` -> `options.mode` via `mapApprovalModeToProviderAutonomy("acpRegistry_cursor", slotConfig)` (defaults to `"agent"`, or `"plan"` / `"ask"`) plus `options.reasoning_effort` (`"minimal"` -> `"low"`, `"max"` -> `"xhigh"`, else `"low"|"medium"|"high"|"xhigh"`) and `options.effort` (`"minimal"` -> `"low"`, else `"low"|"medium"|"high"|"xhigh"|"max"`)
@@ -40,6 +40,24 @@ When dispatching via `delegate_task`, model slot settings (including numeric eff
   - `"auto-low"` -> `"auto-accept-edits"`
   - `"auto-medium"` -> `"auto"`
   - `"auto-high"` -> `"full-access"`
+
+---
+
+## First-Principles HUD Acceptance Criteria (Mandatory for Validators)
+
+When any Validator (`gpt-6.1-sol`, `scrutiny-validator`, or `user-testing-validator`) inspects the T3 Mission Control HUD, validate against these **First-Principles T3-Native HUD Acceptance Criteria**:
+
+1. **No Fake Standalone Chat Composer**:
+   - The HUD runs inside T3 Code's preview pane alongside T3's native chat thread.
+   - There must be **NO** fake chat input box (`"Pause to send messages"`), **NO** fake `Autonomy ||` or `Connectors (1)` toolbar chips, **NO** `< Back to App` button, **NO** fake `USAGE 0%` bar, and **NO** hardcoded `Wu David` avatar.
+2. **At-a-Glance Progress Clarity**:
+   - Milestones (`#milestone-pipeline-bar`), Features (`#features-list`, `.feature-row[data-feature-id]` with their linked `VAL-*` assertion pills), and Validation Contract assertions (`#assertions-list`, `.assertion-row[data-assertion-id]`) must be displayed in full (**never** truncated to `.slice(0, 8)`).
+   - Progress bars (`#metric-progress-bar`, `#metric-contract-bar`) must reflect real completion percentages (`0%` when `0/N`, never hardcoded `65%`).
+3. **Zero Log Spam / Duplication**:
+   - Changing model slots or effort bars must **not** flood `#orchestrator-stream` in the center execution board with `model_slots_updated` cards, and consecutive `model_slots_updated` events in `#progress-log-list` are coalesced.
+   - There must be **no** hardcoded fallback strings (`Open SlideStudio`, `Milestone 1: Intake`, `Milestone 2: Materials In Run`, `M2 material test gaps`, `Worker #28`) when mission fields are empty.
+4. **Role Model Capability Gating**:
+   - Fixed-tier models (`supportsEffort: false`, such as `gemini-4-argon-high` or `gpt-6-astra-high`) hide `#effort-bars-<slot>` (`display: none`, `aria-hidden="true"`, 0 `.effort-bar-btn` children) and omit `effort` and `reasoningEffort` keys in `.mission/model-settings.json`.
 
 ---
 

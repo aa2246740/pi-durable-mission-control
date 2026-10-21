@@ -2428,3 +2428,189 @@ test("Validator #7 Fixes (V7-F01, V7-F05, V7-F06): UNINITIALIZED status label, c
   assert.match(lastErr, /HTTP 409/);
   assert.match(lastErr, /RESUME_BLOCKED_BY_CONFLICTS/);
 });
+
+test("First-Principles T3-Native HUD Redesign: No fake composer/toolbar/fallbacks, full >8 features & >8 assertions without truncation, and model_slots_updated spam filtering", async () => {
+  const indexHtmlPath = path.resolve(__dirname, "../hud/public/index.html");
+  const stylesCssPath = path.resolve(__dirname, "../hud/public/styles.css");
+  const indexHtml = fs.readFileSync(indexHtmlPath, "utf8");
+  const stylesCss = fs.readFileSync(stylesCssPath, "utf8");
+  const appRaw = fs.readFileSync(APP_JS_PATH, "utf8");
+
+  // 1. Verify absence of fake standalone chat composer, toolbar chips, fake metric widths, and hardcoded fallback strings
+  for (const banned of [
+    "Pause to send messages",
+    "Connectors (1)",
+    "Autonomy",
+    "Wu David",
+    "Back to App",
+    "Open SlideStudio",
+    "Milestone 1: Intake",
+    "Milestone 2: Materials In Run",
+    "M2 material test gaps",
+    "m2-material-test-gaps",
+  ]) {
+    assert.equal(
+      indexHtml.includes(banned),
+      false,
+      `index.html must not contain fake/hardcoded string: ${banned}`
+    );
+    assert.equal(
+      appRaw.includes(banned),
+      false,
+      `app.js must not contain fake/hardcoded string: ${banned}`
+    );
+  }
+  assert.equal(stylesCss.includes("width: 65%"), false, "styles.css must not hardcode 65% bar width");
+  assert.equal(appRaw.includes(".slice(0, 8)"), false, "app.js must not truncate features or assertions to .slice(0, 8)");
+
+  // 2. Verify DOM rendering of >8 features (with linked VAL-* pills) and >8 assertions without truncation, plus model_slots_updated spam filtering
+  const appSrc = appRaw
+    .replace("export function applySnapshot", "function applySnapshot")
+    .replace(/initHud\(\);\s*$/, "");
+
+  const elements = new Map();
+  function makeEl(id) {
+    return {
+      id,
+      textContent: "",
+      innerHTML: "",
+      dataset: {},
+      style: {},
+      value: "",
+      listeners: {},
+      classList: {
+        classes: new Set(),
+        add(c) { this.classes.add(c); },
+        remove(c) { this.classes.delete(c); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this.classes.has(c)) this.classes.delete(c);
+            else this.classes.add(c);
+          } else if (force) {
+            this.classes.add(c);
+          } else {
+            this.classes.delete(c);
+          }
+        },
+        contains(c) { return this.classes.has(c); },
+      },
+      addEventListener(type, fn) {
+        this.listeners[type] = fn;
+      },
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+    };
+  }
+
+  for (const id of [
+    "mission-repo-path",
+    "mission-title",
+    "metric-time",
+    "metric-progress",
+    "metric-progress-bar",
+    "metric-contract",
+    "metric-contract-bar",
+    "status-strip",
+    "status-strip-label",
+    "status-strip-subtext",
+    "strip-approve-btn",
+    "btn-pause",
+    "btn-resume",
+    "milestone-stepper-track",
+    "pipeline-text",
+    "sessions-list",
+    "sessions-count",
+    "onboarding-card",
+    "plan-approval-card",
+    "session-inspector",
+    "session-handoff-view",
+    "orchestrator-stream",
+    "resume-diagnostic-card",
+    "features-count",
+    "features-list",
+    "assertions-count",
+    "assertions-list",
+    "progress-log-count",
+    "progress-log-list",
+  ]) {
+    elements.set(id, makeEl(id));
+  }
+
+  const vmCtx = vm.createContext({
+    document: {
+      getElementById: (id) => elements.get(id) || null,
+    },
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+  });
+
+  vm.runInContext(appSrc, vmCtx);
+
+  const twelveFeatures = Array.from({ length: 12 }, (_, i) => ({
+    id: `f-${i + 1}`,
+    title: `Feature Item #${i + 1}`,
+    milestoneId: i < 6 ? "m1" : "m2",
+    status: i < 3 ? "completed" : i === 3 ? "running" : "pending",
+    kind: "implementation",
+    fulfills: [`VAL-M-${String(i + 1).padStart(3, "0")}`],
+  }));
+
+  const twelveAssertions = Array.from({ length: 12 }, (_, i) => ({
+    id: `VAL-M-${String(i + 1).padStart(3, "0")}`,
+    milestoneId: i < 6 ? "m1" : "m2",
+    description: `Assertion requirement #${i + 1}`,
+    status: i < 3 ? "passed" : "pending",
+  }));
+
+  const spammyLogs = [
+    { seq: 1, timestamp: new Date().toISOString(), type: "plan_proposed", message: "Proposed mission plan" },
+    { seq: 2, timestamp: new Date().toISOString(), type: "model_slots_updated", message: "Model slots updated: validator=gpt-6.1-sol (low/2)" },
+    { seq: 3, timestamp: new Date().toISOString(), type: "model_slots_updated", message: "Model slots updated: validator=gpt-6.1-sol (medium/3)" },
+    { seq: 4, timestamp: new Date().toISOString(), type: "model_slots_updated", message: "Model slots updated: validator=gpt-6.1-sol (high/4)" },
+    { seq: 5, timestamp: new Date().toISOString(), type: "model_slots_updated", message: "Model slots updated: validator=gpt-6.1-sol (max/5)" },
+  ];
+
+  vmCtx.largeSnapshot = {
+    initialized: true,
+    state: {
+      status: "awaiting_input",
+      planAccepted: false,
+      revision: 5,
+      title: "12-Feature Precision Mission",
+      milestones: [
+        { id: "m1", title: "Core Architecture", ordinal: 1 },
+        { id: "m2", title: "Validation Matrix", ordinal: 2 },
+      ],
+      assertions: twelveAssertions,
+    },
+    features: twelveFeatures,
+    progressLog: spammyLogs,
+    modelSettings: {},
+    catalog: [],
+  };
+
+  vm.runInContext("applySnapshot(largeSnapshot)", vmCtx);
+
+  // All 12 features and all 12 assertions must be rendered in full
+  const featuresHtml = elements.get("features-list").innerHTML;
+  const assertionsHtml = elements.get("assertions-list").innerHTML;
+  for (let i = 1; i <= 12; i++) {
+    const valId = `VAL-M-${String(i).padStart(3, "0")}`;
+    assert.match(featuresHtml, new RegExp(`data-feature-id="f-${i}"`), `Missing feature f-${i}`);
+    assert.match(featuresHtml, new RegExp(valId), `Feature row f-${i} should render linked ${valId} pill`);
+    assert.match(assertionsHtml, new RegExp(`data-assertion-id="${valId}"`), `Missing assertion ${valId}`);
+  }
+
+  // Verify #orchestrator-stream does NOT contain model_slots_updated spam
+  const streamHtml = elements.get("orchestrator-stream").innerHTML;
+  assert.equal(
+    streamHtml.includes("model_slots_updated"),
+    false,
+    "#orchestrator-stream must filter out model_slots_updated spam"
+  );
+
+  // Verify #progress-log-list coalesces the 4 consecutive model_slots_updated entries into 1
+  assert.equal(elements.get("progress-log-count").textContent, "2");
+  const logHtml = elements.get("progress-log-list").innerHTML;
+  assert.match(logHtml, /max\/5/);
+  assert.equal(logHtml.includes("low/2"), false, "Earlier consecutive model_slots_updated entries should be coalesced");
+});

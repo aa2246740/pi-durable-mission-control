@@ -669,10 +669,7 @@ function buildUninitializedState(repoDir) {
       instructions:
         "Propose a mission plan to initialize .mission/state.json, or click Approve & Start Mission once your Validation Contract and features are ready.",
     },
-    milestones: [
-      { id: "m1", title: "Milestone 1: Intake", ordinal: 1 },
-      { id: "m2", title: "Milestone 2: Materials In Run", ordinal: 2 },
-    ],
+    milestones: [],
     assertions: [],
     activeWorker: null,
     sessions: [],
@@ -1667,12 +1664,12 @@ export function createMissionHudServer({
 
     const entriesToAppend = [];
     if (updatedState.activeWorker) {
-      const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
+      const workerNumber = updatedState.activeWorker.workerNumber ?? null;
       const featureTitle =
         updatedState.activeWorker.featureTitle ||
         updatedState.activeWorker.title ||
         updatedState.activeWorker.featureId ||
-        "M2 material test gaps";
+        "active feature";
       updatedState.activeWorker = {
         ...updatedState.activeWorker,
         status: "paused",
@@ -1682,7 +1679,7 @@ export function createMissionHudServer({
       if (Array.isArray(updatedState.sessions)) {
         updatedState.sessions = updatedState.sessions.map((s) =>
           s.runId === updatedState.activeWorker.runId ||
-          s.workerNumber === workerNumber ||
+          (workerNumber !== null && s.workerNumber === workerNumber) ||
           (updatedState.activeWorker.featureId &&
             s.featureId === updatedState.activeWorker.featureId)
             ? { ...s, status: "paused", pausedAt: nowIso }
@@ -1690,10 +1687,11 @@ export function createMissionHudServer({
         );
       }
 
+      const workerLabel = workerNumber !== null ? `Worker #${workerNumber}` : "Active worker";
       entriesToAppend.push({
         timestamp: nowIso,
         type: "worker_paused",
-        message: `Worker #${workerNumber} paused ${featureTitle}`,
+        message: `${workerLabel} paused ${featureTitle}`,
         featureId: updatedState.activeWorker.featureId ?? null,
         workerNumber,
       });
@@ -1738,10 +1736,10 @@ export function createMissionHudServer({
         if (pwRes?.daemonStatus && typeof pwRes.daemonStatus === "string" && updatedState.activeWorker) {
           updatedState.activeWorker.daemonStatus = pwRes.daemonStatus;
           if (Array.isArray(updatedState.sessions)) {
-            const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
+            const workerNumber = updatedState.activeWorker.workerNumber ?? null;
             updatedState.sessions = updatedState.sessions.map((s) =>
               s.runId === updatedState.activeWorker.runId ||
-              s.workerNumber === workerNumber ||
+              (workerNumber !== null && s.workerNumber === workerNumber) ||
               (updatedState.activeWorker.featureId &&
                 s.featureId === updatedState.activeWorker.featureId)
                 ? { ...s, daemonStatus: pwRes.daemonStatus }
@@ -1770,10 +1768,10 @@ export function createMissionHudServer({
         if (pmRes?.daemonStatus && typeof pmRes.daemonStatus === "string" && updatedState.activeWorker) {
           updatedState.activeWorker.daemonStatus = pmRes.daemonStatus;
           if (Array.isArray(updatedState.sessions)) {
-            const workerNumber = updatedState.activeWorker.workerNumber ?? 28;
+            const workerNumber = updatedState.activeWorker.workerNumber ?? null;
             updatedState.sessions = updatedState.sessions.map((s) =>
               s.runId === updatedState.activeWorker.runId ||
-              s.workerNumber === workerNumber ||
+              (workerNumber !== null && s.workerNumber === workerNumber) ||
               (updatedState.activeWorker.featureId &&
                 s.featureId === updatedState.activeWorker.featureId)
                 ? { ...s, daemonStatus: pmRes.daemonStatus }
@@ -1839,15 +1837,15 @@ export function createMissionHudServer({
     }
 
     let workerNumber = null;
-    let featureId = "m2-material-test-gaps";
-    let featureTitle = "M2 material test gaps";
+    let featureId = "active-feature";
+    let featureTitle = "active feature";
 
     if (existingState.activeWorker) {
-      workerNumber = existingState.activeWorker.workerNumber ?? 28;
+      workerNumber = existingState.activeWorker.workerNumber ?? null;
       featureId =
         existingState.activeWorker.featureId ||
         existingState.activeWorker.id ||
-        "m2-material-test-gaps";
+        "active-feature";
       featureTitle =
         existingState.activeWorker.featureTitle ||
         existingState.activeWorker.title ||
@@ -1921,7 +1919,7 @@ export function createMissionHudServer({
     const resumeSummary =
       body.resumeSummary ||
       (updatedState.activeWorker
-        ? `Resume M2 fixes: ${featureId} (${featureTitle})`
+        ? `Resume ${featureId} (${featureTitle})`
         : "Resume mission execution");
 
     const entriesToAppend = [

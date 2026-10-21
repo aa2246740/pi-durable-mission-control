@@ -3,149 +3,160 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>T3 Mission Control HUD · Factory Droid</title>
+    <title>T3 Mission Control HUD</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="hud-shell" id="hud-shell">
-      <!-- Top Bar -->
+      <!-- Unified Top Header & Control Bar -->
       <header class="hud-topbar" id="hud-topbar">
         <div class="topbar-left">
-          <div class="breadcrumb-row">
-            <span class="back-chip" id="back-to-app">&lt; Back to App</span>
+          <div class="topbar-meta-row">
+            <div class="status-strip" id="status-strip" data-status="awaiting_input">
+              <span class="status-dot" id="status-strip-dot"></span>
+              <span class="status-text" id="status-strip-label">AWAITING INPUT</span>
+            </div>
             <span class="mission-badge">MISSION</span>
-            <span class="mission-repo-path" id="mission-repo-path">/Volumes/Workspace/openslide-studio-agentready</span>
+            <span class="mission-repo-path mono" id="mission-repo-path"></span>
+            <span class="sse-indicator" id="sse-indicator" title="SSE Stream Status">● Live</span>
+            <span class="status-subtext" id="status-strip-subtext">Connecting to mission state...</span>
           </div>
-          <h1 class="mission-title" id="mission-title">
-            Open SlideStudio 参考材料附件：图片 / PPTX 模板 / 数据表 / PDF / Word
-          </h1>
+          <h1 class="mission-title" id="mission-title">Waiting for Mission Initialization</h1>
         </div>
 
-        <div class="topbar-metrics">
-          <div class="metric-box">
-            <span class="metric-label">TIME</span>
-            <span class="metric-value mono" id="metric-time">00:00:00</span>
-            <div class="metric-bar"><div class="metric-bar-fill time-fill" id="metric-time-bar"></div></div>
+        <div class="topbar-right">
+          <div class="topbar-metrics">
+            <div class="metric-box">
+              <span class="metric-label">ELAPSED</span>
+              <span class="metric-value mono" id="metric-time">00:00:00</span>
+            </div>
+            <div class="metric-box">
+              <div class="metric-head">
+                <span class="metric-label">FEATURES</span>
+                <span class="metric-value mono" id="metric-progress">0/0</span>
+              </div>
+              <div class="metric-bar">
+                <div class="metric-bar-fill progress-fill" id="metric-progress-bar"></div>
+              </div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-head">
+                <span class="metric-label">CONTRACT</span>
+                <span class="metric-value mono" id="metric-contract">0/0 PASSED</span>
+              </div>
+              <div class="metric-bar">
+                <div class="metric-bar-fill contract-fill" id="metric-contract-bar"></div>
+              </div>
+            </div>
           </div>
-          <div class="metric-box">
-            <span class="metric-label">PROGRESS</span>
-            <span class="metric-value mono" id="metric-progress">0/0</span>
-            <div class="metric-bar"><div class="metric-bar-fill progress-fill" id="metric-progress-bar"></div></div>
-          </div>
-          <div class="metric-box">
-            <span class="metric-label">USAGE</span>
-            <span class="metric-value mono" id="metric-usage">0%</span>
-            <div class="metric-bar"><div class="metric-bar-fill usage-fill" id="metric-usage-bar"></div></div>
+
+          <div class="status-strip-actions">
+            <button
+              type="button"
+              class="strip-btn strip-btn-approve"
+              id="strip-approve-btn"
+              data-action="approve"
+              title="Approve & Start Mission"
+            >
+              ✓ Approve &amp; Start Mission
+            </button>
+            <button
+              type="button"
+              class="strip-btn strip-btn-pause"
+              id="btn-pause"
+              data-action="pause"
+              title="Pause Mission"
+            >
+              Pause
+            </button>
+            <button
+              type="button"
+              class="strip-btn strip-btn-resume"
+              id="btn-resume"
+              data-action="resume"
+              title="Resume Mission"
+            >
+              Resume
+            </button>
           </div>
         </div>
       </header>
 
-      <!-- Orange Status / Turn Strip -->
-      <section class="status-strip" id="status-strip" data-status="awaiting_input">
-        <div class="status-strip-left">
-          <span class="status-dot" id="status-strip-dot"></span>
-          <span class="status-text" id="status-strip-label">AWAITING INPUT</span>
-          <span class="status-subtext" id="status-strip-subtext">Revision #1 · Live SSE Connected</span>
-        </div>
-        <div class="status-strip-actions">
-          <button
-            type="button"
-            class="strip-btn strip-btn-approve"
-            id="strip-approve-btn"
-            data-action="approve"
-            title="Approve & Start Mission"
-          >
-            ✓ Approve &amp; Start Mission
-          </button>
-          <button
-            type="button"
-            class="strip-btn strip-btn-pause"
-            id="btn-pause"
-            data-action="pause"
-            title="Pause Mission"
-          >
-            || Pause
-          </button>
-          <button
-            type="button"
-            class="strip-btn strip-btn-resume"
-            id="btn-resume"
-            data-action="resume"
-            title="Resume Mission"
-          >
-            ▶ Resume Mission
-          </button>
-        </div>
-      </section>
+      <!-- Milestone Pipeline Stepper Strip -->
+      <div class="milestone-pipeline-bar" id="milestone-pipeline-bar">
+        <div class="milestone-stepper-track" id="milestone-stepper-track"></div>
+        <span class="pipeline-text" id="pipeline-text">No milestones planned yet</span>
+      </div>
 
       <!-- Three-Column Main Workspace -->
       <main class="hud-workspace" id="hud-workspace">
-        <!-- Left Column: Sessions -->
-        <aside class="hud-col hud-col-left" id="sessions-panel" aria-label="Sessions">
+        <!-- Left Column: Execution Sessions -->
+        <aside class="hud-col hud-col-left" id="sessions-panel" aria-label="Execution Sessions">
           <div class="panel-header">
-            <span class="panel-title">Sessions</span>
+            <span class="panel-title">Execution Sessions</span>
             <span class="panel-count mono" id="sessions-count">1</span>
           </div>
-          <div class="session-list-container" id="session-list" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+          <div class="session-list-container" id="session-list">
             <div class="sessions-list" id="sessions-list">
               <!-- Populated by app.js -->
             </div>
           </div>
-          <div class="sidebar-footer">
-            <div class="user-chip">
-              <span class="user-avatar">WD</span>
-              <span class="user-name">Wu David</span>
-            </div>
-            <span class="sse-indicator" id="sse-indicator" title="SSE Stream Status">● Live</span>
-          </div>
         </aside>
 
-        <!-- Center Column: Orchestrator Turn / Plan Approval / Session Handoff Detail -->
-        <section class="hud-col hud-col-center" id="center-panel" aria-label="Orchestrator Turn and Handoff">
+        <!-- Center Column: Mission Execution Board & Validation Contract -->
+        <section class="hud-col hud-col-center" id="center-panel" aria-label="Mission Execution Board and Contract">
           <!-- Uninitialized Banner (hidden when initialized) -->
           <div class="onboarding-card hidden" id="onboarding-card"></div>
 
-          <!-- Plan Approval Card (shown prominently when status === 'awaiting_input' && !planAccepted) -->
+          <!-- Plan Review Banner (shown when status === 'awaiting_input' && !planAccepted) -->
           <div class="approval-card hidden" id="plan-approval-card"></div>
 
-          <!-- Session Handoff Inspector (shown when a Worker/Explorer/Validator session is clicked) -->
+          <!-- Session Handoff Inspector (shown when a Worker/Validator session is clicked) -->
           <div class="session-inspector hidden" id="session-inspector">
             <div class="session-handoff-view hidden" id="session-handoff-view"></div>
           </div>
 
-          <!-- Orchestrator Action Stream (Droid timeline flow) -->
-          <div class="orchestrator-stream" id="orchestrator-stream"></div>
+          <!-- Primary Mission Execution Board -->
+          <div class="execution-board" id="execution-board">
+            <!-- Diagnostic / Active Turn Stream -->
+            <div class="orchestrator-stream" id="orchestrator-stream"></div>
 
-          <!-- Bottom Droid Composer & Milestone Capsule -->
-          <footer class="center-composer" id="center-composer">
-            <div class="milestone-pipeline-bar" id="milestone-pipeline-bar">
-              <span class="pipeline-dot">●</span>
-              <span class="pipeline-text" id="pipeline-text">
-                执行并处理交接：M1 已通过验收 → M2（资料进入生成）→ M3（模板）
-              </span>
-            </div>
-            <div class="composer-box">
-              <div class="composer-status-msg" id="composer-status-msg">
-                Mission is running. Pause to send messages.
+            <!-- Milestone & Feature Execution Swimlanes -->
+            <section class="board-section features-section" id="features-section">
+              <div class="board-section-header">
+                <div class="board-section-title-group">
+                  <span class="board-section-title">Milestones &amp; Features</span>
+                  <span class="board-section-subtitle">Click any feature or session to inspect handoff details</span>
+                </div>
+                <span class="section-count mono" id="features-count">0/0</span>
               </div>
-              <div class="composer-toolbar">
-                <span class="toolbar-chip model-active-chip" id="toolbar-orchestrator-model">
-                  Claude Code · Opus 5.5 (claude-opus-5-5)
-                </span>
-                <span class="toolbar-chip">Autonomy <strong class="mono">||</strong></span>
-                <span class="toolbar-chip mission-mode-chip">Mission Mode</span>
-                <span class="toolbar-chip connectors-chip">● Connectors (1)</span>
+              <div class="features-list" id="features-list">
+                <!-- Populated by app.js -->
               </div>
-            </div>
-          </footer>
+            </section>
+
+            <!-- Validation Contract Matrix -->
+            <section class="board-section assertions-section" id="assertions-section">
+              <div class="board-section-header">
+                <div class="board-section-title-group">
+                  <span class="board-section-title">Validation Contract</span>
+                  <span class="board-section-subtitle">Full VAL-* acceptance assertions across milestones</span>
+                </div>
+                <span class="section-count mono" id="assertions-count">0/0</span>
+              </div>
+              <div class="assertions-list" id="assertions-list">
+                <!-- Populated by app.js -->
+              </div>
+            </section>
+          </div>
         </section>
 
-        <!-- Right Column: Model Slots + Features + Validation Contract + Progress Log -->
-        <aside class="hud-col hud-col-right" id="right-panel" aria-label="Model, Features, and Progress Log">
-          <!-- Model 3-Slot Selector -->
+        <!-- Right Column: Role Models & Activity Timeline -->
+        <aside class="hud-col hud-col-right" id="right-panel" aria-label="Role Models and Activity Timeline">
+          <!-- Role Models 3-Slot Selector -->
           <section class="right-section model-section" id="model-section">
             <div class="section-header">
-              <span class="section-title">Model</span>
+              <span class="section-title">Role Models</span>
               <span class="section-meta" id="model-save-status">Synced</span>
             </div>
             <div class="model-slots-list" id="model-slots-list">
@@ -211,32 +222,10 @@
             </div>
           </section>
 
-          <!-- Features Checklist -->
-          <section class="right-section features-section" id="features-section">
-            <div class="section-header">
-              <span class="section-title">Features</span>
-              <span class="section-count mono" id="features-count">0/0</span>
-            </div>
-            <div class="features-list" id="features-list">
-              <!-- Populated by app.js -->
-            </div>
-          </section>
-
-          <!-- Validation Assertions Checklist -->
-          <section class="right-section assertions-section" id="assertions-section">
-            <div class="section-header">
-              <span class="section-title">Validation Contract</span>
-              <span class="section-count mono" id="assertions-count">0/0</span>
-            </div>
-            <div class="assertions-list" id="assertions-list">
-              <!-- Populated by app.js -->
-            </div>
-          </section>
-
-          <!-- Progress Log -->
+          <!-- Activity Timeline -->
           <section class="right-section progress-log-section" id="progress-log-section">
             <div class="section-header">
-              <span class="section-title">Progress Log</span>
+              <span class="section-title">Activity Timeline</span>
               <span class="section-count mono" id="progress-log-count">0</span>
             </div>
             <div class="progress-log-list" id="progress-log-list">
