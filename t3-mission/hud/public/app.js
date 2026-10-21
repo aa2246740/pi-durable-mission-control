@@ -833,6 +833,14 @@ function renderCenterColumn(snapshot) {
 function renderRightColumn(snapshot) {
   const { state, features, modelSettings, progressLog, catalog } = snapshot;
 
+  const effortLevelNames = {
+    1: "minimal",
+    2: "low",
+    3: "medium",
+    4: "high",
+    5: "max",
+  };
+
   // 1. Model 3-Slot Controls
   for (const slot of ["orchestrator", "worker", "validator"]) {
     const selectEl = document.getElementById(`model-select-${slot}`);
@@ -841,18 +849,30 @@ function renderRightColumn(snapshot) {
     const currentModel = slotCfg.model || "gpt-6.1-sol";
     const currentEffort = Number(slotCfg.effort || slotCfg.options?.effort || 4);
 
-    if (selectEl) {
-      const optionsList = Array.isArray(catalog) ? [...catalog] : [];
-      if (!optionsList.some((c) => c.model === currentModel || c.id === currentModel)) {
-        optionsList.unshift({
-          id: currentModel,
-          model: currentModel,
-          label: slotCfg.label || currentModel,
-          providerInstanceId: slotCfg.providerInstanceId || "custom",
-          effort: currentEffort,
-        });
-      }
+    const optionsList = Array.isArray(catalog) ? [...catalog] : [];
+    const catalogEntry = optionsList.find(
+      (c) => c.model === currentModel || c.id === currentModel
+    );
+    const supportsEffort =
+      catalogEntry?.supportsEffort !== undefined
+        ? Boolean(catalogEntry.supportsEffort)
+        : slotCfg.supportsEffort !== undefined
+          ? Boolean(slotCfg.supportsEffort)
+          : slotCfg.providerInstanceId !== "antigravity" &&
+            !/-(low|medium|high)$/i.test(currentModel);
 
+    if (!catalogEntry) {
+      optionsList.unshift({
+        id: currentModel,
+        model: currentModel,
+        label: slotCfg.label || currentModel,
+        providerInstanceId: slotCfg.providerInstanceId || "custom",
+        supportsEffort,
+        effort: supportsEffort ? currentEffort : null,
+      });
+    }
+
+    if (selectEl) {
       selectEl.innerHTML = optionsList
         .map(
           (item) => `
@@ -860,7 +880,8 @@ function renderRightColumn(snapshot) {
               value="${escapeHtml(item.model)}"
               data-provider="${escapeHtml(item.providerInstanceId || "")}"
               data-label="${escapeHtml(item.label || item.model)}"
-              data-effort="${escapeHtml(item.effort || 4)}"
+              data-supports-effort="${item.supportsEffort !== false}"
+              data-effort="${escapeHtml(item.supportsEffort === false ? "" : item.effort || 4)}"
               ${item.model === currentModel ? "selected" : ""}
             >
               ${escapeHtml(item.label || item.model)}
@@ -871,31 +892,43 @@ function renderRightColumn(snapshot) {
     }
 
     if (barsEl) {
-      let barsHtml = "";
-      for (let level = 1; level <= 5; level++) {
-        const isActive = level <= currentEffort;
-        barsHtml += `
+      if (!supportsEffort) {
+        barsEl.classList.add("hidden");
+        barsEl.style.display = "none";
+        barsEl.innerHTML = "";
+        barsEl.setAttribute?.("aria-hidden", "true");
+      } else {
+        barsEl.classList.remove("hidden");
+        barsEl.style.display = "";
+        barsEl.removeAttribute?.("aria-hidden");
+
+        let barsHtml = "";
+        for (let level = 1; level <= 5; level++) {
+          const isActive = level <= currentEffort;
+          const levelName = effortLevelNames[level] || "high";
+          barsHtml += `
           <button
             type="button"
             class="effort-bar-btn ${isActive ? "active" : ""}"
             data-slot="${slot}"
             data-effort="${level}"
-            title="Reasoning Effort ${level}/5"
+            title="Reasoning Effort: ${levelName} (${level}/5)"
             aria-label="${slot} effort ${level}"
           ></button>
         `;
-      }
-      barsEl.innerHTML = barsHtml;
+        }
+        barsEl.innerHTML = barsHtml;
 
-      barsEl.querySelectorAll(".effort-bar-btn").forEach((btn) => {
-        btn.addEventListener("click", async () => {
-          const newEffort = Number(btn.dataset.effort || 4);
-          await updateModelSlot(slot, {
-            model: selectEl?.value || currentModel,
-            effort: newEffort,
+        barsEl.querySelectorAll(".effort-bar-btn").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const newEffort = Number(btn.dataset.effort || 4);
+            await updateModelSlot(slot, {
+              model: selectEl?.value || currentModel,
+              effort: newEffort,
+            });
           });
         });
-      });
+      }
     }
   }
 
@@ -1046,13 +1079,11 @@ async function triggerResume() {
 async function updateModelSlot(slot, { model, providerInstanceId, label, effort }) {
   const statusEl = document.getElementById("model-save-status");
   if (statusEl) statusEl.textContent = "Saving...";
-  await postJson("/api/mission/model-slots", {
-    slot,
-    model,
-    providerInstanceId,
-    label,
-    effort,
-  });
+  const payload = { slot, model, providerInstanceId, label };
+  if (effort !== undefined && effort !== null) {
+    payload.effort = effort;
+  }
+  await postJson("/api/mission/model-slots", payload);
   if (statusEl) statusEl.textContent = "Saved";
 }
 
@@ -1068,14 +1099,16 @@ function bindStaticListeners() {
       const model = e.target.value;
       const providerInstanceId = opt?.dataset?.provider || undefined;
       const label = opt?.dataset?.label || undefined;
-      const currentEffort =
-        hudState.snapshot?.modelSettings?.[slot]?.effort ||
-        Number(opt?.dataset?.effort || 4);
+      const optSupportsEffort = opt?.dataset?.supportsEffort !== "false";
+      const currentEffort = optSupportsEffort
+        ? hudState.snapshot?.modelSettings?.[slot]?.effort ||
+          Number(opt?.dataset?.effort || 4)
+        : null;
       await updateModelSlot(slot, {
         model,
         providerInstanceId,
         label,
-        effort: currentEffort,
+        ...(optSupportsEffort ? { effort: currentEffort } : {}),
       });
     });
   }

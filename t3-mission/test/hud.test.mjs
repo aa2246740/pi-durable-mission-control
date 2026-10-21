@@ -7,7 +7,12 @@ import http from "node:http";
 import vm from "node:vm";
 import cp, { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createMissionHudServer } from "../hud/server.mjs";
+import {
+  createMissionHudServer,
+  BUILTIN_MODEL_CATALOG,
+  doesModelSupportEffort,
+  normalizeHudModelSettings,
+} from "../hud/server.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2022,4 +2027,211 @@ test("Round 7 E2E Browser Contract Fixes (UI-STATUS-LABEL, UI-APPROVE-ID, RESUME
   assert.equal(conflictBody.error, "Unresolved git merge conflicts in working tree");
   assert.equal(conflictBody.gitCheck.hasConflicts, true);
   assert.equal(conflictBody.gitCheck.canResume, false);
+});
+
+test("HUD Effort Capability Fix (t3m-m1-w3-hud-effort-cap-fix-v1): Fixed-tier / antigravity models hide effort bars and strip effort options", async () => {
+  // 1. Verify BUILTIN_MODEL_CATALOG effort metadata and doesModelSupportEffort helper
+  const geminiEntry = BUILTIN_MODEL_CATALOG.find((m) => m.id === "gemini-4-argon-high");
+  assert.ok(geminiEntry);
+  assert.equal(geminiEntry.supportsEffort, false);
+  assert.deepEqual(geminiEntry.effortLevels, []);
+  assert.equal(geminiEntry.effort, null);
+  assert.equal(geminiEntry.reasoningEffort, null);
+
+  const astraEntry = BUILTIN_MODEL_CATALOG.find((m) => m.id === "gpt-6-astra-high");
+  assert.ok(astraEntry);
+  assert.equal(astraEntry.supportsEffort, false);
+  assert.deepEqual(astraEntry.effortLevels, []);
+  assert.equal(astraEntry.effort, null);
+  assert.equal(astraEntry.reasoningEffort, null);
+
+  const opusEntry = BUILTIN_MODEL_CATALOG.find((m) => m.id === "claude-opus-5-5");
+  assert.equal(opusEntry.supportsEffort, true);
+  assert.deepEqual(opusEntry.effortLevels, ["low", "medium", "high", "xhigh", "max"]);
+
+  assert.equal(doesModelSupportEffort("gemini-4-argon-high"), false);
+  assert.equal(doesModelSupportEffort({ model: "custom-model", providerInstanceId: "antigravity" }), false);
+  assert.equal(doesModelSupportEffort({ model: "custom-model-high", providerInstanceId: "openai" }), false);
+  assert.equal(doesModelSupportEffort("gpt-6.1-sol"), true);
+  assert.equal(doesModelSupportEffort("claude-opus-5-5"), true);
+
+  // 2. Verify normalizeHudModelSettings strips effort/reasoningEffort for gemini-4-argon-high (antigravity)
+  const normalized = normalizeHudModelSettings({
+    orchestrator: {
+      model: "gemini-4-argon-high",
+      providerInstanceId: "antigravity",
+      effort: 4,
+      reasoningEffort: "high",
+      options: { effort: 4, reasoningEffort: "high" },
+    },
+    worker: "gpt-6.1-sol",
+    validator: "claude-opus-5-5",
+  });
+
+  assert.equal(normalized.orchestrator.model, "gemini-4-argon-high");
+  assert.equal(normalized.orchestrator.providerInstanceId, "antigravity");
+  assert.equal(normalized.orchestrator.supportsEffort, false);
+  assert.deepEqual(normalized.orchestrator.effortLevels, []);
+  assert.equal(normalized.orchestrator.effort, null);
+  assert.equal(normalized.orchestrator.reasoningEffort, null);
+  assert.equal(normalized.orchestrator.options.effort, undefined);
+  assert.equal(normalized.orchestrator.options.reasoningEffort, undefined);
+  assert.deepEqual(normalized.orchestrator.options, {});
+
+  assert.equal(normalized.worker.model, "gpt-6.1-sol");
+  assert.equal(normalized.worker.supportsEffort, true);
+  assert.equal(normalized.worker.effort, 4);
+  assert.equal(normalized.worker.reasoningEffort, "high");
+  assert.equal(normalized.worker.options.effort, 4);
+  assert.equal(normalized.worker.options.reasoningEffort, "high");
+
+  assert.equal(normalized.validator.model, "claude-opus-5-5");
+  assert.equal(normalized.validator.supportsEffort, true);
+  assert.equal(normalized.validator.effort, 5);
+  assert.equal(normalized.validator.reasoningEffort, "max");
+
+  // 3. Verify HUD DOM hides #effort-bars-<slot> for gemini-4-argon-high and shows interactive bars for gpt-6.1-sol / claude-opus-5-5
+  const appSrc = fs
+    .readFileSync(APP_JS_PATH, "utf8")
+    .replace("export function applySnapshot", "function applySnapshot")
+    .replace(/initHud\(\);\s*$/, "");
+
+  const elements = new Map();
+  const slotUpdates = [];
+
+  function makeDomEl(id) {
+    const attrs = new Map();
+    const el = {
+      id,
+      textContent: "",
+      innerHTML: "",
+      dataset: {},
+      style: {},
+      value: "",
+      listeners: {},
+      _buttons: [],
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      classList: {
+        classes: new Set(),
+        add(c) {
+          this.classes.add(c);
+        },
+        remove(c) {
+          this.classes.delete(c);
+        },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this.classes.has(c)) this.classes.delete(c);
+            else this.classes.add(c);
+          } else if (force) {
+            this.classes.add(c);
+          } else {
+            this.classes.delete(c);
+          }
+        },
+        contains(c) {
+          return this.classes.has(c);
+        },
+      },
+      addEventListener(type, fn) {
+        this.listeners[type] = fn;
+      },
+      querySelector() {
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel === ".effort-bar-btn") {
+          const matches = [
+            ...this.innerHTML.matchAll(
+              /<button[^>]*class="effort-bar-btn[^"]*"[^>]*data-slot="([^"]+)"[^>]*data-effort="(\d+)"[^>]*>/g
+            ),
+          ];
+          this._buttons = matches.map((m) => {
+            const btn = makeDomEl(`btn-${m[1]}-${m[2]}`);
+            btn.dataset = { slot: m[1], effort: m[2] };
+            return btn;
+          });
+          return this._buttons;
+        }
+        return [];
+      },
+    };
+    return el;
+  }
+
+  for (const slot of ["orchestrator", "worker", "validator"]) {
+    elements.set(`model-select-${slot}`, makeDomEl(`model-select-${slot}`));
+    elements.set(`effort-bars-${slot}`, makeDomEl(`effort-bars-${slot}`));
+  }
+
+  const vmCtx = vm.createContext({
+    document: {
+      getElementById: (id) => elements.get(id) || null,
+    },
+    fetch: async (url, opts) => {
+      if (url === "/api/mission/model-slots" && opts?.body) {
+        slotUpdates.push(JSON.parse(opts.body));
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true }),
+      };
+    },
+  });
+
+  vm.runInContext(appSrc, vmCtx);
+
+  vmCtx.snapshot = {
+    initialized: true,
+    state: { status: "running", planAccepted: true, revision: 1, milestones: [], assertions: [] },
+    features: [],
+    progressLog: [],
+    modelSettings: normalized,
+    catalog: BUILTIN_MODEL_CATALOG,
+  };
+  vm.runInContext("applySnapshot(snapshot)", vmCtx);
+
+  // Orchestrator has gemini-4-argon-high -> hidden and 0 effort buttons
+  const orchBars = elements.get("effort-bars-orchestrator");
+  assert.equal(orchBars.classList.contains("hidden"), true);
+  assert.equal(orchBars.style.display, "none");
+  assert.equal(orchBars.getAttribute("aria-hidden"), "true");
+  assert.equal(orchBars.innerHTML, "");
+  assert.equal(orchBars.querySelectorAll(".effort-bar-btn").length, 0);
+
+  const orchSelectHtml = elements.get("model-select-orchestrator").innerHTML;
+  assert.match(orchSelectHtml, /value="gemini-4-argon-high"[\s\S]*?data-supports-effort="false"/);
+  assert.match(orchSelectHtml, /value="claude-opus-5-5"[\s\S]*?data-supports-effort="true"/);
+
+  // Worker has gpt-6.1-sol -> visible and 5 interactive effort buttons
+  const workerBars = elements.get("effort-bars-worker");
+  assert.equal(workerBars.classList.contains("hidden"), false);
+  assert.equal(workerBars.style.display, "");
+  assert.equal(workerBars.getAttribute("aria-hidden"), null);
+  assert.equal(workerBars._buttons.length, 5);
+  assert.match(workerBars.innerHTML, /title="Reasoning Effort: high \(4\/5\)"/);
+
+  // Validator has claude-opus-5-5 -> visible and 5 interactive effort buttons
+  const validatorBars = elements.get("effort-bars-validator");
+  assert.equal(validatorBars.classList.contains("hidden"), false);
+  assert.equal(validatorBars.style.display, "");
+  assert.equal(validatorBars.getAttribute("aria-hidden"), null);
+  assert.equal(validatorBars._buttons.length, 5);
+  assert.match(validatorBars.innerHTML, /title="Reasoning Effort: max \(5\/5\)"/);
+
+  // Clicking bar #3 on worker triggers POST /api/mission/model-slots with effort: 3
+  await workerBars._buttons[2].listeners.click();
+  assert.equal(slotUpdates.length, 1);
+  assert.equal(slotUpdates[0].slot, "worker");
+  assert.equal(slotUpdates[0].model, "gpt-6.1-sol");
+  assert.equal(slotUpdates[0].effort, 3);
 });

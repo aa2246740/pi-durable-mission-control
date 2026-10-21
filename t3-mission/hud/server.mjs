@@ -17,6 +17,8 @@ export const BUILTIN_MODEL_CATALOG = [
     label: "Claude Code · Opus 5.5",
     displayName: "Claude Code · Opus 5.5 (claude-opus-5-5)",
     providerInstanceId: "claude-code",
+    supportsEffort: true,
+    effortLevels: ["low", "medium", "high", "xhigh", "max"],
     effort: 5,
     reasoningEffort: "max",
     slots: ["orchestrator", "worker", "validator"],
@@ -27,8 +29,10 @@ export const BUILTIN_MODEL_CATALOG = [
     label: "Gemini 4 Argon (High)",
     displayName: "Gemini 4 Argon (High)",
     providerInstanceId: "antigravity",
-    effort: 4,
-    reasoningEffort: "high",
+    supportsEffort: false,
+    effortLevels: [],
+    effort: null,
+    reasoningEffort: null,
     slots: ["orchestrator", "worker", "validator"],
   },
   {
@@ -37,6 +41,8 @@ export const BUILTIN_MODEL_CATALOG = [
     label: "Codex · GPT-6.1-Sol (Max/High)",
     displayName: "Codex · GPT-6.1-Sol (Max/High)",
     providerInstanceId: "codex",
+    supportsEffort: true,
+    effortLevels: ["low", "medium", "high", "xhigh", "max"],
     effort: 4,
     reasoningEffort: "high",
     slots: ["orchestrator", "worker", "validator"],
@@ -47,6 +53,8 @@ export const BUILTIN_MODEL_CATALOG = [
     label: "CPA swe-2 Max",
     displayName: "CPA swe-2 Max",
     providerInstanceId: "cpa",
+    supportsEffort: true,
+    effortLevels: ["low", "medium", "high", "xhigh", "max"],
     effort: 5,
     reasoningEffort: "max",
     slots: ["orchestrator", "worker", "validator"],
@@ -57,8 +65,10 @@ export const BUILTIN_MODEL_CATALOG = [
     label: "CPA grok-4.7",
     displayName: "CPA grok-4.7",
     providerInstanceId: "cpa",
+    supportsEffort: true,
+    effortLevels: ["low", "medium", "high", "xhigh"],
     effort: 3,
-    reasoningEffort: "medium",
+    reasoningEffort: "high",
     slots: ["orchestrator", "worker", "validator"],
   },
   {
@@ -67,8 +77,10 @@ export const BUILTIN_MODEL_CATALOG = [
     label: "GPT-6-Astra (High)",
     displayName: "GPT-6-Astra (High)",
     providerInstanceId: "openai",
-    effort: 4,
-    reasoningEffort: "high",
+    supportsEffort: false,
+    effortLevels: [],
+    effort: null,
+    reasoningEffort: null,
     slots: ["orchestrator", "worker", "validator"],
   },
 ];
@@ -110,6 +122,8 @@ export const DEFAULT_HUD_MODEL_SETTINGS = {
     providerInstanceId: "claude-code",
     model: "claude-opus-5-5",
     label: "Claude Code · Opus 5.5",
+    supportsEffort: true,
+    effortLevels: ["low", "medium", "high", "xhigh", "max"],
     effort: 5,
     reasoningEffort: "max",
     options: { reasoningEffort: "max", effort: 5 },
@@ -118,6 +132,8 @@ export const DEFAULT_HUD_MODEL_SETTINGS = {
     providerInstanceId: "cpa",
     model: "swe-2-max",
     label: "CPA swe-2 Max",
+    supportsEffort: true,
+    effortLevels: ["low", "medium", "high", "xhigh", "max"],
     effort: 5,
     reasoningEffort: "max",
     options: { reasoningEffort: "max", effort: 5 },
@@ -126,6 +142,8 @@ export const DEFAULT_HUD_MODEL_SETTINGS = {
     providerInstanceId: "cpa",
     model: "grok-4.7",
     label: "CPA grok-4.7",
+    supportsEffort: true,
+    effortLevels: ["low", "medium", "high", "xhigh"],
     effort: 3,
     reasoningEffort: "medium",
     options: { reasoningEffort: "medium", effort: 3 },
@@ -146,6 +164,31 @@ function findCatalogEntry(modelOrLabel) {
         item.displayName.toLowerCase() === needle
     ) || null
   );
+}
+
+export function doesModelSupportEffort(rawSlot, catalogEntry = null) {
+  const slotObj = typeof rawSlot === "object" && rawSlot ? rawSlot : null;
+  const candidateModel =
+    typeof rawSlot === "string"
+      ? rawSlot
+      : slotObj?.model || slotObj?.id || slotObj?.label || catalogEntry?.model || "";
+  const entry = catalogEntry || findCatalogEntry(candidateModel);
+
+  if (entry?.supportsEffort === false) return false;
+  if (slotObj?.supportsEffort === false) return false;
+
+  const providerInstanceId = String(
+    slotObj?.providerInstanceId || entry?.providerInstanceId || ""
+  )
+    .trim()
+    .toLowerCase();
+  if (providerInstanceId === "antigravity") return false;
+
+  if (!entry && /-(low|medium|high)$/i.test(String(candidateModel).trim())) {
+    return false;
+  }
+
+  return true;
 }
 
 function normalizeEffortPair(rawEffort, rawReasoningEffort, fallbackLevel = 4) {
@@ -191,15 +234,38 @@ function normalizeSlotConfig(rawSlot, fallbackSlot) {
   const base = fallbackSlot || DEFAULT_HUD_MODEL_SETTINGS.orchestrator;
   if (typeof rawSlot === "string") {
     const entry = findCatalogEntry(rawSlot);
+    const providerInstanceId =
+      entry?.providerInstanceId || base.providerInstanceId || "codex";
+    const model = entry?.model || rawSlot;
+    const label = entry?.label || rawSlot;
+    if (!doesModelSupportEffort({ model, providerInstanceId }, entry)) {
+      const cleanedOptions = { ...(base.options || {}) };
+      delete cleanedOptions.effort;
+      delete cleanedOptions.reasoningEffort;
+      delete cleanedOptions.reasoning_effort;
+      delete cleanedOptions.thinking;
+      return {
+        providerInstanceId,
+        model,
+        label,
+        supportsEffort: false,
+        effortLevels: [],
+        effort: null,
+        reasoningEffort: null,
+        options: cleanedOptions,
+      };
+    }
     const { effort, reasoningEffort } = normalizeEffortPair(
       entry?.effort,
       entry?.reasoningEffort,
       base.effort || 4
     );
     return {
-      providerInstanceId: entry?.providerInstanceId || base.providerInstanceId || "codex",
-      model: entry?.model || rawSlot,
-      label: entry?.label || rawSlot,
+      providerInstanceId,
+      model,
+      label,
+      supportsEffort: true,
+      effortLevels: entry?.effortLevels || ["minimal", "low", "medium", "high", "max"],
       effort,
       reasoningEffort,
       options: {
@@ -211,20 +277,56 @@ function normalizeSlotConfig(rawSlot, fallbackSlot) {
   }
 
   if (!rawSlot || typeof rawSlot !== "object") {
-    return structuredClone(base);
+    if (base && typeof base === "object" && base !== rawSlot) {
+      return normalizeSlotConfig(base, DEFAULT_HUD_MODEL_SETTINGS.orchestrator);
+    }
+    return structuredClone(DEFAULT_HUD_MODEL_SETTINGS.orchestrator);
   }
 
   const candidateModel = rawSlot.model || rawSlot.id || rawSlot.label || base.model;
   const entry = findCatalogEntry(candidateModel);
+  const providerInstanceId =
+    rawSlot.providerInstanceId ||
+    entry?.providerInstanceId ||
+    base.providerInstanceId ||
+    "codex";
+  const model = entry?.model || String(candidateModel);
+  const label = rawSlot.label || entry?.label || String(candidateModel);
+
+  if (!doesModelSupportEffort({ ...rawSlot, providerInstanceId, model }, entry)) {
+    const cleanedOptions = {
+      ...(base.options || {}),
+      ...(rawSlot.options || {}),
+    };
+    delete cleanedOptions.effort;
+    delete cleanedOptions.reasoningEffort;
+    delete cleanedOptions.reasoning_effort;
+    delete cleanedOptions.thinking;
+    return {
+      providerInstanceId,
+      model,
+      label,
+      supportsEffort: false,
+      effortLevels: [],
+      effort: null,
+      reasoningEffort: null,
+      options: cleanedOptions,
+    };
+  }
 
   const explicitEffort =
-    rawSlot.effort !== undefined ? rawSlot.effort : rawSlot.options?.effort;
+    rawSlot.effort !== undefined && rawSlot.effort !== null
+      ? rawSlot.effort
+      : rawSlot.options?.effort;
   const explicitReasoning =
-    rawSlot.effort !== undefined && rawSlot.reasoningEffort === undefined
+    rawSlot.effort !== undefined &&
+    rawSlot.effort !== null &&
+    rawSlot.reasoningEffort === undefined
       ? undefined
-      : rawSlot.reasoningEffort !== undefined
+      : rawSlot.reasoningEffort !== undefined && rawSlot.reasoningEffort !== null
         ? rawSlot.reasoningEffort
-        : rawSlot.options?.reasoningEffort !== undefined
+        : rawSlot.options?.reasoningEffort !== undefined &&
+            rawSlot.options?.reasoningEffort !== null
           ? rawSlot.options.reasoningEffort
           : entry?.reasoningEffort;
 
@@ -235,13 +337,11 @@ function normalizeSlotConfig(rawSlot, fallbackSlot) {
   );
 
   return {
-    providerInstanceId:
-      rawSlot.providerInstanceId ||
-      entry?.providerInstanceId ||
-      base.providerInstanceId ||
-      "codex",
-    model: entry?.model || String(candidateModel),
-    label: rawSlot.label || entry?.label || String(candidateModel),
+    providerInstanceId,
+    model,
+    label,
+    supportsEffort: true,
+    effortLevels: entry?.effortLevels || ["minimal", "low", "medium", "high", "max"],
     effort,
     reasoningEffort,
     options: {
@@ -1431,8 +1531,23 @@ export function createMissionHudServer({
         nextOptions.reasoningEffort = String(derivedReasoning).trim().toLowerCase();
       }
 
+      const modelChanged =
+        incoming.model !== undefined && incoming.model !== prevSlot?.model;
+      const incomingEntry =
+        incoming.model !== undefined ? findCatalogEntry(incoming.model) : null;
+
       const merged = {
         ...prevSlot,
+        ...(modelChanged
+          ? {
+              providerInstanceId:
+                incoming.providerInstanceId ??
+                incomingEntry?.providerInstanceId ??
+                prevSlot?.providerInstanceId,
+              label: incoming.label ?? incomingEntry?.label ?? incoming.model,
+              supportsEffort: incoming.supportsEffort,
+            }
+          : {}),
         ...(incoming.model !== undefined ? { model: incoming.model } : {}),
         ...(incoming.providerInstanceId !== undefined
           ? { providerInstanceId: incoming.providerInstanceId }
