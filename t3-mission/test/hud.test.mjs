@@ -2235,3 +2235,164 @@ test("HUD Effort Capability Fix (t3m-m1-w3-hud-effort-cap-fix-v1): Fixed-tier / 
   assert.equal(slotUpdates[0].model, "gpt-6.1-sol");
   assert.equal(slotUpdates[0].effort, 3);
 });
+
+test("Validator #7 Fixes (V7-F01, V7-F05, V7-F06): UNINITIALIZED status label, caught postAction errors without unhandled rejection, and dual #session-list/#sessions-list + #session-inspector/#session-handoff-view selectors", async () => {
+  // 1. V7-F06: Verify index.html contains both #session-list and #sessions-list, and both #session-inspector and #session-handoff-view
+  const indexHtmlPath = path.resolve(__dirname, "../hud/public/index.html");
+  const indexHtml = fs.readFileSync(indexHtmlPath, "utf8");
+  assert.match(indexHtml, /id="session-list"[\s\S]*?id="sessions-list"/);
+  assert.match(indexHtml, /id="session-inspector"[\s\S]*?id="session-handoff-view"/);
+
+  // 2. V7-F01, V7-F05, V7-F06 in app.js DOM execution
+  const appSrc = fs
+    .readFileSync(APP_JS_PATH, "utf8")
+    .replace("export function applySnapshot", "function applySnapshot")
+    .replace(/initHud\(\);\s*$/, "");
+
+  const elements = new Map();
+  function makeEl(id) {
+    const el = {
+      id,
+      textContent: "",
+      innerHTML: "",
+      dataset: {},
+      style: {},
+      value: "",
+      listeners: {},
+      classList: {
+        classes: new Set(["hidden"]),
+        add(c) { this.classes.add(c); },
+        remove(c) { this.classes.delete(c); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this.classes.has(c)) this.classes.delete(c);
+            else this.classes.add(c);
+          } else if (force) {
+            this.classes.add(c);
+          } else {
+            this.classes.delete(c);
+          }
+        },
+        contains(c) { return this.classes.has(c); }
+      },
+      addEventListener(type, fn) {
+        this.listeners[type] = fn;
+      },
+      querySelector() { return null; },
+      querySelectorAll() { return []; }
+    };
+    return el;
+  }
+
+  for (const id of [
+    "status-strip",
+    "status-strip-label",
+    "status-strip-subtext",
+    "strip-approve-btn",
+    "btn-pause",
+    "btn-resume",
+    "sessions-list",
+    "sessions-count",
+    "onboarding-card",
+    "plan-approval-card",
+    "session-inspector",
+    "session-handoff-view",
+    "orchestrator-stream",
+    "resume-diagnostic-card",
+    "pipeline-text",
+    "composer-status-msg",
+    "toolbar-orchestrator-model",
+    "model-save-status",
+    "features-count",
+    "features-list",
+    "assertions-count",
+    "assertions-list",
+    "progress-log-count",
+    "progress-log-list"
+  ]) {
+    elements.set(id, makeEl(id));
+  }
+
+  const vmCtx = vm.createContext({
+    document: {
+      getElementById: (id) => elements.get(id) || null
+    },
+    fetch: async (url) => {
+      if (url === "/api/mission/resume") {
+        return {
+          ok: false,
+          status: 409,
+          text: async () => JSON.stringify({
+            ok: false,
+            code: "GIT_RESUME_BLOCKED",
+            reasonCode: "RESUME_BLOCKED_BY_CONFLICTS",
+            error: "Unresolved git merge conflicts in working tree"
+          })
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true })
+      };
+    }
+  });
+
+  vm.runInContext(appSrc, vmCtx);
+  vm.runInContext("bindStaticListeners()", vmCtx);
+
+  // V7-F01: When snapshot.initialized === false, #status-strip-label is UNINITIALIZED
+  vmCtx.uninitSnapshot = {
+    initialized: false,
+    state: { status: "planning", planAccepted: false, revision: 0 },
+    features: [],
+    progressLog: [],
+    modelSettings: {},
+    catalog: []
+  };
+  vm.runInContext("applySnapshot(uninitSnapshot)", vmCtx);
+  assert.equal(elements.get("status-strip-label").textContent, "UNINITIALIZED");
+
+  // When snapshot.initialized === true and status === "planning", #status-strip-label remains PLANNING
+  vmCtx.planningSnapshot = {
+    initialized: true,
+    state: {
+      status: "planning",
+      planAccepted: false,
+      revision: 1,
+      sessions: [
+        {
+          sessionId: "worker-1",
+          runId: "run-1",
+          workerNumber: 1,
+          role: "Worker",
+          milestoneId: "m1",
+          featureId: "f1",
+          title: "Feature 1",
+          status: "completed"
+        }
+      ]
+    },
+    features: [{ id: "f1", title: "Feature 1", milestoneId: "m1", status: "completed" }],
+    progressLog: [],
+    modelSettings: {},
+    catalog: []
+  };
+  vm.runInContext("applySnapshot(planningSnapshot)", vmCtx);
+  assert.equal(elements.get("status-strip-label").textContent, "PLANNING");
+
+  // V7-F06: Selecting a non-orchestrator session unhides both #session-inspector and #session-handoff-view
+  vm.runInContext(`hudState.selectedSessionId = "worker-1"; renderCenterColumn(hudState.snapshot);`, vmCtx);
+  assert.equal(elements.get("session-inspector").classList.contains("hidden"), false);
+  assert.equal(elements.get("session-handoff-view").classList.contains("hidden"), false);
+
+  // V7-F05: Clicking #btn-resume when server returns HTTP 409 does NOT reject / throw uncaught error, and records hudState.lastActionError
+  const resumeBtn = elements.get("btn-resume");
+  assert.equal(typeof resumeBtn.listeners.click, "function");
+  await assert.doesNotReject(async () => {
+    await resumeBtn.listeners.click();
+  });
+  const lastErr = vm.runInContext("hudState.lastActionError", vmCtx);
+  assert.match(lastErr, /HTTP 409/);
+  assert.match(lastErr, /RESUME_BLOCKED_BY_CONFLICTS/);
+});

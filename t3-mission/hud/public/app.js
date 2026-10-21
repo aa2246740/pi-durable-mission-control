@@ -4,6 +4,7 @@ const hudState = {
   copiedThreadUri: null,
   sseConnected: false,
   lastEventId: null,
+  lastActionError: null,
 };
 
 function escapeHtml(value) {
@@ -53,9 +54,15 @@ function computeLiveElapsedMs(state) {
   return base;
 }
 
-function getStatusBannerText(state) {
+function getStatusBannerText(state, initialized = true) {
+  if (initialized === false || state?.initialized === false) {
+    return "UNINITIALIZED";
+  }
   if (!state) return "PLANNING";
   const st = String(state.status || "planning").toLowerCase();
+  if (st === "uninitialized") {
+    return "UNINITIALIZED";
+  }
   if (st === "awaiting_input") {
     return "AWAITING INPUT";
   }
@@ -353,6 +360,21 @@ function synthesizeSessions(state, features) {
   return Array.from(byId.values());
 }
 
+function handleActionError(err) {
+  hudState.lastActionError = err?.message || String(err);
+  const subEl = document.getElementById("status-strip-subtext");
+  if (subEl) {
+    subEl.textContent = hudState.lastActionError;
+  }
+  const diagEl = document.getElementById("resume-diagnostic-card");
+  if (diagEl) {
+    diagEl.innerHTML = `
+      <div class="stream-narrative-title">\u25a3 Check mission state before resuming</div>
+      <div>${escapeHtml(hudState.lastActionError)}</div>
+    `;
+  }
+}
+
 async function postJson(url, payload = {}) {
   const res = await fetch(url, {
     method: "POST",
@@ -363,6 +385,7 @@ async function postJson(url, payload = {}) {
     const errText = await res.text();
     throw new Error(`HTTP ${res.status}: ${errText}`);
   }
+  hudState.lastActionError = null;
   const data = await res.json();
   if (data?.snapshot) {
     applySnapshot(data.snapshot);
@@ -370,14 +393,25 @@ async function postJson(url, payload = {}) {
   return data;
 }
 
+const postAction = postJson;
+
 function renderTopBar(snapshot) {
-  const { state, features } = snapshot;
+  const { state = {}, features } = snapshot;
   const repoEl = document.getElementById("mission-repo-path");
   const titleEl = document.getElementById("mission-title");
   const timeEl = document.getElementById("metric-time");
   const progressEl = document.getElementById("metric-progress");
   const progressBarEl = document.getElementById("metric-progress-bar");
   const usageEl = document.getElementById("metric-usage");
+  const stripLabelEl = document.getElementById("status-strip-label");
+
+  const isUninitialized =
+    snapshot.initialized === false ||
+    state?.initialized === false ||
+    state?.status === "uninitialized";
+  if (stripLabelEl && isUninitialized) {
+    stripLabelEl.textContent = "UNINITIALIZED";
+  }
 
   if (repoEl) repoEl.textContent = state.repoPath || "/Volumes/Workspace/project";
   if (titleEl) titleEl.textContent = state.title || "T3 Mission Control";
@@ -402,7 +436,7 @@ function renderTopBar(snapshot) {
 }
 
 function renderStatusStrip(snapshot) {
-  const { state } = snapshot;
+  const { state = {} } = snapshot;
   const stripEl = document.getElementById("status-strip");
   const labelEl = document.getElementById("status-strip-label");
   const subEl = document.getElementById("status-strip-subtext");
@@ -410,19 +444,29 @@ function renderStatusStrip(snapshot) {
   const pauseBtn = document.getElementById("btn-pause");
   const resumeBtn = document.getElementById("btn-resume");
 
-  const status = state.status || "planning";
+  const isUninitialized =
+    snapshot.initialized === false ||
+    state?.initialized === false ||
+    state?.status === "uninitialized";
+  const status = isUninitialized ? "uninitialized" : (state.status || "planning");
   if (stripEl) stripEl.dataset.status = status;
-  if (labelEl) labelEl.textContent = getStatusBannerText(state);
+  if (labelEl) {
+    labelEl.textContent = isUninitialized
+      ? "UNINITIALIZED"
+      : getStatusBannerText(state, snapshot.initialized);
+  }
 
   const activeRole = state.activeWorker ? inferSessionRole(state.activeWorker) : "Worker";
   const activeWorkerSummary = state.activeWorker
-    ? ` · ${activeRole} #${state.activeWorker.workerNumber ?? 28} (${state.activeWorker.status || status})`
+    ? ` \u00b7 ${activeRole} #${state.activeWorker.workerNumber ?? 28} (${state.activeWorker.status || status})`
     : "";
   if (subEl) {
-    subEl.textContent = `Revision #${state.revision ?? 1}${activeWorkerSummary}`;
+    subEl.textContent = hudState.lastActionError
+      ? hudState.lastActionError
+      : `Revision #${state.revision ?? 1}${activeWorkerSummary}`;
   }
 
-  const needsApproval = status === "awaiting_input" && !state.planAccepted;
+  const needsApproval = !isUninitialized && status === "awaiting_input" && !state.planAccepted;
   if (approveBtn) {
     approveBtn.classList.toggle("hidden", !needsApproval);
     approveBtn.classList.toggle("is-primary-action", needsApproval);
@@ -523,6 +567,7 @@ function renderCenterColumn(snapshot) {
   const { initialized, state, features, progressLog, modelSettings } = snapshot;
   const onboardingEl = document.getElementById("onboarding-card");
   const approvalEl = document.getElementById("plan-approval-card");
+  const inspectorEl = document.getElementById("session-inspector");
   const handoffEl = document.getElementById("session-handoff-view");
   const streamEl = document.getElementById("orchestrator-stream");
   const pipelineTextEl = document.getElementById("pipeline-text");
@@ -613,7 +658,13 @@ function renderCenterColumn(snapshot) {
         </div>
       `;
       const approveBtn = approvalEl.querySelector("#btn-approve");
-      approveBtn?.addEventListener("click", () => triggerApprove());
+      approveBtn?.addEventListener("click", async () => {
+        try {
+          await triggerApprove();
+        } catch (err) {
+          handleActionError(err);
+        }
+      });
     } else {
       approvalEl.classList.add("hidden");
     }
@@ -628,6 +679,7 @@ function renderCenterColumn(snapshot) {
 
   if (handoffEl) {
     if (selectedSession) {
+      inspectorEl?.classList.remove("hidden");
       handoffEl.classList.remove("hidden");
       const threadUri = selectedSession.childThreadId
         ? `t3-thread://v1/${selectedSession.childThreadId}`
@@ -727,6 +779,7 @@ function renderCenterColumn(snapshot) {
         renderCenterColumn(hudState.snapshot);
       });
     } else {
+      inspectorEl?.classList.add("hidden");
       handoffEl.classList.add("hidden");
     }
   }
@@ -741,6 +794,7 @@ function renderCenterColumn(snapshot) {
       Boolean(state.lastResumeTrigger) ||
       (progressLog || []).some((e) => e.type === "mission_resumed");
     const resumeDiagnostic =
+      hudState.lastActionError ||
       state.lastResumeDiagnostic ||
       (state.activeWorker
         ? `${inferSessionRole(state.activeWorker)} #${state.activeWorker.workerNumber ?? 1} (${state.activeWorker.featureTitle || state.activeWorker.featureId}) is currently ${state.activeWorker.status || state.status}.`
@@ -921,11 +975,15 @@ function renderRightColumn(snapshot) {
 
         barsEl.querySelectorAll(".effort-bar-btn").forEach((btn) => {
           btn.addEventListener("click", async () => {
-            const newEffort = Number(btn.dataset.effort || 4);
-            await updateModelSlot(slot, {
-              model: selectEl?.value || currentModel,
-              effort: newEffort,
-            });
+            try {
+              const newEffort = Number(btn.dataset.effort || 4);
+              await updateModelSlot(slot, {
+                model: selectEl?.value || currentModel,
+                effort: newEffort,
+              });
+            } catch (err) {
+              handleActionError(err);
+            }
           });
         });
       }
@@ -1059,21 +1117,33 @@ export function applySnapshot(snapshot) {
 }
 
 async function triggerApprove() {
-  await postJson("/api/mission/approve", {
-    approvedBy: "user",
-  });
+  try {
+    await postAction("/api/mission/approve", {
+      approvedBy: "user",
+    });
+  } catch (err) {
+    handleActionError(err);
+  }
 }
 
 async function triggerPause() {
-  await postJson("/api/mission/pause", {
-    requestedBy: "user",
-  });
+  try {
+    await postAction("/api/mission/pause", {
+      requestedBy: "user",
+    });
+  } catch (err) {
+    handleActionError(err);
+  }
 }
 
 async function triggerResume() {
-  await postJson("/api/mission/resume", {
-    trigger: "[resume the mission]",
-  });
+  try {
+    await postAction("/api/mission/resume", {
+      trigger: "[resume the mission]",
+    });
+  } catch (err) {
+    handleActionError(err);
+  }
 }
 
 async function updateModelSlot(slot, { model, providerInstanceId, label, effort }) {
@@ -1083,33 +1153,60 @@ async function updateModelSlot(slot, { model, providerInstanceId, label, effort 
   if (effort !== undefined && effort !== null) {
     payload.effort = effort;
   }
-  await postJson("/api/mission/model-slots", payload);
-  if (statusEl) statusEl.textContent = "Saved";
+  try {
+    await postAction("/api/mission/model-slots", payload);
+    if (statusEl) statusEl.textContent = "Saved";
+  } catch (err) {
+    if (statusEl) statusEl.textContent = "Error";
+    handleActionError(err);
+  }
 }
 
 function bindStaticListeners() {
-  document.getElementById("strip-approve-btn")?.addEventListener("click", () => triggerApprove());
-  document.getElementById("btn-pause")?.addEventListener("click", () => triggerPause());
-  document.getElementById("btn-resume")?.addEventListener("click", () => triggerResume());
+  document.getElementById("strip-approve-btn")?.addEventListener("click", async () => {
+    try {
+      await triggerApprove();
+    } catch (err) {
+      handleActionError(err);
+    }
+  });
+  document.getElementById("btn-pause")?.addEventListener("click", async () => {
+    try {
+      await triggerPause();
+    } catch (err) {
+      handleActionError(err);
+    }
+  });
+  document.getElementById("btn-resume")?.addEventListener("click", async () => {
+    try {
+      await triggerResume();
+    } catch (err) {
+      handleActionError(err);
+    }
+  });
 
   for (const slot of ["orchestrator", "worker", "validator"]) {
     const selectEl = document.getElementById(`model-select-${slot}`);
     selectEl?.addEventListener("change", async (e) => {
-      const opt = e.target.selectedOptions?.[0];
-      const model = e.target.value;
-      const providerInstanceId = opt?.dataset?.provider || undefined;
-      const label = opt?.dataset?.label || undefined;
-      const optSupportsEffort = opt?.dataset?.supportsEffort !== "false";
-      const currentEffort = optSupportsEffort
-        ? hudState.snapshot?.modelSettings?.[slot]?.effort ||
-          Number(opt?.dataset?.effort || 4)
-        : null;
-      await updateModelSlot(slot, {
-        model,
-        providerInstanceId,
-        label,
-        ...(optSupportsEffort ? { effort: currentEffort } : {}),
-      });
+      try {
+        const opt = e.target.selectedOptions?.[0];
+        const model = e.target.value;
+        const providerInstanceId = opt?.dataset?.provider || undefined;
+        const label = opt?.dataset?.label || undefined;
+        const optSupportsEffort = opt?.dataset?.supportsEffort !== "false";
+        const currentEffort = optSupportsEffort
+          ? hudState.snapshot?.modelSettings?.[slot]?.effort ||
+            Number(opt?.dataset?.effort || 4)
+          : null;
+        await updateModelSlot(slot, {
+          model,
+          providerInstanceId,
+          label,
+          ...(optSupportsEffort ? { effort: currentEffort } : {}),
+        });
+      } catch (err) {
+        handleActionError(err);
+      }
     });
   }
 }

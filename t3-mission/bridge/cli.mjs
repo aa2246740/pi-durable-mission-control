@@ -686,8 +686,22 @@ export async function runCli(argv = process.argv.slice(2), context = {}) {
       error && typeof error === "object" && "code" in error
         ? /** @type {any} */ (error).code
         : "CLI_ERROR";
-    stderr.write(`${JSON.stringify({ ok: false, code, error: message })}\n`);
-    return { exitCode: 1, error: message };
+    const reasonCode =
+      error && typeof error === "object" && "reasonCode" in error
+        ? /** @type {any} */ (error).reasonCode
+        : code === "PLAN_ACCEPTANCE_REQUIRED"
+          ? "PLAN_NOT_ACCEPTED"
+          : code === "HANDOFF_ATTENTION_REQUIRED"
+            ? "HANDOFF_GATE_BLOCKED"
+            : undefined;
+    const errorPayload = {
+      ok: false,
+      code,
+      ...(reasonCode ? { reasonCode } : {}),
+      error: message
+    };
+    stderr.write(`${JSON.stringify(errorPayload)}\n`);
+    return { exitCode: 1, error: message, code, ...(reasonCode ? { reasonCode } : {}) };
   }
 }
 

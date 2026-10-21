@@ -341,12 +341,15 @@ export function resolveEffectiveRuntimeMode({
     desiredMode = fromAutonomy;
   }
 
-  const ceilingMode = normalizeToT3RuntimeMode(parentRuntimeMode, "full-access");
+  const normalizedParent = normalizeToT3RuntimeMode(parentRuntimeMode);
+  const ceilingMode = normalizedParent ?? "full-access";
   const desiredRank = T3_RUNTIME_MODE_ORDER.indexOf(desiredMode);
   const ceilingRank = T3_RUNTIME_MODE_ORDER.indexOf(ceilingMode);
   const maxAllowedRank = Math.min(desiredRank, ceilingRank);
 
-  const normalizedProviderModes = Array.isArray(providerRuntimeModes)
+  const hasNonEmptyProviderModes =
+    Array.isArray(providerRuntimeModes) && providerRuntimeModes.length > 0;
+  const normalizedProviderModes = hasNonEmptyProviderModes
     ? providerRuntimeModes
         .map((m) => normalizeToT3RuntimeMode(m))
         .filter((m) => Boolean(m))
@@ -355,7 +358,9 @@ export function resolveEffectiveRuntimeMode({
   const candidatePool =
     normalizedProviderModes.length > 0
       ? T3_RUNTIME_MODE_ORDER.filter((m) => normalizedProviderModes.includes(m))
-      : [...T3_RUNTIME_MODE_ORDER];
+      : hasNonEmptyProviderModes
+        ? []
+        : [...T3_RUNTIME_MODE_ORDER];
 
   const withinCeiling = candidatePool.filter(
     (m) => T3_RUNTIME_MODE_ORDER.indexOf(m) <= maxAllowedRank
@@ -364,6 +369,15 @@ export function resolveEffectiveRuntimeMode({
   if (withinCeiling.length > 0) {
     return /** @type {any} */ (withinCeiling[withinCeiling.length - 1]);
   }
+
+  if (normalizedParent && hasNonEmptyProviderModes) {
+    const err = new Error(
+      `Cannot resolve runtimeMode: no provider runtimeMode in [${providerRuntimeModes.join(", ")}] is within parent ceiling "${normalizedParent}"`
+    );
+    /** @type {any} */ (err).code = "RUNTIME_MODE_CEILING_EXCEEDED";
+    throw err;
+  }
+
   return /** @type {any} */ (candidatePool[0] ?? "approval-required");
 }
 
@@ -1028,11 +1042,13 @@ export async function delegateMissionTask(params, envOrOptions = process.env) {
   if (target) {
     delegateArgs.target = target;
   }
-  if (params.runtimeMode) {
+  if (params.runtimeMode || params.parentRuntimeMode || params.providerRuntimeModes) {
+    const rawAutonomy = params.autonomyLevel ?? params.autonomy_level;
     delegateArgs.runtimeMode =
       params.parentRuntimeMode || params.providerRuntimeModes
         ? resolveEffectiveRuntimeMode({
-            requestedMode: String(params.runtimeMode),
+            requestedMode: params.runtimeMode ? String(params.runtimeMode) : undefined,
+            autonomyLevel: rawAutonomy ? String(rawAutonomy) : undefined,
             parentRuntimeMode: params.parentRuntimeMode
               ? String(params.parentRuntimeMode)
               : undefined,

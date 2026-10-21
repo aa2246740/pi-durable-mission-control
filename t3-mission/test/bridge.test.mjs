@@ -1969,3 +1969,103 @@ test("SKILL.md contains complete YAML frontmatter and required workflow instruct
   assert.match(content, /acpRegistry_devin/);
   assert.match(content, /acpRegistry_cursor/);
 });
+
+test("V7-F03, V7-F02 & V7-F07: resolveEffectiveRuntimeMode and delegateMissionTask reject with RUNTIME_MODE_CEILING_EXCEEDED when providerRuntimeModes exceed parentRuntimeMode, and CLI outputs reasonCode aliases", async () => {
+  // 1. V7-F03: resolveEffectiveRuntimeMode throws RUNTIME_MODE_CEILING_EXCEEDED
+  assert.throws(
+    () =>
+      resolveEffectiveRuntimeMode({
+        parentRuntimeMode: "approval-required",
+        providerRuntimeModes: ["full-access"]
+      }),
+    (err) => {
+      assert.equal(err.code, "RUNTIME_MODE_CEILING_EXCEEDED");
+      assert.match(err.message, /no provider runtimeMode.*within parent ceiling "approval-required"/i);
+      return true;
+    }
+  );
+
+  // 2. V7-F03: delegateMissionTask rejects with RUNTIME_MODE_CEILING_EXCEEDED before calling delegate_task
+  let delegateCalled = false;
+  await assert.rejects(
+    () =>
+      delegateMissionTask(
+        {
+          missionId: "m-v7-f03",
+          milestoneId: "M1",
+          featureId: "f-ceiling",
+          task: "Test runtime ceiling rejection",
+          parentRuntimeMode: "approval-required",
+          providerRuntimeModes: ["full-access"],
+          slot: {
+            providerInstanceId: "antigravity",
+            model: "gemini-4-argon-high"
+          }
+        },
+        {
+          transportClient: async () => {
+            delegateCalled = true;
+            return { taskId: "should-not-run" };
+          }
+        }
+      ),
+    (err) => {
+      assert.equal(err.code, "RUNTIME_MODE_CEILING_EXCEEDED");
+      return true;
+    }
+  );
+  assert.equal(delegateCalled, false);
+
+  // 3. V7-F02 & V7-F07: StartMissionRun CLI JSON error output includes reasonCode aliases
+  const tempMissionDir = createTempDir("t3-v7-f02-f07-");
+  try {
+    await callMissionTool("ProposeMission", {
+      missionDir: tempMissionDir,
+      title: "V7 CLI Reason Codes",
+      milestones: [{ id: "m1", title: "M1" }],
+      features: [
+        { id: "f1", milestoneId: "m1", title: "F1" },
+        { id: "f2", milestoneId: "m1", title: "F2" }
+      ],
+      assertions: [{ id: "VAL-1", milestoneId: "m1", description: "Assertion 1" }]
+    });
+
+    const stderrChunks1 = [];
+    const res1 = await runCli(["StartMissionRun", "--mission-dir", tempMissionDir], {
+      stdout: { write() {} },
+      stderr: { write(chunk) { stderrChunks1.push(String(chunk)); } }
+    });
+    assert.equal(res1.exitCode, 1);
+    const errJson1 = JSON.parse(stderrChunks1.join("").trim());
+    assert.equal(errJson1.ok, false);
+    assert.equal(errJson1.code, "PLAN_ACCEPTANCE_REQUIRED");
+    assert.equal(errJson1.reasonCode, "PLAN_NOT_ACCEPTED");
+
+    await callMissionTool("ApproveMissionPlan", { missionDir: tempMissionDir });
+    const started = await callMissionTool("StartMissionRun", { missionDir: tempMissionDir });
+    await callMissionTool("EndFeatureRun", {
+      missionDir: tempMissionDir,
+      runId: started.activeWorker.runId,
+      featureId: "f1",
+      successState: "success",
+      validatorsPassed: true,
+      handoff: {
+        whatWasImplemented: "Implemented F1 with more than fifty characters of detailed implementation notes.",
+        whatWasLeftUndone: "Follow-up edge case requires orchestrator triage"
+      }
+    });
+
+    const stderrChunks2 = [];
+    const res2 = await runCli(["StartMissionRun", "--mission-dir", tempMissionDir], {
+      stdout: { write() {} },
+      stderr: { write(chunk) { stderrChunks2.push(String(chunk)); } }
+    });
+    assert.equal(res2.exitCode, 1);
+    const errJson2 = JSON.parse(stderrChunks2.join("").trim());
+    assert.equal(errJson2.ok, false);
+    assert.equal(errJson2.code, "HANDOFF_ATTENTION_REQUIRED");
+    assert.equal(errJson2.reasonCode, "HANDOFF_GATE_BLOCKED");
+  } finally {
+    fs.rmSync(tempMissionDir, { recursive: true, force: true });
+  }
+});

@@ -86,8 +86,10 @@
             <span class="panel-title">Sessions</span>
             <span class="panel-count mono" id="sessions-count">1</span>
           </div>
-          <div class="sessions-list" id="sessions-list">
-            <!-- Populated by app.js -->
+          <div class="session-list-container" id="session-list" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+            <div class="sessions-list" id="sessions-list">
+              <!-- Populated by app.js -->
+            </div>
           </div>
           <div class="sidebar-footer">
             <div class="user-chip">
@@ -107,7 +109,9 @@
           <div class="approval-card hidden" id="plan-approval-card"></div>
 
           <!-- Session Handoff Inspector (shown when a Worker/Explorer/Validator session is clicked) -->
-          <div class="session-handoff-view hidden" id="session-handoff-view"></div>
+          <div class="session-inspector hidden" id="session-inspector">
+            <div class="session-handoff-view hidden" id="session-handoff-view"></div>
+          </div>
 
           <!-- Orchestrator Action Stream (Droid timeline flow) -->
           <div class="orchestrator-stream" id="orchestrator-stream"></div>

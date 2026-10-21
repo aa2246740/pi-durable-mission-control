@@ -79,6 +79,13 @@ export class MissionKernelError extends Error {
     this.name = "MissionKernelError";
     this.code = code;
     this.details = details;
+    if (details && typeof details === "object" && details.reasonCode) {
+      this.reasonCode = details.reasonCode;
+    } else if (code === "PLAN_ACCEPTANCE_REQUIRED") {
+      this.reasonCode = "PLAN_NOT_ACCEPTED";
+    } else if (code === "HANDOFF_ATTENTION_REQUIRED") {
+      this.reasonCode = "HANDOFF_GATE_BLOCKED";
+    }
   }
 }
 
