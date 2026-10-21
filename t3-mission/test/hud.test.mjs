@@ -2874,3 +2874,179 @@ test("Validator #8 Visual Polish Fixes (HUD-V8-001, HUD-V8-002, HUD-V8-003, HUD-
     "Completed mission must not display stale lastResumeDiagnostic"
   );
 });
+
+test("Validator #8 Round 2 Fix (HUD-V8-005): SSE snapshot convergence when features.json milestone validators are injected milliseconds after state.json revision update", async (t) => {
+  const workspaceDir = createTempMissionWorkspace();
+  const dotMission = path.join(workspaceDir, ".mission");
+  fs.mkdirSync(dotMission, { recursive: true });
+
+  const initialFeatures = [
+    ...Array.from({ length: 12 }, (_, i) => ({
+      id: `f${String(i + 1).padStart(2, "0")}`,
+      title: `Feature ${i + 1}`,
+      milestoneId: `m${Math.floor(i / 3) + 1}`,
+      kind: "implementation",
+      status: i < 5 ? "completed" : i === 5 ? "running" : "pending",
+    })),
+    {
+      id: "scrutiny-validator-m1",
+      title: "Scrutiny Validator (m1)",
+      milestoneId: "m1",
+      kind: "scrutiny-validator",
+      status: "completed",
+    },
+    {
+      id: "user-testing-validator-m1",
+      title: "User Testing Validator (m1)",
+      milestoneId: "m1",
+      kind: "user-testing-validator",
+      status: "completed",
+    },
+  ];
+
+  const initialState = {
+    missionId: "mission-hud-v8-005",
+    title: "HUD-V8-005 SSE Convergence Test",
+    repoPath: workspaceDir,
+    status: "running",
+    planAccepted: true,
+    revision: 35,
+    milestones: [
+      { id: "m1", title: "M1", ordinal: 1 },
+      { id: "m2", title: "M2", ordinal: 2 },
+      { id: "m3", title: "M3", ordinal: 3 },
+      { id: "m4", title: "M4", ordinal: 4 },
+    ],
+    assertions: [],
+    activeWorker: {
+      runId: "run-f06",
+      workerNumber: 8,
+      featureId: "f06",
+      featureTitle: "Feature 6",
+      milestoneId: "m2",
+      status: "running",
+    },
+    sessions: [],
+  };
+
+  fs.writeFileSync(path.join(dotMission, "state.json"), JSON.stringify(initialState, null, 2) + "\n");
+  fs.writeFileSync(
+    path.join(dotMission, "features.json"),
+    JSON.stringify({ features: initialFeatures, updatedAt: new Date().toISOString() }, null, 2) + "\n"
+  );
+  fs.writeFileSync(path.join(dotMission, "model-settings.json"), "{}\n");
+  fs.writeFileSync(
+    path.join(dotMission, "progress_log.jsonl"),
+    JSON.stringify({ seq: 1, timestamp: new Date().toISOString(), type: "worker_started", message: "Started f06" }) + "\n"
+  );
+
+  const hud = await createMissionHudServer({ missionDir: workspaceDir, port: 0 });
+  t.after(async () => {
+    await hud.close();
+    fs.rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  // Connect live SSE client to /api/mission/events and keep it open across the multi-file write race
+  const receivedSnapshots = [];
+  let resolveConverged;
+  const convergedPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(
+        new Error(
+          `Timed out waiting for 16-feature SSE snapshot (last count: ${receivedSnapshots.at(-1)?.features?.length})`
+        )
+      );
+    }, 480);
+    resolveConverged = (snap) => {
+      clearTimeout(timeout);
+      resolve(snap);
+    };
+  });
+
+  let resolveInitial;
+  const initialPromise = new Promise((resolve) => {
+    resolveInitial = resolve;
+  });
+
+  const req = http.get(`${hud.url}/api/mission/events`, (res) => {
+    res.setEncoding("utf8");
+    let buffer = "";
+    res.on("data", (chunk) => {
+      buffer += chunk;
+      const blocks = buffer.split("\n\n");
+      buffer = blocks.pop() || "";
+      for (const block of blocks) {
+        const lines = block.split("\n").filter((l) => l && !l.startsWith(":"));
+        let dataRaw = "";
+        for (const line of lines) {
+          if (line.startsWith("data:")) dataRaw += line.slice(5).trim();
+        }
+        if (dataRaw) {
+          const parsed = JSON.parse(dataRaw);
+          receivedSnapshots.push(parsed);
+          if (receivedSnapshots.length === 1) {
+            resolveInitial(parsed);
+          }
+          const ids = (parsed.features || []).map((f) => f.id);
+          if (
+            ids.length === 16 &&
+            ids.includes("scrutiny-validator-m2") &&
+            ids.includes("user-testing-validator-m2")
+          ) {
+            resolveConverged(parsed);
+          }
+        }
+      }
+    });
+  });
+  t.after(() => {
+    req.destroy();
+  });
+
+  const firstSnap = await initialPromise;
+  assert.equal(firstSnap.features.length, 14);
+
+  const raceStartMs = Date.now();
+  // Step 1: Write state.json with revision 36 first (simulating EndFeatureRun)
+  const nextState = {
+    ...initialState,
+    status: "orchestrator_turn",
+    revision: 36,
+    activeWorker: null,
+    milestoneValidationTriggered: { m1: true, m2: true },
+  };
+  fs.writeFileSync(path.join(dotMission, "state.json"), JSON.stringify(nextState, null, 2) + "\n");
+
+  // Step 2: 3ms later, write features.json with 16 features (injecting scrutiny-validator-m2 & user-testing-validator-m2) WITHOUT changing state.revision
+  await new Promise((r) => setTimeout(r, 3));
+  const updatedFeatures = [
+    ...initialFeatures.map((f) => (f.id === "f06" ? { ...f, status: "completed" } : f)),
+    {
+      id: "scrutiny-validator-m2",
+      title: "Scrutiny Validator (m2)",
+      milestoneId: "m2",
+      kind: "scrutiny-validator",
+      status: "pending",
+    },
+    {
+      id: "user-testing-validator-m2",
+      title: "User Testing Validator (m2)",
+      milestoneId: "m2",
+      kind: "user-testing-validator",
+      status: "pending",
+    },
+  ];
+  fs.writeFileSync(
+    path.join(dotMission, "features.json"),
+    JSON.stringify({ features: updatedFeatures, updatedAt: new Date().toISOString() }, null, 2) + "\n"
+  );
+
+  const convergedSnap = await convergedPromise;
+  const elapsedMs = Date.now() - raceStartMs;
+  assert.ok(elapsedMs < 500, `Expected convergence in < 500ms, took ${elapsedMs}ms`);
+  assert.equal(convergedSnap.state.revision, 36);
+  assert.equal(convergedSnap.features.length, 16);
+  const convergedIds = convergedSnap.features.map((f) => f.id);
+  assert.ok(convergedIds.includes("scrutiny-validator-m2"));
+  assert.ok(convergedIds.includes("user-testing-validator-m2"));
+});

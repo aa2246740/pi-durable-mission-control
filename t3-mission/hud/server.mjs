@@ -865,6 +865,7 @@ export function createMissionHudServer({
   let parentWatcher = null;
   let pollInterval = null;
   let lastDiskSignature = "";
+  let lastBroadcastSnapshotSignature = "";
   let closed = false;
 
   function reconcileStaleRunningStateOnStartup() {
@@ -990,11 +991,36 @@ export function createMissionHudServer({
     };
   }
 
+  function computeSnapshotSignature(snapshot) {
+    if (!snapshot) return "";
+    return crypto
+      .createHash("sha1")
+      .update(
+        JSON.stringify({
+          initialized: snapshot.initialized,
+          state: snapshot.state,
+          features: snapshot.features,
+          modelSettings: snapshot.modelSettings,
+          progressLogLen: Array.isArray(snapshot.progressLog) ? snapshot.progressLog.length : 0,
+          lastLogSeq: Array.isArray(snapshot.progressLog) ? snapshot.progressLog.at(-1)?.seq : null,
+        })
+      )
+      .digest("hex");
+  }
+
   function loadSnapshot() {
-    const rawState = safeReadJsonSync(paths.statePath, null);
-    const rawFeatures = safeReadJsonSync(paths.featuresPath, null);
-    const rawModelSettings = safeReadJsonSync(paths.modelSettingsPath, null);
-    const progressLog = readProgressLogSync(paths.progressLogPath);
+    const sigBefore = computeDiskSignature();
+    let rawState = safeReadJsonSync(paths.statePath, null);
+    let rawFeatures = safeReadJsonSync(paths.featuresPath, null);
+    let rawModelSettings = safeReadJsonSync(paths.modelSettingsPath, null);
+    let progressLog = readProgressLogSync(paths.progressLogPath);
+    const sigAfter = computeDiskSignature();
+    if (sigBefore !== sigAfter) {
+      rawState = safeReadJsonSync(paths.statePath, null);
+      rawFeatures = safeReadJsonSync(paths.featuresPath, null);
+      rawModelSettings = safeReadJsonSync(paths.modelSettingsPath, null);
+      progressLog = readProgressLogSync(paths.progressLogPath);
+    }
 
     return buildInMemorySnapshot({
       state: rawState,
@@ -1054,7 +1080,8 @@ export function createMissionHudServer({
         }
       } catch {}
     }
-    lastDiskSignature = computeDiskSignature();
+    lastDiskSignature = "";
+    lastBroadcastSnapshotSignature = "";
   }
 
   function writeSseEvent(res, eventName, data, id) {
@@ -1063,10 +1090,12 @@ export function createMissionHudServer({
     res.write(`id: ${eventId}\nevent: ${eventName}\ndata: ${serialized}\n\n`);
   }
 
-  function broadcastSnapshot(reason = "update") {
+  function broadcastSnapshot(reason = "update", preloadedSnapshot = null) {
     if (closed) return null;
-    const snapshot = loadSnapshot();
-    lastDiskSignature = computeDiskSignature();
+    const diskSigBefore = computeDiskSignature();
+    const snapshot = preloadedSnapshot || loadSnapshot();
+    lastDiskSignature = diskSigBefore;
+    lastBroadcastSnapshotSignature = computeSnapshotSignature(snapshot);
     const eventId = sseEventSeq++;
     const payload = {
       ...snapshot,
@@ -1086,13 +1115,15 @@ export function createMissionHudServer({
 
   function setupWatchers() {
     lastDiskSignature = computeDiskSignature();
+    lastBroadcastSnapshotSignature = computeSnapshotSignature(loadSnapshot());
 
     const checkAndBroadcast = () => {
       if (closed) return;
-      const sig = computeDiskSignature();
-      if (sig !== lastDiskSignature) {
-        lastDiskSignature = sig;
-        broadcastSnapshot("fs_change");
+      const diskSig = computeDiskSignature();
+      const currentSnapshot = loadSnapshot();
+      const snapSig = computeSnapshotSignature(currentSnapshot);
+      if (diskSig !== lastDiskSignature || snapSig !== lastBroadcastSnapshotSignature) {
+        broadcastSnapshot("fs_change", currentSnapshot);
       }
     };
 
@@ -2105,7 +2136,7 @@ export function createMissionHudServer({
         return;
       }
 
-      if (method === "GET" && pathname === "/api/mission/stream") {
+      if (method === "GET" && (pathname === "/api/mission/stream" || pathname === "/api/mission/events")) {
         const lastEventIdHeader =
           req.headers["last-event-id"] || urlObj.searchParams.get("lastEventId") || null;
 
