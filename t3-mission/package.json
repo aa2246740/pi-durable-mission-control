@@ -1,0 +1,14 @@
+{
+  "name": "t3-mission-mode",
+  "version": "1.0.0",
+  "description": "Durable multi-milestone Mission Mode for T3 Code with 3-role model slots, live SSE Mission HUD, Git-guarded pause/resume, and cross-provider autonomy mapping.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test t3-mission/test/bridge.test.mjs t3-mission/test/hud.test.mjs t3-mission/test/kernel.test.mjs",
+    "hud": "node t3-mission/hud/server.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
