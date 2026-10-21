@@ -114,8 +114,32 @@ function parseEffortLevel(rawEffort) {
   return null;
 }
 
+function doesSlotSupportEffort(providerInstanceId, model, safeRaw = {}, safeBase = {}) {
+  if (safeRaw.supportsEffort === false) return false;
+  if (safeRaw.supportsEffort === true) return true;
+  if (
+    safeRaw.supportsEffort === undefined &&
+    safeBase.supportsEffort === false &&
+    (!safeRaw.model || safeRaw.model === safeBase.model)
+  ) {
+    return false;
+  }
+  if (String(providerInstanceId || "").trim().toLowerCase() === "antigravity") {
+    return false;
+  }
+  if (/-(low|medium|high)$/i.test(String(model || "").trim())) {
+    return false;
+  }
+  return true;
+}
+
 export function normalizeSlotConfig(raw = {}, base = {}) {
-  const safeRaw = raw && typeof raw === "object" ? raw : {};
+  const safeRaw =
+    typeof raw === "string" && raw.trim()
+      ? { model: raw.trim() }
+      : raw && typeof raw === "object"
+        ? raw
+        : {};
   const safeBase = base && typeof base === "object" ? base : {};
 
   const providerInstanceId =
@@ -137,6 +161,18 @@ export function normalizeSlotConfig(raw = {}, base = {}) {
     ...baseOptions,
     ...rawOptions,
   };
+
+  if (!doesSlotSupportEffort(providerInstanceId, model, safeRaw, safeBase)) {
+    delete options.effort;
+    delete options.reasoningEffort;
+    delete options.reasoning_effort;
+    delete options.thinking;
+    return {
+      providerInstanceId,
+      model,
+      options,
+    };
+  }
 
   const rawEffortVal = safeRaw.effort ?? rawOptions.effort;
   const rawReasoningVal =

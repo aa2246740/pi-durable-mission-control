@@ -855,6 +855,16 @@ test("F03, F07, F08, F09, F10, F11, F12: handoff attention ledger, strict dismis
   assert.equal(normalizedMinimal.options.effort, 1);
   assert.equal(normalizedMinimal.options.reasoningEffort, "minimal");
 
+  // V7-R2-F01: fixed-tier models omit effort and reasoningEffort keys completely
+  const normalizedFixed = normalizeSlotConfig(
+    { providerInstanceId: "antigravity", model: "gemini-4-argon-high", effort: 4, reasoningEffort: "high" },
+    { providerInstanceId: "codex", model: "gpt-6.1-sol", options: { effort: 4, reasoningEffort: "high" } }
+  );
+  assert.equal(!("effort" in normalizedFixed), true);
+  assert.equal(!("reasoningEffort" in normalizedFixed), true);
+  assert.equal(!("effort" in normalizedFixed.options), true);
+  assert.equal(!("reasoningEffort" in normalizedFixed.options), true);
+
   // F03 (P14): Starting without runFeature sets dispatchPending=true, and subsequent startMissionRun with runFeature dispatches that worker
   await startMissionRun(projectDir);
   assert.equal(loadState(projectDir).activeWorker.dispatchPending, true);

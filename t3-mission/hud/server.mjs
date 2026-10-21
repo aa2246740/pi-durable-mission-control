@@ -250,8 +250,6 @@ function normalizeSlotConfig(rawSlot, fallbackSlot) {
         label,
         supportsEffort: false,
         effortLevels: [],
-        effort: null,
-        reasoningEffort: null,
         options: cleanedOptions,
       };
     }
@@ -308,8 +306,6 @@ function normalizeSlotConfig(rawSlot, fallbackSlot) {
       label,
       supportsEffort: false,
       effortLevels: [],
-      effort: null,
-      reasoningEffort: null,
       options: cleanedOptions,
     };
   }
@@ -1595,8 +1591,12 @@ export function createMissionHudServer({
       ["orchestrator", "worker", "validator"].includes(k)
     );
     const summaryParts = (changedRoles.length ? changedRoles : ["validator"]).map(
-      (role) =>
-        `${role}=${updatedSettings[role].model} (${updatedSettings[role].reasoningEffort}/${updatedSettings[role].effort})`
+      (role) => {
+        const slotCfg = updatedSettings[role];
+        return slotCfg.supportsEffort === false
+          ? `${role}=${slotCfg.model}`
+          : `${role}=${slotCfg.model} (${slotCfg.reasoningEffort}/${slotCfg.effort})`;
+      }
     );
 
     const logEntries = buildProgressLogEntries(existingLogs, [

@@ -501,6 +501,28 @@ test("VAL-HUD-003: POST /api/mission/model-slots hot-swaps Validator model from 
   const lastLog = logLines.at(-1);
   assert.equal(lastLog.type, "model_slots_updated");
   assert.match(lastLog.message, /gpt-6\.1-sol/);
+
+  // Fixed-tier model selection (V7-R2-F01): switching to gemini-4-argon-high omits top-level effort and reasoningEffort keys in .mission/model-settings.json
+  const fixedSwitchRes = await fetch(`${hud.url}/api/mission/model-slots`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      slot: "validator",
+      model: "gemini-4-argon-high",
+      providerInstanceId: "antigravity",
+    }),
+  });
+  assert.equal(fixedSwitchRes.status, 200);
+  const diskSettingsFixed = JSON.parse(
+    fs.readFileSync(path.join(dotMission, "model-settings.json"), "utf8")
+  );
+  const updatedSlot = diskSettingsFixed.validator;
+  assert.equal(updatedSlot.model, "gemini-4-argon-high");
+  assert.equal(updatedSlot.supportsEffort, false);
+  assert.equal(!("effort" in updatedSlot), true);
+  assert.equal(!("reasoningEffort" in updatedSlot), true);
+  assert.equal(!("effort" in updatedSlot.options), true);
+  assert.equal(!("reasoningEffort" in updatedSlot.options), true);
 });
 
 test("VAL-HUD-004: POST /api/mission/pause and POST /api/mission/resume reproduce Worker #28 pause & resume closed loop", async (t) => {
@@ -2072,11 +2094,21 @@ test("HUD Effort Capability Fix (t3m-m1-w3-hud-effort-cap-fix-v1): Fixed-tier / 
   assert.equal(normalized.orchestrator.providerInstanceId, "antigravity");
   assert.equal(normalized.orchestrator.supportsEffort, false);
   assert.deepEqual(normalized.orchestrator.effortLevels, []);
-  assert.equal(normalized.orchestrator.effort, null);
-  assert.equal(normalized.orchestrator.reasoningEffort, null);
-  assert.equal(normalized.orchestrator.options.effort, undefined);
-  assert.equal(normalized.orchestrator.options.reasoningEffort, undefined);
+  assert.equal("effort" in normalized.orchestrator, false);
+  assert.equal("reasoningEffort" in normalized.orchestrator, false);
+  assert.equal(Object.hasOwn(normalized.orchestrator, "effort"), false);
+  assert.equal(Object.hasOwn(normalized.orchestrator, "reasoningEffort"), false);
+  assert.equal("effort" in normalized.orchestrator.options, false);
+  assert.equal("reasoningEffort" in normalized.orchestrator.options, false);
   assert.deepEqual(normalized.orchestrator.options, {});
+
+  const normalizedString = normalizeHudModelSettings({
+    orchestrator: "gemini-4-argon-high",
+  });
+  assert.equal(normalizedString.orchestrator.supportsEffort, false);
+  assert.equal("effort" in normalizedString.orchestrator, false);
+  assert.equal("reasoningEffort" in normalizedString.orchestrator, false);
+  assert.deepEqual(normalizedString.orchestrator.options, {});
 
   assert.equal(normalized.worker.model, "gpt-6.1-sol");
   assert.equal(normalized.worker.supportsEffort, true);
